@@ -1,0 +1,44 @@
+id: T-sort_into-01009
+title: 建一个叫 final 的文件夹，然后把所有 .csv 文件放进去，别的文件留在原
+surface: finder
+tags:
+- train
+- finder
+- train
+- sort_into
+app: com.apple.finder
+goal: 建一个叫 final 的文件夹，然后把所有 .csv 文件放进去，别的文件留在原地。
+fixture: train/T-sort_into-01009
+budget:
+  max_actions: 30
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: folder
+    check:
+      file_exists:
+        path: $WS/final
+  - name: moved
+    critical: true
+    check:
+      dir_manifest:
+        dir: $WS/final
+        value:
+        - plan-27.csv
+        - plan-70.csv
+  guards:
+  - file_exists:
+      path: $WS/summary-81.log
+  - file_exists:
+      path: $WS/记录-83.txt
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir 'final'
+- mv 'plan-70.csv' 'final/'
+- mv 'plan-27.csv' 'final/'

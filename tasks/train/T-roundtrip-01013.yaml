@@ -1,0 +1,38 @@
+id: T-roundtrip-01013
+title: Read the 金额 and 订单号 from 原始.txt and writ
+surface: editor
+tags:
+- train
+- textedit
+- train
+- roundtrip
+app: com.apple.TextEdit
+goal: Read the 金额 and 订单号 from 原始.txt and write them into 结果.txt as one line in the
+  format `金额,订单号`. Values only. Save.
+fixture: train/T-roundtrip-01013
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/结果.txt"
+- open -a TextEdit "$WS/原始.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/原始.txt
+grade:
+  checkpoints:
+  - name: written
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/结果.txt
+        normalise: nfc_rstrip
+        value: K-6168,44620
+oracle_effect:
+- 'cat > ''结果.txt'' <<''HANDS_EOF''
+
+  K-6168,44620
+
+  HANDS_EOF'

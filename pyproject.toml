@@ -1,0 +1,47 @@
+[project]
+name = "deskmind-hands"
+version = "0.1.0"
+description = "A macOS computer-use harness: background execution, a projection layer, typed-question planners"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{name = "The DeskMind authors"}]
+keywords = ["computer-use", "agents", "macos", "accessibility", "desktop-automation", "dagger"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# The task schema, the graders and the failure taxonomy live in deskmind-bench, the scorer of record.
+dependencies = ["pyyaml>=6.0", "deskmind-bench"]
+
+[project.optional-dependencies]
+render = ["pillow>=10.0"]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.50"]
+mlx = ["mlx-vlm"]
+# The real-desktop driver: Peekaboo (installed separately, see README) plus the macOS bridges it uses.
+macos = ["pillow>=10.0", "pyobjc-framework-Quartz>=10.0", "pyobjc-framework-Cocoa>=10.0",
+         "pyobjc-framework-ScreenCaptureKit>=10.0"]
+
+[project.urls]
+Homepage = "https://github.com/deskmind-ai/hands"
+Repository = "https://github.com/deskmind-ai/hands"
+Issues = "https://github.com/deskmind-ai/hands/issues"
+
+[project.scripts]
+deskmind-hands = "deskmind_hands.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["deskmind_hands"]
+
+[tool.uv.sources]
+deskmind-bench = { path = "../bench", editable = true }

@@ -1,0 +1,32 @@
+id: T-rename_deep-01016
+title: 归档/final 下有一个 .md 文件，请把它的名字改成 清单-final.m
+surface: finder
+tags:
+- train
+- finder
+- train
+- rename_deep
+app: com.apple.finder
+goal: 归档/final 下有一个 .md 文件，请把它的名字改成 清单-final.md。
+fixture: train/T-rename_deep-01016
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/归档/final/清单-final.md
+  - name: old_gone
+    check:
+      file_absent:
+        path: $WS/归档/final/report-37.md
+  guards:
+  - file_exists:
+      path: $WS/归档/final/预算-127.log
+oracle_effect:
+- mv '归档/final/report-37.md' '归档/final/清单-final.md'

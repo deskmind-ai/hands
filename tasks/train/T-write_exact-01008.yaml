@@ -1,0 +1,41 @@
+id: T-write_exact-01008
+title: 在 agenda.txt 里一字不差地写下：
+surface: editor
+tags:
+- train
+- textedit
+- train
+- write_exact
+app: com.apple.TextEdit
+goal: '在 agenda.txt 里一字不差地写下：
+
+  库存周转天数为 1470 天，同比下降 22.2%。
+
+  写完保存。'
+fixture: train/T-write_exact-01008
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/agenda.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/agenda.txt
+        normalise: nfc_rstrip
+        value: '库存周转天数为 1470 天，同比下降 22.2%。
+
+          '
+oracle_effect:
+- 'cat > ''agenda.txt'' <<''HANDS_EOF''
+
+  库存周转天数为 1470 天，同比下降 22.2%。
+
+  HANDS_EOF'

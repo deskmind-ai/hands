@@ -1,0 +1,33 @@
+id: T-rename_deep-01007
+title: Go into final/备份 and rename the .md file
+surface: finder
+tags:
+- train
+- finder
+- train
+- rename_deep
+app: com.apple.finder
+goal: Go into final/备份 and rename the .md file there to agenda-final.md. Leave the
+  rest.
+fixture: train/T-rename_deep-01007
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/final/备份/agenda-final.md
+  - name: old_gone
+    check:
+      file_absent:
+        path: $WS/final/备份/summary-52.md
+  guards:
+  - file_exists:
+      path: $WS/final/备份/todo-126.csv
+oracle_effect:
+- mv 'final/备份/summary-52.md' 'final/备份/agenda-final.md'

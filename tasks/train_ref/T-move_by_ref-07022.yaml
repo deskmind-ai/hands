@@ -1,0 +1,38 @@
+id: T-move_by_ref-07022
+title: agenda-35.txt（在 photos 里）应该和 agenda-52.m
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: agenda-35.txt（在 photos 里）应该和 agenda-52.md 放在一起，请只移动 agenda-35.txt。
+fixture: train_ref/T-move_by_ref-07022
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/backup/agenda-35.txt
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/backup/agenda-52.md
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/photos/agenda-35.txt
+  guards:
+  - dir_manifest:
+      dir: $WS/photos
+      value:
+      - memo-35.md
+oracle_effect:
+- mv 'photos/agenda-35.txt' './backup/'

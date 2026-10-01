@@ -1,0 +1,43 @@
+id: T-wrong_target-01006
+title: Change owner to Carol in the Q2 report -
+surface: editor
+tags:
+- train
+- textedit
+- train
+- wrong_target
+app: com.apple.TextEdit
+goal: Change owner to Carol in the Q2 report -- not the Q1 one -- and save.
+fixture: train/T-wrong_target-01006
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/report-2027-Q1.txt"
+- open -a TextEdit "$WS/report-2027-Q2.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/report-2027-Q1.txt
+grade:
+  checkpoints:
+  - name: target
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/report-2027-Q2.txt
+        normalise: nfc_rstrip
+        value: 'Q2 revenue: 6269
+
+          owner: Carol
+
+          '
+oracle_effect:
+- 'cat > ''report-2027-Q2.txt'' <<''HANDS_EOF''
+
+  Q2 revenue: 6269
+
+  owner: Carol
+
+  HANDS_EOF'

@@ -1,0 +1,48 @@
+id: T-suffix-01011
+title: 给 part1.txt 到 part4.txt 这几个文件的名字末尾都加上 -d
+surface: finder
+tags:
+- train
+- finder
+- train
+- suffix
+app: com.apple.finder
+goal: 给 part1.txt 到 part4.txt 这几个文件的名字末尾都加上 -done，比如 part1-done.txt。
+fixture: train/T-suffix-01011
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed_1
+    critical: true
+    check:
+      file_exists:
+        path: $WS/part1-done.txt
+  - name: renamed_2
+    critical: false
+    check:
+      file_exists:
+        path: $WS/part2-done.txt
+  - name: renamed_3
+    critical: false
+    check:
+      file_exists:
+        path: $WS/part3-done.txt
+  - name: renamed_4
+    critical: false
+    check:
+      file_exists:
+        path: $WS/part4-done.txt
+  guards:
+  - file_count:
+      dir: $WS
+      glob: '*.txt'
+      value: 4
+oracle_effect:
+- mv 'part1.txt' 'part1-done.txt'
+- mv 'part2.txt' 'part2-done.txt'
+- mv 'part3.txt' 'part3-done.txt'
+- mv 'part4.txt' 'part4-done.txt'

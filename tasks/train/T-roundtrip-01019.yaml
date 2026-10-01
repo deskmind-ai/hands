@@ -1,0 +1,37 @@
+id: T-roundtrip-01019
+title: '从 info.txt 里读出金额和订单号，按「金额,订单号」的格式写成一行放进 '
+surface: editor
+tags:
+- train
+- textedit
+- train
+- roundtrip
+app: com.apple.TextEdit
+goal: 从 info.txt 里读出金额和订单号，按「金额,订单号」的格式写成一行放进 out.txt，存盘。只要值，不要标签。
+fixture: train/T-roundtrip-01019
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/out.txt"
+- open -a TextEdit "$WS/info.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/info.txt
+grade:
+  checkpoints:
+  - name: written
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/out.txt
+        normalise: nfc_rstrip
+        value: A-4769,11195
+oracle_effect:
+- 'cat > ''out.txt'' <<''HANDS_EOF''
+
+  A-4769,11195
+
+  HANDS_EOF'

@@ -1,0 +1,37 @@
+id: T-roundtrip-01010
+title: out.txt 里需要一行 `编号,金额`，值取自 info.txt，写完保存（
+surface: editor
+tags:
+- train
+- textedit
+- train
+- roundtrip
+app: com.apple.TextEdit
+goal: out.txt 里需要一行 `编号,金额`，值取自 info.txt，写完保存（不带标签文字）。
+fixture: train/T-roundtrip-01010
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/out.txt"
+- open -a TextEdit "$WS/info.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/info.txt
+grade:
+  checkpoints:
+  - name: written
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/out.txt
+        normalise: nfc_rstrip
+        value: C-2367,9919
+oracle_effect:
+- 'cat > ''out.txt'' <<''HANDS_EOF''
+
+  C-2367,9919
+
+  HANDS_EOF'

@@ -1,0 +1,105 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Music</title>
+<style>
+ body{font-family:-apple-system,"PingFang SC";margin:0;background:#fafafa;color:#222}
+ header{padding:12px 20px;display:flex;gap:10px;align-items:center;color:#fff}
+ header input{width:300px;padding:6px 10px;border-radius:14px;border:0}
+ header button{border:0;border-radius:12px;padding:5px 12px}
+ main{padding:16px 24px 90px} table{border-collapse:collapse;width:100%} td{padding:8px;border-bottom:1px solid #eee}
+ tr .play{visibility:visible} body.hover tr .play{visibility:hidden} body.hover tr:hover .play{visibility:visible}
+ #bar{position:fixed;bottom:0;left:0;right:0;background:#fff;border-top:1px solid #ddd;padding:12px 20px}
+ .item{display:flex;align-items:center;gap:14px;padding:8px 6px;border-bottom:1px solid #eee}
+ .item .t{font-size:15px} .item .s{font-size:12px;color:#777;margin-top:3px} .item .grow{flex:1}
+ .cards{display:grid;grid-template-columns:repeat(4,180px);gap:22px 18px}
+ .card .cover{width:150px;height:150px;border-radius:8px;margin-bottom:8px}
+ .card .t{font-size:14px} .card .s{font-size:12px;color:#777;margin-top:3px}
+</style></head>
+<body>
+<header id="top"><b id="brand"></b>
+ <form onsubmit="doSearch();return false"><input id="q"></form><button id="go" onclick="doSearch()"></button>
+</header>
+<main><h2 id="heading"></h2><button id="playall" onclick="playAll()" style="display:none;margin-bottom:10px"></button><div id="list"></div></main>
+<div id="bar"><span id="nowlabel"></span><span id="now"></span> <button id="pp" onclick="toggle()"></button></div>
+<script>
+// The task arrives in the URL hash (base64 JSON) from the gym runner: catalog, texts, variant flags. The page's true
+// state is posted to /state?run=<id> after every change, for the grader and the oracle.
+const params = new URLSearchParams(location.search);
+const RUN = params.get('run') || 'dev';
+let T, S;
+fetch('/task?run=' + RUN).then(r => r.json()).then(task => { T = task; init(); });
+function init() {
+S = {query: '', searched: null, results: [], playing: T.nowPlaying, paused: false};
+document.title = T.app;
+document.getElementById('brand').textContent = T.app;
+document.getElementById('top').style.background = T.color;
+const q = document.getElementById('q'); q.placeholder = T.texts.placeholder; q.setAttribute('aria-label', T.texts.placeholder);
+const go = document.getElementById('go'); go.textContent = T.texts.search; if (!T.searchButton) go.style.display = 'none';
+if (T.hoverPlay && (T.layout || 'table') === 'table') document.body.classList.add('hover');
+// Some apps say "Now playing:" before the song, most only show it (T.barLabel).
+document.getElementById('nowlabel').textContent = (T.barLabel === false) ? '' : T.texts.nowPlaying + '：';
+document.getElementById('playall').textContent = '▶ ' + (T.texts.playAll || 'Play all');
+q.addEventListener('input', () => { S.query = q.value; post(); });
+// A value written through accessibility fires no input event: the field is polled too, so the state (and the
+// oracle) sees what the box holds however it got there.
+setInterval(() => { if (q.value !== S.query) { S.query = q.value; post(); } }, 300);
+function post() { fetch('/state?run=' + RUN, {method: 'POST', body: JSON.stringify(S)}); }
+// Four ways apps lay out a list of songs (T.layout): a table; two lines, title over artist; one line, "title —
+// artist"; a grid of cards with a cover. Every item plays on a double-click, and has a play button except in the
+// grid (whose covers would carry it on hover).
+function playButton(s) {
+  return `<button class="play" aria-label="${T.texts.play} ${s.title} - ${s.artist}">▶ ${T.texts.play}</button>`;
+}
+function render(rows, heading) {
+  document.getElementById('heading').textContent = heading;
+  const pa = document.getElementById('playall');
+  pa.style.display = (T.playAll && rows !== T.home) ? '' : 'none';
+  const box = document.getElementById('list'); box.innerHTML = '';
+  const layout = T.layout || 'table';
+  let parent = box;
+  if (layout === 'table') { parent = document.createElement('table'); box.appendChild(parent); }
+  if (layout === 'cards') { parent = document.createElement('div'); parent.className = 'cards'; box.appendChild(parent); }
+  // Items are rows of a grid to assistive apps, as a list of songs is: named by their text, opened by a double-click.
+  if (layout !== 'table') parent.setAttribute('role', 'grid');
+  rows.forEach((s, i) => {
+    let el;
+    if (layout === 'table') {
+      el = document.createElement('tr');
+      el.innerHTML = `<td>${s.title}</td><td>${s.artist}</td><td>${s.album}</td><td>${playButton(s)}</td>`;
+    } else if (layout === 'list2') {
+      el = document.createElement('div'); el.className = 'item';
+      el.innerHTML = `<div class="grow"><div class="t">${s.title}</div><div class="s">${s.artist} · ${s.album}</div></div>${playButton(s)}`;
+    } else if (layout === 'inline') {
+      el = document.createElement('div'); el.className = 'item';
+      el.innerHTML = `<div class="grow t">${s.title} — ${s.artist}</div>${playButton(s)}`;
+    } else {
+      el = document.createElement('div'); el.className = 'card';
+      el.innerHTML = `<div class="cover" style="background:hsl(${(i * 67) % 360},45%,62%)"></div><div class="t">${s.title}</div><div class="s">${s.artist}</div>`;
+    }
+    if (layout !== 'table') el.setAttribute('role', 'row');
+    const b = el.querySelector('button'); if (b) b.onclick = () => play(s);
+    el.ondblclick = () => play(s); parent.appendChild(el); });
+}
+function doSearch() {
+  const words = q.value.trim().split(/\s+/).filter(Boolean);
+  S.searched = q.value.trim();
+  const hits = s => words.filter(w => (s.title + ' ' + s.artist + ' ' + s.album).includes(w)).length;
+  // As apps do: anything matching a word of the query, best matches first. With decoyFirst the target never leads:
+  // the next best (its live cut, the same title by someone else) is put before it, so "play all" plays a decoy.
+  S.results = T.catalog.filter(s => hits(s) > 0).sort((a, b) => hits(b) - hits(a));
+  const isTarget = s => s.title === T.target.title && s.artist === T.target.artist;
+  if (T.decoyFirst && S.results.length > 1 && isTarget(S.results[0])) {
+    [S.results[0], S.results[1]] = [S.results[1], S.results[0]];
+  }
+  render(S.results, T.echoHeading ? S.searched : T.texts.resultsFor.replace('%s', S.searched)); post();
+}
+// "Play all": plays the list from its first song, whatever the query was after.
+function playAll() { if (S.results.length) play(S.results[0]); }
+window.playAll = playAll;
+function play(s) { S.playing = {title: s.title, artist: s.artist}; S.paused = false; show(); post(); }
+function toggle() { S.paused = !S.paused; show(); post(); }
+function show() { document.getElementById('now').textContent = S.playing ? `${S.playing.title} — ${S.playing.artist}` : '';
+  document.getElementById('pp').textContent = S.paused ? T.texts.resume : T.texts.pause; }
+window.doSearch = doSearch; window.toggle = toggle;   // for the page's onclick/onsubmit attributes
+render(T.home, T.texts.home); show(); post();
+}
+</script></body></html>

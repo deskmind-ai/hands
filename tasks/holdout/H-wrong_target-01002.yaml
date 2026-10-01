@@ -1,0 +1,43 @@
+id: H-wrong_target-01002
+title: 请只修改 Q4 季度报告的 status 为 final，Q3 那份不能改，保存
+surface: editor
+tags:
+- train
+- textedit
+- holdout
+- wrong_target
+app: com.apple.TextEdit
+goal: 请只修改 Q4 季度报告的 status 为 final，Q3 那份不能改，保存。
+fixture: train/H-wrong_target-01002
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/report-2024-Q3.txt"
+- open -a TextEdit "$WS/report-2024-Q4.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/report-2024-Q3.txt
+grade:
+  checkpoints:
+  - name: target
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/report-2024-Q4.txt
+        normalise: nfc_rstrip
+        value: 'Q4 revenue: 7535
+
+          status: final
+
+          '
+oracle_effect:
+- 'cat > ''report-2024-Q4.txt'' <<''HANDS_EOF''
+
+  Q4 revenue: 7535
+
+  status: final
+
+  HANDS_EOF'

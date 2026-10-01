@@ -1,0 +1,35 @@
+id: S03-zh-text
+title: 中文普通文本逐字写入
+surface: editor
+tags: [smoke, core, zh]
+goal: |
+  打开 doc.txt，写入下面这段文字（全角标点、数字与换行都要一致），然后保存：
+  季度总结：营收 120 万元，同比增长 15%。
+  下一步：完成 3 项验收。
+fixture: zh_doc
+vars:
+  body: "季度总结：营收 120 万元，同比增长 15%。\n下一步：完成 3 项验收。\n"
+budget: {max_actions: 12, wall_clock_s: 600}
+sentinels:
+  - "$WS/keep/reference.txt"
+grade:
+  checkpoints:
+    # Two levels on purpose: "wrote Chinese at all" and "wrote it byte-exactly"
+    # are different failures with different fixes (transport vs IME/normalisation).
+    - name: chinese_written
+      check: {file_text_matches: {path: "$WS/doc.txt", pattern: "季度总结"}}
+    - name: exact_text
+      check:
+        file_text_equals:
+          path: "$WS/doc.txt"
+          value: "${body}"
+          normalise: nfc_rstrip
+  guards:
+    - {driver_state: {key: "editor_dirty", value: false}}
+oracle:
+  - {kind: double_click, binding: {element_id: "row:doc.txt"}}
+  - {kind: click, binding: {element_id: "editor:body"}}
+  - {kind: key, keys: "cmd+a"}
+  - {kind: type_text, text: "季度总结：营收 120 万元，同比增长 15%。\n下一步：完成 3 项验收。\n"}
+  - {kind: key, keys: "cmd+s"}
+  - {kind: done}

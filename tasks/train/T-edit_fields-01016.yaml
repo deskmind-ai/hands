@@ -1,0 +1,45 @@
+id: T-edit_fields-01016
+title: 在 TextEdit 里打开的 记录.txt 中，把 Priority 改为 h
+surface: editor
+tags:
+- train
+- textedit
+- train
+- edit_fields
+app: com.apple.TextEdit
+goal: 在 TextEdit 里打开的 记录.txt 中，把 Priority 改为 high，预算 由 5200 改为 6000，其他不变，然后保存。
+fixture: train/T-edit_fields-01016
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/记录.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/记录.txt
+        normalise: nfc_rstrip
+        value: 'Quarterly review
+
+          Priority: high
+
+          预算: 6000
+
+          '
+oracle_effect:
+- 'cat > ''记录.txt'' <<''HANDS_EOF''
+
+  Quarterly review
+
+  Priority: high
+
+  预算: 6000
+
+  HANDS_EOF'

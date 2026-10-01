@@ -1,0 +1,38 @@
+id: T-move_by_ref-07020
+title: Move memo-86.md from drafts so that it s
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: Move memo-86.md from drafts so that it sits next to 计划-66.csv; do not move 计划-66.csv.
+fixture: train_ref/T-move_by_ref-07020
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/草稿/memo-86.md
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/草稿/计划-66.csv
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/drafts/memo-86.md
+  guards:
+  - dir_manifest:
+      dir: $WS/drafts
+      value:
+      - plan-51.csv
+oracle_effect:
+- mv 'drafts/memo-86.md' './草稿/'

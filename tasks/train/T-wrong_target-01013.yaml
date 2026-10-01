@@ -1,0 +1,43 @@
+id: T-wrong_target-01013
+title: Q4 报告里的 status 需要改成 approved，注意别动 Q3 的那份
+surface: editor
+tags:
+- train
+- textedit
+- train
+- wrong_target
+app: com.apple.TextEdit
+goal: Q4 报告里的 status 需要改成 approved，注意别动 Q3 的那份，改完保存。
+fixture: train/T-wrong_target-01013
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/report-2027-Q3.txt"
+- open -a TextEdit "$WS/report-2027-Q4.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/report-2027-Q3.txt
+grade:
+  checkpoints:
+  - name: target
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/report-2027-Q4.txt
+        normalise: nfc_rstrip
+        value: 'Q4 revenue: 9679
+
+          status: approved
+
+          '
+oracle_effect:
+- 'cat > ''report-2027-Q4.txt'' <<''HANDS_EOF''
+
+  Q4 revenue: 9679
+
+  status: approved
+
+  HANDS_EOF'

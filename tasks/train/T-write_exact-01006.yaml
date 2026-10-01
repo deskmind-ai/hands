@@ -1,0 +1,40 @@
+id: T-write_exact-01006
+title: draft.txt is open and empty. Type exactl
+surface: editor
+tags:
+- train
+- textedit
+- train
+- write_exact
+app: com.apple.TextEdit
+goal: 'draft.txt is open and empty. Type exactly the following, punctuation and line
+  breaks included, then save:
+
+  Revenue reached 7741k this quarter, up 9.1%.'
+fixture: train/T-write_exact-01006
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/draft.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/draft.txt
+        normalise: nfc_rstrip
+        value: 'Revenue reached 7741k this quarter, up 9.1%.
+
+          '
+oracle_effect:
+- 'cat > ''draft.txt'' <<''HANDS_EOF''
+
+  Revenue reached 7741k this quarter, up 9.1%.
+
+  HANDS_EOF'

@@ -1,0 +1,47 @@
+id: T-write_exact-01013
+title: 在 budget.txt 里一字不差地写下：
+surface: editor
+tags:
+- train
+- textedit
+- train
+- write_exact
+app: com.apple.TextEdit
+goal: '在 budget.txt 里一字不差地写下：
+
+  67 tickets remain open; 5 are overdue.
+
+  未结订单 81 笔，其中 2 笔已逾期。
+
+  写完保存。'
+fixture: train/T-write_exact-01013
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/budget.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/budget.txt
+        normalise: nfc_rstrip
+        value: '67 tickets remain open; 5 are overdue.
+
+          未结订单 81 笔，其中 2 笔已逾期。
+
+          '
+oracle_effect:
+- 'cat > ''budget.txt'' <<''HANDS_EOF''
+
+  67 tickets remain open; 5 are overdue.
+
+  未结订单 81 笔，其中 2 笔已逾期。
+
+  HANDS_EOF'

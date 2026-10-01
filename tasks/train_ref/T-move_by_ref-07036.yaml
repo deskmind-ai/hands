@@ -1,0 +1,39 @@
+id: T-move_by_ref-07036
+title: Move plan-91.log from 备份 so that it sits
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: Move plan-91.log from 备份 so that it sits next to draft-21.txt; do not move draft-21.txt.
+fixture: train_ref/T-move_by_ref-07036
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/old/plan-91.log
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/old/draft-21.txt
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/备份/plan-91.log
+  guards:
+  - dir_manifest:
+      dir: $WS/备份
+      value:
+      - budget-78.log
+      - report-64.csv
+oracle_effect:
+- mv '备份/plan-91.log' './old/'

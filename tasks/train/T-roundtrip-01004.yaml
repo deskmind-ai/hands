@@ -1,0 +1,37 @@
+id: T-roundtrip-01004
+title: '从 source.txt 里读出编号和金额，按「编号,金额」的格式写成一行放进 '
+surface: editor
+tags:
+- train
+- textedit
+- train
+- roundtrip
+app: com.apple.TextEdit
+goal: 从 source.txt 里读出编号和金额，按「编号,金额」的格式写成一行放进 target.txt，存盘。只要值，不要标签。
+fixture: train/T-roundtrip-01004
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/target.txt"
+- open -a TextEdit "$WS/source.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/source.txt
+grade:
+  checkpoints:
+  - name: written
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/target.txt
+        normalise: nfc_rstrip
+        value: A-2859,4941
+oracle_effect:
+- 'cat > ''target.txt'' <<''HANDS_EOF''
+
+  A-2859,4941
+
+  HANDS_EOF'

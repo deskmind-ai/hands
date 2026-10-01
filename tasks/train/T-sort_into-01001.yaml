@@ -1,0 +1,46 @@
+id: T-sort_into-01001
+title: Gather all the .csv files into a new fol
+surface: finder
+tags:
+- train
+- finder
+- train
+- sort_into
+app: com.apple.finder
+goal: Gather all the .csv files into a new folder called 草稿.
+fixture: train/T-sort_into-01001
+budget:
+  max_actions: 30
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: folder
+    check:
+      file_exists:
+        path: $WS/草稿
+  - name: moved
+    critical: true
+    check:
+      dir_manifest:
+        dir: $WS/草稿
+        value:
+        - agenda-34.csv
+        - report-8.csv
+        - 周报-55.csv
+  guards:
+  - file_exists:
+      path: $WS/周报-71.md
+  - file_exists:
+      path: $WS/log-92.log
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir '草稿'
+- mv '周报-55.csv' '草稿/'
+- mv 'report-8.csv' '草稿/'
+- mv 'agenda-34.csv' '草稿/'

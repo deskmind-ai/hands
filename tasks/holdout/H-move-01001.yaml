@@ -1,0 +1,35 @@
+id: H-move-01001
+title: 请将 会议纪要-20.log 从 backup 转移至 the old fold
+surface: finder
+tags:
+- train
+- finder
+- holdout
+- move
+app: com.apple.finder
+goal: 请将 会议纪要-20.log 从 backup 转移至 the old folder。
+fixture: train/H-move-01001
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/old/会议纪要-20.log
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/backup/会议纪要-20.log
+  guards:
+  - dir_manifest:
+      dir: $WS/backup
+      value:
+      - draft-72.txt
+      - 计划-34.txt
+oracle_effect:
+- mv 'backup/会议纪要-20.log' './old/'

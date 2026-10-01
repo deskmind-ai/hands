@@ -1,0 +1,42 @@
+id: T-suffix-01002
+title: clip1.txt……clip3.txt 这些文件，请在文件名后面补上 -ok（
+surface: finder
+tags:
+- train
+- finder
+- train
+- suffix
+app: com.apple.finder
+goal: clip1.txt……clip3.txt 这些文件，请在文件名后面补上 -ok（如 clip1-ok.txt）。
+fixture: train/T-suffix-01002
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed_1
+    critical: true
+    check:
+      file_exists:
+        path: $WS/clip1-ok.txt
+  - name: renamed_2
+    critical: false
+    check:
+      file_exists:
+        path: $WS/clip2-ok.txt
+  - name: renamed_3
+    critical: false
+    check:
+      file_exists:
+        path: $WS/clip3-ok.txt
+  guards:
+  - file_count:
+      dir: $WS
+      glob: '*.txt'
+      value: 3
+oracle_effect:
+- mv 'clip1.txt' 'clip1-ok.txt'
+- mv 'clip2.txt' 'clip2-ok.txt'
+- mv 'clip3.txt' 'clip3-ok.txt'

@@ -1,0 +1,38 @@
+id: T-move_by_ref-07029
+title: 把 资料 里的 说明-36.md 放到 记录-1.txt 所在的那个文件夹里，记
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: 把 资料 里的 说明-36.md 放到 记录-1.txt 所在的那个文件夹里，记录-1.txt 本身不要动。
+fixture: train_ref/T-move_by_ref-07029
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/final/说明-36.md
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/final/记录-1.txt
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/资料/说明-36.md
+  guards:
+  - dir_manifest:
+      dir: $WS/资料
+      value:
+      - 会议纪要-49.txt
+oracle_effect:
+- mv '资料/说明-36.md' './final/'

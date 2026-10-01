@@ -1,0 +1,37 @@
+id: H-roundtrip-01000
+title: 请根据 原始.txt 填写 结果.txt：一行，格式 `金额,订单号`，只写数值
+surface: editor
+tags:
+- train
+- textedit
+- holdout
+- roundtrip
+app: com.apple.TextEdit
+goal: 请根据 原始.txt 填写 结果.txt：一行，格式 `金额,订单号`，只写数值，保存。
+fixture: train/H-roundtrip-01000
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/结果.txt"
+- open -a TextEdit "$WS/原始.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/原始.txt
+grade:
+  checkpoints:
+  - name: written
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/结果.txt
+        normalise: nfc_rstrip
+        value: C-3371,28786
+oracle_effect:
+- 'cat > ''结果.txt'' <<''HANDS_EOF''
+
+  C-3371,28786
+
+  HANDS_EOF'

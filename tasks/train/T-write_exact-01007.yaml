@@ -1,0 +1,47 @@
+id: T-write_exact-01007
+title: 在 会议纪要.txt 里一字不差地写下：
+surface: editor
+tags:
+- train
+- textedit
+- train
+- write_exact
+app: com.apple.TextEdit
+goal: '在 会议纪要.txt 里一字不差地写下：
+
+  本月新增客户 52 家，流失 7 家。
+
+  未结订单 48 笔，其中 3 笔已逾期。
+
+  写完保存。'
+fixture: train/T-write_exact-01007
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/会议纪要.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/会议纪要.txt
+        normalise: nfc_rstrip
+        value: '本月新增客户 52 家，流失 7 家。
+
+          未结订单 48 笔，其中 3 笔已逾期。
+
+          '
+oracle_effect:
+- 'cat > ''会议纪要.txt'' <<''HANDS_EOF''
+
+  本月新增客户 52 家，流失 7 家。
+
+  未结订单 48 笔，其中 3 笔已逾期。
+
+  HANDS_EOF'

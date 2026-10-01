@@ -1,0 +1,32 @@
+id: H-rename_deep-01000
+title: 请将 docs/报告 目录中的 .txt 文件重命名成 notes-final.
+surface: finder
+tags:
+- train
+- finder
+- holdout
+- rename_deep
+app: com.apple.finder
+goal: 请将 docs/报告 目录中的 .txt 文件重命名成 notes-final.txt。
+fixture: train/H-rename_deep-01000
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/docs/报告/notes-final.txt
+  - name: old_gone
+    check:
+      file_absent:
+        path: $WS/docs/报告/report-87.txt
+  guards:
+  - file_exists:
+      path: $WS/docs/报告/清单-110.log
+oracle_effect:
+- mv 'docs/报告/report-87.txt' 'docs/报告/notes-final.txt'

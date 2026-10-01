@@ -1,0 +1,82 @@
+name: evals
+
+# The evaluation gates that can run without a desktop, a model or a
+# credential -- which is the whole reason they were built that way. The dev
+# and formal sets cost money and are run deliberately, not on every push.
+#
+# This runs on Linux on purpose. The mock desktop is platform-independent, so
+# the cheap gates stay cheap; macOS runners cost 10x the minutes. A second
+# job on macos-latest for the Peekaboo driver, where the same six tasks have to
+# pass unchanged, is planned.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Action majors are pinned to the ones that declare `using: node24`; GitHub's
+# runners offer node20 (deprecated) and node24, and nothing newer. Verify with
+#   gh api "repos/actions/<name>/contents/action.yml?ref=<tag>" --jq .content | base64 -d | grep using:
+jobs:
+  gates:
+    name: contracts, task self-check, smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Check out deskmind-bench
+        uses: actions/checkout@v7
+        with:
+          repository: deskmind-ai/bench
+          path: _bench
+          # remove once deskmind-ai/bench is public
+          ssh-key: ${{ secrets.BENCH_DEPLOY_KEY }}
+
+      - name: Install
+        run: python -m pip install --quiet pyyaml pillow ./_bench
+
+      - name: Environment report
+        run: python -m deskmind_hands.cli doctor
+
+      # Contracts -- coordinate spaces, action parsing, grader semantics, sandbox
+      # boundaries, and the clustered-bootstrap claim. Milliseconds.
+      - name: Contracts
+        run: python -m unittest discover -s tests -v
+
+      # Task self-check -- every task's oracle must reach strict success and every task's
+      # null control must score zero. A failure here means a task is broken,
+      # not hard, and nothing measured with it could be interpreted.
+      - name: Task self-verification
+        run: python -m deskmind_hands.cli verify-tasks --set smoke
+
+      # Smoke -- the loop end to end on the mock desktop. The oracle is known-good,
+      # so anything below 100% is a regression in the harness itself.
+      - name: Smoke
+        run: python -m deskmind_hands.cli run --set smoke --adapter oracle --repeats 1 --gate 100 --no-screenshots
+
+      # These gates must never need a credential. If one starts to, it will stop
+      # being run on every change and the whole tiering collapses.
+      - name: Assert the gates stayed model-free
+        run: |
+          if [ -n "${ANTHROPIC_API_KEY:-}${OPENAI_API_KEY:-}" ]; then
+            echo "::error::The free gates ran with a model credential in the environment."
+            echo "These tiers must stay free so they run on every change."
+            exit 1
+          fi
+          echo "ok: no model credential was present"
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: eval-reports
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,0 +1,37 @@
+id: T-roundtrip-01003
+title: Copy the two values (金额, 客户) from 原始.txt
+surface: editor
+tags:
+- train
+- textedit
+- train
+- roundtrip
+app: com.apple.TextEdit
+goal: Copy the two values (金额, 客户) from 原始.txt into 结果.txt as `金额,客户` and save.
+fixture: train/T-roundtrip-01003
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/结果.txt"
+- open -a TextEdit "$WS/原始.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/原始.txt
+grade:
+  checkpoints:
+  - name: written
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/结果.txt
+        normalise: nfc_rstrip
+        value: B-5551,8733
+oracle_effect:
+- 'cat > ''结果.txt'' <<''HANDS_EOF''
+
+  B-5551,8733
+
+  HANDS_EOF'

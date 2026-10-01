@@ -1,0 +1,44 @@
+id: T-wrong_target-01019
+title: Both reports are open and their names di
+surface: editor
+tags:
+- train
+- textedit
+- train
+- wrong_target
+app: com.apple.TextEdit
+goal: Both reports are open and their names differ by one character. In the Q1 one
+  only, set owner to Dave. Leave Q2 untouched. Save.
+fixture: train/T-wrong_target-01019
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/report-2024-Q2.txt"
+- open -a TextEdit "$WS/report-2024-Q1.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/report-2024-Q2.txt
+grade:
+  checkpoints:
+  - name: target
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/report-2024-Q1.txt
+        normalise: nfc_rstrip
+        value: 'Q1 revenue: 6273
+
+          owner: Dave
+
+          '
+oracle_effect:
+- 'cat > ''report-2024-Q1.txt'' <<''HANDS_EOF''
+
+  Q1 revenue: 6273
+
+  owner: Dave
+
+  HANDS_EOF'

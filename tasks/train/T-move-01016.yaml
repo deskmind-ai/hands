@@ -1,0 +1,35 @@
+id: T-move-01016
+title: Please relocate photos/log-16.csv to 旁边的
+surface: finder
+tags:
+- train
+- finder
+- train
+- move
+app: com.apple.finder
+goal: Please relocate photos/log-16.csv to 旁边的 报告.
+fixture: train/T-move-01016
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/报告/log-16.csv
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/photos/log-16.csv
+  guards:
+  - dir_manifest:
+      dir: $WS/photos
+      value:
+      - budget-80.csv
+      - memo-42.csv
+oracle_effect:
+- mv 'photos/log-16.csv' './报告/'

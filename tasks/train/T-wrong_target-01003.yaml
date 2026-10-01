@@ -1,0 +1,43 @@
+id: T-wrong_target-01003
+title: Q2 报告里的 owner 需要改成 Erin，注意别动 Q4 的那份，改完保存
+surface: editor
+tags:
+- train
+- textedit
+- train
+- wrong_target
+app: com.apple.TextEdit
+goal: Q2 报告里的 owner 需要改成 Erin，注意别动 Q4 的那份，改完保存。
+fixture: train/T-wrong_target-01003
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/report-2026-Q4.txt"
+- open -a TextEdit "$WS/report-2026-Q2.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/report-2026-Q4.txt
+grade:
+  checkpoints:
+  - name: target
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/report-2026-Q2.txt
+        normalise: nfc_rstrip
+        value: 'Q2 revenue: 4451
+
+          owner: Erin
+
+          '
+oracle_effect:
+- 'cat > ''report-2026-Q2.txt'' <<''HANDS_EOF''
+
+  Q2 revenue: 4451
+
+  owner: Erin
+
+  HANDS_EOF'

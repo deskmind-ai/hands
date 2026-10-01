@@ -1,0 +1,36 @@
+id: T-move-01000
+title: 说明-99.md 现在在 backup/归档 里，请把它放到 the top o
+surface: finder
+tags:
+- train
+- finder
+- train
+- move
+app: com.apple.finder
+goal: 说明-99.md 现在在 backup/归档 里，请把它放到 the top of the working directory。
+fixture: train/T-move-01000
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/说明-99.md
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/backup/归档/说明-99.md
+  guards:
+  - dir_manifest:
+      dir: $WS/backup/归档
+      value:
+      - memo-69.md
+      - summary-18.md
+      - summary-93.txt
+oracle_effect:
+- mv 'backup/归档/说明-99.md' ./

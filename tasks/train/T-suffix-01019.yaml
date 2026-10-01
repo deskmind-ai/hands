@@ -1,0 +1,42 @@
+id: T-suffix-01019
+title: 给 clip1.txt 到 clip3.txt 这几个文件的名字末尾都加上 -d
+surface: finder
+tags:
+- train
+- finder
+- train
+- suffix
+app: com.apple.finder
+goal: 给 clip1.txt 到 clip3.txt 这几个文件的名字末尾都加上 -done，比如 clip1-done.txt。
+fixture: train/T-suffix-01019
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed_1
+    critical: true
+    check:
+      file_exists:
+        path: $WS/clip1-done.txt
+  - name: renamed_2
+    critical: false
+    check:
+      file_exists:
+        path: $WS/clip2-done.txt
+  - name: renamed_3
+    critical: false
+    check:
+      file_exists:
+        path: $WS/clip3-done.txt
+  guards:
+  - file_count:
+      dir: $WS
+      glob: '*.txt'
+      value: 3
+oracle_effect:
+- mv 'clip1.txt' 'clip1-done.txt'
+- mv 'clip2.txt' 'clip2-done.txt'
+- mv 'clip3.txt' 'clip3-done.txt'

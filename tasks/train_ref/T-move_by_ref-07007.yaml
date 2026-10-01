@@ -1,0 +1,41 @@
+id: T-move_by_ref-07007
+title: Move report-2.csv from 图片 so that it sit
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: Move report-2.csv from 图片 so that it sits next to agenda-37.txt; do not move
+  agenda-37.txt.
+fixture: train_ref/T-move_by_ref-07007
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/report-2.csv
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/agenda-37.txt
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/图片/report-2.csv
+  guards:
+  - dir_manifest:
+      dir: $WS/图片
+      value:
+      - memo-20.md
+      - report-20.txt
+      - 计划-46.csv
+oracle_effect:
+- mv '图片/report-2.csv' ./

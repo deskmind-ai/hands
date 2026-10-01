@@ -1,0 +1,39 @@
+id: T-move_by_ref-07038
+title: summary-47.csv（在 reports 里）应该和 budget-32
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: summary-47.csv（在 reports 里）应该和 budget-32.log 放在一起，请只移动 summary-47.csv。
+fixture: train_ref/T-move_by_ref-07038
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/归档/summary-47.csv
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/归档/budget-32.log
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/reports/summary-47.csv
+  guards:
+  - dir_manifest:
+      dir: $WS/reports
+      value:
+      - agenda-7.log
+      - plan-7.log
+oracle_effect:
+- mv 'reports/summary-47.csv' './归档/'

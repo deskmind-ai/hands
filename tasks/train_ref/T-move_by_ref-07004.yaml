@@ -1,0 +1,38 @@
+id: T-move_by_ref-07004
+title: 把 final 里的 summary-98.log 放到 周报-77.csv 所
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: 把 final 里的 summary-98.log 放到 周报-77.csv 所在的那个文件夹里，周报-77.csv 本身不要动。
+fixture: train_ref/T-move_by_ref-07004
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/项目/summary-98.log
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/项目/周报-77.csv
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/final/summary-98.log
+  guards:
+  - dir_manifest:
+      dir: $WS/final
+      value:
+      - 说明-54.txt
+oracle_effect:
+- mv 'final/summary-98.log' './项目/'

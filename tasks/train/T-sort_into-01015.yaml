@@ -1,0 +1,46 @@
+id: T-sort_into-01015
+title: 建一个叫 old 的文件夹，然后把所有 .log 文件放进去，别的文件留在原地。
+surface: finder
+tags:
+- train
+- finder
+- train
+- sort_into
+app: com.apple.finder
+goal: 建一个叫 old 的文件夹，然后把所有 .log 文件放进去，别的文件留在原地。
+fixture: train/T-sort_into-01015
+budget:
+  max_actions: 30
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: folder
+    check:
+      file_exists:
+        path: $WS/old
+  - name: moved
+    critical: true
+    check:
+      dir_manifest:
+        dir: $WS/old
+        value:
+        - agenda-56.log
+        - 说明-28.log
+        - 预算-92.log
+  guards:
+  - file_exists:
+      path: $WS/log-20.txt
+  - file_exists:
+      path: $WS/summary-9.txt
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir 'old'
+- mv '说明-28.log' 'old/'
+- mv 'agenda-56.log' 'old/'
+- mv '预算-92.log' 'old/'

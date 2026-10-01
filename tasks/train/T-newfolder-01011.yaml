@@ -1,0 +1,35 @@
+id: T-newfolder-01011
+title: Make a new directory called final here.
+surface: finder
+tags:
+- train
+- finder
+- train
+- newfolder
+app: com.apple.finder
+goal: Make a new directory called final here.
+fixture: train/T-newfolder-01011
+budget:
+  max_actions: 12
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: created
+    critical: true
+    check:
+      file_exists:
+        path: $WS/final
+  guards:
+  - file_count:
+      dir: $WS
+      glob: '*.*'
+      value: 2
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir 'final'

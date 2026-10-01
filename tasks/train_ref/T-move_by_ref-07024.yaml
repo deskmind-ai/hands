@@ -1,0 +1,39 @@
+id: T-move_by_ref-07024
+title: Put backup/会议纪要-71.csv in the same folde
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: Put backup/会议纪要-71.csv in the same folder as 记录-91.md. 记录-91.md itself stays
+  where it is.
+fixture: train_ref/T-move_by_ref-07024
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/会议纪要-71.csv
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/记录-91.md
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/backup/会议纪要-71.csv
+  guards:
+  - dir_manifest:
+      dir: $WS/backup
+      value:
+      - agenda-80.md
+oracle_effect:
+- mv 'backup/会议纪要-71.csv' ./

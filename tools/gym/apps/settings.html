@@ -1,0 +1,49 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Settings</title>
+<style>
+ body{font-family:-apple-system,"PingFang SC";margin:0;background:#fafafa;color:#222;display:flex;flex-direction:column;height:100vh}
+ header{padding:10px 20px;color:#fff}
+ #wrap{display:flex;flex:1;min-height:0}
+ nav{width:200px;border-right:1px solid #ddd;padding:12px;display:flex;flex-direction:column;gap:6px}
+ nav button{text-align:left;border:0;background:none;padding:6px 10px;border-radius:6px;font-size:14px}
+ nav button.on{background:#dde8ff}
+ main{flex:1;padding:16px 28px} label{display:flex;justify-content:space-between;width:420px;padding:10px 0;border-bottom:1px solid #eee}
+ fieldset{border:0;padding:10px 0;width:420px} fieldset label{display:inline-flex;width:auto;border:0;margin-right:16px}
+</style></head>
+<body>
+<header id="top"><b id="brand"></b></header>
+<div id="wrap"><nav id="nav"></nav><main id="main"></main></div>
+<script>
+// The task comes from the gym server (/task?run=<id>); the page's true state goes to /state?run=<id> after every
+// change, for the grader and the oracle.
+const RUN = new URLSearchParams(location.search).get('run') || 'dev';
+let T, S;
+fetch('/task?run=' + RUN).then(r => r.json()).then(task => { T = task; init(); });
+function init() {
+S = {section: T.start, values: Object.assign({}, T.values), changed: false};
+const [apName, apSection, modes] = T.appearance;
+document.title = T.app;
+document.getElementById('brand').textContent = T.app;
+document.getElementById('top').style.background = T.color;
+function post() { fetch('/state?run=' + RUN, {method: 'POST', body: JSON.stringify(S)}); }
+function render() {
+  const nav = document.getElementById('nav'); nav.innerHTML = '';
+  Object.keys(T.sections).forEach(s => { const b = document.createElement('button'); b.textContent = s;
+    if (s === S.section) b.className = 'on'; b.onclick = () => { S.section = s; render(); post(); }; nav.appendChild(b); });
+  const m = document.getElementById('main'); m.innerHTML = `<h2>${S.section}</h2>`;
+  if (S.section === apSection) {
+    const f = document.createElement('fieldset'); f.innerHTML = `<legend>${apName}</legend>`;
+    modes.forEach(mode => { const l = document.createElement('label');
+      l.innerHTML = `<input type="radio" name="ap" aria-label="${mode}"> ${mode}`;
+      const i = l.querySelector('input'); i.checked = S.values[apName] === mode;
+      i.onchange = () => { S.values[apName] = mode; S.changed = true; post(); }; f.appendChild(l); });
+    m.appendChild(f);
+  }
+  T.sections[S.section].forEach(name => { const l = document.createElement('label');
+    l.innerHTML = `<span>${name}</span><input type="checkbox" role="switch" aria-label="${name}">`;
+    const i = l.querySelector('input'); i.checked = !!S.values[name];
+    i.onchange = () => { S.values[name] = i.checked; S.changed = true; post(); }; m.appendChild(l); });
+}
+render(); post();
+}
+</script></body></html>

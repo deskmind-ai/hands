@@ -1,0 +1,29 @@
+id: S01-rename
+title: 重命名文件并保留内容
+surface: files
+tags: [smoke, core]
+goal: |
+  把工作目录里的 draft.txt 重命名为 final.txt。文件内容必须保持不变，
+  目录里的其他文件不要改动。
+fixture: basic_files
+budget: {max_actions: 12, wall_clock_s: 600}
+sentinels:
+  - "$WS/keep/reference.txt"
+  - "$WS/notes.txt"
+grade:
+  checkpoints:
+    - name: renamed
+      check: {file_exists: {path: "$WS/final.txt"}}
+    - name: old_name_gone
+      check: {file_absent: {path: "$WS/draft.txt"}}
+    - name: content_preserved
+      critical: true
+      check: {file_text_equals: {path: "$WS/final.txt", value: "Draft version 1\n"}}
+  forbid:
+    - {file_exists: {path: "$WS/untitled folder 1"}}
+oracle:
+  - {kind: click, binding: {element_id: "row:draft.txt"}}
+  - {kind: click, binding: {element_id: "btn:rename"}}
+  - {kind: type_text, text: "final.txt"}
+  - {kind: key, keys: "return"}
+  - {kind: done}

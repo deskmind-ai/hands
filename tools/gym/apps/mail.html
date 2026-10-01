@@ -1,0 +1,80 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Mail</title>
+<style>
+ body{font-family:-apple-system,"PingFang SC";margin:0;background:#fafafa;color:#222;display:flex;flex-direction:column;height:100vh}
+ header{padding:10px 20px;display:flex;gap:10px;align-items:center;color:#fff}
+ header button{border:0;border-radius:6px;padding:5px 12px}
+ #wrap{display:flex;flex:1;min-height:0}
+ #listpane{width:46%;overflow:auto;border-right:1px solid #ddd} #read{flex:1;padding:16px 24px;overflow:auto}
+ table{border-collapse:collapse;width:100%} td{padding:8px;border-bottom:1px solid #eee;font-size:13px}
+ tr.sel{background:#dde8ff} tr{cursor:default}
+ #compose{margin-top:16px} #compose textarea{width:90%;height:70px}
+ #dialog{position:fixed;inset:0;background:rgba(0,0,0,.25);display:flex;align-items:center;justify-content:center}
+ #dialog div{background:#fff;padding:20px;border-radius:10px}
+</style></head>
+<body>
+<header id="top"><b id="brand"></b> <span id="inboxlabel"></span>
+ <span style="flex:1"></span>
+ <button id="reply" onclick="startReply()"></button><button id="del" onclick="askDelete()"></button><button id="flag" onclick="toggleFlag()"></button>
+</header>
+<div id="wrap"><div id="listpane"><table id="list"></table></div><div id="read"></div></div>
+<script>
+// The task comes from the gym server (/task?run=<id>); the page's true state goes to /state?run=<id> after every
+// change, for the grader and the oracle.
+const RUN = new URLSearchParams(location.search).get('run') || 'dev';
+let T, S;
+fetch('/task?run=' + RUN).then(r => r.json()).then(task => { T = task; init(); });
+function init() {
+S = {selected: null, opened: [], flagged: T.flagged.slice(), deleted: [], replies: [], dialog: false, composing: false, draft: ''};
+document.title = T.app;
+document.getElementById('brand').textContent = T.app;
+document.getElementById('top').style.background = T.color;
+document.getElementById('inboxlabel').textContent = T.texts.inbox;
+document.getElementById('reply').textContent = T.texts.reply;
+document.getElementById('del').textContent = T.texts.delete;
+function post() { fetch('/state?run=' + RUN, {method: 'POST', body: JSON.stringify(S)}); }
+function msg(id) { return T.inbox.find(m => m.id === id); }
+function render() {
+  const t = document.getElementById('list'); t.innerHTML = '';
+  T.inbox.filter(m => !S.deleted.includes(m.id)).forEach(m => {
+    const tr = document.createElement('tr'); if (m.id === S.selected) tr.className = 'sel';
+    tr.innerHTML = `<td>${m.from}</td><td>${m.subject}</td><td>${S.flagged.includes(m.id) ? '⚑' : ''}</td><td>${m.date}</td>`;
+    tr.onclick = () => select(m.id); t.appendChild(tr); });
+  const r = document.getElementById('read');
+  const m = S.selected && msg(S.selected);
+  document.getElementById('flag').textContent = m && S.flagged.includes(m.id) ? T.texts.unflag : T.texts.flag;
+  if (!m) { r.innerHTML = `<p>${T.texts.empty}</p>`; }
+  else {
+    r.innerHTML = `<h3>${m.subject}</h3><p>${m.from}</p>` + m.body.map(l => `<p>${l}</p>`).join('');
+    if (S.composing) {
+      const c = document.createElement('div'); c.id = 'compose';
+      c.innerHTML = `<textarea id="body" aria-label="${T.texts.body}" placeholder="${T.texts.body}"></textarea><br>
+        <button id="send">${T.texts.send}</button> <button id="cancelc">${T.texts.cancel}</button>`;
+      r.appendChild(c);
+      const b = c.querySelector('#body'); b.value = S.draft;
+      b.addEventListener('input', () => { S.draft = b.value; post(); });
+      c.querySelector('#send').onclick = send; c.querySelector('#cancelc').onclick = cancelReply;
+    }
+  }
+  let d = document.getElementById('dialog'); if (d) d.remove();
+  if (S.dialog) {
+    d = document.createElement('div'); d.id = 'dialog'; d.setAttribute('role', 'dialog');
+    d.innerHTML = `<div><p>${T.texts.confirmText}</p><button id="ok">${T.texts.confirm}</button> <button id="no">${T.texts.cancel}</button></div>`;
+    document.body.appendChild(d);
+    d.querySelector('#ok').onclick = doDelete; d.querySelector('#no').onclick = () => { S.dialog = false; render(); post(); };
+  }
+}
+// A value written through accessibility fires no input event: the reply box is polled too.
+setInterval(() => { const b = document.getElementById('body'); if (b && b.value !== S.draft) { S.draft = b.value; post(); } }, 300);
+function select(id) { if (S.dialog) return; S.selected = id; if (!S.opened.includes(id)) S.opened.push(id); S.composing = false; S.draft = ''; render(); post(); }
+function startReply() { if (!S.selected || S.dialog) return; S.composing = true; S.draft = ''; render(); post(); }
+function cancelReply() { S.composing = false; S.draft = ''; render(); post(); }
+function send() { S.replies.push({to: S.selected, body: S.draft}); S.composing = false; S.draft = ''; render(); post(); }
+function askDelete() { if (!S.selected || S.dialog) return; S.dialog = true; render(); post(); }
+function doDelete() { S.deleted.push(S.selected); S.selected = null; S.dialog = false; S.composing = false; render(); post(); }
+function toggleFlag() { if (!S.selected || S.dialog) return;
+  const i = S.flagged.indexOf(S.selected); if (i >= 0) S.flagged.splice(i, 1); else S.flagged.push(S.selected); render(); post(); }
+window.startReply = startReply; window.askDelete = askDelete; window.toggleFlag = toggleFlag;
+render(); post();
+}
+</script></body></html>

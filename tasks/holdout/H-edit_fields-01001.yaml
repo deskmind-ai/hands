@@ -1,0 +1,45 @@
+id: H-edit_fields-01001
+title: 请修改 draft.txt：Status 一行改成 draft，Headcoun
+surface: editor
+tags:
+- train
+- textedit
+- holdout
+- edit_fields
+app: com.apple.TextEdit
+goal: 请修改 draft.txt：Status 一行改成 draft，Headcount 的 4100 换成 4600，保存文件。
+fixture: train/H-edit_fields-01001
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/draft.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/draft.txt
+        normalise: nfc_rstrip
+        value: 'Quarterly plan
+
+          Status: draft
+
+          Headcount: 4600
+
+          '
+oracle_effect:
+- 'cat > ''draft.txt'' <<''HANDS_EOF''
+
+  Quarterly plan
+
+  Status: draft
+
+  Headcount: 4600
+
+  HANDS_EOF'

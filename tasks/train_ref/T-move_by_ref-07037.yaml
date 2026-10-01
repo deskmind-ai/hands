@@ -1,0 +1,40 @@
+id: T-move_by_ref-07037
+title: budget-54.log（在 归档 里）应该和 draft-95.log 放在
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: budget-54.log（在 归档 里）应该和 draft-95.log 放在一起，请只移动 budget-54.log。
+fixture: train_ref/T-move_by_ref-07037
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/misc/budget-54.log
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/misc/draft-95.log
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/归档/budget-54.log
+  guards:
+  - dir_manifest:
+      dir: $WS/归档
+      value:
+      - 会议纪要-1.log
+      - 会议纪要-51.txt
+      - 预算-41.txt
+oracle_effect:
+- mv '归档/budget-54.log' './misc/'

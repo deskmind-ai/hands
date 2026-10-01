@@ -1,0 +1,46 @@
+id: H-sort_into-01002
+title: 请整理一下：新建 备份，把全部 .csv 文件移入其中。
+surface: finder
+tags:
+- train
+- finder
+- holdout
+- sort_into
+app: com.apple.finder
+goal: 请整理一下：新建 备份，把全部 .csv 文件移入其中。
+fixture: train/H-sort_into-01002
+budget:
+  max_actions: 30
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: folder
+    check:
+      file_exists:
+        path: $WS/备份
+  - name: moved
+    critical: true
+    check:
+      dir_manifest:
+        dir: $WS/备份
+        value:
+        - report-16.csv
+        - summary-9.csv
+        - 清单-2.csv
+  guards:
+  - file_exists:
+      path: $WS/清单-56.log
+  - file_exists:
+      path: $WS/plan-25.txt
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir '备份'
+- mv 'report-16.csv' '备份/'
+- mv '清单-2.csv' '备份/'
+- mv 'summary-9.csv' '备份/'

@@ -1,0 +1,33 @@
+id: T-rename_deep-01004
+title: 'In the folder 归档/old, the only .md file '
+surface: finder
+tags:
+- train
+- finder
+- train
+- rename_deep
+app: com.apple.finder
+goal: In the folder 归档/old, the only .md file should be called draft-final.md -- please
+  rename it.
+fixture: train/T-rename_deep-01004
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/归档/old/draft-final.md
+  - name: old_gone
+    check:
+      file_absent:
+        path: $WS/归档/old/summary-78.md
+  guards:
+  - file_exists:
+      path: $WS/归档/old/周报-133.csv
+oracle_effect:
+- mv '归档/old/summary-78.md' '归档/old/draft-final.md'

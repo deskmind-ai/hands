@@ -1,0 +1,38 @@
+id: T-roundtrip-01015
+title: Read the 日期 and 发票号 from notes.md and wr
+surface: editor
+tags:
+- train
+- textedit
+- train
+- roundtrip
+app: com.apple.TextEdit
+goal: Read the 日期 and 发票号 from notes.md and write them into row.csv as one line in
+  the format `日期,发票号`. Values only. Save.
+fixture: train/T-roundtrip-01015
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/row.csv"
+- open -a TextEdit "$WS/notes.md"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/notes.md
+grade:
+  checkpoints:
+  - name: written
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/row.csv
+        normalise: nfc_rstrip
+        value: K-1665,92751
+oracle_effect:
+- 'cat > ''row.csv'' <<''HANDS_EOF''
+
+  K-1665,92751
+
+  HANDS_EOF'

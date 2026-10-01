@@ -1,0 +1,32 @@
+id: T-rename_deep-01010
+title: 合同/old 下有一个 .log 文件，请把它的名字改成 report-fina
+surface: finder
+tags:
+- train
+- finder
+- train
+- rename_deep
+app: com.apple.finder
+goal: 合同/old 下有一个 .log 文件，请把它的名字改成 report-final.log。
+fixture: train/T-rename_deep-01010
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/合同/old/report-final.log
+  - name: old_gone
+    check:
+      file_absent:
+        path: $WS/合同/old/report-34.log
+  guards:
+  - file_exists:
+      path: $WS/合同/old/draft-179.md
+oracle_effect:
+- mv '合同/old/report-34.log' '合同/old/report-final.log'

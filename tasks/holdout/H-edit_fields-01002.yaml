@@ -1,0 +1,45 @@
+id: H-edit_fields-01002
+title: 请修改 draft.txt：负责人 一行改成 刘洋，Headcount 的 54
+surface: editor
+tags:
+- train
+- textedit
+- holdout
+- edit_fields
+app: com.apple.TextEdit
+goal: 请修改 draft.txt：负责人 一行改成 刘洋，Headcount 的 5400 换成 7200，保存文件。
+fixture: train/H-edit_fields-01002
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/draft.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/draft.txt
+        normalise: nfc_rstrip
+        value: 'Quarterly review
+
+          负责人: 刘洋
+
+          Headcount: 7200
+
+          '
+oracle_effect:
+- 'cat > ''draft.txt'' <<''HANDS_EOF''
+
+  Quarterly review
+
+  负责人: 刘洋
+
+  Headcount: 7200
+
+  HANDS_EOF'

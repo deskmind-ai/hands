@@ -1,0 +1,46 @@
+id: T-sort_into-01005
+title: 把工作目录里的 .md 文件归到一个新文件夹 备份 里。
+surface: finder
+tags:
+- train
+- finder
+- train
+- sort_into
+app: com.apple.finder
+goal: 把工作目录里的 .md 文件归到一个新文件夹 备份 里。
+fixture: train/T-sort_into-01005
+budget:
+  max_actions: 30
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: folder
+    check:
+      file_exists:
+        path: $WS/备份
+  - name: moved
+    critical: true
+    check:
+      dir_manifest:
+        dir: $WS/备份
+        value:
+        - 会议纪要-66.md
+        - 清单-68.md
+        - 说明-14.md
+  guards:
+  - file_exists:
+      path: $WS/todo-96.txt
+  - file_exists:
+      path: $WS/log-48.log
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir '备份'
+- mv '清单-68.md' '备份/'
+- mv '说明-14.md' '备份/'
+- mv '会议纪要-66.md' '备份/'

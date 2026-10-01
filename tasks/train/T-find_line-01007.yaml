@@ -1,0 +1,37 @@
+id: T-find_line-01007
+title: 在 log.txt 里找出状态为「紧急」的那一行，把它的项目编号写到 answe
+surface: editor
+tags:
+- train
+- textedit
+- train
+- find_line
+app: com.apple.TextEdit
+goal: 在 log.txt 里找出状态为「紧急」的那一行，把它的项目编号写到 answer.txt，存盘。
+fixture: train/T-find_line-01007
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/answer.txt"
+- open -a TextEdit "$WS/log.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/log.txt
+grade:
+  checkpoints:
+  - name: answer
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/answer.txt
+        normalise: nfc_rstrip
+        value: J-1024
+oracle_effect:
+- 'cat > ''answer.txt'' <<''HANDS_EOF''
+
+  J-1024
+
+  HANDS_EOF'

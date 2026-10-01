@@ -1,0 +1,45 @@
+id: H-write_exact-01001
+title: 请把下面这段抄进 log.txt，保持完全一致，然后保存：
+surface: editor
+tags:
+- train
+- textedit
+- holdout
+- write_exact
+app: com.apple.TextEdit
+goal: '请把下面这段抄进 log.txt，保持完全一致，然后保存：
+
+  一季度营收 9009 万元，环比增长 9.1%。
+
+  70 tickets remain open; 8 are overdue.'
+fixture: train/H-write_exact-01001
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/log.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/log.txt
+        normalise: nfc_rstrip
+        value: '一季度营收 9009 万元，环比增长 9.1%。
+
+          70 tickets remain open; 8 are overdue.
+
+          '
+oracle_effect:
+- 'cat > ''log.txt'' <<''HANDS_EOF''
+
+  一季度营收 9009 万元，环比增长 9.1%。
+
+  70 tickets remain open; 8 are overdue.
+
+  HANDS_EOF'

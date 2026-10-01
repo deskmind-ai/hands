@@ -1,0 +1,38 @@
+id: T-move_by_ref-07012
+title: 把 资料 里的 agenda-61.log 放到 周报-47.txt 所在的那个
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: 把 资料 里的 agenda-61.log 放到 周报-47.txt 所在的那个文件夹里，周报-47.txt 本身不要动。
+fixture: train_ref/T-move_by_ref-07012
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/agenda-61.log
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/周报-47.txt
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/资料/agenda-61.log
+  guards:
+  - dir_manifest:
+      dir: $WS/资料
+      value:
+      - log-89.log
+oracle_effect:
+- mv '资料/agenda-61.log' ./

@@ -1,0 +1,32 @@
+id: H-rename_deep-01001
+title: 请将 资料/docs 目录中的 .txt 文件重命名成 todo-final.t
+surface: finder
+tags:
+- train
+- finder
+- holdout
+- rename_deep
+app: com.apple.finder
+goal: 请将 资料/docs 目录中的 .txt 文件重命名成 todo-final.txt。
+fixture: train/H-rename_deep-01001
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/资料/docs/todo-final.txt
+  - name: old_gone
+    check:
+      file_absent:
+        path: $WS/资料/docs/summary-6.txt
+  guards:
+  - file_exists:
+      path: $WS/资料/docs/周报-139.md
+oracle_effect:
+- mv '资料/docs/summary-6.txt' '资料/docs/todo-final.txt'

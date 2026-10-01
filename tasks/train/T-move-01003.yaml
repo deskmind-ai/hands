@@ -1,0 +1,36 @@
+id: T-move-01003
+title: 'Move report-76.csv out of docs and into '
+surface: finder
+tags:
+- train
+- finder
+- train
+- move
+app: com.apple.finder
+goal: Move report-76.csv out of docs and into 上一级. Don't touch the other files.
+fixture: train/T-move-01003
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/report-76.csv
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/docs/report-76.csv
+  guards:
+  - dir_manifest:
+      dir: $WS/docs
+      value:
+      - draft-12.csv
+      - memo-15.csv
+      - plan-6.md
+oracle_effect:
+- mv 'docs/report-76.csv' ./

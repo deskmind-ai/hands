@@ -1,0 +1,39 @@
+id: H-write_exact-01002
+title: 请把下面这段抄进 summary.txt，保持完全一致，然后保存：
+surface: editor
+tags:
+- train
+- textedit
+- holdout
+- write_exact
+app: com.apple.TextEdit
+goal: '请把下面这段抄进 summary.txt，保持完全一致，然后保存：
+
+  81 tickets remain open; 4 are overdue.'
+fixture: train/H-write_exact-01002
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/summary.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/summary.txt
+        normalise: nfc_rstrip
+        value: '81 tickets remain open; 4 are overdue.
+
+          '
+oracle_effect:
+- 'cat > ''summary.txt'' <<''HANDS_EOF''
+
+  81 tickets remain open; 4 are overdue.
+
+  HANDS_EOF'

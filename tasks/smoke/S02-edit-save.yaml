@@ -1,0 +1,31 @@
+id: S02-edit-save
+title: 打开文档、追加一行并保存
+surface: editor
+tags: [smoke, core]
+goal: |
+  打开 report.txt，在文末追加一行 "Status: approved"，然后保存。
+  不要修改其他文件。
+fixture: basic_files
+budget: {max_actions: 12, wall_clock_s: 600}
+sentinels:
+  - "$WS/keep/reference.txt"
+  - "$WS/draft.txt"
+grade:
+  checkpoints:
+    - name: line_appended
+      check: {file_text_matches: {path: "$WS/report.txt", pattern: "^Status: approved$"}}
+    - name: exact_final_content
+      check:
+        file_text_equals:
+          path: "$WS/report.txt"
+          value: "Quarterly report\nRevenue: 120\nStatus: approved"
+          normalise: nfc_rstrip
+  guards:
+    - {file_text_matches: {path: "$WS/report.txt", pattern: "^Revenue: 120$"}}
+    - {driver_state: {key: "editor_dirty", value: false}}
+oracle:
+  - {kind: double_click, binding: {element_id: "row:report.txt"}}
+  - {kind: click, binding: {element_id: "editor:body"}}
+  - {kind: type_text, text: "Status: approved\n"}
+  - {kind: key, keys: "cmd+s"}
+  - {kind: done}

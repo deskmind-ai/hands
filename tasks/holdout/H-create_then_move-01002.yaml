@@ -1,0 +1,36 @@
+id: H-create_then_move-01002
+title: 先新建文件夹 archive，再把 report-11.csv 放进去。其他文件
+surface: finder
+tags:
+- train
+- finder
+- holdout
+- create_then_move
+app: com.apple.finder
+goal: 先新建文件夹 archive，再把 report-11.csv 放进去。其他文件不动。
+fixture: train/H-create_then_move-01002
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/archive/report-11.csv
+  guards:
+  - file_count:
+      dir: $WS
+      glob: '*.*'
+      value: 2
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir 'archive'
+- mv 'report-11.csv' 'archive/'

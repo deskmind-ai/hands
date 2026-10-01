@@ -1,0 +1,45 @@
+id: T-edit_fields-01006
+title: 'summary.txt 需要更新两处：状态 → 已批准，额度 从 700 调到 '
+surface: editor
+tags:
+- train
+- textedit
+- train
+- edit_fields
+app: com.apple.TextEdit
+goal: summary.txt 需要更新两处：状态 → 已批准，额度 从 700 调到 1900。改好存盘。
+fixture: train/T-edit_fields-01006
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/summary.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/summary.txt
+        normalise: nfc_rstrip
+        value: 'Quarterly report
+
+          状态: 已批准
+
+          额度: 1900
+
+          '
+oracle_effect:
+- 'cat > ''summary.txt'' <<''HANDS_EOF''
+
+  Quarterly report
+
+  状态: 已批准
+
+  额度: 1900
+
+  HANDS_EOF'

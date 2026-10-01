@@ -1,0 +1,37 @@
+id: T-roundtrip-01008
+title: 结果.txt 里需要一行 `编号,客户`，值取自 原始.txt，写完保存（不带标
+surface: editor
+tags:
+- train
+- textedit
+- train
+- roundtrip
+app: com.apple.TextEdit
+goal: 结果.txt 里需要一行 `编号,客户`，值取自 原始.txt，写完保存（不带标签文字）。
+fixture: train/T-roundtrip-01008
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/结果.txt"
+- open -a TextEdit "$WS/原始.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/原始.txt
+grade:
+  checkpoints:
+  - name: written
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/结果.txt
+        normalise: nfc_rstrip
+        value: K-7895,47290
+oracle_effect:
+- 'cat > ''结果.txt'' <<''HANDS_EOF''
+
+  K-7895,47290
+
+  HANDS_EOF'

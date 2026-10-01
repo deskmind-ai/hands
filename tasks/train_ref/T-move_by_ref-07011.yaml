@@ -1,0 +1,41 @@
+id: T-move_by_ref-07011
+title: Move memo-46.md from drafts so that it s
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: Move memo-46.md from drafts so that it sits next to report-52.md; do not move
+  report-52.md.
+fixture: train_ref/T-move_by_ref-07011
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/memo-46.md
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/report-52.md
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/drafts/memo-46.md
+  guards:
+  - dir_manifest:
+      dir: $WS/drafts
+      value:
+      - agenda-67.log
+      - todo-83.txt
+      - 记录-43.md
+oracle_effect:
+- mv 'drafts/memo-46.md' ./

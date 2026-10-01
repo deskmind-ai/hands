@@ -1,0 +1,35 @@
+id: T-move-01007
+title: Please relocate 归档/memo-41.log to 工作目录顶层
+surface: finder
+tags:
+- train
+- finder
+- train
+- move
+app: com.apple.finder
+goal: Please relocate 归档/memo-41.log to 工作目录顶层.
+fixture: train/T-move-01007
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/memo-41.log
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/归档/memo-41.log
+  guards:
+  - dir_manifest:
+      dir: $WS/归档
+      value:
+      - report-43.txt
+      - summary-32.md
+oracle_effect:
+- mv '归档/memo-41.log' ./

@@ -1,0 +1,46 @@
+id: T-sort_into-01010
+title: Gather all the .md files into a new fold
+surface: finder
+tags:
+- train
+- finder
+- train
+- sort_into
+app: com.apple.finder
+goal: Gather all the .md files into a new folder called invoices.
+fixture: train/T-sort_into-01010
+budget:
+  max_actions: 30
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: folder
+    check:
+      file_exists:
+        path: $WS/invoices
+  - name: moved
+    critical: true
+    check:
+      dir_manifest:
+        dir: $WS/invoices
+        value:
+        - draft-76.md
+        - report-26.md
+        - 说明-91.md
+  guards:
+  - file_exists:
+      path: $WS/report-55.log
+  - file_exists:
+      path: $WS/周报-70.txt
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir 'invoices'
+- mv 'draft-76.md' 'invoices/'
+- mv '说明-91.md' 'invoices/'
+- mv 'report-26.md' 'invoices/'

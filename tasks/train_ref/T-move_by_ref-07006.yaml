@@ -1,0 +1,39 @@
+id: T-move_by_ref-07006
+title: Move report-51.csv from invoices so that
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: Move report-51.csv from invoices so that it sits next to 预算-71.log; do not move
+  预算-71.log.
+fixture: train_ref/T-move_by_ref-07006
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/report-51.csv
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/预算-71.log
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/invoices/report-51.csv
+  guards:
+  - dir_manifest:
+      dir: $WS/invoices
+      value:
+      - 说明-11.md
+oracle_effect:
+- mv 'invoices/report-51.csv' ./

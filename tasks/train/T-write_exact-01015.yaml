@@ -1,0 +1,46 @@
+id: T-write_exact-01015
+title: 记录.txt is open and empty. Type exactly t
+surface: editor
+tags:
+- train
+- textedit
+- train
+- write_exact
+app: com.apple.TextEdit
+goal: '记录.txt is open and empty. Type exactly the following, punctuation and line
+  breaks included, then save:
+
+  一季度营收 3576 万元，环比增长 24.8%。
+
+  未结订单 2 笔，其中 2 笔已逾期。'
+fixture: train/T-write_exact-01015
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/记录.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/记录.txt
+        normalise: nfc_rstrip
+        value: '一季度营收 3576 万元，环比增长 24.8%。
+
+          未结订单 2 笔，其中 2 笔已逾期。
+
+          '
+oracle_effect:
+- 'cat > ''记录.txt'' <<''HANDS_EOF''
+
+  一季度营收 3576 万元，环比增长 24.8%。
+
+  未结订单 2 笔，其中 2 笔已逾期。
+
+  HANDS_EOF'

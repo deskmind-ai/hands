@@ -1,0 +1,35 @@
+id: H-newfolder-01002
+title: 请新增文件夹 photos（放在工作目录顶层）。
+surface: finder
+tags:
+- train
+- finder
+- holdout
+- newfolder
+app: com.apple.finder
+goal: 请新增文件夹 photos（放在工作目录顶层）。
+fixture: train/H-newfolder-01002
+budget:
+  max_actions: 12
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: created
+    critical: true
+    check:
+      file_exists:
+        path: $WS/photos
+  guards:
+  - file_count:
+      dir: $WS
+      glob: '*.*'
+      value: 3
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir 'photos'

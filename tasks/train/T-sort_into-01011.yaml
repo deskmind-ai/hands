@@ -1,0 +1,46 @@
+id: T-sort_into-01011
+title: 建一个叫 reports 的文件夹，然后把所有 .log 文件放进去，别的文件留
+surface: finder
+tags:
+- train
+- finder
+- train
+- sort_into
+app: com.apple.finder
+goal: 建一个叫 reports 的文件夹，然后把所有 .log 文件放进去，别的文件留在原地。
+fixture: train/T-sort_into-01011
+budget:
+  max_actions: 30
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: folder
+    check:
+      file_exists:
+        path: $WS/reports
+  - name: moved
+    critical: true
+    check:
+      dir_manifest:
+        dir: $WS/reports
+        value:
+        - log-2.log
+        - 记录-63.log
+        - 预算-79.log
+  guards:
+  - file_exists:
+      path: $WS/draft-25.md
+  - file_exists:
+      path: $WS/notes-46.md
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir 'reports'
+- mv 'log-2.log' 'reports/'
+- mv '预算-79.log' 'reports/'
+- mv '记录-63.log' 'reports/'

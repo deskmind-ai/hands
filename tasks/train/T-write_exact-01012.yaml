@@ -1,0 +1,41 @@
+id: T-write_exact-01012
+title: 在 todo.txt 里一字不差地写下：
+surface: editor
+tags:
+- train
+- textedit
+- train
+- write_exact
+app: com.apple.TextEdit
+goal: '在 todo.txt 里一字不差地写下：
+
+  库存周转天数为 6607 天，同比下降 11.3%。
+
+  写完保存。'
+fixture: train/T-write_exact-01012
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/todo.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/todo.txt
+        normalise: nfc_rstrip
+        value: '库存周转天数为 6607 天，同比下降 11.3%。
+
+          '
+oracle_effect:
+- 'cat > ''todo.txt'' <<''HANDS_EOF''
+
+  库存周转天数为 6607 天，同比下降 11.3%。
+
+  HANDS_EOF'

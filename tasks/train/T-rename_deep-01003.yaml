@@ -1,0 +1,33 @@
+id: T-rename_deep-01003
+title: Go into 项目/reports and rename the .csv f
+surface: finder
+tags:
+- train
+- finder
+- train
+- rename_deep
+app: com.apple.finder
+goal: Go into 项目/reports and rename the .csv file there to todo-final.csv. Leave the
+  rest.
+fixture: train/T-rename_deep-01003
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/项目/reports/todo-final.csv
+  - name: old_gone
+    check:
+      file_absent:
+        path: $WS/项目/reports/report-82.csv
+  guards:
+  - file_exists:
+      path: $WS/项目/reports/draft-152.log
+oracle_effect:
+- mv '项目/reports/report-82.csv' '项目/reports/todo-final.csv'

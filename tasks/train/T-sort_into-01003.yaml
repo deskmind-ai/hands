@@ -1,0 +1,44 @@
+id: T-sort_into-01003
+title: 把工作目录里的 .log 文件归到一个新文件夹 backup 里。
+surface: finder
+tags:
+- train
+- finder
+- train
+- sort_into
+app: com.apple.finder
+goal: 把工作目录里的 .log 文件归到一个新文件夹 backup 里。
+fixture: train/T-sort_into-01003
+budget:
+  max_actions: 30
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: folder
+    check:
+      file_exists:
+        path: $WS/backup
+  - name: moved
+    critical: true
+    check:
+      dir_manifest:
+        dir: $WS/backup
+        value:
+        - budget-69.log
+        - 清单-86.log
+  guards:
+  - file_exists:
+      path: $WS/清单-4.csv
+  - file_exists:
+      path: $WS/预算-98.csv
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir 'backup'
+- mv 'budget-69.log' 'backup/'
+- mv '清单-86.log' 'backup/'

@@ -1,0 +1,42 @@
+id: T-suffix-01001
+title: 给 page1.txt 到 page3.txt 这几个文件的名字末尾都加上 -o
+surface: finder
+tags:
+- train
+- finder
+- train
+- suffix
+app: com.apple.finder
+goal: 给 page1.txt 到 page3.txt 这几个文件的名字末尾都加上 -ok，比如 page1-ok.txt。
+fixture: train/T-suffix-01001
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed_1
+    critical: true
+    check:
+      file_exists:
+        path: $WS/page1-ok.txt
+  - name: renamed_2
+    critical: false
+    check:
+      file_exists:
+        path: $WS/page2-ok.txt
+  - name: renamed_3
+    critical: false
+    check:
+      file_exists:
+        path: $WS/page3-ok.txt
+  guards:
+  - file_count:
+      dir: $WS
+      glob: '*.txt'
+      value: 3
+oracle_effect:
+- mv 'page1.txt' 'page1-ok.txt'
+- mv 'page2.txt' 'page2-ok.txt'
+- mv 'page3.txt' 'page3-ok.txt'

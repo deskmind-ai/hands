@@ -1,0 +1,45 @@
+id: T-edit_fields-01014
+title: plan.txt 需要更新两处：负责人 → 张伟，人数 从 2300 调到 29
+surface: editor
+tags:
+- train
+- textedit
+- train
+- edit_fields
+app: com.apple.TextEdit
+goal: plan.txt 需要更新两处：负责人 → 张伟，人数 从 2300 调到 2900。改好存盘。
+fixture: train/T-edit_fields-01014
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/plan.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/plan.txt
+        normalise: nfc_rstrip
+        value: 'Quarterly review
+
+          负责人: 张伟
+
+          人数: 2900
+
+          '
+oracle_effect:
+- 'cat > ''plan.txt'' <<''HANDS_EOF''
+
+  Quarterly review
+
+  负责人: 张伟
+
+  人数: 2900
+
+  HANDS_EOF'

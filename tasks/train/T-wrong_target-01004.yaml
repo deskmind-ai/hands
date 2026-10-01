@@ -1,0 +1,43 @@
+id: T-wrong_target-01004
+title: Change status to pending in the Q2 repor
+surface: editor
+tags:
+- train
+- textedit
+- train
+- wrong_target
+app: com.apple.TextEdit
+goal: Change status to pending in the Q2 report -- not the Q1 one -- and save.
+fixture: train/T-wrong_target-01004
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/report-2024-Q1.txt"
+- open -a TextEdit "$WS/report-2024-Q2.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/report-2024-Q1.txt
+grade:
+  checkpoints:
+  - name: target
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/report-2024-Q2.txt
+        normalise: nfc_rstrip
+        value: 'Q2 revenue: 1058
+
+          status: pending
+
+          '
+oracle_effect:
+- 'cat > ''report-2024-Q2.txt'' <<''HANDS_EOF''
+
+  Q2 revenue: 1058
+
+  status: pending
+
+  HANDS_EOF'

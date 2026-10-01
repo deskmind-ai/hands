@@ -1,0 +1,39 @@
+id: T-move_by_ref-07019
+title: report-55.txt（在 报告 里）应该和 budget-92.log 放
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: report-55.txt（在 报告 里）应该和 budget-92.log 放在一起，请只移动 report-55.txt。
+fixture: train_ref/T-move_by_ref-07019
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/report-55.txt
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/budget-92.log
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/报告/report-55.txt
+  guards:
+  - dir_manifest:
+      dir: $WS/报告
+      value:
+      - log-86.log
+      - 清单-41.txt
+oracle_effect:
+- mv '报告/report-55.txt' ./

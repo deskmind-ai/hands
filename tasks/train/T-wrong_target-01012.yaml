@@ -1,0 +1,43 @@
+id: T-wrong_target-01012
+title: 两个很像的报告都开着。只改 Q1 那份：把 priority 设为 low；Q3
+surface: editor
+tags:
+- train
+- textedit
+- train
+- wrong_target
+app: com.apple.TextEdit
+goal: 两个很像的报告都开着。只改 Q1 那份：把 priority 设为 low；Q3 那份保持原样。保存。
+fixture: train/T-wrong_target-01012
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/report-2026-Q3.txt"
+- open -a TextEdit "$WS/report-2026-Q1.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/report-2026-Q3.txt
+grade:
+  checkpoints:
+  - name: target
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/report-2026-Q1.txt
+        normalise: nfc_rstrip
+        value: 'Q1 revenue: 7577
+
+          priority: low
+
+          '
+oracle_effect:
+- 'cat > ''report-2026-Q1.txt'' <<''HANDS_EOF''
+
+  Q1 revenue: 7577
+
+  priority: low
+
+  HANDS_EOF'

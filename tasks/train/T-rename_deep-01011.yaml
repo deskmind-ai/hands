@@ -1,0 +1,33 @@
+id: T-rename_deep-01011
+title: Go into 报告/photos and rename the .log fi
+surface: finder
+tags:
+- train
+- finder
+- train
+- rename_deep
+app: com.apple.finder
+goal: Go into 报告/photos and rename the .log file there to memo-final.log. Leave the
+  rest.
+fixture: train/T-rename_deep-01011
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/报告/photos/memo-final.log
+  - name: old_gone
+    check:
+      file_absent:
+        path: $WS/报告/photos/log-10.log
+  guards:
+  - file_exists:
+      path: $WS/报告/photos/清单-174.csv
+oracle_effect:
+- mv '报告/photos/log-10.log' '报告/photos/memo-final.log'

@@ -1,0 +1,32 @@
+id: T-rename_deep-01001
+title: invoices/archive 下有一个 .log 文件，请把它的名字改成 清
+surface: finder
+tags:
+- train
+- finder
+- train
+- rename_deep
+app: com.apple.finder
+goal: invoices/archive 下有一个 .log 文件，请把它的名字改成 清单-final.log。
+fixture: train/T-rename_deep-01001
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/invoices/archive/清单-final.log
+  - name: old_gone
+    check:
+      file_absent:
+        path: $WS/invoices/archive/记录-26.log
+  guards:
+  - file_exists:
+      path: $WS/invoices/archive/记录-152.csv
+oracle_effect:
+- mv 'invoices/archive/记录-26.log' 'invoices/archive/清单-final.log'

@@ -1,0 +1,45 @@
+id: T-write_exact-01010
+title: log.txt 是空的，已经在 TextEdit 里打开。请原样输入下面的内容（
+surface: editor
+tags:
+- train
+- textedit
+- train
+- write_exact
+app: com.apple.TextEdit
+goal: 'log.txt 是空的，已经在 TextEdit 里打开。请原样输入下面的内容（标点、数字、换行都不能差）并保存：
+
+  库存周转天数为 4029 天，同比下降 17.8%。
+
+  11 tickets remain open; 3 are overdue.'
+fixture: train/T-write_exact-01010
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/log.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/log.txt
+        normalise: nfc_rstrip
+        value: '库存周转天数为 4029 天，同比下降 17.8%。
+
+          11 tickets remain open; 3 are overdue.
+
+          '
+oracle_effect:
+- 'cat > ''log.txt'' <<''HANDS_EOF''
+
+  库存周转天数为 4029 天，同比下降 17.8%。
+
+  11 tickets remain open; 3 are overdue.
+
+  HANDS_EOF'

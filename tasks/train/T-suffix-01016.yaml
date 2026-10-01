@@ -1,0 +1,43 @@
+id: T-suffix-01016
+title: 'Rename each of page1.txt … page3.txt by '
+surface: finder
+tags:
+- train
+- finder
+- train
+- suffix
+app: com.apple.finder
+goal: Rename each of page1.txt … page3.txt by adding -v2 before the extension, like
+  page1-v2.txt.
+fixture: train/T-suffix-01016
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed_1
+    critical: true
+    check:
+      file_exists:
+        path: $WS/page1-v2.txt
+  - name: renamed_2
+    critical: false
+    check:
+      file_exists:
+        path: $WS/page2-v2.txt
+  - name: renamed_3
+    critical: false
+    check:
+      file_exists:
+        path: $WS/page3-v2.txt
+  guards:
+  - file_count:
+      dir: $WS
+      glob: '*.txt'
+      value: 3
+oracle_effect:
+- mv 'page1.txt' 'page1-v2.txt'
+- mv 'page2.txt' 'page2-v2.txt'
+- mv 'page3.txt' 'page3-v2.txt'

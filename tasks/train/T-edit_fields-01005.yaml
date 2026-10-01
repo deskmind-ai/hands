@@ -1,0 +1,45 @@
+id: T-edit_fields-01005
+title: agenda.txt 需要更新两处：状态 → 已批准，Budget 从 1700
+surface: editor
+tags:
+- train
+- textedit
+- train
+- edit_fields
+app: com.apple.TextEdit
+goal: agenda.txt 需要更新两处：状态 → 已批准，Budget 从 1700 调到 3500。改好存盘。
+fixture: train/T-edit_fields-01005
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/agenda.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/agenda.txt
+        normalise: nfc_rstrip
+        value: 'Quarterly report
+
+          状态: 已批准
+
+          Budget: 3500
+
+          '
+oracle_effect:
+- 'cat > ''agenda.txt'' <<''HANDS_EOF''
+
+  Quarterly report
+
+  状态: 已批准
+
+  Budget: 3500
+
+  HANDS_EOF'

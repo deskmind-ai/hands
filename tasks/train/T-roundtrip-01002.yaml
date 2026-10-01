@@ -1,0 +1,37 @@
+id: T-roundtrip-01002
+title: row.csv 里需要一行 `编号,订单号`，值取自 notes.md，写完保存
+surface: editor
+tags:
+- train
+- textedit
+- train
+- roundtrip
+app: com.apple.TextEdit
+goal: row.csv 里需要一行 `编号,订单号`，值取自 notes.md，写完保存（不带标签文字）。
+fixture: train/T-roundtrip-01002
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/row.csv"
+- open -a TextEdit "$WS/notes.md"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/notes.md
+grade:
+  checkpoints:
+  - name: written
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/row.csv
+        normalise: nfc_rstrip
+        value: K-8817,2384
+oracle_effect:
+- 'cat > ''row.csv'' <<''HANDS_EOF''
+
+  K-8817,2384
+
+  HANDS_EOF'

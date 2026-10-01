@@ -1,0 +1,44 @@
+id: T-sort_into-01000
+title: Create docs and move every .txt file int
+surface: finder
+tags:
+- train
+- finder
+- train
+- sort_into
+app: com.apple.finder
+goal: Create docs and move every .txt file into it; other files stay where they are.
+fixture: train/T-sort_into-01000
+budget:
+  max_actions: 30
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: folder
+    check:
+      file_exists:
+        path: $WS/docs
+  - name: moved
+    critical: true
+    check:
+      dir_manifest:
+        dir: $WS/docs
+        value:
+        - notes-36.txt
+        - 计划-12.txt
+  guards:
+  - file_exists:
+      path: $WS/budget-96.log
+  - file_exists:
+      path: $WS/draft-64.csv
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir 'docs'
+- mv 'notes-36.txt' 'docs/'
+- mv '计划-12.txt' 'docs/'

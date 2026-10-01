@@ -1,0 +1,33 @@
+id: T-rename_deep-01009
+title: Go into final/misc and rename the .log f
+surface: finder
+tags:
+- train
+- finder
+- train
+- rename_deep
+app: com.apple.finder
+goal: Go into final/misc and rename the .log file there to report-final.log. Leave
+  the rest.
+fixture: train/T-rename_deep-01009
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/final/misc/report-final.log
+  - name: old_gone
+    check:
+      file_absent:
+        path: $WS/final/misc/周报-79.log
+  guards:
+  - file_exists:
+      path: $WS/final/misc/预算-171.md
+oracle_effect:
+- mv 'final/misc/周报-79.log' 'final/misc/report-final.log'

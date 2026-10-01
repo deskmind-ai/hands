@@ -1,0 +1,46 @@
+id: T-sort_into-01014
+title: Gather all the .csv files into a new fol
+surface: finder
+tags:
+- train
+- finder
+- train
+- sort_into
+app: com.apple.finder
+goal: Gather all the .csv files into a new folder called 资料.
+fixture: train/T-sort_into-01014
+budget:
+  max_actions: 30
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: folder
+    check:
+      file_exists:
+        path: $WS/资料
+  - name: moved
+    critical: true
+    check:
+      dir_manifest:
+        dir: $WS/资料
+        value:
+        - 计划-19.csv
+        - 说明-46.csv
+        - 预算-59.csv
+  guards:
+  - file_exists:
+      path: $WS/budget-76.md
+  - file_exists:
+      path: $WS/memo-34.md
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir '资料'
+- mv '计划-19.csv' '资料/'
+- mv '预算-59.csv' '资料/'
+- mv '说明-46.csv' '资料/'

@@ -1,0 +1,39 @@
+id: T-move_by_ref-07033
+title: 把 草稿 里的 notes-79.md 放到 agenda-84.log 所在的
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: 把 草稿 里的 notes-79.md 放到 agenda-84.log 所在的那个文件夹里，agenda-84.log 本身不要动。
+fixture: train_ref/T-move_by_ref-07033
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/notes-79.md
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/agenda-84.log
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/草稿/notes-79.md
+  guards:
+  - dir_manifest:
+      dir: $WS/草稿
+      value:
+      - summary-62.log
+      - summary-77.md
+oracle_effect:
+- mv '草稿/notes-79.md' ./

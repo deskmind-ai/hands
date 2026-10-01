@@ -1,0 +1,30 @@
+id: H-rename_then_move-01000
+title: 把 misc 里的 report-46.md 改名为 agenda-rename
+surface: finder
+tags:
+- train
+- finder
+- holdout
+- rename_then_move
+app: com.apple.finder
+goal: 把 misc 里的 report-46.md 改名为 agenda-renamed.md，然后移到工作目录顶层。
+fixture: train/H-rename_then_move-01000
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: done
+    critical: true
+    check:
+      file_exists:
+        path: $WS/agenda-renamed.md
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/misc/report-46.md
+  guards: []
+oracle_effect:
+- mv 'misc/report-46.md' './agenda-renamed.md'

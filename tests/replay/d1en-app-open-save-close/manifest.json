@@ -1,0 +1,30 @@
+{
+  "run_id": "do-20261001-181348",
+  "task_id": "do-20261001-181348",
+  "system": "do:deskmind-local",
+  "goal": "In Safari, a parts inventory table is open. Open parts.csv from the attached folder in TextEdit, append the table's four rows to it as `Part No.,Name,Qty`, sorted by Qty from high to low (the header is already there; don't repeat it), then save and close it.",
+  "target": "/Users/user/DeskMind-demo/D1en-r1",
+  "apps": {
+    "Safari": "com.apple.Safari",
+    "TextEdit": "com.apple.TextEdit"
+  },
+  "adapter": "systemone",
+  "app": "com.apple.Safari",
+  "ask": "stdin",
+  "driver": "peekaboo",
+  "live": true,
+  "budget": {
+    "max_actions": 40,
+    "wall_clock_s": 1800.0
+  },
+  "files_before": 2,
+  "environment": {
+    "captured_at": "2026-10-01T18:13:48+0800",
+    "harness_commit": null,
+    "harness_dirty": false,
+    "python": "3.12.11",
+    "platform": "macOS-27.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "os_version": "27.2"
+  }
+}

@@ -1,0 +1,36 @@
+id: T-move-01013
+title: 把 项目/备份 里面的 report-31.log 挪到 工作目录的顶层，其余文
+surface: finder
+tags:
+- train
+- finder
+- train
+- move
+app: com.apple.finder
+goal: 把 项目/备份 里面的 report-31.log 挪到 工作目录的顶层，其余文件别动。
+fixture: train/T-move-01013
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/report-31.log
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/项目/备份/report-31.log
+  guards:
+  - dir_manifest:
+      dir: $WS/项目/备份
+      value:
+      - report-92.csv
+      - 会议纪要-72.log
+      - 说明-88.csv
+oracle_effect:
+- mv '项目/备份/report-31.log' ./

@@ -1,0 +1,32 @@
+id: S06-stale-binding
+title: 窗口移动后必须重新定位再动手
+surface: files
+tags: [smoke, interaction]
+goal: |
+  把 report.txt 重命名为 report-final.txt。
+  期间窗口位置可能变化，动手前要确认目标仍然有效。
+fixture: basic_files
+budget: {max_actions: 12, wall_clock_s: 600}
+sentinels:
+  - "$WS/keep/reference.txt"
+  - "$WS/draft.txt"
+inject:
+  - event: move_window
+    at_action: 1
+    params: {dx: 140, dy: 70}
+grade:
+  checkpoints:
+    - name: renamed
+      check: {file_exists: {path: "$WS/report-final.txt"}}
+    - name: content_preserved
+      critical: true
+      check: {file_text_equals: {path: "$WS/report-final.txt", value: "Quarterly report\nRevenue: 120\n"}}
+    - name: stale_action_was_refused
+      check: {run_field: {key: "metrics.stale_refusals", op: gte, value: 1}}
+oracle:
+  - {kind: click, binding: {element_id: "row:report.txt"}}
+  - {kind: click, binding: {element_id: "btn:rename"}}
+  - {kind: click, binding: {element_id: "btn:rename"}}
+  - {kind: type_text, text: "report-final.txt"}
+  - {kind: key, keys: "return"}
+  - {kind: done}

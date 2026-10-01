@@ -1,0 +1,46 @@
+id: T-sort_into-01008
+title: 建一个叫 old 的文件夹，然后把所有 .md 文件放进去，别的文件留在原地。
+surface: finder
+tags:
+- train
+- finder
+- train
+- sort_into
+app: com.apple.finder
+goal: 建一个叫 old 的文件夹，然后把所有 .md 文件放进去，别的文件留在原地。
+fixture: train/T-sort_into-01008
+budget:
+  max_actions: 30
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: folder
+    check:
+      file_exists:
+        path: $WS/old
+  - name: moved
+    critical: true
+    check:
+      dir_manifest:
+        dir: $WS/old
+        value:
+        - 会议纪要-69.md
+        - 周报-83.md
+        - 预算-40.md
+  guards:
+  - file_exists:
+      path: $WS/draft-19.log
+  - file_exists:
+      path: $WS/report-73.txt
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir 'old'
+- mv '预算-40.md' 'old/'
+- mv '周报-83.md' 'old/'
+- mv '会议纪要-69.md' 'old/'

@@ -1,0 +1,39 @@
+id: T-move_by_ref-07039
+title: 把 invoices 里的 draft-98.csv 放到 budget-83.
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: 把 invoices 里的 draft-98.csv 放到 budget-83.log 所在的那个文件夹里，budget-83.log 本身不要动。
+fixture: train_ref/T-move_by_ref-07039
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/资料/draft-98.csv
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/资料/budget-83.log
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/invoices/draft-98.csv
+  guards:
+  - dir_manifest:
+      dir: $WS/invoices
+      value:
+      - log-93.txt
+      - notes-94.csv
+oracle_effect:
+- mv 'invoices/draft-98.csv' './资料/'

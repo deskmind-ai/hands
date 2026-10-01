@@ -1,0 +1,36 @@
+id: T-suffix-01014
+title: 给 scan1.txt 到 scan2.txt 这几个文件的名字末尾都加上 -v
+surface: finder
+tags:
+- train
+- finder
+- train
+- suffix
+app: com.apple.finder
+goal: 给 scan1.txt 到 scan2.txt 这几个文件的名字末尾都加上 -v2，比如 scan1-v2.txt。
+fixture: train/T-suffix-01014
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed_1
+    critical: true
+    check:
+      file_exists:
+        path: $WS/scan1-v2.txt
+  - name: renamed_2
+    critical: false
+    check:
+      file_exists:
+        path: $WS/scan2-v2.txt
+  guards:
+  - file_count:
+      dir: $WS
+      glob: '*.txt'
+      value: 2
+oracle_effect:
+- mv 'scan1.txt' 'scan1-v2.txt'
+- mv 'scan2.txt' 'scan2-v2.txt'

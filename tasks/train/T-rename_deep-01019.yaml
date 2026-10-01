@@ -1,0 +1,32 @@
+id: T-rename_deep-01019
+title: 打开 图片/docs 这个文件夹，把其中唯一的 .csv 文件改名为 summa
+surface: finder
+tags:
+- train
+- finder
+- train
+- rename_deep
+app: com.apple.finder
+goal: 打开 图片/docs 这个文件夹，把其中唯一的 .csv 文件改名为 summary-final.csv。
+fixture: train/T-rename_deep-01019
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/图片/docs/summary-final.csv
+  - name: old_gone
+    check:
+      file_absent:
+        path: $WS/图片/docs/agenda-17.csv
+  guards:
+  - file_exists:
+      path: $WS/图片/docs/清单-183.md
+oracle_effect:
+- mv '图片/docs/agenda-17.csv' '图片/docs/summary-final.csv'

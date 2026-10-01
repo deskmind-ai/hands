@@ -1,0 +1,46 @@
+id: T-sort_into-01017
+title: Gather all the .txt files into a new fol
+surface: finder
+tags:
+- train
+- finder
+- train
+- sort_into
+app: com.apple.finder
+goal: Gather all the .txt files into a new folder called docs.
+fixture: train/T-sort_into-01017
+budget:
+  max_actions: 30
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: folder
+    check:
+      file_exists:
+        path: $WS/docs
+  - name: moved
+    critical: true
+    check:
+      dir_manifest:
+        dir: $WS/docs
+        value:
+        - log-87.txt
+        - memo-62.txt
+        - plan-34.txt
+  guards:
+  - file_exists:
+      path: $WS/清单-38.csv
+  - file_exists:
+      path: $WS/预算-16.csv
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir 'docs'
+- mv 'memo-62.txt' 'docs/'
+- mv 'log-87.txt' 'docs/'
+- mv 'plan-34.txt' 'docs/'

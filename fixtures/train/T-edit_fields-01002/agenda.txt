@@ -1,0 +1,3 @@
+Quarterly plan
+Priority: low
+Budget: 2300

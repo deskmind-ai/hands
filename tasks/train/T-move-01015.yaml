@@ -1,0 +1,36 @@
+id: T-move-01015
+title: 把 docs 里面的 notes-68.txt 挪到 上一级，其余文件别动。
+surface: finder
+tags:
+- train
+- finder
+- train
+- move
+app: com.apple.finder
+goal: 把 docs 里面的 notes-68.txt 挪到 上一级，其余文件别动。
+fixture: train/T-move-01015
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/notes-68.txt
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/docs/notes-68.txt
+  guards:
+  - dir_manifest:
+      dir: $WS/docs
+      value:
+      - agenda-81.txt
+      - agenda-95.txt
+      - 周报-50.md
+oracle_effect:
+- mv 'docs/notes-68.txt' ./

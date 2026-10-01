@@ -1,0 +1,45 @@
+id: H-edit_fields-01000
+title: 请修改 todo.txt：状态 一行改成 已批准，Budget 的 2100 换
+surface: editor
+tags:
+- train
+- textedit
+- holdout
+- edit_fields
+app: com.apple.TextEdit
+goal: 请修改 todo.txt：状态 一行改成 已批准，Budget 的 2100 换成 3600，保存文件。
+fixture: train/H-edit_fields-01000
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/todo.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/todo.txt
+        normalise: nfc_rstrip
+        value: 'Quarterly review
+
+          状态: 已批准
+
+          Budget: 3600
+
+          '
+oracle_effect:
+- 'cat > ''todo.txt'' <<''HANDS_EOF''
+
+  Quarterly review
+
+  状态: 已批准
+
+  Budget: 3600
+
+  HANDS_EOF'

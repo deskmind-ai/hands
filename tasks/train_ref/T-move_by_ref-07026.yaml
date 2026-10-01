@@ -1,0 +1,39 @@
+id: T-move_by_ref-07026
+title: 'Move draft-3.md from archive so that it '
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: Move draft-3.md from archive so that it sits next to plan-85.csv; do not move
+  plan-85.csv.
+fixture: train_ref/T-move_by_ref-07026
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/old/draft-3.md
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/old/plan-85.csv
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/archive/draft-3.md
+  guards:
+  - dir_manifest:
+      dir: $WS/archive
+      value:
+      - 记录-61.md
+oracle_effect:
+- mv 'archive/draft-3.md' './old/'

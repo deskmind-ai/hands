@@ -1,0 +1,80 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Expense</title>
+<style>
+ body{font-family:-apple-system,"PingFang SC";margin:0;background:#f7f7f5;color:#222}
+ header{padding:14px 26px;color:#fff;font-size:22px;font-weight:600}
+ form{padding:22px 30px;font-size:20px}
+ label{display:block;margin:14px 0 6px;font-weight:600}
+ input,select{font-size:20px;padding:8px;width:420px;box-sizing:border-box}
+ button{font-size:22px;padding:10px 34px;margin-top:22px;border:0;border-radius:8px;color:#fff}
+ .err{color:#b3261e;font-size:16px;min-height:18px}
+ .two-column form{display:grid;grid-template-columns:1fr 1fr;column-gap:26px}
+ .two-column input,.two-column select{width:100%}
+ .compact form{font-size:17px} .compact input,.compact select{width:320px;font-size:17px;padding:5px}
+ table.fields td{padding:8px 12px;vertical-align:top} table.fields label{margin:0}
+ #done{padding:26px 30px;font-size:22px} #done td{padding:6px 18px;border-bottom:1px solid #ddd}
+</style></head>
+<body>
+<header id="top"></header>
+<div id="main"></div>
+<script>
+// The task comes from the gym server (/task?run=<id>); the page's true state goes to /state?run=<id> after every
+// change: the fields as typed or chosen, the errors shown, and what was submitted.
+const RUN = new URLSearchParams(location.search).get('run') || 'dev';
+const FIELDS = ['merchant', 'date', 'amount', 'category', 'notes'];
+let T, S;
+fetch('/task?run=' + RUN).then(r => r.json()).then(task => { T = task; init(); });
+function post() { fetch('/state?run=' + RUN, {method: 'POST', body: JSON.stringify(S)}); }
+function field(name) {
+  const t = T.texts;
+  if (name === 'category') {
+    const opts = [`<option value="">${t.choose}</option>`].concat(T.options.map(o => `<option>${o}</option>`)).join('');
+    return `<label for="category">${t.category}</label><select id="category" name="category">${opts}</select>`;
+  }
+  const ph = name === 'date' ? ` placeholder="${T.date_format}"` : '';
+  return `<label for="${name}">${t[name]}</label><input id="${name}" name="${name}"${ph}>`;
+}
+function init() {
+  S = {fields: {merchant: '', date: '', amount: '', category: '', notes: ''}, errors: {}, submitted: null};
+  document.title = T.app;
+  const top = document.getElementById('top');
+  top.textContent = T.app + ' · ' + T.texts.title; top.style.background = T.color;
+  document.body.className = T.layout;
+  const main = document.getElementById('main');
+  let inner;
+  if (T.layout === 'table') {
+    inner = '<table class="fields">' + FIELDS.map(f => `<tr><td>${field(f)}</td><td class="err" id="err-${f}"></td></tr>`).join('') + '</table>';
+  } else {
+    inner = FIELDS.map(f => `<div>${field(f)}<div class="err" id="err-${f}"></div></div>`).join('');
+  }
+  main.innerHTML = `<form id="form" novalidate>${inner}<div><button type="submit" style="background:${T.color}">${T.texts.submit}</button></div></form>`;
+  FIELDS.forEach(f => {
+    const el = document.getElementById(f);
+    const on = () => { S.fields[f] = el.value; post(); };
+    el.addEventListener('input', on); el.addEventListener('change', on);
+  });
+  // Values set without an input event (accessibility writes) are picked up too.
+  setInterval(() => { let ch = false; FIELDS.forEach(f => { const v = document.getElementById(f) && document.getElementById(f).value;
+    if (v !== undefined && v !== S.fields[f]) { S.fields[f] = v; ch = true; } }); if (ch) post(); }, 300);
+  document.getElementById('form').addEventListener('submit', ev => { ev.preventDefault(); submit(); });
+  post();
+}
+function validDate(v) {
+  if (T.date_format === 'MM/DD/YYYY') return /^(0?[1-9]|1[0-2])\/(0?[1-9]|[12]\d|3[01])\/\d{4}$/.test(v.trim());
+  return /^\d{4}-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])$/.test(v.trim());
+}
+function submit() {
+  const t = T.texts, e = {};
+  ['merchant', 'date', 'amount', 'category'].forEach(f => { if (!S.fields[f].trim()) e[f] = t.required; });
+  if (!e.date && !validDate(S.fields.date)) e.date = t.bad_date.replace('{fmt}', T.date_format);
+  if (!e.amount && !/^\d+([.,]\d{1,2})?$/.test(S.fields.amount.trim())) e.amount = t.bad_amount;
+  S.errors = e;
+  FIELDS.forEach(f => { const d = document.getElementById('err-' + f); if (d) d.textContent = e[f] || ''; });
+  if (Object.keys(e).length) { post(); return; }
+  S.submitted = Object.assign({}, S.fields);
+  post();
+  const rows = FIELDS.map(f => `<tr><td>${t[f]}</td><td>${S.fields[f]}</td></tr>`).join('');
+  document.getElementById('main').innerHTML = `<div id="done"><h2>${t.done} ✓</h2><table>${rows}</table></div>`;
+}
+</script>
+</body></html>

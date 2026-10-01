@@ -1,0 +1,38 @@
+id: T-move_by_ref-07025
+title: '记录-98.md（在 old 里）应该和 清单-65.md 放在一起，请只移动 '
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: 记录-98.md（在 old 里）应该和 清单-65.md 放在一起，请只移动 记录-98.md。
+fixture: train_ref/T-move_by_ref-07025
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/docs/记录-98.md
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/docs/清单-65.md
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/old/记录-98.md
+  guards:
+  - dir_manifest:
+      dir: $WS/old
+      value:
+      - log-40.log
+oracle_effect:
+- mv 'old/记录-98.md' './docs/'

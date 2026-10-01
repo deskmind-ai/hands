@@ -1,0 +1,41 @@
+id: T-move_by_ref-07028
+title: 'Put 备份/report-89.log in the same folder '
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: Put 备份/report-89.log in the same folder as 会议纪要-32.txt. 会议纪要-32.txt itself stays
+  where it is.
+fixture: train_ref/T-move_by_ref-07028
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/misc/report-89.log
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/misc/会议纪要-32.txt
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/备份/report-89.log
+  guards:
+  - dir_manifest:
+      dir: $WS/备份
+      value:
+      - draft-34.log
+      - memo-35.csv
+      - notes-59.md
+oracle_effect:
+- mv '备份/report-89.log' './misc/'

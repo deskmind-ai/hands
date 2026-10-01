@@ -1,0 +1,36 @@
+id: H-suffix-01002
+title: 请批量改名：page1.txt 到 page2.txt 全部加后缀 -done，
+surface: finder
+tags:
+- train
+- finder
+- holdout
+- suffix
+app: com.apple.finder
+goal: 请批量改名：page1.txt 到 page2.txt 全部加后缀 -done，示例 page1-done.txt。
+fixture: train/H-suffix-01002
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed_1
+    critical: true
+    check:
+      file_exists:
+        path: $WS/page1-done.txt
+  - name: renamed_2
+    critical: false
+    check:
+      file_exists:
+        path: $WS/page2-done.txt
+  guards:
+  - file_count:
+      dir: $WS
+      glob: '*.txt'
+      value: 2
+oracle_effect:
+- mv 'page1.txt' 'page1-done.txt'
+- mv 'page2.txt' 'page2-done.txt'

@@ -1,0 +1,38 @@
+id: T-roundtrip-01006
+title: 'Read the 编号 and 订单号 from source.txt and '
+surface: editor
+tags:
+- train
+- textedit
+- train
+- roundtrip
+app: com.apple.TextEdit
+goal: Read the 编号 and 订单号 from source.txt and write them into target.txt as one line
+  in the format `编号,订单号`. Values only. Save.
+fixture: train/T-roundtrip-01006
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/target.txt"
+- open -a TextEdit "$WS/source.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/source.txt
+grade:
+  checkpoints:
+  - name: written
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/target.txt
+        normalise: nfc_rstrip
+        value: K-8310,43941
+oracle_effect:
+- 'cat > ''target.txt'' <<''HANDS_EOF''
+
+  K-8310,43941
+
+  HANDS_EOF'

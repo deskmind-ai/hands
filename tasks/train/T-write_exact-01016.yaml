@@ -1,0 +1,45 @@
+id: T-write_exact-01016
+title: Enter this text verbatim into 预算.txt and
+surface: editor
+tags:
+- train
+- textedit
+- train
+- write_exact
+app: com.apple.TextEdit
+goal: 'Enter this text verbatim into 预算.txt and save it:
+
+  本月新增客户 83 家，流失 3 家。
+
+  库存周转天数为 9182 天，同比下降 15.6%。'
+fixture: train/T-write_exact-01016
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/预算.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/预算.txt
+        normalise: nfc_rstrip
+        value: '本月新增客户 83 家，流失 3 家。
+
+          库存周转天数为 9182 天，同比下降 15.6%。
+
+          '
+oracle_effect:
+- 'cat > ''预算.txt'' <<''HANDS_EOF''
+
+  本月新增客户 83 家，流失 3 家。
+
+  库存周转天数为 9182 天，同比下降 15.6%。
+
+  HANDS_EOF'

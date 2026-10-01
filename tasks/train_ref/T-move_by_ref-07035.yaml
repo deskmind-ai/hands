@@ -1,0 +1,39 @@
+id: T-move_by_ref-07035
+title: Put reports/记录-58.log in the same folder
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: Put reports/记录-58.log in the same folder as log-27.txt. log-27.txt itself stays
+  where it is.
+fixture: train_ref/T-move_by_ref-07035
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/记录-58.log
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/log-27.txt
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/reports/记录-58.log
+  guards:
+  - dir_manifest:
+      dir: $WS/reports
+      value:
+      - todo-59.txt
+oracle_effect:
+- mv 'reports/记录-58.log' ./

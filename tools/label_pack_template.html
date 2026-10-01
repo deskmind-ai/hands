@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>桌面操作标注</title>
+<style>
+:root { --bg:#f6f7f9; --card:#fff; --ink:#1f2328; --muted:#656d76; --line:#d8dee4; --accent:#2563eb;
+        --ok:#1a7f37; --warn:#9a6700; --pick:#dbeafe; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0d1117; --card:#161b22; --ink:#e6edf3; --muted:#8b949e;
+        --line:#30363d; --accent:#4c8df6; --ok:#3fb950; --warn:#d29922; --pick:#1c2d4a; } }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.55 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+header { position:sticky; top:0; z-index:5; background:var(--card); border-bottom:1px solid var(--line);
+         padding:10px 16px; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+header b { font-size:15px; }
+.bar { flex:1; min-width:160px; height:8px; background:var(--line); border-radius:4px; overflow:hidden; }
+.bar i { display:block; height:100%; background:var(--ok); width:0; }
+button { font:inherit; padding:6px 12px; border:1px solid var(--line); border-radius:6px; background:var(--card);
+         color:var(--ink); cursor:pointer; }
+button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+input[type=text] { font:inherit; padding:5px 8px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--ink); }
+main { max-width:1180px; margin:0 auto; padding:16px; display:grid; grid-template-columns: 1fr 420px; gap:16px; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:14px; }
+h3 { margin:0 0 8px; font-size:14px; color:var(--muted); font-weight:600; }
+.goal { font-size:16px; font-weight:600; white-space:pre-wrap; }
+.outcome li { white-space:pre-wrap; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+td, th { border-bottom:1px solid var(--line); padding:4px 6px; text-align:left; vertical-align:top; }
+th { color:var(--muted); font-weight:600; }
+pre { white-space:pre-wrap; max-height:220px; overflow:auto; background:var(--bg); padding:8px; border-radius:6px; margin:0; font-size:12px; }
+.q { margin-bottom:14px; }
+.q .t { font-weight:600; margin-bottom:6px; }
+.opt { display:block; padding:6px 8px; border:1px solid var(--line); border-radius:6px; margin:4px 0; cursor:pointer; white-space:pre-wrap; }
+.opt.on { background:var(--pick); border-color:var(--accent); }
+.opt input { margin-right:6px; }
+.hidden { display:none; }
+.status { font-size:13px; color:var(--muted); }
+.done-mark { color:var(--ok); font-weight:600; }
+.skip { color:var(--warn); }
+.nav { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+</style>
+</head>
+<body>
+<header>
+  <b>桌面操作标注 · __PACK__</b>
+  <span>标注员：<input type="text" id="who" placeholder="名字或昵称" size="12"></span>
+  <div class="bar"><i id="prog"></i></div>
+  <span class="status" id="count"></span>
+  <button id="export" class="primary">导出答案</button>
+</header>
+<main>
+  <section>
+    <div class="card"><h3>任务目标（用户原话）</h3><div class="goal" id="goal"></div></div>
+    <div class="card"><h3>任务最终要达到的结果（标准答案，仅供标注参考）</h3><ul class="outcome" id="outcome"></ul></div>
+    <div class="card"><h3>当前画面</h3>
+      <div>应用：<b id="app"></b>　窗口：<b id="win"></b></div>
+      <h3 style="margin-top:10px">已经做成的事</h3><ul id="sofar"></ul>
+      <h3>最近几步</h3><table id="recent"></table>
+    </div>
+    <div class="card"><h3>屏幕上能操作的元素</h3><table id="els"></table></div>
+    <div class="card"><h3>窗口里的文字</h3><pre id="text"></pre></div>
+  </section>
+  <aside>
+    <div class="card" style="position:sticky; top:64px">
+      <div class="nav">
+        <button id="prev">← 上一题</button>
+        <b id="qid"></b>
+        <button id="next">下一题 →</button>
+        <button id="nextTodo">下一道未做</button>
+      </div>
+      <p class="status">先选"做哪种操作"，再回答它下面出现的问题。选项里没有合适答案时点"无法判断"。</p>
+      <div id="qs"></div>
+      <label class="opt" id="skipBox"><input type="checkbox" id="skip"> 无法判断（选项里没有能推进任务的操作）</label>
+      <div class="q"><div class="t">备注（可选）</div><input type="text" id="note" style="width:100%"></div>
+      <div id="state" class="status"></div>
+    </div>
+  </aside>
+</main>
+<script>
+const ITEMS = /*__ITEMS__*/[];
+const STORE = "label_pack___PACK__";
+let answers = {};
+try { answers = JSON.parse(localStorage.getItem(STORE) || "{}"); } catch (e) {}
+let i = 0;
+const $ = (id) => document.getElementById(id);
+try { $("who").value = localStorage.getItem(STORE + "_who") || ""; } catch (e) {}
+$("who").oninput = () => { try { localStorage.setItem(STORE + "_who", $("who").value); } catch (e) {} };
+function save() { try { localStorage.setItem(STORE, JSON.stringify(answers)); } catch (e) {} progress(); }
+function complete(it, a) {
+  if (!a) return false;
+  if (a.skip) return true;
+  const op = a.operation; if (!op) return false;
+  return (it.heads[op] || []).filter(h => it.questions[h]).every(h => a[h]);
+}
+function progress() {
+  const n = ITEMS.filter(it => complete(it, answers[it.id])).length;
+  $("prog").style.width = (100 * n / ITEMS.length) + "%";
+  $("count").textContent = `已完成 ${n} / ${ITEMS.length}`;
+}
+function esc(s) { return String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function renderQ(it, a) {
+  const box = $("qs"); box.innerHTML = "";
+  const show = ["operation"].concat(a.operation ? (it.heads[a.operation] || []).filter(h => it.questions[h]) : []);
+  for (const qid of show) {
+    const q = it.questions[qid];
+    const d = document.createElement("div"); d.className = "q";
+    d.innerHTML = `<div class="t">${esc(q.title)}</div>`;
+    for (const o of q.options) {
+      const l = document.createElement("label"); l.className = "opt" + (a[qid] === o.key ? " on" : "");
+      l.innerHTML = `<input type="radio" name="${qid}" ${a[qid] === o.key ? "checked" : ""}>${esc(o.text)}`;
+      l.onclick = (ev) => { ev.preventDefault(); a[qid] = o.key; a.skip = false;
+        if (qid === "operation") for (const k of Object.keys(a)) if (!["operation","note","skip"].includes(k)) delete a[k];
+        answers[it.id] = a; save(); render(); };
+      d.appendChild(l);
+    }
+    box.appendChild(d);
+  }
+}
+function render() {
+  const it = ITEMS[i]; const a = answers[it.id] || {};
+  $("qid").textContent = `${it.id}（${i + 1}/${ITEMS.length}）`;
+  $("goal").textContent = it.goal;
+  $("outcome").innerHTML = it.target_outcome.map(x => `<li>${esc(x)}</li>`).join("");
+  $("app").textContent = it.app || "（无）"; $("win").textContent = it.window || "（没有窗口）";
+  $("sofar").innerHTML = (it.done_so_far.length ? it.done_so_far : ["（还没有）"]).map(x => `<li>${esc(x)}</li>`).join("");
+  $("recent").innerHTML = "<tr><th>操作</th><th>对象</th><th>内容</th><th>结果</th></tr>" + it.recent_actions.map(r =>
+    `<tr><td>${esc(r.kind)}</td><td>${esc(r.action)}</td><td>${esc(r.text)}</td><td>${r.ok === false ? "失败：" + esc(r.error) : (r.page_changed === false ? "成功，但画面没变" : "成功")}</td></tr>`).join("");
+  $("els").innerHTML = "<tr><th>名称</th><th>类型</th><th>当前值</th></tr>" + it.elements.map(e =>
+    `<tr><td>${esc(e.label)}</td><td>${esc(e.role)}</td><td>${esc(e.value)}</td></tr>`).join("");
+  $("text").textContent = it.page_text || "（无）";
+  renderQ(it, a);
+  $("skip").checked = !!a.skip; $("note").value = a.note || "";
+  $("state").innerHTML = complete(it, a) ? (a.skip ? '<span class="skip">已标为无法判断</span>' : '<span class="done-mark">本题已完成</span>') : "本题未完成";
+}
+$("skip").onchange = () => { const it = ITEMS[i]; const a = answers[it.id] || {}; a.skip = $("skip").checked; answers[it.id] = a; save(); render(); };
+$("note").oninput = () => { const it = ITEMS[i]; const a = answers[it.id] || {}; a.note = $("note").value; answers[it.id] = a; save(); };
+$("prev").onclick = () => { if (i > 0) { i--; render(); scrollTo(0, 0); } };
+$("next").onclick = () => { if (i < ITEMS.length - 1) { i++; render(); scrollTo(0, 0); } };
+$("nextTodo").onclick = () => { for (let k = 1; k <= ITEMS.length; k++) { const j = (i + k) % ITEMS.length;
+  if (!complete(ITEMS[j], answers[ITEMS[j].id])) { i = j; render(); scrollTo(0, 0); return; } } alert("全部完成了"); };
+$("export").onclick = () => {
+  if (!$("who").value.trim()) { alert("请先填写标注员名字"); return; }
+  const out = { pack: "__PACK__", annotator: $("who").value.trim(), exported_at: new Date().toISOString(), answers };
+  const b = new Blob([JSON.stringify(out, null, 1)], { type: "application/json" });
+  const u = URL.createObjectURL(b); const l = document.createElement("a");
+  l.href = u; l.download = `answers___PACK___${$("who").value.trim()}.json`; l.click(); URL.revokeObjectURL(u);
+};
+document.addEventListener("keydown", (e) => { if (e.target.tagName === "INPUT" && e.target.type === "text") return;
+  if (e.key === "ArrowRight") $("next").click(); if (e.key === "ArrowLeft") $("prev").click(); });
+render(); progress();
+</script>
+</body>
+</html>

@@ -1,0 +1,43 @@
+id: T-wrong_target-01009
+title: Q1 报告里的 status 需要改成 draft，注意别动 Q3 的那份，改完
+surface: editor
+tags:
+- train
+- textedit
+- train
+- wrong_target
+app: com.apple.TextEdit
+goal: Q1 报告里的 status 需要改成 draft，注意别动 Q3 的那份，改完保存。
+fixture: train/T-wrong_target-01009
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/report-2024-Q3.txt"
+- open -a TextEdit "$WS/report-2024-Q1.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/report-2024-Q3.txt
+grade:
+  checkpoints:
+  - name: target
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/report-2024-Q1.txt
+        normalise: nfc_rstrip
+        value: 'Q1 revenue: 6891
+
+          status: draft
+
+          '
+oracle_effect:
+- 'cat > ''report-2024-Q1.txt'' <<''HANDS_EOF''
+
+  Q1 revenue: 6891
+
+  status: draft
+
+  HANDS_EOF'

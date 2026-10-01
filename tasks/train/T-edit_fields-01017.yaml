@@ -1,0 +1,45 @@
+id: T-edit_fields-01017
+title: 在 TextEdit 里打开的 说明.txt 中，把 Priority 改为 l
+surface: editor
+tags:
+- train
+- textedit
+- train
+- edit_fields
+app: com.apple.TextEdit
+goal: 在 TextEdit 里打开的 说明.txt 中，把 Priority 改为 low，人数 由 1200 改为 3000，其他不变，然后保存。
+fixture: train/T-edit_fields-01017
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/说明.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/说明.txt
+        normalise: nfc_rstrip
+        value: 'Quarterly plan
+
+          Priority: low
+
+          人数: 3000
+
+          '
+oracle_effect:
+- 'cat > ''说明.txt'' <<''HANDS_EOF''
+
+  Quarterly plan
+
+  Priority: low
+
+  人数: 3000
+
+  HANDS_EOF'

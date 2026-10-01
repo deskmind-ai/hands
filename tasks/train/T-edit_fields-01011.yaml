@@ -1,0 +1,45 @@
+id: T-edit_fields-01011
+title: 在 TextEdit 里打开的 清单.txt 中，把 状态 改为 审核中，Quo
+surface: editor
+tags:
+- train
+- textedit
+- train
+- edit_fields
+app: com.apple.TextEdit
+goal: 在 TextEdit 里打开的 清单.txt 中，把 状态 改为 审核中，Quota 由 2700 改为 4000，其他不变，然后保存。
+fixture: train/T-edit_fields-01011
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/清单.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/清单.txt
+        normalise: nfc_rstrip
+        value: 'Quarterly review
+
+          状态: 审核中
+
+          Quota: 4000
+
+          '
+oracle_effect:
+- 'cat > ''清单.txt'' <<''HANDS_EOF''
+
+  Quarterly review
+
+  状态: 审核中
+
+  Quota: 4000
+
+  HANDS_EOF'

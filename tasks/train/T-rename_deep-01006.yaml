@@ -1,0 +1,32 @@
+id: T-rename_deep-01006
+title: 打开 old/备份 这个文件夹，把其中唯一的 .txt 文件改名为 周报-fin
+surface: finder
+tags:
+- train
+- finder
+- train
+- rename_deep
+app: com.apple.finder
+goal: 打开 old/备份 这个文件夹，把其中唯一的 .txt 文件改名为 周报-final.txt。
+fixture: train/T-rename_deep-01006
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/old/备份/周报-final.txt
+  - name: old_gone
+    check:
+      file_absent:
+        path: $WS/old/备份/计划-9.txt
+  guards:
+  - file_exists:
+      path: $WS/old/备份/summary-184.log
+oracle_effect:
+- mv 'old/备份/计划-9.txt' 'old/备份/周报-final.txt'

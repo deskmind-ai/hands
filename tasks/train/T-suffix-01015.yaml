@@ -1,0 +1,36 @@
+id: T-suffix-01015
+title: Append -ok to the names of page1.txt thr
+surface: finder
+tags:
+- train
+- finder
+- train
+- suffix
+app: com.apple.finder
+goal: Append -ok to the names of page1.txt through page2.txt (e.g. page1-ok.txt).
+fixture: train/T-suffix-01015
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed_1
+    critical: true
+    check:
+      file_exists:
+        path: $WS/page1-ok.txt
+  - name: renamed_2
+    critical: false
+    check:
+      file_exists:
+        path: $WS/page2-ok.txt
+  guards:
+  - file_count:
+      dir: $WS
+      glob: '*.txt'
+      value: 2
+oracle_effect:
+- mv 'page1.txt' 'page1-ok.txt'
+- mv 'page2.txt' 'page2-ok.txt'

@@ -1,0 +1,48 @@
+id: T-suffix-01003
+title: page1.txt……page4.txt 这些文件，请在文件名后面补上 -old
+surface: finder
+tags:
+- train
+- finder
+- train
+- suffix
+app: com.apple.finder
+goal: page1.txt……page4.txt 这些文件，请在文件名后面补上 -old（如 page1-old.txt）。
+fixture: train/T-suffix-01003
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed_1
+    critical: true
+    check:
+      file_exists:
+        path: $WS/page1-old.txt
+  - name: renamed_2
+    critical: false
+    check:
+      file_exists:
+        path: $WS/page2-old.txt
+  - name: renamed_3
+    critical: false
+    check:
+      file_exists:
+        path: $WS/page3-old.txt
+  - name: renamed_4
+    critical: false
+    check:
+      file_exists:
+        path: $WS/page4-old.txt
+  guards:
+  - file_count:
+      dir: $WS
+      glob: '*.txt'
+      value: 4
+oracle_effect:
+- mv 'page1.txt' 'page1-old.txt'
+- mv 'page2.txt' 'page2-old.txt'
+- mv 'page3.txt' 'page3-old.txt'
+- mv 'page4.txt' 'page4-old.txt'

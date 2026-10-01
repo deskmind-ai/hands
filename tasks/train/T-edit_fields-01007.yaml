@@ -1,0 +1,46 @@
+id: T-edit_fields-01007
+title: In budget.txt (already open in TextEdit)
+surface: editor
+tags:
+- train
+- textedit
+- train
+- edit_fields
+app: com.apple.TextEdit
+goal: In budget.txt (already open in TextEdit), set 负责人 to 王芳 and change Quota from
+  2900 to 3400. Keep the other lines. Save when done.
+fixture: train/T-edit_fields-01007
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/budget.txt"
+budget:
+  max_actions: 25
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: exact
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/budget.txt
+        normalise: nfc_rstrip
+        value: 'Quarterly review
+
+          负责人: 王芳
+
+          Quota: 3400
+
+          '
+oracle_effect:
+- 'cat > ''budget.txt'' <<''HANDS_EOF''
+
+  Quarterly review
+
+  负责人: 王芳
+
+  Quota: 3400
+
+  HANDS_EOF'

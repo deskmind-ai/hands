@@ -1,0 +1,32 @@
+id: T-rename_deep-01012
+title: Go into old/草稿 and rename the .md file t
+surface: finder
+tags:
+- train
+- finder
+- train
+- rename_deep
+app: com.apple.finder
+goal: Go into old/草稿 and rename the .md file there to 清单-final.md. Leave the rest.
+fixture: train/T-rename_deep-01012
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/old/草稿/清单-final.md
+  - name: old_gone
+    check:
+      file_absent:
+        path: $WS/old/草稿/budget-18.md
+  guards:
+  - file_exists:
+      path: $WS/old/草稿/周报-139.log
+oracle_effect:
+- mv 'old/草稿/budget-18.md' 'old/草稿/清单-final.md'

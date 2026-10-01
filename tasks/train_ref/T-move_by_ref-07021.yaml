@@ -1,0 +1,39 @@
+id: T-move_by_ref-07021
+title: 把 invoices 里的 summary-93.log 放到 会议纪要-67.
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: 把 invoices 里的 summary-93.log 放到 会议纪要-67.log 所在的那个文件夹里，会议纪要-67.log 本身不要动。
+fixture: train_ref/T-move_by_ref-07021
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/summary-93.log
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/会议纪要-67.log
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/invoices/summary-93.log
+  guards:
+  - dir_manifest:
+      dir: $WS/invoices
+      value:
+      - draft-44.csv
+      - 清单-91.txt
+oracle_effect:
+- mv 'invoices/summary-93.log' ./

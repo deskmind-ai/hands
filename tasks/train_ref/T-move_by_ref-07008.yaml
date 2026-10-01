@@ -1,0 +1,41 @@
+id: T-move_by_ref-07008
+title: Put 图片/plan-62.csv in the same folder as
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: Put 图片/plan-62.csv in the same folder as log-9.md. log-9.md itself stays where
+  it is.
+fixture: train_ref/T-move_by_ref-07008
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/资料/plan-62.csv
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/资料/log-9.md
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/图片/plan-62.csv
+  guards:
+  - dir_manifest:
+      dir: $WS/图片
+      value:
+      - 会议纪要-17.txt
+      - 清单-88.csv
+      - 预算-52.csv
+oracle_effect:
+- mv '图片/plan-62.csv' './资料/'

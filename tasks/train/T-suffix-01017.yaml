@@ -1,0 +1,42 @@
+id: T-suffix-01017
+title: item1.txt……item3.txt 这些文件，请在文件名后面补上 -don
+surface: finder
+tags:
+- train
+- finder
+- train
+- suffix
+app: com.apple.finder
+goal: item1.txt……item3.txt 这些文件，请在文件名后面补上 -done（如 item1-done.txt）。
+fixture: train/T-suffix-01017
+budget:
+  max_actions: 20
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: renamed_1
+    critical: true
+    check:
+      file_exists:
+        path: $WS/item1-done.txt
+  - name: renamed_2
+    critical: false
+    check:
+      file_exists:
+        path: $WS/item2-done.txt
+  - name: renamed_3
+    critical: false
+    check:
+      file_exists:
+        path: $WS/item3-done.txt
+  guards:
+  - file_count:
+      dir: $WS
+      glob: '*.txt'
+      value: 3
+oracle_effect:
+- mv 'item1.txt' 'item1-done.txt'
+- mv 'item2.txt' 'item2-done.txt'
+- mv 'item3.txt' 'item3-done.txt'

@@ -1,0 +1,35 @@
+id: H-move-01000
+title: 请将 draft-81.csv 从 backup/final 转移至 the t
+surface: finder
+tags:
+- train
+- finder
+- holdout
+- move
+app: com.apple.finder
+goal: 请将 draft-81.csv 从 backup/final 转移至 the top of the working directory。
+fixture: train/H-move-01000
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/draft-81.csv
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/backup/final/draft-81.csv
+  guards:
+  - dir_manifest:
+      dir: $WS/backup/final
+      value:
+      - budget-55.md
+      - 计划-52.csv
+oracle_effect:
+- mv 'backup/final/draft-81.csv' ./

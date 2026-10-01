@@ -1,0 +1,44 @@
+id: H-sort_into-01001
+title: 请整理一下：新建 drafts，把全部 .md 文件移入其中。
+surface: finder
+tags:
+- train
+- finder
+- holdout
+- sort_into
+app: com.apple.finder
+goal: 请整理一下：新建 drafts，把全部 .md 文件移入其中。
+fixture: train/H-sort_into-01001
+budget:
+  max_actions: 30
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: folder
+    check:
+      file_exists:
+        path: $WS/drafts
+  - name: moved
+    critical: true
+    check:
+      dir_manifest:
+        dir: $WS/drafts
+        value:
+        - memo-5.md
+        - 会议纪要-50.md
+  guards:
+  - file_exists:
+      path: $WS/log-52.txt
+  - file_exists:
+      path: $WS/todo-99.txt
+  forbid:
+  - file_exists:
+      path: $WS/untitled folder
+  - file_exists:
+      path: $WS/未命名文件夹
+oracle_effect:
+- mkdir 'drafts'
+- mv 'memo-5.md' 'drafts/'
+- mv '会议纪要-50.md' 'drafts/'

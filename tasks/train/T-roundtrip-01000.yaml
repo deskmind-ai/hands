@@ -1,0 +1,37 @@
+id: T-roundtrip-01000
+title: 从 notes.md 里读出客户和编号，按「客户,编号」的格式写成一行放进 ro
+surface: editor
+tags:
+- train
+- textedit
+- train
+- roundtrip
+app: com.apple.TextEdit
+goal: 从 notes.md 里读出客户和编号，按「客户,编号」的格式写成一行放进 row.csv，存盘。只要值，不要标签。
+fixture: train/T-roundtrip-01000
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/row.csv"
+- open -a TextEdit "$WS/notes.md"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/notes.md
+grade:
+  checkpoints:
+  - name: written
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/row.csv
+        normalise: nfc_rstrip
+        value: A-9209,8603
+oracle_effect:
+- 'cat > ''row.csv'' <<''HANDS_EOF''
+
+  A-9209,8603
+
+  HANDS_EOF'

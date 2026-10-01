@@ -1,0 +1,29 @@
+{
+  "run_id": "do-20260930-180242",
+  "task_id": "do-20260930-180242",
+  "system": "do:g18b-4B-q8",
+  "goal": "Find Lisa Wong's order in records.txt and add it to ledger.csv as `Date,Customer,Order,Amount`, then save ledger.csv. Both files are in the attached folder; open them in TextEdit.",
+  "target": "/Users/user/DeskMind-demo/D4en2-r2",
+  "apps": {
+    "TextEdit": "com.apple.TextEdit"
+  },
+  "adapter": "systemone",
+  "app": "com.apple.TextEdit",
+  "ask": "stdin",
+  "driver": "peekaboo",
+  "live": true,
+  "budget": {
+    "max_actions": 30,
+    "wall_clock_s": 480.0
+  },
+  "files_before": 2,
+  "environment": {
+    "captured_at": "2026-09-30T18:02:42+0800",
+    "harness_commit": "803b1c0c58cffa520d604863fe90fa53cff41ebf",
+    "harness_dirty": true,
+    "python": "3.12.11",
+    "platform": "macOS-27.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "os_version": "27.2"
+  }
+}

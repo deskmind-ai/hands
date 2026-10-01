@@ -1,0 +1,37 @@
+id: T-roundtrip-01016
+title: target.txt 里需要一行 `发票号,日期`，值取自 source.txt
+surface: editor
+tags:
+- train
+- textedit
+- train
+- roundtrip
+app: com.apple.TextEdit
+goal: target.txt 里需要一行 `发票号,日期`，值取自 source.txt，写完保存（不带标签文字）。
+fixture: train/T-roundtrip-01016
+reset_apps:
+- com.apple.TextEdit
+stage:
+- open -a TextEdit "$WS/target.txt"
+- open -a TextEdit "$WS/source.txt"
+budget:
+  max_actions: 20
+  wall_clock_s: 900
+sentinels:
+- $WS/keep/reference.txt
+- $WS/source.txt
+grade:
+  checkpoints:
+  - name: written
+    critical: true
+    check:
+      file_text_equals:
+        path: $WS/target.txt
+        normalise: nfc_rstrip
+        value: A-3130,77003
+oracle_effect:
+- 'cat > ''target.txt'' <<''HANDS_EOF''
+
+  A-3130,77003
+
+  HANDS_EOF'

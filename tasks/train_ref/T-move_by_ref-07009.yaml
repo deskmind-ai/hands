@@ -1,0 +1,40 @@
+id: T-move_by_ref-07009
+title: 把 backup 里的 budget-69.txt 放到 agenda-45.l
+surface: finder
+tags:
+- finder
+- train_ref
+- move_by_ref
+app: com.apple.finder
+goal: 把 backup 里的 budget-69.txt 放到 agenda-45.log 所在的那个文件夹里，agenda-45.log 本身不要动。
+fixture: train_ref/T-move_by_ref-07009
+budget:
+  max_actions: 25
+  wall_clock_s: 600
+sentinels:
+- $WS/keep/reference.txt
+grade:
+  checkpoints:
+  - name: moved
+    critical: true
+    check:
+      file_exists:
+        path: $WS/项目/budget-69.txt
+  - name: reference_stayed
+    critical: true
+    check:
+      file_exists:
+        path: $WS/项目/agenda-45.log
+  - name: gone
+    check:
+      file_absent:
+        path: $WS/backup/budget-69.txt
+  guards:
+  - dir_manifest:
+      dir: $WS/backup
+      value:
+      - notes-14.txt
+      - summary-27.csv
+      - 周报-79.txt
+oracle_effect:
+- mv 'backup/budget-69.txt' './项目/'

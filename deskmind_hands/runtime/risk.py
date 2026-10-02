@@ -2,7 +2,8 @@
 
 The planner is not trusted to ask. A typed-choice planner has no "request approval" answer at all, and one that has
 would still be the thing being guarded against. So the loop asks, before executing, whenever `risky` names the
-action -- and only in a run with a person to ask (`RunConfig.approve_risky`, set by `deskmind-hands do --ask stdin`). The
+action, in a run with a person to ask (`RunConfig.approve_risky`, set by `deskmind-hands do --ask stdin`). A live run
+with nobody to ask refuses those actions (`RunConfig.refuse_risky`) unless `--allow-risky` was given on purpose. The
 graded task sets have scripted users and fixtures whose deletions are the task; they are not gated.
 
 Named by what the action targets, not by what the model meant:

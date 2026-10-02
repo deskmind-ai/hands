@@ -86,7 +86,7 @@ class User:
 class LoopTest(unittest.TestCase):
     """The loop asks before a risky step, and a denied step is not carried out (mock desktop, S01's oracle)."""
 
-    def run_s01(self, user, approve_risky=True):
+    def run_s01(self, user, approve_risky=True, refuse_risky=False):
         import tempfile
         from deskmind_hands.adapters.scripted import OracleAdapter
         from deskmind_hands.drivers.mock import MockDriver
@@ -101,7 +101,7 @@ class LoopTest(unittest.TestCase):
         risk.risky = lambda a, o, last=None: "click it" if a.kind is ActionKind.CLICK else None
         try:
             res = run_task(task, MockDriver(render=False), OracleAdapter(), ws,
-                           config=RunConfig(user=user, approve_risky=approve_risky))
+                           config=RunConfig(user=user, approve_risky=approve_risky, refuse_risky=refuse_risky))
         finally:
             risk.risky = real
         return res, ws
@@ -119,6 +119,15 @@ class LoopTest(unittest.TestCase):
         self.assertGreaterEqual(len(user.asked), 1)
         self.assertTrue((ws.ws / "draft.txt").exists(), "a denied click must not have happened")
         self.assertFalse((ws.ws / "final.txt").exists())
+
+    def test_refused_when_nobody_is_there_to_ask(self):
+        """`do` without --ask stdin: a risky step is refused, not asked and not carried out (10-02 review)."""
+        user = User(approve=True)
+        res, ws = self.run_s01(user, approve_risky=False, refuse_risky=True)
+        self.assertEqual(user.asked, [])
+        self.assertTrue((ws.ws / "draft.txt").exists(), "a refused click must not have happened")
+        self.assertFalse((ws.ws / "final.txt").exists())
+        self.assertTrue(any(s.get("kind") == "refused_risky" for s in res.steps))
 
     def test_off_without_a_person(self):
         user = User(approve=False)

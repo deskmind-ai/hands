@@ -75,6 +75,9 @@ class RunConfig:
     #: Ask the user before an action `risk.risky` names (send, delete, pay, publish, share). Live runs with a person
     #: to ask only: a graded set's scripted user and its deletions would turn every such step into a dialogue turn.
     approve_risky: bool = False
+    #: A live run with nobody to ask (`deskmind-hands do` without --ask stdin): the actions `risk.risky` names are
+    #: refused, not carried out unasked. Running them without approval is a mode chosen on purpose (--allow-risky).
+    refuse_risky: bool = False
 
 
 @dataclass
@@ -556,7 +559,7 @@ def run_task(
                     recorder.step(steps[-1])
                 break
 
-            what = risk.risky(action, obs, last_typed_label) if cfg.approve_risky else None
+            what = risk.risky(action, obs, last_typed_label) if (cfg.approve_risky or cfg.refuse_risky) else None
             # An approval is for one step, in one app: approving one "click 'Send'" once covered every later Send of
             # the run, whatever it sent and in whichever app (10-02 review). The confirmation a just-approved step
             # opens ("Delete" -> the dialog's "Delete message") is the same decision: not asked twice when it
@@ -566,6 +569,18 @@ def run_task(
                     and len(steps) - just_approved[2] <= 2:
                 what = None
                 just_approved = None
+            if what and not cfg.approve_risky:
+                # Nobody to ask: the step is not carried out, and the planner is told why (10-02 review: a CLI run
+                # without --ask sent and deleted unasked).
+                entry = {"n": len(steps) + 1, "kind": "refused_risky", "question": what, "by": "harness"}
+                steps.append(entry)
+                if recorder:
+                    recorder.step(entry)
+                history.append(Turn(action.to_json(), False, f"not done: {what} needs a person's approval, and this "
+                                                              f"run has nobody to ask"))
+                notice = (f"{what} was not done: it needs a person's approval and there is nobody to ask in this run. "
+                          f"Do not try it another way; finish with what is done.")
+                continue
             if what:
                 # The harness asks, not the planner: see risk.py. A denial is the user's answer, not a failure --
                 # the step is not carried out and the planner is told so.

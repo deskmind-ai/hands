@@ -325,6 +325,8 @@ def main() -> int:
             sys.argv.append("--foreground-ok")   # web typing needs the brief foreground (see the module notes)
         if a.approve != "off":
             sys.argv += ["--ask", "stdin"]       # a live run: risky steps wait for approval (hands/runtime/risk.py)
+        else:
+            sys.argv += ["--allow-risky"]        # the gym host is a sandbox: its deletions are the task
         asked.clear()
         started = time.time()
         try:

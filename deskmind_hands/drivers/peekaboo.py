@@ -972,7 +972,7 @@ class PeekabooDriver:
                   '  set n to count of Finder windows\n'
                   '  repeat with i from n to 1 by -1\n'
                   '    set w to Finder window i\n'
-                  f'    if (name of w) is "{self.ws.name}" then close w\n'
+                  f'    if (name of w) is "{self._q(self.ws.name)}" then close w\n'
                   '  end repeat\n'
                   'end tell')
         try:
@@ -1228,7 +1228,7 @@ class PeekabooDriver:
         # By the folder the window shows, not by id: Finder's scripting ids are its own numbering and do not match
         # the CGWindowID Peekaboo reports. And by the resolved path, compared window by window -- `whose target
         # is` never matched, because /tmp is really /private/tmp and the alias comparison is literal.
-        folder = (os.path.realpath(str(self.ws)) + "/").replace('"', '\\"')
+        folder = self._q(os.path.realpath(str(self.ws)) + "/")
         script = ('tell application "Finder"\n'
                   '  repeat with i from 1 to (count of Finder windows)\n'
                   '    set w to Finder window i\n'

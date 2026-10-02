@@ -27,6 +27,7 @@ from pathlib import Path
 from .drivers.base import Element
 from .apps import APPS
 from .geometry import Rect
+from .grounding import grounder_headers
 
 OCR_BIN = Path(__file__).resolve().parents[1] / "tools" / "native" / "ocr"
 GROUNDER_URL = os.environ.get("HANDS_GROUNDER_URL", "http://127.0.0.1:8010/ground")
@@ -122,7 +123,7 @@ def _icons(app: str, shot: Path, width: float, height: float, rows: list[dict] |
         try:
             req = urllib.request.Request(GROUNDER_URL, data=json.dumps({
                 "image": str(shot.resolve()), "size": [round(width), round(height)], "queries": vocab}).encode(),
-                headers={"Content-Type": "application/json"})
+                headers=grounder_headers())
             with urllib.request.urlopen(req, timeout=300) as r:
                 pts = json.load(r)["points"]
         except (OSError, ValueError, KeyError):
@@ -187,7 +188,7 @@ def ground_one(shot: Path, width: float, height: float, description: str) -> tup
     try:
         req = urllib.request.Request(GROUNDER_URL, data=json.dumps({
             "image": str(shot.resolve()), "size": [round(width), round(height)], "queries": {"q": description}}).encode(),
-            headers={"Content-Type": "application/json"})
+            headers=grounder_headers())
         with urllib.request.urlopen(req, timeout=120) as r:
             pt = json.load(r)["points"].get("q")
     except (OSError, ValueError, KeyError):

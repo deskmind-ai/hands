@@ -917,6 +917,18 @@ class GymMailMusic(unittest.TestCase):
         self.assertIn(t["target"]["title"], [x for x in msg["body"] if t["target"]["title"] in x][0])
 
 
+class GrounderToken(unittest.TestCase):
+    """The app's grounding server needs its token: every grounder request carries HANDS_GROUNDER_TOKEN when set."""
+
+    def test_header(self):
+        from unittest import mock
+        from deskmind_hands.grounding import grounder_headers
+        with mock.patch.dict(os.environ, {"HANDS_GROUNDER_TOKEN": "abc"}):
+            self.assertEqual(grounder_headers()["Authorization"], "Bearer abc")
+        with mock.patch.dict(os.environ, {"HANDS_GROUNDER_TOKEN": ""}):
+            self.assertNotIn("Authorization", grounder_headers())
+
+
 if __name__ == "__main__":
     unittest.main()
 

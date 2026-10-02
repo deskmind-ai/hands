@@ -23,6 +23,15 @@ from pathlib import Path
 from .apps import APPS
 
 GROUNDER_URL = os.environ.get("HANDS_GROUNDER_URL", "http://127.0.0.1:8010/ground")
+
+
+def grounder_headers() -> dict:
+    """The grounder's request headers: with HANDS_GROUNDER_TOKEN set (the app sets it), its Bearer token, which the
+    app's grounding server requires so that nothing else on the Mac can answer in its place."""
+    h = {"Content-Type": "application/json"}
+    if os.environ.get("HANDS_GROUNDER_TOKEN"):
+        h["Authorization"] = f"Bearer {os.environ['HANDS_GROUNDER_TOKEN']}"
+    return h
 UNNAMED = {"按钮", "button", "Button", ""}
 
 #: What each app's unnamed buttons can be, from the local apps file (`grounding:`). The description is the
@@ -51,7 +60,7 @@ def name_unnamed(app: str, els: list, shot: Path, width: float, height: float, p
             req = urllib.request.Request(GROUNDER_URL, data=json.dumps({"image": str(shot.resolve()),
                                                                         "size": [round(width), round(height)],
                                                                         "queries": vocab}).encode(),
-                                         headers={"Content-Type": "application/json"})
+                                         headers=grounder_headers())
             with urllib.request.urlopen(req, timeout=300) as r:
                 points = json.load(r)["points"]
         except (OSError, ValueError, KeyError):

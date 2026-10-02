@@ -805,6 +805,14 @@ class PeekabooDriver:
             self._foreground_actions += 1
             self._osa(f'tell application "{self._q(front_before)}" to activate')
 
+    def _runs_roots(self) -> list[str]:
+        """The runs directory every staged workspace lives in (DESKMIND_RUNS_DIR, else the workspace's nearest
+        ancestor named `runs`, else its run directory), as given and resolved, each ending in a slash."""
+        ws = Path(getattr(self, "ws", "") or ".")
+        root = os.environ.get("DESKMIND_RUNS_DIR") or next(
+            (str(p) for p in [ws, *ws.parents] if p.name == "runs"), str(ws.parent))
+        return sorted({r.rstrip("/") + "/" for r in (root, os.path.realpath(root))})
+
     def _close_all_windows(self, bundle: str) -> int:
         """Close every window of an application before a run starts.
 
@@ -820,9 +828,15 @@ class PeekabooDriver:
             # running then tell ...`, since compiling the tell loads its dictionary. A bare launch opens TextEdit's
             # 「打开」 panel, which the document staged a moment later hides but never closes: the hidden "Save Panel
             # Accessory View" window a later run found. So the check is made outside AppleScript.
+            # Only documents inside the runs directory are closed: sandbox files an earlier run left open. A document
+            # of the user's own -- saved elsewhere, or untitled with no path at all -- is never closed: `close every
+            # document saving no` threw away whatever the user had not saved, from the app's Try examples (10-02).
             if not _app_running("TextEdit"):
                 return 0
-            ok, _ = self._osa('tell application "TextEdit" to close every document saving no')
+            ok = False
+            for root in self._runs_roots():
+                ok |= self._osa(f'tell application "TextEdit" to close (every document whose path starts with '
+                                f'"{self._q(root)}") saving no')[0]
             time.sleep(0.5)
             return 1 if ok else 0
         ok, data, _ = self._run("window_list_of", app=bundle)

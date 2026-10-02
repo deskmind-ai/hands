@@ -56,6 +56,38 @@ class DoRunWindows(unittest.TestCase):
         self.assertEqual(fresh_windows({"1", "7", "9"}, {"1"}, "1"), ["7", "9"])   # newest last
 
 
+class UsersDocumentsKept(unittest.TestCase):
+    """Clearing TextEdit before a staged task closes only documents in the runs directory: `close every document
+    saving no` threw away the user's unsaved documents from the app's Try examples (10-02)."""
+
+    def _driver(self, ws):
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        d.ws = Path(ws)
+        d.scripts = []
+        d._osa = lambda script: d.scripts.append(script) or (True, "")
+        return d
+
+    def test_only_documents_under_the_runs_directory(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as t, mock.patch.dict(os.environ, {"DESKMIND_RUNS_DIR": ""}), \
+                mock.patch("deskmind_hands.drivers.peekaboo._app_running", lambda name: True), \
+                mock.patch("time.sleep", lambda s: None):
+            runs = Path(t) / "work" / "runs"
+            d = self._driver(runs / "20261002-run" / "G04-chinese-exact-r1" / "ws")
+            d._close_all_windows("com.apple.TextEdit")
+        self.assertTrue(d.scripts)
+        for script in d.scripts:
+            self.assertNotIn("close every document saving no", script)
+            self.assertIn("whose path starts with", script)
+        self.assertTrue(any(f'"{runs}/"' in sc or f'"{os.path.realpath(runs)}/"' in sc for sc in d.scripts))
+
+    def test_the_runs_directory_from_the_environment(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"DESKMIND_RUNS_DIR": "/tmp/x/runs"}):
+            d = self._driver("/elsewhere/ws")
+            self.assertIn("/tmp/x/runs/", d._runs_roots())
+
+
 class Cycling(unittest.TestCase):
     def test_three_app_cycle_is_stuck(self):
         cycle = [("focus_app", "ncm", None), ("type_text", "PN-5581", "搜索框"), ("focus_app", "textedit", None),

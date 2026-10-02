@@ -258,9 +258,8 @@ def run_task(
     history: list[Turn] = []
     digests: list[str] = []
     ineffective: list[str] = []
-    approved: set[str] = set()                   # risky steps the user already approved in this run (risk.py)
     last_typed_label: str | None = None          # the field the last successful TYPE_TEXT wrote into
-    just_approved: tuple[str, int] | None = None # (kind, step count) of the last approval
+    just_approved: tuple[str, str, int] | None = None  # (kind, app, step count) of the last approval
     fired: set[int] = set()
     state = RunState.PREPARING
     failure = Failure(FailureClass.NONE)
@@ -558,11 +557,16 @@ def run_task(
                 break
 
             what = risk.risky(action, obs, last_typed_label) if cfg.approve_risky else None
-            # The confirmation a just-approved step opens ("Delete" -> the dialog's "Delete message") is the same
-            # decision: not asked twice when it follows within two steps.
-            if what and just_approved and just_approved[0] == risk.kind(what) and len(steps) - just_approved[1] <= 2:
+            # An approval is for one step, in one app: approving one "click 'Send'" once covered every later Send of
+            # the run, whatever it sent and in whichever app (10-02 review). The confirmation a just-approved step
+            # opens ("Delete" -> the dialog's "Delete message") is the same decision: not asked twice when it
+            # follows within two steps in the same app.
+            app_now = obs.focused_app or task.app or ""
+            if what and just_approved and just_approved[:2] == (risk.kind(what), app_now) \
+                    and len(steps) - just_approved[2] <= 2:
                 what = None
-            if what and what not in approved:
+                just_approved = None
+            if what:
                 # The harness asks, not the planner: see risk.py. A denial is the user's answer, not a failure --
                 # the step is not carried out and the planner is told so.
                 reply, ok_, delay = user.respond(risk.question(what, obs.focused_app or task.app or "", task.goal),
@@ -581,8 +585,7 @@ def run_task(
                     notice = (f"The user declined: {what}. It was not done. Do not try it another way; finish with "
                               f"what is done, or stop if nothing else is left to do.")
                     continue
-                approved.add(what)
-                just_approved = (risk.kind(what), len(steps))
+                just_approved = (risk.kind(what), app_now, len(steps))
             times["t_act_start"] = round(time.time(), 3)
             res: ExecResult = driver.execute(action)
             times["t_act_end"] = round(time.time(), 3)

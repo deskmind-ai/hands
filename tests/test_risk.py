@@ -127,6 +127,47 @@ class LoopTest(unittest.TestCase):
         self.assertTrue((ws.ws / "final.txt").exists())
 
 
+class OneStepApprovals(unittest.TestCase):
+    """An approval covers one step: approving one "click 'Send'" covered every later Send of the run, whatever it
+    sent (10-02 review). The confirmation right after an approved step is still the same decision."""
+
+    def run_actions(self, actions):
+        import tempfile
+        from deskmind_hands.adapters.scripted import ReplayAdapter
+        from deskmind_hands.drivers.mock import MockDriver
+        from deskmind_hands.env.workspace import Workspace
+        from deskmind_hands.runtime.loop import RunConfig, run_task
+        from deskmind_bench.task import load_task
+        repo = Path(__file__).resolve().parent.parent
+        task = load_task(repo / "tasks" / "smoke" / "S01-rename.yaml")
+        ws = Workspace.create(Path(tempfile.mkdtemp()), repo / "fixtures")
+        user = User(approve=True)
+        real = risk.risky
+        risk.risky = lambda a, o, last=None: ("click 'Send'" if a.kind is ActionKind.CLICK
+                                              and a.binding.element_id == "row:draft.txt" else None)
+        try:
+            run_task(task, MockDriver(render=False), ReplayAdapter(actions), ws,
+                     config=RunConfig(user=user, approve_risky=True))
+        finally:
+            risk.risky = real
+        return user.asked
+
+    CLICK = {"kind": "click", "binding": {"element_id": "row:draft.txt"}}
+    WAIT = {"kind": "click", "binding": {"element_id": "row:notes.txt"}}   # not risky: a step in between
+
+    def test_a_later_send_is_asked_again(self):
+        asked = self.run_actions([self.CLICK, self.WAIT, self.WAIT, self.WAIT, self.CLICK, {"kind": "done"}])
+        self.assertEqual(len(asked), 2)
+
+    def test_the_confirmation_right_after_is_not_asked_twice(self):
+        asked = self.run_actions([self.CLICK, self.CLICK, {"kind": "done"}])
+        self.assertEqual(len(asked), 1)
+
+    def test_one_confirmation_per_approval(self):
+        asked = self.run_actions([self.CLICK, self.CLICK, self.CLICK, {"kind": "done"}])
+        self.assertEqual(len(asked), 2)
+
+
 class AskRecord(unittest.TestCase):
     """The planner's decision to ask is recorded with its probabilities and time, and when the reply came: a
     recording's overlay showed nothing for the question step, which read as the harness's doing."""

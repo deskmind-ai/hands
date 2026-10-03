@@ -12,6 +12,8 @@
   <a href="docs/data.zh-CN.md">训练数据</a> · <a href="docs/apps-config.zh-CN.md">应用配置</a>
 </p>
 
+> 本仓库属于 **[DeskMind](https://github.com/deskmind-ai/deskmind)**：App、演示和其他组件都从那里开始。
+
 ---
 
 **DeskMind · 得心** —— *得心，应手。* 一组开源项目，让智能体在你自己的电脑上**看**屏幕、**想**下一步、**做**

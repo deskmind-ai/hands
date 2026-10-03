@@ -12,6 +12,8 @@
   <a href="docs/data.md">Training data</a> · <a href="docs/apps-config.md">App config</a>
 </p>
 
+> Part of **[DeskMind](https://github.com/deskmind-ai/deskmind)**: start there for the app, the demo and the other components.
+
 ---
 
 **DeskMind · 得心** — *得心，应手。* (from 得心应手: what the mind decides, the hand carries out) is a family of

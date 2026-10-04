@@ -606,7 +606,9 @@ def cmd_do(args) -> int:
                                         approve_risky=args.ask == "stdin",
                                         # Nobody to ask: those steps are refused, unless unattended risky steps
                                         # were chosen on purpose (--allow-risky: a sandbox like the gym).
-                                        refuse_risky=args.ask != "stdin" and not args.allow_risky),
+                                        refuse_risky=args.ask != "stdin" and not args.allow_risky,
+                                        # A person's own folder: renaming a file or folder waits for approval too.
+                                        confirm_renames=args.confirm_renames),
                        run_id=task.id, recorder=rec)
     finally:
         driver.close()
@@ -731,6 +733,9 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--allow-risky", action="store_true",
                    help="without --ask stdin, carry out sending, deleting, paying, publishing and sharing unasked "
                         "(by default they are refused when there is nobody to ask); for sandboxes such as the gym")
+    d.add_argument("--confirm-renames", action="store_true",
+                   help="renaming a file or folder needs approval too, like deleting (there is no undo): for a "
+                        "person's own folder, not a sample one")
     d.add_argument("--foreground-ok", action="store_true",
                    help="the user agreed these apps may be brought forward briefly when they ignore background input")
     d.add_argument("--in", dest="into", default=None, metavar="DIR",

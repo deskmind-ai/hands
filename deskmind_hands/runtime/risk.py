@@ -12,7 +12,10 @@ Named by what the action targets, not by what the model meant:
   - Return (or cmd/ctrl+Return) straight after typing into a field that is not a search, name or path box --
     in a chat window that is how a message is sent;
   - cmd+Delete, which moves the selection to the Trash, and Delete on its own when no text was just typed (in Mail
-    or a list it deletes the selected item).
+    or a list it deletes the selected item);
+  - with `renames` (a person's own folder: `deskmind-hands do --confirm-renames`), renaming a file or folder -- typing
+    a new name into its row. There is no undo for it, and on a vague goal a planner renamed real files to "file-8"
+    and "file-3" (10-05). The sample folder, made to be played with, is not gated.
 """
 from __future__ import annotations
 
@@ -52,9 +55,17 @@ def _verb(label: str) -> str | None:
     return m.group(0).strip() if m else None
 
 
-def risky(action: Action, obs, last_typed_label: str | None = None) -> str | None:
+#: Rows that are files or folders: typing into one renames it.
+_FILE_ROLES = {"file", "folder"}
+
+
+def risky(action: Action, obs, last_typed_label: str | None = None, renames: bool = False) -> str | None:
     """What the action would do, as a short phrase for the approval question, or None if it needs no approval."""
     k = action.kind
+    if renames and k is ActionKind.TYPE_TEXT and action.binding.element_id:
+        el = next((e for e in obs.elements if e.id == action.binding.element_id), None)
+        if el is not None and (el.role or "").lower() in _FILE_ROLES and (action.text or "").strip() != (el.label or "").strip():
+            return f"rename {el.label.strip()!r} to {(action.text or '').strip()!r}"
     if k in (ActionKind.CLICK, ActionKind.DOUBLE_CLICK) and action.binding.element_id:
         el = next((e for e in obs.elements if e.id == action.binding.element_id), None)
         if el is None or (el.role or "").lower() in _NOT_ACTIONS:

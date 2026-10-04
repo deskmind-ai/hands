@@ -98,7 +98,7 @@ class LoopTest(unittest.TestCase):
         ws = Workspace.create(Path(tempfile.mkdtemp()), repo / "fixtures")
         # Every click counts as risky here: the mock desktop has no Send or Delete button of its own.
         real = risk.risky
-        risk.risky = lambda a, o, last=None: "click it" if a.kind is ActionKind.CLICK else None
+        risk.risky = lambda a, o, last=None, **kw: "click it" if a.kind is ActionKind.CLICK else None
         try:
             res = run_task(task, MockDriver(render=False), OracleAdapter(), ws,
                            config=RunConfig(user=user, approve_risky=approve_risky, refuse_risky=refuse_risky))
@@ -152,7 +152,7 @@ class OneStepApprovals(unittest.TestCase):
         ws = Workspace.create(Path(tempfile.mkdtemp()), repo / "fixtures")
         user = User(approve=True)
         real = risk.risky
-        risk.risky = lambda a, o, last=None: ("click 'Send'" if a.kind is ActionKind.CLICK
+        risk.risky = lambda a, o, last=None, **kw: ("click 'Send'" if a.kind is ActionKind.CLICK
                                               and a.binding.element_id == "row:draft.txt" else None)
         try:
             run_task(task, MockDriver(render=False), ReplayAdapter(actions), ws,
@@ -231,6 +231,28 @@ class OwnExamples(unittest.TestCase):
         from deskmind_hands.runtime import risk
         with mock.patch.object(risk, "EXAMPLES", (("button", "删除线", None, True), ("button", "发送", None, False))):
             self.assertEqual(risk.check_examples(), ["button '删除线' is not asked about", "button '发送' is asked about"])
+
+
+class RenameTest(unittest.TestCase):
+    """Renaming a file or folder in a person's own folder waits for approval (10-05: a vague goal renamed real files
+    to "file-8" and "file-3", with no undo)."""
+
+    def typed(self, text, i=0):
+        return Action(kind=ActionKind.TYPE_TEXT, text=text, binding=Binding(element_id=f"e{i}"))
+
+    def test_rename_asked_when_renames_are_confirmed(self):
+        o = obs(("file", "report.pdf"), ("folder", "Archive"))
+        self.assertEqual(risk.risky(self.typed("file-8"), o, renames=True), "rename 'report.pdf' to 'file-8'")
+        self.assertEqual(risk.risky(self.typed("Old", 1), o, renames=True), "rename 'Archive' to 'Old'")
+
+    def test_not_asked_otherwise(self):
+        o = obs(("file", "report.pdf"), ("textField", "Name"))
+        self.assertIsNone(risk.risky(self.typed("file-8"), o))                     # the sample folder: not gated
+        self.assertIsNone(risk.risky(self.typed("report.pdf"), o, renames=True))   # the name it has: no rename
+        self.assertIsNone(risk.risky(self.typed("hello", 1), o, renames=True))     # typing into a field is not renaming
+
+    def test_each_rename_is_its_own_approval(self):
+        self.assertNotEqual(risk.kind("rename 'a.pdf' to 'b.pdf'"), risk.kind("rename 'c.pdf' to 'd.pdf'"))
 
 
 if __name__ == "__main__":

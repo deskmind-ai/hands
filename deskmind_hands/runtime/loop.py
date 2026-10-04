@@ -78,6 +78,8 @@ class RunConfig:
     #: A live run with nobody to ask (`deskmind-hands do` without --ask stdin): the actions `risk.risky` names are
     #: refused, not carried out unasked. Running them without approval is a mode chosen on purpose (--allow-risky).
     refuse_risky: bool = False
+    #: Renaming a file or folder needs approval too (risk.risky's `renames`): a run in a person's own folder.
+    confirm_renames: bool = False
 
 
 @dataclass
@@ -559,7 +561,8 @@ def run_task(
                     recorder.step(steps[-1])
                 break
 
-            what = risk.risky(action, obs, last_typed_label) if (cfg.approve_risky or cfg.refuse_risky) else None
+            what = (risk.risky(action, obs, last_typed_label, renames=cfg.confirm_renames)
+                    if (cfg.approve_risky or cfg.refuse_risky) else None)
             # An approval is for one step, in one app: approving one "click 'Send'" once covered every later Send of
             # the run, whatever it sent and in whichever app (10-02 review). The confirmation a just-approved step
             # opens ("Delete" -> the dialog's "Delete message") is the same decision: not asked twice when it

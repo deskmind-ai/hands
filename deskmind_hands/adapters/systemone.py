@@ -1448,6 +1448,10 @@ class SystemOneAdapter:
                                     "SCROLL") if head_criteria(op)]
         select_options = {o["index"]: {"element": f"[{o['index']}] {o['label']}", "current_value": e.get("current_value", "")}
                           for e in elements if e.get("options") for o in e["options"]}
+        # As many as a target head offers elements: every dropdown's every option was 380 on a Downloads folder with
+        # ten subfolders, and even cut to the protocol's 255 the request took over a minute (the timeout) to answer.
+        # The first dropdowns' options, in the elements' ranked order; the rest come into reach as those are used.
+        select_options = dict(list(select_options.items())[:MAX_ELEMENTS])
         operations = {op: OPERATION_LABELS[op] for op in targetable}
         if select_options:
             operations["SELECT"] = OPERATION_LABELS["SELECT"]

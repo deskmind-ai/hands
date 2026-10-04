@@ -74,7 +74,12 @@ class ManyDropdowns(unittest.TestCase):
         for key, q in sent.items():
             if q.get("type") == "choice":
                 self.assertTrue(1 <= len(q["criteria"]) <= MAX_CHOICE_OPTIONS, f"{key}: {len(q['criteria'])} options")
-        self.assertIn("select_target", sent)                            # still offered, cut to the bound
+        self.assertIn("select_target", sent)                            # still offered
+        # and no larger than a target head's element list: 255 options took over a minute to answer
+        from deskmind_hands.adapters.systemone import MAX_ELEMENTS
+        self.assertLessEqual(len(sent["select_target"]["criteria"]), MAX_ELEMENTS)
+        first = list(sent["select_target"]["criteria"])[:10]
+        self.assertEqual(len({k.split(":")[0] for k in first}), 1)      # a dropdown's options stay together
 
 
 class Refused(unittest.TestCase):

@@ -1061,6 +1061,12 @@ class SystemOneAdapter:
         prev_key, prev_seen = getattr(self, "_last_seen", (None, None))
         seen_before = prev_seen if prev_key == window_key else None
         elements = []
+        # Dropdown options shown in the state, in all: no more than a target head offers elements. Each file's
+        # "move to" list named every subfolder, so a Downloads folder of 150 files and 12 folders put 56,000
+        # characters of options in the state. The model's prefill then asked the GPU for 98 GB (first run, 10-05),
+        # or on a larger Mac took over a minute. Smaller windows, under 40 options in all, are shown exactly as
+        # before.
+        options_left = MAX_ELEMENTS
         # When the goal names the files it is about, a file it does not name gets no "move to" dropdown. With the
         # task done, a planner wavering between BLOCKED and moving 2026-01-a.log would have been pushed onto the
         # second -- a file the goal never mentioned. (Moves only: a rename's old name is often unnamed.)
@@ -1211,9 +1217,10 @@ class SystemOneAdapter:
             shown_role = "link" if role == "folder" else (e.role or e.ax_role)
             idx = str(len(elements) + 1)
             row = {"index": idx, "id": e.id, "role": shown_role, "label": e.label, "operations": ops}
-            if e.options:
+            if e.options and options_left > 0:
                 row["options"] = [{"index": f"{idx}:{k + 1}", "label": f"{e.label} → {o}", "value": o}
-                                  for k, o in enumerate(e.options)]
+                                  for k, o in enumerate(e.options[:options_left])]
+                options_left -= len(row["options"])
             if e.value:
                 row["current_value"] = e.value[:400]
             if e.focused:

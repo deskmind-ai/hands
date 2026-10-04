@@ -69,7 +69,7 @@ class ManyDropdowns(unittest.TestCase):
         with self.assertRaises(AdapterUnavailable):
             a.propose(TurnContext(task=task, observation=o, history=[], channels=frozenset({"ax"})))
         sent = a.last_request["questions"]                              # as it went on the wire
-        raw = sum(len(e.get("options") or ()) for e in a.last_request["state"]["elements"])
+        raw = sum(len(e.options) for e in o.elements)
         self.assertGreater(raw, MAX_CHOICE_OPTIONS)                     # the screen did offer more than the bound
         for key, q in sent.items():
             if q.get("type") == "choice":
@@ -80,6 +80,30 @@ class ManyDropdowns(unittest.TestCase):
         self.assertLessEqual(len(sent["select_target"]["criteria"]), MAX_ELEMENTS)
         first = list(sent["select_target"]["criteria"])[:10]
         self.assertEqual(len({k.split(":")[0] for k in first}), 1)      # a dropdown's options stay together
+
+    def test_the_state_carries_no_more_options_than_a_head_offers(self):
+        # 150 files and 12 subfolders put 56,000 characters of options in the state: the prefill asked for 98 GB.
+        d = Path(tempfile.mkdtemp())
+        task = live_task("整理目录", d, app="com.apple.finder", max_actions=5, wall_clock_s=60)
+        names = [f"合同扫描件_北京某某科技有限公司_2026年第三季度_最终版v{i}.pdf" for i in range(150)]
+        o = folder_window(names, [f"文件夹 {k}" for k in range(12)])
+        a = SystemOneAdapter(url="http://127.0.0.1:9", timeout=2)
+        with self.assertRaises(AdapterUnavailable):
+            a.propose(TurnContext(task=task, observation=o, history=[], channels=frozenset({"ax"})))
+        from deskmind_hands.adapters.systemone import MAX_ELEMENTS
+        shown = sum(len(e.get("options") or ()) for e in a.last_request["state"]["elements"])
+        self.assertLessEqual(shown, MAX_ELEMENTS)
+        self.assertLess(len(json.dumps(a.last_request["state"], ensure_ascii=False)), 20000)
+
+    def test_a_small_window_is_shown_as_before(self):
+        d = Path(tempfile.mkdtemp())
+        task = live_task("把 a.pdf 移到 Receipts", d, app="com.apple.finder", max_actions=5, wall_clock_s=60)
+        o = folder_window(["a.pdf", "b.csv", "c.txt"], ["Receipts", "Archive"])
+        a = SystemOneAdapter(url="http://127.0.0.1:9", timeout=2)
+        with self.assertRaises(AdapterUnavailable):
+            a.propose(TurnContext(task=task, observation=o, history=[], channels=frozenset({"ax"})))
+        rows = [e for e in a.last_request["state"]["elements"] if e.get("options")]
+        self.assertTrue(all(len(e["options"]) == 2 for e in rows) and rows)      # every dropdown, every option
 
 
 class Refused(unittest.TestCase):

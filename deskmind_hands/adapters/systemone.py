@@ -20,6 +20,7 @@ import os
 import re
 from pathlib import Path
 import time
+import urllib.error
 import urllib.request
 
 from ..actions import Action, ActionError, ActionKind, Binding
@@ -750,6 +751,60 @@ DESTINATION = re.compile(r"(?:\u5199\u8fdb|\u5199\u5165|\u8ffd\u52a0\u8fdb|\u8ff
                          r"(?:\u5df2\u5728\s*\S+\s*\u4e2d\u6253\u5f00\u7684\s*)?([\w\u4e00-\u9fff.\-]+\.[A-Za-z0-9]{1,5})")
 
 MAX_ELEMENTS = 40
+#: The most options one choice question may have, and the fewest: the /v1/systemone protocol's bounds, which DeskMind
+#: Brain enforces (a request outside them is refused whole, HTTP 400). A Downloads folder with ten subfolders put 38
+#: "move to" dropdowns of ten destinations each on screen -- 380 options in one SELECT head -- and the run ended
+#: before its first step (first run, 10-05).
+MAX_CHOICE_OPTIONS = 255
+
+
+def fit_choices(questions: dict) -> dict:
+    """Every choice question within the protocol's bounds: one with no options is left out (and so is the operation
+    it is the target of), one with too many keeps the first MAX_CHOICE_OPTIONS -- options are built in ranked order, so
+    those are the likeliest. What the planner is asked otherwise stays as it was."""
+    out: dict = {}
+    dropped: set[str] = set()
+    for key, q in questions.items():
+        crit = q.get("criteria") if isinstance(q, dict) else None
+        if q.get("type") != "choice" or not isinstance(crit, dict):
+            out[key] = q
+            continue
+        if not crit:
+            dropped.add(key)
+            continue
+        if len(crit) > MAX_CHOICE_OPTIONS:
+            q = {**q, "criteria": dict(list(crit.items())[:MAX_CHOICE_OPTIONS])}
+        out[key] = q
+    op = out.get("operation")
+    if op and dropped and isinstance(op.get("criteria"), dict):
+        kept = {name: v for name, v in op["criteria"].items() if f"{name.lower()}_target" not in dropped}
+        out["operation"] = {**op, "criteria": kept}
+    return out
+
+
+def server_message(exc: Exception) -> str:
+    """What a planner server said when it refused a request (the body of an HTTP error), shortened; else nothing.
+    Without it a refusal read as an outage: \"HTTP Error 400: Bad Request\", and the reason -- which question was out
+    of bounds -- was thrown away."""
+    if not isinstance(exc, urllib.error.HTTPError):
+        return ""
+    try:
+        raw = exc.read().decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 -- the error is reported either way
+        return ""
+    try:
+        msg = (json.loads(raw).get("error") or {}).get("message") or raw
+    except (ValueError, AttributeError):
+        msg = raw
+    return " ".join(str(msg).split())[:300]
+
+
+def request_shape(request: dict | None) -> dict:
+    """A request as its questions' kinds and sizes, without the state or the options' text (they carry what was on
+    screen): what a failed request leaves in the run's trace."""
+    qs = (request or {}).get("questions") or {}
+    return {k: {"type": q.get("type"), "options": len(q.get("criteria") or ())} for k, q in qs.items()
+            if isinstance(q, dict)}
 
 #: Roles where a double click means "open" rather than "click harder".
 OPENABLE_ROLES = {"row", "cell", "item", "listitem", "outline", "link", "axrow", "axcell",
@@ -933,7 +988,7 @@ class SystemOneAdapter:
         local_only = self.model.lower().startswith("decider") or os.environ.get("SYSTEMONE_LOCAL_SINGLETONS") == "1"
         fixed = {k: q for k, q in questions.items()
                  if local_only and q.get("type") == "choice" and len(q.get("criteria") or {}) == 1}
-        asked = {k: q for k, q in questions.items() if k not in fixed}
+        asked = fit_choices({k: q for k, q in questions.items() if k not in fixed})
         self.last_request = {"state": state, "model": self.model, "questions": asked}
         body = json.dumps(self.last_request).encode()
         headers = {"Content-Type": "application/json"}
@@ -947,7 +1002,8 @@ class SystemOneAdapter:
                 # DeskMind Brain's two-tier router says which model answered ({by: fast|strong, reason, fast_conf}).
                 self._routing = resp.get("routing")
         except Exception as exc:
-            raise AdapterUnavailable(f"system one endpoint {self.url} failed: {exc}") from exc
+            said = server_message(exc)
+            raise AdapterUnavailable(f"system one endpoint {self.url} failed: {exc}" + (f" -- {said}" if said else "")) from exc
         for k, q in fixed.items():
             only = next(iter(q["criteria"]))
             answers[k] = {"type": "choice", "choice": only, "confidence": 1.0, "probabilities": {only: 1.0}}

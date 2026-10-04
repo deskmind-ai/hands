@@ -690,6 +690,12 @@ def run_task(
         # so an outage never reads as a weak model.
         state = RunState.ERRORED
         failure = Failure(FailureClass.PROVIDER_UNAVAILABLE, str(exc), auto=True)
+        # The request that failed, as its questions' kinds and sizes (not the screen's text): a refusal can then be
+        # told apart from an outage, and a question out of bounds named, from the run's trace alone.
+        if recorder:
+            from ..adapters.systemone import request_shape
+            recorder._write({"t": "request_failed", "n": len(steps) + 1, "error": str(exc),
+                             "questions": request_shape(getattr(adapter, "last_request", None))})
     except Exception as exc:  # noqa: BLE001 - any harness crash must be visible, not silent
         state = RunState.ERRORED
         text = f"{type(exc).__name__}: {exc}"

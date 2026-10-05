@@ -2054,21 +2054,56 @@ class PeekabooDriver:
             Q.CGEventPost(Q.kCGHIDEventTap, ev)
             time.sleep(0.05 if count == 1 else 0.02)
 
-    @staticmethod
-    def _post_key(Q, keycode: int, flags: int = 0) -> None:
+    #: The key codes this driver presses: A and V (with cmd: select all, paste), Return.
+    _KEY_CODES = (0, 9, 36)
+    #: The key events, serialized: "<key code>:<1 down | 0 up>" -> bytes. Made once per process (see _key_event).
+    _key_blobs: dict = {}
+    _KEY_CHILD = (
+        "import base64, json, Quartz as Q\n"
+        "print(json.dumps({f'{k}:{int(d)}': base64.b64encode(bytes(Q.CGEventCreateData(None,"
+        " Q.CGEventCreateKeyboardEvent(None, k, d)))).decode() for k in %r for d in (True, False)}))\n"
+    )
+
+    @classmethod
+    def _key_event(cls, Q, keycode: int, down: bool):
+        """A key event for `keycode`, rebuilt from one a child process made.
+
+        Not CGEventCreateKeyboardEvent here: it reads the keyboard layout, and asking Text Input Sources anything
+        registers the asking process with LaunchServices as an app -- after which every process it starts (peekaboo,
+        osascript) leaves a Dock tile for the app responsible for the run (see _ascii_input_source). The first
+        background paste of a gym episode did that, and four episodes left 48 tiles. A child asks once, for every
+        key this driver presses, and hands the events back as data; rebuilding them asks nothing. An event built by
+        hand (type, key code, characters) is not the same thing: cmd+A and cmd+V built that way did nothing in a web
+        view. If the child cannot be run, the events are made here as before."""
+        if not cls._key_blobs:
+            import base64
+            try:
+                out = subprocess.run([sys.executable, "-c", cls._KEY_CHILD % (cls._KEY_CODES,)], capture_output=True,
+                                     text=True, timeout=20).stdout
+                cls._key_blobs = {k: base64.b64decode(v) for k, v in json.loads(out).items()}
+            except (OSError, ValueError, subprocess.SubprocessError):
+                cls._key_blobs = {"failed": b""}
+        raw = cls._key_blobs.get(f"{keycode}:{int(down)}")
+        if not raw:
+            return Q.CGEventCreateKeyboardEvent(None, keycode, down)
+        from Foundation import NSData
+        return Q.CGEventCreateFromData(None, NSData.dataWithBytes_length_(raw, len(raw)))
+
+    @classmethod
+    def _post_key(cls, Q, keycode: int, flags: int = 0) -> None:
         for down in (True, False):
-            ev = Q.CGEventCreateKeyboardEvent(None, keycode, down)
+            ev = cls._key_event(Q, keycode, down)
             if flags:
                 Q.CGEventSetFlags(ev, flags)
             Q.CGEventPost(Q.kCGHIDEventTap, ev)
             time.sleep(0.03)
 
-    @staticmethod
-    def _post_text(Q, text: str) -> None:
+    @classmethod
+    def _post_text(cls, Q, text: str) -> None:
         for i in range(0, len(text), 16):
             chunk = text[i:i + 16]
             for down in (True, False):
-                ev = Q.CGEventCreateKeyboardEvent(None, 0, down)
+                ev = cls._key_event(Q, 0, down)
                 Q.CGEventKeyboardSetUnicodeString(ev, len(chunk), chunk)
                 Q.CGEventPost(Q.kCGHIDEventTap, ev)
             time.sleep(0.03)

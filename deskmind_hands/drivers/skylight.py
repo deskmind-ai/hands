@@ -58,12 +58,20 @@ def _load() -> dict | None:
             "psn": f("SLSGetConnectionPSN", [u32, vp], ctypes.c_int),
 
         }
-        # GetProcessPID (the front app's pid from its serial number) lives in ApplicationServices; optional.
+        # The front app's pid from its serial number, asked of the window server (its connection, then that
+        # connection's pid); optional. Not GetProcessPID: that Process Manager call registers the asking process with
+        # LaunchServices as an app, and from then on every process it starts (peekaboo, osascript) leaves a Dock tile
+        # for the app responsible for the run -- four in a three-step gym episode, after the first background input.
         try:
-            hi = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
-            fns["pid_of_psn"] = hi.GetProcessPID
-            fns["pid_of_psn"].argtypes, fns["pid_of_psn"].restype = [vp, ctypes.POINTER(ctypes.c_int)], ctypes.c_int
-        except (OSError, AttributeError):
+            conn_of = f("SLSGetConnectionIDForPSN", [u32, vp, ctypes.POINTER(u32)], ctypes.c_int)
+            pid_of_conn = f("SLSConnectionGetPID", [u32, ctypes.POINTER(ctypes.c_int)], ctypes.c_int)
+            cid = fns["cid"]
+
+            def pid_of_psn(psn, pid_ref) -> int:
+                conn = u32(0)
+                return conn_of(cid(), psn, ctypes.byref(conn)) or pid_of_conn(conn.value, pid_ref)
+            fns["pid_of_psn"] = pid_of_psn
+        except AttributeError:
             fns["pid_of_psn"] = None
         objc_lib.objc_getClass.restype, objc_lib.objc_getClass.argtypes = vp, [ctypes.c_char_p]
         objc_lib.sel_registerName.restype, objc_lib.sel_registerName.argtypes = vp, [ctypes.c_char_p]

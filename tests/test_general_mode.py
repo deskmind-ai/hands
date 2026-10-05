@@ -917,6 +917,49 @@ class GymMailMusic(unittest.TestCase):
         self.assertIn(t["target"]["title"], [x for x in msg["body"] if t["target"]["title"] in x][0])
 
 
+class KeyEventsFromAChild(unittest.TestCase):
+    """Key events come from a child process as data, so this process never asks for the keyboard layout."""
+
+    class _Q:
+        def __init__(self): self.made = []
+        def CGEventCreateKeyboardEvent(self, _src, keycode, down):   # noqa: N802 -- Quartz's name
+            self.made.append((keycode, down)); return ("here", keycode, down)
+        def CGEventCreateFromData(self, _alloc, data):   # noqa: N802
+            return ("rebuilt", bytes(data))
+
+    def setUp(self):
+        from deskmind_hands.drivers.peekaboo import PeekabooDriver
+        self.D, self._saved = PeekabooDriver, PeekabooDriver._key_blobs
+        PeekabooDriver._key_blobs = {}
+
+    def tearDown(self):
+        self.D._key_blobs = self._saved
+
+    def test_the_child_is_asked_once_for_every_key(self):
+        import base64, json
+        from unittest import mock
+        try:
+            import Foundation  # noqa: F401
+        except ImportError:
+            self.skipTest("pyobjc not installed")
+        out = json.dumps({f"{k}:{d}": base64.b64encode(f"ev{k}{d}".encode()).decode() for k in (0, 9, 36) for d in (0, 1)})
+        q = self._Q()
+        with mock.patch("deskmind_hands.drivers.peekaboo.subprocess.run",
+                        return_value=mock.Mock(stdout=out)) as run:
+            self.assertEqual(self.D._key_event(q, 9, True), ("rebuilt", b"ev91"))
+            self.assertEqual(self.D._key_event(q, 36, False), ("rebuilt", b"ev360"))
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(q.made, [])   # nothing asked of the layout in this process
+
+    def test_without_the_child_events_are_made_here(self):
+        from unittest import mock
+        q = self._Q()
+        with mock.patch("deskmind_hands.drivers.peekaboo.subprocess.run", side_effect=OSError("no python")) as run:
+            self.assertEqual(self.D._key_event(q, 9, True), ("here", 9, True))
+            self.assertEqual(self.D._key_event(q, 0, False), ("here", 0, False))
+        self.assertEqual(run.call_count, 1)   # not retried for every key
+
+
 class GrounderToken(unittest.TestCase):
     """The app's grounding server needs its token: every grounder request carries HANDS_GROUNDER_TOKEN when set."""
 

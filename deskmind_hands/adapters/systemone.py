@@ -339,6 +339,36 @@ def environment(ctx) -> dict:
     return out
 
 
+def replace_edit(goal: str, full: str, old: str, new: str) -> str | None:
+    """A field's whole text after a REPLACE_TEXT of `old` with `new`, or None when the pair is not a valid edit of it.
+
+    Both halves are choices -- the old text from the screen, the new from the goal -- and the edit is applied against
+    the field's full value rather than the truncated one in the state."""
+    if not old or old not in full:
+        return None
+    # A new value that already holds everything the field holds is the field rewritten, not a piece to splice in.
+    # Spliced, the document went inside itself: with report.txt already right and saved, a planner replaced "1,240"
+    # with the whole dictated text, and every step after rewrote a longer copy until the budget ran out (G04, on app
+    # 0.4.0 and after, deskmind#23). As a rewrite it is the text itself, and when the field already holds it the
+    # driver says nothing changed and the value is not offered again.
+    if full.strip() and full.strip() in new:
+        return new
+    # The goal says what to change FROM, word for word. When the chosen span contains that value but is more than
+    # it -- the whole line "Budget: 1200" for "Budget from 1200 to 1500" -- only the named value is replaced and the
+    # rest of the line stays. Otherwise the label went with it, twice.
+    for source in change_sources(goal):
+        if source != old and source in old:
+            new = old.replace(source, new, 1)
+            break
+    else:
+        # "change the status to final": the chosen span is the whole "status: draft" line and the new value is just
+        # "final". The label is not part of what the goal asked to change, so it stays.
+        labelled = re.match(r"^(\s*[^:\uff1a\n]{1,40}[:\uff1a]\s*)(\S.*)$", old)
+        if labelled and not re.search(r"[:\uff1a]", new):
+            new = labelled.group(1) + new
+    return None if old == new else full.replace(old, new, 1)
+
+
 def value_candidates(goal: str, visible_text: str = "", limit: int = 14) -> list[str]:
     """Strings a typed value could be, drawn from the goal and from what is on screen.
 
@@ -1795,25 +1825,6 @@ class SystemOneAdapter:
                 element = next((e for e in ctx.observation.elements if e.id == chosen["id"]), None)
                 full = (element.value if element else None) or ""
 
-                def applied(old_: str, new_: str) -> str | None:
-                    """The edit as it will be made, or None when the pair is not a valid edit of this text."""
-                    if not old_ or old_ not in full:
-                        return None
-                    # The goal says what to change FROM, word for word. When the chosen span contains that value but
-                    # is more than it -- the whole line "Budget: 1200" for "Budget from 1200 to 1500" -- only the
-                    # named value is replaced and the rest of the line stays. Otherwise the label went with it, twice.
-                    for source in change_sources(goal):
-                        if source != old_ and source in old_:
-                            new_ = old_.replace(source, new_, 1)
-                            break
-                    else:
-                        # "change the status to final": the chosen span is the whole "status: draft" line and the new
-                        # value is just "final". The label is not part of what the goal asked to change, so it stays.
-                        labelled = re.match(r"^(\s*[^:\uff1a\n]{1,40}[:\uff1a]\s*)(\S.*)$", old_)
-                        if labelled and not re.search(r"[:\uff1a]", new_):
-                            new_ = labelled.group(1) + new_
-                    return None if old_ == new_ else new_
-
                 # Each head picks its own best option, and the pair can be nonsense as a whole -- "保存" (a button's
                 # label) as the text to replace, or a line replaced by itself; three such refusals ended a run. The
                 # pairs are tried in order of the two heads' joint probability and the first valid one is made.
@@ -1821,18 +1832,17 @@ class SystemOneAdapter:
                 p_new = (answers.get("type_text_value") or {}).get("probabilities") or {}
                 pairs = sorted(((p_old.get(str(i + 1), 0.0) * p_new.get(str(j + 1), 0.0), i, j)
                                 for i in range(len(olds)) for j in range(len(candidates))), reverse=True)
-                old = new = None
+                edited = None
                 for rank, (_, i, j) in enumerate(pairs):
-                    made = applied(olds[i], candidates[j])
-                    if made is not None:
-                        old, new = olds[i], made
+                    edited = replace_edit(goal, full, olds[i], candidates[j])
+                    if edited is not None:
                         if rank:
                             overrode = f"REPLACE pair #{rank + 1} (first valid)"
                         break
-                if old is None:
+                if edited is None:
                     return self._refuse("no offered pair of old text and new value is a valid edit of that field",
                                         answers, t0)
-                action = Action(kind=ActionKind.TYPE_TEXT, text=full.replace(old, new, 1), clear_first=True,
+                action = Action(kind=ActionKind.TYPE_TEXT, text=edited, clear_first=True,
                                 foreground=True, binding=bound, raw=answers)
             elif op == "OPEN":
                 action = Action(kind=ActionKind.DOUBLE_CLICK, binding=bound, raw=answers)

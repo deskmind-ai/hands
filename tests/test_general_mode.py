@@ -237,6 +237,22 @@ class TruncatedTree(unittest.TestCase):
         self.assertIsNone(ax_truncation_note(_mcp_see_as_cli_data({"ui_elements": []}, "Application: X")))
 
 
+class ReleasedPeekabooRoles(unittest.TestCase):
+    def test_a_coarse_role_is_named_from_the_ax_role(self):
+        from deskmind_hands.drivers.peekaboo import _mcp_see_as_cli_data
+        # Released Peekaboo: role is a category ("other" for text, rows, tables), ax_role the AX name.
+        released = [{"id": "elem_1", "role": "other", "ax_role": "AXRow", "label": "row"},
+                    {"id": "elem_2", "role": "other", "ax_role": "AXStaticText", "label": "旧信"},
+                    {"id": "elem_3", "role": "button", "ax_role": "AXButton", "label": "搜索"}]
+        # The builds before it: role is the AX name itself.
+        earlier = [{"id": "elem_1", "role": "AXRow", "label": "row"}]
+        roles = [(e["role"], e["ax_role"]) for e in _mcp_see_as_cli_data({"ui_elements": released}, "")["ui_elements"]]
+        self.assertEqual(roles, [("row", "AXRow"), ("staticText", "AXStaticText"), ("button", "AXButton")])
+        self.assertEqual(_mcp_see_as_cli_data({"ui_elements": earlier}, "")["ui_elements"][0]["role"], "row")
+        # No AX name at all: left as it came.
+        self.assertEqual(_mcp_see_as_cli_data({"ui_elements": [{"role": "other"}]}, "")["ui_elements"][0]["role"], "other")
+
+
 class WindowCapture(unittest.TestCase):
     def test_screencapturekit_first_screencapture_if_it_fails(self):
         from unittest import mock

@@ -26,7 +26,7 @@ openai = ["openai>=1.50"]
 mlx = ["mlx-vlm"]
 # The real-desktop driver: Peekaboo (installed separately, see README) plus the macOS bridges it uses.
 macos = ["pillow>=10.0", "pyobjc-framework-Quartz>=10.0", "pyobjc-framework-Cocoa>=10.0",
-         "pyobjc-framework-ScreenCaptureKit>=10.0"]
+         "pyobjc-framework-ScreenCaptureKit>=10.0", "pyobjc-framework-ApplicationServices>=10.0"]
 
 [project.urls]
 Homepage = "https://github.com/deskmind-ai/hands"

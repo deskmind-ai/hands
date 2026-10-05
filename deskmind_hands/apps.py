@@ -61,6 +61,10 @@ def load(path: Path | None = None) -> AppsConfig:
     raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"{p}: the apps file must be a mapping")
+    known = ("grounding", "deep_ax", "vision", "chat", "chords")
+    unknown = [str(k) for k in raw if k not in known]
+    if unknown:
+        raise ValueError(f"{p}: unknown keys: {', '.join(unknown)}; known keys: {', '.join(known)}")
     chat = raw.get("chat") or {}
     vision = {}
     for bundle, spec in (raw.get("vision") or {}).items():

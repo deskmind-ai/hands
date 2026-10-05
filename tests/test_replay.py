@@ -22,6 +22,22 @@ class ReplaySnapshots(unittest.TestCase):
         failures = harness_replay.check()
         self.assertEqual(failures, [], "\n".join(f"{n}: {d}" for n, d in failures))
 
+    def test_the_replay_does_not_depend_on_the_login_name(self):
+        """hands#3: on a machine whose login name was "user" -- the name the recorded traces were sanitized to --
+        the sidebar label was redacted a second time and the snapshot differed."""
+        import harness_replay
+        from deskmind_hands.adapters import systemone
+        os.environ["HANDS_EFFECT_NOTES"] = "0"
+        saved = systemone.HOME_NAME
+        try:
+            for name in ("user", "someone", ""):
+                systemone.HOME_NAME = name
+                failures = harness_replay.check()
+                self.assertEqual(failures, [], f"login name {name!r}: " + "\n".join(f"{n}: {d}" for n, d in failures))
+                self.assertEqual(systemone.HOME_NAME, name, "the replay puts the login name back")
+        finally:
+            systemone.HOME_NAME = saved
+
     def test_a_changed_option_is_a_divergence(self):
         """The recorded choice missing from the options is reported, not guessed around."""
         from deskmind_hands.replay import FollowAdapter

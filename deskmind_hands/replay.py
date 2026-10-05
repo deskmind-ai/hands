@@ -304,6 +304,13 @@ def replay(run_dir: Path) -> ReplayResult:
     notes = []
     if obs_recs and not all(k in obs_recs[0] for k in FULL_TRACE_KEYS):
         notes.append("trace predates window titles and window lists: FOCUS_WINDOW options are empty")
+    # The account name is taken out of states as they are built (SystemOneAdapter._redact), by the login name of the
+    # machine the adapter runs on. A replay must not depend on which machine that is: the recorded traces are
+    # sanitized (the home folder reads "user"), and on a machine whose login name was "user" that label was
+    # redacted a second time and the snapshot differed (hands#3). The name is pinned for the replay: the one
+    # the recording names, else none.
+    from .adapters import systemone
+    home_name, systemone.HOME_NAME = systemone.HOME_NAME, manifest.get("home_name") or ""
     try:
         res = run_task(task, driver, adapter, ws,
                        config=RunConfig(channels=frozenset({"ax", "screenshot"}), save_screenshots=False,
@@ -314,6 +321,8 @@ def replay(run_dir: Path) -> ReplayResult:
         state, failure, steps = res.state.value, res.failure.detail if res.failure else "", len(res.steps)
     except ReplayExhausted as exc:
         state, failure, steps = "exhausted", str(exc), driver.executed
+    finally:
+        systemone.HOME_NAME = home_name
     return ReplayResult(run=run_dir.name, requests=adapter.requests, divergences=adapter.divergences,
                         state=state, failure=failure, recorded_state=summary.get("state", ""),
                         steps=steps, recorded_steps=len(step_recs),

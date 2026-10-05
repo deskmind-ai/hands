@@ -2081,8 +2081,11 @@ class PeekabooDriver:
                 out = subprocess.run([sys.executable, "-c", cls._KEY_CHILD % (cls._KEY_CODES,)], capture_output=True,
                                      text=True, timeout=20).stdout
                 cls._key_blobs = {k: base64.b64decode(v) for k, v in json.loads(out).items()}
-            except (OSError, ValueError, subprocess.SubprocessError):
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 cls._key_blobs = {"failed": b""}
+                # Said once: from here the keys are made in this process, and the Dock tiles come back with them.
+                print(f"hands: key events could not be made in a child process ({type(exc).__name__}: {exc}); "
+                      f"making them here, which registers this run as an app (Dock tiles)", file=sys.stderr)
         raw = cls._key_blobs.get(f"{keycode}:{int(down)}")
         if not raw:
             return Q.CGEventCreateKeyboardEvent(None, keycode, down)

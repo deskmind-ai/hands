@@ -75,7 +75,7 @@ deskmind-hands run --set smoke --adapter systemone --systemone-url http://127.0.
 
 ## 真实桌面
 
-真实运行需要 macOS、`PATH` 上有 Peekaboo（需要上游 4.3.1 或更新版本，其中包含 MCP `see` 的修复；在 macOS 27、简体中文系统语言下测试），并给 Peekaboo
+真实运行需要 macOS、`PATH` 上有 Peekaboo（需要上游 4.7.0 或更新版本：这是第一个 MCP `see` 会返回元素表的正式版；在 macOS 27、简体中文系统语言下测试），并给 Peekaboo
 的宿主应用授予“屏幕录制”和“辅助功能”权限。额外依赖用 `pip install -e ".[macos]"` 安装。
 
 ```bash

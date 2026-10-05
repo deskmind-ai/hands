@@ -1,6 +1,7 @@
 """Host-desktop driver via the Peekaboo CLI.
 
-Requires upstream Peekaboo 4.3.1 or later (with the MCP `see` fix); verified on macOS 27.0 with a zh-Hans system
+Requires upstream Peekaboo 4.7.0 or later (the first release whose MCP `see` returns the element table, on
+`include_elements`); verified on macOS 27.0 with a zh-Hans system
 locale.
 Three things surfaced on the real desktop that a mock can never teach, and each
 one silently breaks clicking if you get it wrong:
@@ -310,6 +311,12 @@ def _mcp_see_as_cli_data(meta: dict, text: str) -> dict:
     for e in meta.get("ui_elements") or []:
         e = dict(e)
         ax = e.get("role") or ""
+        if not ax.startswith("AX") and str(e.get("ax_role") or "").startswith("AX"):
+            # Released Peekaboo (4.7.0 on, the include_elements table) sends a coarse role beside the AX one: text,
+            # rows, cells, tables and headings are all "other". Named from the AX role, as the builds that sent
+            # role=AXStaticText were, or nothing downstream can tell a row from a label: with every web table row
+            # left as "row", the gym's card pages offered no row to click and the oracle could not finish them.
+            ax = e["ax_role"]
         if ax.startswith("AX"):                 # CLI JSON says role=textField, ax_role=AXTextField
             e["ax_role"] = ax
             e["role"] = ax[2:3].lower() + ax[3:]

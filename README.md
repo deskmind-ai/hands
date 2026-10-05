@@ -81,7 +81,7 @@ deskmind-hands run --set smoke --adapter systemone --systemone-url http://127.0.
 
 ## The real desktop
 
-Real runs need macOS, Peekaboo on `PATH` (upstream 4.3.1 or later, which has the MCP `see` fix; tested on
+Real runs need macOS, Peekaboo on `PATH` (upstream 4.7.0 or later: the first release whose MCP `see` returns the element table; tested on
 macOS 27, zh-Hans system locale), and Screen
 Recording plus Accessibility granted to Peekaboo's host app. Install the extras with `pip install -e ".[macos]"`.
 

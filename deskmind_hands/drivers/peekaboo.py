@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -151,29 +152,51 @@ def _app_running(process_name: str) -> bool:
 class _ascii_input_source:
     """For the brief foreground: an ASCII keyboard layout while keys are sent, the user's input source afterwards.
     With a Chinese input method in Chinese mode (the user had been typing in another app), Return went to the input
-    method, and a web page's search box held the pasted query without ever searching it."""
+    method, and a web page's search box held the pasted query without ever searching it.
+
+    The switch is made in a child process that holds it until restore(). Asking Text Input Sources anything registers
+    the asking process with LaunchServices as an app, and from then on every process it starts (peekaboo, osascript)
+    adds a Dock tile for the app that started the run (iTerm, from a terminal) that macOS never removes: about ten a
+    gym episode. A child that asks and exits leaves none, and this process stays unregistered."""
+
+    _CHILD = (
+        "import ctypes, ctypes.util, sys\n"
+        "c = ctypes.cdll.LoadLibrary(ctypes.util.find_library('Carbon'))\n"
+        "c.TISCopyCurrentKeyboardInputSource.restype = ctypes.c_void_p\n"
+        "c.TISCopyCurrentASCIICapableKeyboardInputSource.restype = ctypes.c_void_p\n"
+        "c.TISSelectInputSource.argtypes = [ctypes.c_void_p]\n"
+        "prev = c.TISCopyCurrentKeyboardInputSource()\n"
+        "c.TISSelectInputSource(c.TISCopyCurrentASCIICapableKeyboardInputSource())\n"
+        "print('switched', flush=True)\n"
+        "sys.stdin.read()\n"
+        "if prev: c.TISSelectInputSource(prev)\n"
+    )
 
     def __init__(self) -> None:
-        self._prev = None
+        self._proc = None
         try:
-            import ctypes
-            import ctypes.util
-            carbon = ctypes.cdll.LoadLibrary(ctypes.util.find_library("Carbon"))
-            carbon.TISCopyCurrentKeyboardInputSource.restype = ctypes.c_void_p
-            carbon.TISCopyCurrentASCIICapableKeyboardInputSource.restype = ctypes.c_void_p
-            carbon.TISSelectInputSource.argtypes = [ctypes.c_void_p]
-            self._carbon = carbon
-            self._prev = carbon.TISCopyCurrentKeyboardInputSource()
-            carbon.TISSelectInputSource(carbon.TISCopyCurrentASCIICapableKeyboardInputSource())
-        except (OSError, AttributeError):
-            self._prev = None
+            self._proc = subprocess.Popen([sys.executable, "-c", self._CHILD], stdin=subprocess.PIPE,
+                                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            ready = [False]
+
+            def wait() -> None:
+                ready[0] = self._proc.stdout.readline().strip() == "switched"   # type: ignore[union-attr]
+
+            import threading
+            t = threading.Thread(target=wait, daemon=True)
+            t.start()
+            t.join(2.0)   # keys go out regardless; at worst they meet the user's input method, as before the switch
+        except (OSError, ValueError):
+            self._proc = None
 
     def restore(self) -> None:
-        if self._prev:
-            try:
-                self._carbon.TISSelectInputSource(self._prev)
-            except (OSError, AttributeError):
-                pass
+        if not self._proc:
+            return
+        try:
+            self._proc.stdin.close()   # type: ignore[union-attr]
+            self._proc.wait(timeout=2.0)
+        except (OSError, subprocess.SubprocessError):
+            self._proc.kill()
 
 
 class _MCPSession:

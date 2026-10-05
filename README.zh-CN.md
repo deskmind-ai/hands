@@ -13,6 +13,8 @@
 </p>
 
 > 本仓库属于 **[DeskMind](https://github.com/deskmind-ai/deskmind)**：App、演示和其他组件都从那里开始。
+>
+> 问题和 issue 请提到 [deskmind-ai/deskmind/issues](https://github.com/deskmind-ai/deskmind/issues)，PR 仍然提到本仓库。
 
 ---
 

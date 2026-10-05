@@ -13,6 +13,8 @@
 </p>
 
 > Part of **[DeskMind](https://github.com/deskmind-ai/deskmind)**: start there for the app, the demo and the other components.
+>
+> Issues and questions go to [deskmind-ai/deskmind/issues](https://github.com/deskmind-ai/deskmind/issues). Pull requests come here.
 
 ---
 

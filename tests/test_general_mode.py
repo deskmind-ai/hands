@@ -954,10 +954,23 @@ class KeyEventsFromAChild(unittest.TestCase):
     def test_without_the_child_events_are_made_here(self):
         from unittest import mock
         q = self._Q()
-        with mock.patch("deskmind_hands.drivers.peekaboo.subprocess.run", side_effect=OSError("no python")) as run:
+        import contextlib, io
+        err = io.StringIO()
+        with mock.patch("deskmind_hands.drivers.peekaboo.subprocess.run", side_effect=OSError("no python")) as run, \
+                contextlib.redirect_stderr(err):
             self.assertEqual(self.D._key_event(q, 9, True), ("here", 9, True))
             self.assertEqual(self.D._key_event(q, 0, False), ("here", 0, False))
         self.assertEqual(run.call_count, 1)   # not retried for every key
+        self.assertEqual(err.getvalue().count("Dock tiles"), 1)   # and said once, not per key
+
+    def test_output_that_is_not_the_events_counts_as_failure(self):
+        from unittest import mock
+        import contextlib, io
+        q, err = self._Q(), io.StringIO()
+        with mock.patch("deskmind_hands.drivers.peekaboo.subprocess.run",
+                        return_value=mock.Mock(stdout="a warning, not JSON")), contextlib.redirect_stderr(err):
+            self.assertEqual(self.D._key_event(q, 36, True), ("here", 36, True))
+        self.assertIn("Dock tiles", err.getvalue())
 
 
 class GrounderToken(unittest.TestCase):

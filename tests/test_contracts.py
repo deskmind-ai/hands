@@ -481,6 +481,18 @@ class MockDesktop(unittest.TestCase):
         self.assertEqual(self.d.state()["writes"], ["archive:a.txt"])
 
 
+class AppsConfig(unittest.TestCase):
+    def test_unknown_keys_are_rejected_and_known_keys_are_listed(self):
+        from deskmind_hands.apps import load
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "apps.yaml"
+            p.write_text("groundings: {}\n", encoding="utf-8")
+            with self.assertRaises(ValueError) as raised:
+                load(p)
+        self.assertIn("groundings", str(raised.exception))
+        self.assertIn("known keys: grounding, deep_ax, vision, chat, chords", str(raised.exception))
+
+
 class TaskSchema(unittest.TestCase):
     def test_task_without_checkpoints_is_rejected(self):
         p = Path(tempfile.mkdtemp()) / "t.yaml"

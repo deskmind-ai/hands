@@ -264,8 +264,10 @@ def run_task(
     digests: list[str] = []
     ineffective: list[str] = []
     last_typed_label: str | None = None          # the field the last successful TYPE_TEXT wrote into
-    # (kind, app, step count, a dialog was up) of the last approval: what its confirmation must match
-    just_approved: tuple[str, str, int, bool] | None = None
+    just_approved: risk.Approval | None = None   # the last approval, until its confirmation or the next step
+    # The planner's own questions: what its dialogue budget counts, and what takes ASK away. A harness approval is
+    # neither -- counted with them, one approval used the budget up and took ASK away for the rest of the run (G16).
+    planner_questions = 0
     fired: set[int] = set()
     state = RunState.PREPARING
     failure = Failure(FailureClass.NONE)
@@ -445,8 +447,11 @@ def run_task(
 
             ctx = TurnContext(task=task, observation=_filter(obs, cfg.channels),
                               history=history[-10:], channels=cfg.channels,
-                              dialogue=[(d["question"], d["reply"]) for d in dialogue],
-                              notice=notice, ineffective=tuple(ineffective), run_id=run_id, step=len(steps) + 1)
+                              # The planner's own questions and their answers. A harness approval is not one (G16):
+                              # no training state ever had one in user_answers, and its yes is no answer to the goal.
+                              dialogue=[(d["question"], d["reply"]) for d in dialogue if d.get("by") != "harness"],
+                              notice=notice, ineffective=tuple(ineffective), run_id=run_id, step=len(steps) + 1,
+                              asked=planner_questions)
             notice = None
 
             t0 = time.perf_counter()
@@ -492,7 +497,8 @@ def run_task(
 
             if action.kind in DIALOGUE:
                 m.dialogue_turns += 1
-                if m.dialogue_turns > task.budget.max_dialogue_turns:
+                planner_questions += 1
+                if planner_questions > task.budget.max_dialogue_turns:
                     state = RunState.BUDGET_EXHAUSTED
                     failure = Failure(FailureClass.BUDGET_EXHAUSTED, "dialogue turn budget exhausted", auto=True)
                     break
@@ -577,10 +583,9 @@ def run_task(
             # between (protocol review, 10-06).
             app_now = obs.focused_app or task.app or ""
             if just_approved:
-                kind_, app_, at, dialog_before = just_approved
+                covered = bool(what) and just_approved.covers(what, app_now, len(steps), obs)
                 just_approved = None   # one chance: the next step is its confirmation, or nothing is
-                if what and (risk.kind(what), app_now) == (kind_, app_) and len(steps) - at == 1 \
-                        and risk.dialog_up(obs) and not dialog_before:
+                if covered:
                     what = None
             if what and not cfg.approve_risky:
                 # Nobody to ask: the step is not carried out, and the planner is told why (10-02 review: a CLI run
@@ -601,8 +606,11 @@ def run_task(
                                                  True)
                 m.dialogue_turns += 1
                 asked_s += delay
+                approval = risk.Approval(what=what, kind=risk.kind(what), app=app_now, step=len(steps) + 1,
+                                         observation_id=obs.id, action=action.to_json(),
+                                         dialog_before=risk.dialog_up(obs))
                 entry = {"n": len(steps) + 1, "kind": ActionKind.REQUEST_APPROVAL.value, "question": what,
-                         "reply": reply, "approved": ok_, "delay_s": delay, "by": "harness"}
+                         "reply": reply, "approved": ok_, "delay_s": delay, "by": "harness", **approval.record()}
                 dialogue.append(entry)
                 steps.append(entry)
                 if recorder:
@@ -613,7 +621,7 @@ def run_task(
                     notice = (f"The user declined: {what}. It was not done. Do not try it another way; finish with "
                               f"what is done, or stop if nothing else is left to do.")
                     continue
-                just_approved = (risk.kind(what), app_now, len(steps), risk.dialog_up(obs))
+                just_approved = approval
             times["t_act_start"] = round(time.time(), 3)
             res: ExecResult = driver.execute(action)
             times["t_act_end"] = round(time.time(), 3)

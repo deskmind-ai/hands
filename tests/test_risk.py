@@ -211,6 +211,87 @@ class OneStepApprovals(unittest.TestCase):
         self.assertTrue(r.dialog_up(Obs()), "a sheet counts as the dialog")
 
 
+class ApprovalsApart(unittest.TestCase):
+    """A harness approval is not a planner question (G16, deskmind#36 item 7). It went into the dialogue the planner
+    is shown as user_answers -- which no training state ever held -- took ASK away for the rest of the run, and used
+    up the planner's dialogue budget."""
+
+    def run_with(self, actions, budget=1):
+        import tempfile
+        from deskmind_hands.adapters.scripted import ReplayAdapter
+        from deskmind_hands.drivers.mock import MockDriver
+        from deskmind_hands.env.workspace import Workspace
+        from deskmind_hands.runtime.loop import RunConfig, run_task
+        from deskmind_bench.task import load_task
+        repo = Path(__file__).resolve().parent.parent
+        task = load_task(repo / "tasks" / "smoke" / "S01-rename.yaml")
+        task.budget.max_dialogue_turns = budget
+        ws = Workspace.create(Path(tempfile.mkdtemp()), repo / "fixtures")
+        seen = []
+
+        class Watching(ReplayAdapter):
+            def propose(self, ctx):
+                seen.append((getattr(ctx, "asked", None), list(ctx.dialogue)))
+                return super().propose(ctx)
+        real = risk.risky
+        risk.risky = lambda a, o, last=None, **kw: ("click 'Delete'" if a.kind is ActionKind.CLICK
+                                                    and a.binding.element_id == "row:draft.txt" else None)
+        try:
+            res = run_task(task, MockDriver(render=False), Watching(actions), ws,
+                           config=RunConfig(user=User(approve=True), approve_risky=True))
+        finally:
+            risk.risky = real
+        return res, seen
+
+    DELETE = {"kind": "click", "binding": {"element_id": "row:draft.txt"}}
+    ASK = {"kind": "ask_user", "text": "Which report?"}
+
+    def test_an_approval_leaves_the_planner_its_question(self):
+        res, seen = self.run_with([self.DELETE, self.ASK, {"kind": "done"}], budget=1)
+        self.assertNotEqual(res.state.value, "budget_exhausted", "one approval used up a budget of one question")
+        self.assertEqual(seen[1], (0, []), "after the approval: no question asked, nothing in user_answers")
+        self.assertEqual(seen[2][0], 1)
+        self.assertEqual(seen[2][1], [("Which report?", "ok")], "its own question and answer are there")
+
+    def test_the_approval_says_what_it_was_for(self):
+        res, _ = self.run_with([self.DELETE, {"kind": "done"}])
+        entry = next(s for s in res.steps if s.get("kind") == "request_approval")
+        self.assertTrue(entry["observation"].startswith("obs-"))
+        self.assertEqual(entry["action"]["binding"]["element_id"], "row:draft.txt")
+        self.assertEqual(res.dialogue[0]["by"], "harness", "kept in the run's record, apart from the planner's")
+
+
+class AskOffered(unittest.TestCase):
+    """The typed-choice planner is offered ASK until it has asked once itself (G16)."""
+
+    def offered(self, **ctx_extra):
+        import tempfile
+        from deskmind_hands.adapters.base import TurnContext
+        from deskmind_hands.adapters.systemone import SystemOneAdapter
+        from deskmind_hands.drivers.base import Element, Observation
+        from deskmind_hands.geometry import ImageTransform, Rect, ScreenGeometry, Size
+        from deskmind_hands.live import live_task
+        size = Size(1200, 900)
+        o = Observation(id="obs-1", geometry=ScreenGeometry(size, size), transform=ImageTransform.identity(size),
+                        elements=[Element(id="e1", role="button", ax_role="AXButton", label="Open", rect=Rect(10, 10, 80, 30),
+                                          app="Finder")], focused_app="Finder", window_title="w")
+        task = live_task("Open the report", Path(tempfile.mkdtemp()), app="com.apple.finder", max_actions=20,
+                         wall_clock_s=60)
+        a = SystemOneAdapter(url="http://127.0.0.1:9", timeout=2, text_helper="stub")
+        asked = []
+
+        def answer(state, questions):
+            asked.append(list(questions["operation"]["criteria"]))
+            return {"operation": {"type": "choice", "choice": "DONE", "probabilities": {"DONE": 1.0}}}
+        a._ask = answer
+        a.propose(TurnContext(task=task, observation=o, history=[], channels=frozenset({"ax"}), **ctx_extra))
+        return "ASK" in asked[0]
+
+    def test_ask_stays_until_the_planner_asks(self):
+        self.assertTrue(self.offered(asked=0))
+        self.assertFalse(self.offered(asked=1, dialogue=[("Which report?", "the March one")]))
+
+
 class AskRecord(unittest.TestCase):
     """The planner's decision to ask is recorded with its probabilities and time, and when the reply came: a
     recording's overlay showed nothing for the question step, which read as the harness's doing."""

@@ -46,6 +46,9 @@ class TurnContext:
     #: server's log and the run's trace can be joined.
     run_id: str = ""
     step: int = 0
+    #: How many questions the planner itself has asked this run: what takes ASK away and counts against the budget.
+    #: A harness approval is not one, and is not in `dialogue` either (G16).
+    asked: int = 0
 
 
 @dataclass

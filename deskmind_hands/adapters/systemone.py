@@ -1850,6 +1850,12 @@ class SystemOneAdapter:
         elif p_complete is not None and p_complete >= check_at:
             op, op_conf, stop_by = "DONE", p_complete, "check"
             confidence = op_conf
+        # A head the model did not score is a placeholder, not its choice (scored: false, deskmind#36 item 2): it is
+        # asked again for this operation alone, and the step is refused if it still comes back unscored.
+        answers, unscored = self._scored_heads(op, answers, questions, state)
+        if unscored:
+            return self._refuse(f"the model did not choose {', '.join(unscored)} for {op}; a placeholder is not acted on",
+                                answers, t0)
         answer = None
         if op == "ANSWER":
             key, a_conf = self._pick(answers.get("answer_value", {}))
@@ -2044,6 +2050,23 @@ class SystemOneAdapter:
             self._usage["requests"] += 1
             answers = {**answers, **{h: again[h] for h in heads if h in again}}
         return (best if weight(best, answers) >= needed else None), answers
+
+    def _scored_heads(self, op: str, answers: dict, questions: dict, state: dict) -> tuple[dict, list[str]]:
+        """The answers with `op`'s heads scored, and the heads still unscored. A server marks a head it did not score
+        `scored: false` (brain#10) and returns it uniform; acting on it takes the first option, which the model never
+        chose. Such heads are asked again, for `op` alone. A head with one option needs no choice and is left as is."""
+        def unscored(ans: dict) -> list[str]:
+            return [h for h in HEADS.get(op, ()) if h in questions and len(questions[h].get("criteria") or ()) > 1
+                    and (ans.get(h) or {}).get("scored") is False]
+        if not unscored(answers):
+            return answers, []
+        heads = [h for h in HEADS.get(op, ()) if h in questions]
+        again = self._ask(state, {"operation": {**questions["operation"],
+                                                "criteria": {op: questions["operation"]["criteria"][op]}},
+                                  **{h: questions[h] for h in heads}})
+        self._usage["requests"] += 1
+        answers = {**answers, **{h: again[h] for h in heads if h in again}}
+        return answers, unscored(answers)
 
     @staticmethod
     def _chosen_value(answers: dict, candidates: list[str]) -> str | None:

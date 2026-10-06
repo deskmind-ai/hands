@@ -526,6 +526,11 @@ def run_task(
             sent = getattr(adapter, "sent", None)
             if sent:
                 times["requests"] = list(sent)
+            # What the model answered, head by head, with its full probabilities -- before any rule here acted on it.
+            # Always kept (no screen text in it): the record a calibration study reads (deskmind#59, E1).
+            replies = getattr(adapter, "replies", None)
+            if replies and recorder is not None:
+                recorder._write({"t": "answers", "n": len(steps) + 1, "replies": list(replies)})
             # The exact planner request (state + questions as sent), for building offline probes from real
             # failures. Opt-in: HANDS_LOG_REQUESTS=1; sandbox tasks only, since the state carries screen text.
             req = getattr(adapter, "last_request", None)

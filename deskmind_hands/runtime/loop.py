@@ -466,7 +466,7 @@ def run_task(
             # The exact planner request (state + questions as sent), for building offline probes from real
             # failures. Opt-in: HANDS_LOG_REQUESTS=1; sandbox tasks only, since the state carries screen text.
             req = getattr(adapter, "last_request", None)
-            if req is not None and os.environ.get("HANDS_LOG_REQUESTS") == "1":
+            if req is not None and recorder is not None and os.environ.get("HANDS_LOG_REQUESTS") == "1":
                 recorder._write({"t": "request", "n": len(steps) + 1, "body": req})
                 adapter.last_request = None
             # What the planner was told from earlier runs (lessons.py), once per run and whether or not requests are

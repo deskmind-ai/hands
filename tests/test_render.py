@@ -31,6 +31,15 @@ def context(history=()):
 
 
 class Render(unittest.TestCase):
+    def setUp(self):
+        # The optional sections follow HANDS_* switches; whatever the caller's shell has set does not reach these.
+        import os
+        from unittest import mock
+        env = mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if not k.startswith("HANDS_")},
+                              clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+
     def test_asking_changes_nothing_and_gives_the_same_state(self):
         ctx = context()
         mem = render.Memory()

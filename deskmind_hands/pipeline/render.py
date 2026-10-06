@@ -7,9 +7,10 @@ Three parts, called in this order every turn:
     state = render(ctx, mem, ...)   the state -- reads, never writes
     remember_shown(mem, ctx)  what this observation showed, for comparing the next one against
 
-`render` is a function of its arguments: the same context and memory give the same state, and nothing is changed by
-asking. Everything here was moved from SystemOneAdapter._state_raw without a change to what it builds; the rules'
-reasons stay with them.
+`render` writes nothing: asking for the state twice gives the same state and leaves the memory as it was. It is not
+yet a function of its arguments alone -- the optional sections follow HANDS_* switches read when it runs, and the
+`environment` section reads the date and the attachments folder -- which later steps take in as inputs. Everything
+here was moved from SystemOneAdapter._state_raw without a change to what it builds; the rules' reasons stay with them.
 """
 from __future__ import annotations
 

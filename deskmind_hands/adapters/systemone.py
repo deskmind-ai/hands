@@ -372,6 +372,7 @@ def replace_edit(goal: str, full: str, old: str, new: str) -> str | None:
 #: A numbered or bulleted step ("1.", "2)", "-", "•", "一、"), and a file operation named in it: a goal's list of
 #: things to do, not lines to type (value_candidates).
 STEP = re.compile(r"^\s*(?:\d{1,2}[.)、．]|[-•*]|[一二三四五六七八九十]、)\s*")
+WRITE_DOWN = re.compile(r"写|抄|记下|输入|填|粘贴|\b(?:write|type|enter|paste|note down|copy these)\b", re.I)
 STEP_OP = re.compile(r"把|改名|重命名|移到|移动|放进|放到|新建|创建|删除|删掉|复制|拷贝|打开|关闭|保存|"
                      r"\b(?:rename|move|put|create|make|delete|remove|copy|open|close|save)\b", re.I)
 
@@ -402,19 +403,22 @@ def value_candidates(goal: str, visible_text: str = "", limit: int = 14) -> list
     # line, two, three -- because where the dictation ends is not always marked ("...写下：<two lines> 写完保存。"),
     # and ranked after everything else it was cut at the candidate limit: the one value that task needed was
     # never offered.
-    dictated, block = False, []
+    dictated, block, colon_line = False, [], ""
     for line in goal.splitlines():
         line = line.strip()
         if dictated and line and len(line) <= 200:
             block.append(line)
         elif block:
             break
-        dictated = dictated or line.endswith(("\uff1a", ":"))
+        if not dictated and line.endswith(("\uff1a", ":")):
+            dictated, colon_line = True, line
     # Except a list of steps: "请依次完成下面几件事：\n1. 把 记录-81.txt 改名为 …" is things to do, not text, and offered
     # as values, one of its lines became a file's new name (deskmind#26). Only when every line is a numbered step
     # naming a file operation, so dictation that names no writing ("回复他：", "Send this message:") and a to-do list
     # written into a file ("写下：\n1. 买牛奶") stay dictated.
-    if block and all(STEP.match(line) and STEP_OP.search(line) for line in block):
+    # A list the colon's own line says to write down ("写下：\n1. 打开邮箱\n2. 保存报告") is text even when its items name
+    # operations; only that line counts, so a "记录" earlier in the goal does not.
+    if block and not WRITE_DOWN.search(colon_line) and all(STEP.match(line) and STEP_OP.search(line) for line in block):
         block = []
     for k in range(len(block), 0, -1):
         add("\n".join(block[:k]) + "\n", raw=True)

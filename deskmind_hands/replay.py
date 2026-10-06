@@ -161,6 +161,10 @@ class FollowAdapter(SystemOneAdapter):
             self.divergences.append(Divergence(self._n, "the replay asked past the recorded run"))
             answers["operation"] = _one("DONE") if "DONE" in (questions["operation"]["criteria"]) else answers["operation"]
             return answers
+        if "goal_complete" in questions:
+            # The completion check (HANDS_COMPLETION_CHECK) is answered as recorded: "yes" only on the step it ended.
+            # Its first option is "yes", and answered that way every replay ended at the second step.
+            answers["goal_complete"] = _one("yes" if self._recorded_stop(rec) == "check" else "no")
         want = self._recorded_operation(rec)
         ops = questions["operation"]["criteria"]
         if want not in ops:
@@ -169,6 +173,13 @@ class FollowAdapter(SystemOneAdapter):
         answers["operation"] = _one(want)
         self._target(rec, want, state, questions, answers)
         return answers
+
+    @staticmethod
+    def _recorded_stop(rec: dict) -> str | None:
+        try:
+            return json.loads(rec.get("decision") or "{}").get("stop_by")
+        except ValueError:
+            return None
 
     @staticmethod
     def _recorded_operation(rec: dict) -> str:

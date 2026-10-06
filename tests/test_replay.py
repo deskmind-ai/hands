@@ -79,12 +79,23 @@ class ReplaySnapshots(unittest.TestCase):
         self.assertEqual(a.divergences, [])
         self.assertEqual(answers["answer_value"]["choice"], "2")
 
+    def test_the_completion_check_is_answered_as_recorded(self):
+        """Answered with its first option ("yes"), the completion check ended every replay of a run recorded with
+        HANDS_COMPLETION_CHECK at its second step."""
+        from deskmind_hands.replay import FollowAdapter
+        q = {"operation": {"type": "choice", "criteria": {"CLICK": "", "DONE": ""}},
+             "goal_complete": {"type": "choice", "criteria": {"yes": "", "no": ""}}}
+        a = FollowAdapter([{"decision": '{"operation": "CLICK"}', "action": {"kind": "click"}},
+                           {"decision": '{"operation": "DONE", "stop_by": "check"}', "kind": "done"}])
+        self.assertEqual(a._ask({"elements": []}, q)["goal_complete"]["choice"], "no")
+        self.assertEqual(a._ask({"elements": []}, q)["goal_complete"]["choice"], "yes")
+
     def test_what_no_case_reaches_is_known(self):
         """deskmind#58 step 0: the refactor may move only code the snapshots pin. What no case puts to the planner
         is listed here; a new case that reaches one of these takes it off the list."""
         import harness_replay
         self.assertEqual(harness_replay.gaps(), {
-            "questions": ["focus_app_target", "goal_complete", "rename_target"],
+            "questions": ["focus_app_target", "rename_target"],
             "operations": ["FOCUS_APP", "RENAME", "TYPE_FOCUSED"],
         })
 

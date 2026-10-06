@@ -691,6 +691,15 @@ def replace_candidates(text: str, limit: int = 16, exclude: tuple[str, ...] = ()
 #: at which the model is actually reliable.
 BLOCKED_MIN_CONFIDENCE = 0.8
 
+#: The questions (heads) each operation is carried out with, as deskmind's protocol/agent/operations.yaml lists them.
+HEADS = {
+    "CLICK": ("click_target",), "OPEN": ("open_target",), "RENAME": ("rename_target", "type_text_value"),
+    "TYPE_TEXT": ("type_text_target", "type_text_value"), "APPEND_TEXT": ("append_text_target", "type_text_value"),
+    "REPLACE_TEXT": ("replace_text_target", "replace_from", "type_text_value"), "SCROLL": ("scroll_target",),
+    "SELECT": ("select_target",), "FOCUS_APP": ("focus_app_target",), "KEY": ("key_target",),
+    "TYPE_FOCUSED": ("type_text_value",), "FOCUS_WINDOW": ("focus_window_target",), "ANSWER": ("answer_value",),
+}
+
 #: "values taken FROM notes.md": a file the goal reads from, which nothing may be written into.
 SOURCE = re.compile(r"(?:\u53d6\u81ea|\u6765\u81ea|\u6458\u81ea|\u6284\u81ea|\u4ece|\u6839\u636e|\u53c2\u7167|\u5bf9\u7167|\u67e5|"
                     r"from|using|based on|according to|found in|listed in)\s*`?([\w\u4e00-\u9fff.\-]+\.[A-Za-z0-9]{1,5})")
@@ -1780,22 +1789,10 @@ class SystemOneAdapter:
         # low. Overriding it here once replaced a correct DONE (strong 0.47, fast 0.87) with an undo of finished work.
         confirmed = bool((getattr(self, "_routing", None) or {}).get("confirmed"))
         if op in ("BLOCKED", "DONE") and op_conf < BLOCKED_MIN_CONFIDENCE and not persistent_done and not confirmed:
-            # Giving up is the one choice that cannot be taken back, so it is not taken on a coin flip. The best
-            # way forward instead, weighed by how sure the target head is of its element: on a real Finder the
-            # planner had the right row at 1.00 and the right name at 0.74 and still said BLOCKED at 0.42, because
-            # RENAME is a verb it was never trained on and unseen verbs start low.
-            probs = (answers.get("operation") or {}).get("probabilities") or {}
-            best, best_score = None, 0.0
-            for cand, pr in probs.items():
-                if cand in ("DONE", "BLOCKED", "ASK"):
-                    continue
-                head = answers.get(cand.lower() + "_target")
-                tconf = self._pick(head)[1] if head else 1.0
-                if pr * tconf > best_score:
-                    best, best_score = cand, pr * tconf
-            # Overriding DONE takes a real alternative: twice a finished task's DONE (0.37, 0.31) was replaced with
-            # a 0.13 "open the folder", and the run undid its own work from inside it.
-            if best is not None and best_score >= (0.2 if op == "DONE" else 0.1):
+            # Giving up is the one choice that cannot be taken back, so it is not taken on a coin flip (_instead).
+            best, answers = self._instead(op, answers, questions, state)
+            if best is not None:
+                probs = (answers.get("operation") or {}).get("probabilities") or {}
                 self._usage["escalations"] += 1
                 overrode = f"{op}@{op_conf:.2f}"
                 op, op_conf = best, float(probs[best])
@@ -1970,6 +1967,38 @@ class SystemOneAdapter:
                                                              **({"p_complete": round(p_complete, 3)}
                                                                 if p_complete is not None else {})}),
                         latency_s=latency)
+
+    def _instead(self, op: str, answers: dict, questions: dict, state: dict) -> tuple[str | None, dict]:
+        """The operation to take instead of a low DONE or BLOCKED, or None, with the answers to act on.
+
+        The best way forward, weighed by how sure the target head is of its element: on a real Finder the planner
+        had the right row at 1.00 and the right name at 0.74 and still said BLOCKED at 0.42, because RENAME is a verb
+        it was never trained on and unseen verbs start low. Overriding DONE takes a real alternative: twice a
+        finished task's DONE (0.37, 0.31) was replaced with a 0.13 "open the folder", and the run undid its own work
+        from inside it.
+
+        A server that scores in two stages scored only the heads of the operation it chose and returns the others
+        uniform, so the alternative's target and value were never chosen by the model: a single row reads 1.00, and
+        the value is the first candidate. Its heads are asked again, for it alone, and it is weighed on those
+        (protocol review 10-06)."""
+        probs = (answers.get("operation") or {}).get("probabilities") or {}
+
+        def weight(cand: str, ans: dict) -> float:
+            head = ans.get(cand.lower() + "_target")
+            return float(probs[cand]) * (self._pick(head)[1] if head else 1.0)
+        cands = [c for c in probs if c not in ("DONE", "BLOCKED", "ASK")]
+        best = max(cands, key=lambda c: weight(c, answers), default=None)
+        needed = 0.2 if op == "DONE" else 0.1
+        if best is None or weight(best, answers) < needed:
+            return None, answers
+        heads = [h for h in HEADS.get(best, ()) if h in questions]
+        if heads:
+            again = self._ask(state, {"operation": {**questions["operation"],
+                                                    "criteria": {best: questions["operation"]["criteria"][best]}},
+                                      **{h: questions[h] for h in heads}})
+            self._usage["requests"] += 1
+            answers = {**answers, **{h: again[h] for h in heads if h in again}}
+        return (best if weight(best, answers) >= needed else None), answers
 
     @staticmethod
     def _chosen_value(answers: dict, candidates: list[str]) -> str | None:

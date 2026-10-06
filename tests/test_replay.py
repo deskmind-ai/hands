@@ -9,11 +9,13 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tools"))
+sys.path.insert(0, str(REPO / "tests"))
 
 
 class ReplaySnapshots(unittest.TestCase):
@@ -98,6 +100,46 @@ class ReplaySnapshots(unittest.TestCase):
             "questions": ["focus_app_target", "rename_target"],
             "operations": ["FOCUS_APP", "RENAME", "TYPE_FOCUSED"],
         })
+
+    def test_a_task_run_replays_to_the_requests_it_sent(self):
+        """deskmind#58 step 0: bench and gym runs (a task file, not a `hands do` goal) replay too, so the refactor is
+        checked against every recorded run on a machine -- thousands of Finder and TextEdit steps the snapshots do
+        not have -- and a replay of one sends what the run sent."""
+        import tempfile
+        from test_criteria_forms import Server
+        from deskmind_bench.task import load_task
+        from deskmind_hands.adapters.systemone import SystemOneAdapter
+        from deskmind_hands.drivers.mock import MockDriver
+        from deskmind_hands.env.workspace import Workspace
+        from deskmind_hands.record.recorder import Recorder
+        from deskmind_hands.replay import replay
+        from deskmind_hands.runtime.loop import RunConfig, run_task
+        import harness_replay
+        task_file = REPO / "tasks" / "smoke" / "S01-rename.yaml"
+        task = load_task(task_file)
+        task.budget.max_actions = 4
+        root = Path(tempfile.mkdtemp())
+        ws = Workspace.create(root / "live", REPO / "fixtures")
+        rec = Recorder(root / "run")
+        rec.manifest({"run_id": "r1", "task_id": task.id, "task_file": str(task_file), "adapter": "systemone"})
+        server = Server({"id": "m", "criteria_forms": ["object"]})
+        try:
+            run_task(task, MockDriver(render=False), SystemOneAdapter(url=server.url), ws, config=RunConfig(),
+                     recorder=rec)
+        finally:
+            rec.close()
+            server.srv.shutdown()
+        # What the run sent, as a replay builds it (the model name is the replay's own).
+        sent = [{"state": b["state"], "model": "replay", "questions": b["questions"]} for b in server.bodies]
+        self.assertGreaterEqual(len(sent), 2)
+        with mock.patch.dict(os.environ, {k: "0" for k in harness_replay.SWITCHES}):
+            r = replay(root / "run")
+        self.assertEqual(r.divergences, [])
+        self.assertEqual([harness_replay.normalize(q) for q in r.requests],
+                         [harness_replay.normalize(q) for q in sent])
+        dumped = harness_replay.corpus([root])
+        self.assertEqual(list(dumped.values())[0]["requests"], [harness_replay.normalize(q) for q in sent])
+        self.assertNotIn("hands-replay-", json.dumps(dumped), "the scratch folder's name is not in the dump")
 
     def test_a_changed_option_is_a_divergence(self):
         """The recorded choice missing from the options is reported, not guessed around."""

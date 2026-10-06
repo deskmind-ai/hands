@@ -9,6 +9,13 @@ planner, since it is a change to what the model sees.
     python tools/harness_replay.py add runs/do-20260930-172539 --name d4-real-ask
     python tools/harness_replay.py check              # exit 1 on any difference
     python tools/harness_replay.py check --update     # accept the current output
+    python tools/harness_replay.py coverage           # what the cases reach, and what none does
+
+Every run recorded on this machine is a check too (`hands do`, bench and gym runs alike; they stay here, never in the
+repository): dump them before a change that should leave what the planner sees alone, and compare after it.
+
+    python tools/harness_replay.py corpus runs/ --out /tmp/before.json
+    python tools/harness_replay.py corpus runs/ --against /tmp/before.json   # exit 1 on any difference
 """
 from __future__ import annotations
 
@@ -140,6 +147,26 @@ def gaps(only: list[str] | None = None) -> dict[str, list[str]]:
     return {k: sorted(every[k] - set(seen[k])) for k in every}
 
 
+def corpus(runs: list[Path], env: dict[str, str] | None = None) -> dict[str, dict]:
+    """Every run under `runs` that can be replayed, replayed: its requests, normalized, and its outcome. Not a
+    snapshot -- recorded runs from the desktop stay on the machine that made them -- but the same comparison over many
+    more runs: dumped before a change and after it, two dumps that differ name a run whose requests the change moved
+    (deskmind#58: a step that only moves code must leave every one of them as it was)."""
+    out = {}
+    for run in sorted({p.parent for r in runs for p in Path(r).rglob("trace.jsonl")}):
+        try:
+            outside = {k: v for k, v in os.environ.items() if not k.startswith("HANDS_")}
+            with mock.patch.dict(os.environ, outside | {k: "0" for k in SWITCHES} | (env or {}), clear=True):
+                r = replay(run)
+        except Exception as exc:  # noqa: BLE001 - a run that cannot be replayed is listed, not fatal
+            out[str(run)] = {"skipped": f"{type(exc).__name__}: {exc}"[:200]}
+            continue
+        # The replay's scratch folder is new every time, and the grade's words name it.
+        result = json.loads(re.sub(r"[^\"' ]*hands-replay-[^/\"' ]+", "<scratch>", json.dumps(r.to_json())))
+        out[str(run)] = {"result": result, "requests": [normalize(q) for q in r.requests]}
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -152,7 +179,27 @@ def main() -> int:
     c.add_argument("--update", action="store_true")
     c.add_argument("cases", nargs="*")
     sub.add_parser("coverage", help="which questions and operations the cases reach, and which none does")
+    k = sub.add_parser("corpus", help="replay every recorded run under the given folders; dump, or compare to a dump")
+    k.add_argument("runs", nargs="+", type=Path)
+    k.add_argument("--out", type=Path, help="write the dump here")
+    k.add_argument("--against", type=Path, help="compare with an earlier dump; exit 1 on any difference")
     args = ap.parse_args()
+    if args.cmd == "corpus":
+        got = json.loads(json.dumps(corpus(args.runs), ensure_ascii=False))
+        if args.out:
+            args.out.write_text(json.dumps(got, ensure_ascii=False) + "\n", encoding="utf-8")
+        replayed = [k for k, v in got.items() if "requests" in v]
+        print(f"{len(replayed)} run(s) replayed, {sum(len(got[k]['requests']) for k in replayed)} requests; "
+              f"{len(got) - len(replayed)} skipped")
+        if args.against:
+            want = json.loads(args.against.read_text(encoding="utf-8"))
+            diffs = [(k, first_difference(want.get(k), got.get(k))) for k in sorted(set(want) | set(got))]
+            diffs = [(k, d) for k, d in diffs if d]
+            for k, d in diffs[:20]:
+                print(f"CHANGED  {k}: {d}")
+            print(f"{len(diffs)} run(s) changed" if diffs else "every run replays to the same requests")
+            return 1 if diffs else 0
+        return 0
     if args.cmd == "coverage":
         seen = coverage()
         for kind, counts in seen.items():

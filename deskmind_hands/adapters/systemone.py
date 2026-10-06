@@ -1002,6 +1002,14 @@ def position(key, n: int) -> int | None:
     return int(key) - 1
 
 
+def list_form(questions: dict) -> dict:
+    """The questions with every choice's options as [{"key", "description"}], protocol v1 (deskmind#38): the order is
+    the list's, not a JSON object's, which any tool on the way may sort (brain#8: 220 valid steps of 223 became 130)."""
+    return {k: ({**q, "criteria": [{"key": o, "description": d} for o, d in q["criteria"].items()]}
+                if isinstance(q, dict) and q.get("type") == "choice" and isinstance(q.get("criteria"), dict) else q)
+            for k, q in questions.items()}
+
+
 def unoffered(asked: dict, answers: dict) -> str | None:
     """Why a reply is not about what was asked, or None. Every probability must be for an option the question
     offered, and a finite number from 0 to 1; a choice must be offered too. hands acts on the probabilities, so a
@@ -1038,6 +1046,7 @@ class SystemOneAdapter:
         #: /v1/systemone clients do. Without one this adapter refuses to type, which costs it every task that needs input.
         self.text_helper = text_helper
         self._labels: dict[str, str] = {}
+        self._forms: tuple[str, ...] | None = None   # the criteria forms the server reads (_criteria_forms)
         self._value_cache: dict[tuple, str] = {}
         self._seen_text: dict[str, str] = {}
         self._read_by_window: dict[str, dict[str, str]] = {}
@@ -1069,6 +1078,24 @@ class SystemOneAdapter:
 
     # -- wire -------------------------------------------------------------
 
+    def _criteria_forms(self) -> tuple[str, ...]:
+        """The forms of choice options the server reads, from GET /v1/models: ("object", "list") from a Brain that
+        reads the list form (brain#9), ("object",) from one that does not say. Asked once; a server that cannot be
+        reached yet is asked again with the next request, and one that answers anything else gets the object form."""
+        if self._forms is None:
+            headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+            try:
+                with urllib.request.urlopen(urllib.request.Request(f"{self.url}/v1/models", headers=headers),
+                                            timeout=min(5.0, self.timeout)) as r:
+                    data = (json.load(r).get("data") or [{}])[0]
+                forms = data.get("criteria_forms") if isinstance(data, dict) else None
+                self._forms = tuple(forms) if isinstance(forms, list) else ("object",)
+            except urllib.error.HTTPError:
+                self._forms = ("object",)
+            except Exception:
+                return ("object",)
+        return self._forms
+
     def _ask(self, state: dict, questions: dict) -> dict:
         # A choice with one option has one answer. For a model named "decider*" it is filled in here rather than
         # sent: such servers reject a choice of fewer than two options (422). DeskMind Brain's servers answer it
@@ -1079,7 +1106,11 @@ class SystemOneAdapter:
                  if local_only and q.get("type") == "choice" and len(q.get("criteria") or {}) == 1}
         asked = fit_choices({k: q for k, q in questions.items() if k not in fixed})
         self.last_request = {"state": state, "model": self.model, "questions": asked}
-        body = json.dumps(self.last_request).encode()
+        # The options go as a list where the server reads one, so their order is the request's and nothing on the
+        # way can sort it; what is recorded and checked here stays the object form.
+        wire = ({**self.last_request, "questions": list_form(asked)} if "list" in self._criteria_forms()
+                else self.last_request)
+        body = json.dumps(wire).encode()
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"

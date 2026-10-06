@@ -1,5 +1,6 @@
-"""Lines after a colon are text to type only when what leads up to them asks for writing (deskmind#26): a numbered
-list of things to do was offered line by line as values, and a planner renamed a file to one of its instructions."""
+"""Lines after a colon are dictated text, except a list of numbered steps that name file operations (deskmind#26):
+a numbered list of things to do was offered line by line as values, and a planner renamed a file to one of its
+instructions. Dictation that names no writing (a message to send, a reply) must stay dictated."""
 from __future__ import annotations
 
 import sys
@@ -27,6 +28,12 @@ class Dictation(unittest.TestCase):
         self.assertEqual(value_candidates(G04)[0], "一季度营收 1,240 万元，环比增长 8.5%。\n未结订单 37 笔，其中逾期 3 笔。\n")
         self.assertEqual(value_candidates("在 todo.txt 里写下：\n1. 买牛奶\n2. 交报告")[0], "1. 买牛奶\n2. 交报告\n")
         self.assertEqual(value_candidates("Open notes.txt and write these lines:\nalpha\nbeta")[0], "alpha\nbeta\n")
+
+    def test_messages_without_a_writing_word_stay_dictated(self):
+        self.assertEqual(value_candidates("把下面这段话发给 Lisa：\n周五的会改到下午三点。")[0], "周五的会改到下午三点。\n")
+        self.assertEqual(value_candidates("回复他：\n收到，明天给你。")[0], "收到，明天给你。\n")
+        self.assertEqual(value_candidates("Send this message to Sam:\nRunning late, start without me.")[0],
+                         "Running late, start without me.\n")
 
 
 if __name__ == "__main__":

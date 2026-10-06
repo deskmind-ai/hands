@@ -369,6 +369,11 @@ def replace_edit(goal: str, full: str, old: str, new: str) -> str | None:
     return None if old == new else full.replace(old, new, 1)
 
 
+#: Words that ask for text to be written, before a dictated block: "逐字写入下面两行：", "write these lines:".
+DICTATE = re.compile(r"写|输入|填|录入|记下|记录|粘贴|内容|文字|一行|两行|几行|\btype\b|\bwrite\b|\benter\b|\bfill\b|\bpaste\b|"
+                     r"\brecord\b|\bnote\b|\btext\b|\blines?\b", re.I)
+
+
 def value_candidates(goal: str, visible_text: str = "", limit: int = 14) -> list[str]:
     """Strings a typed value could be, drawn from the goal and from what is on screen.
 
@@ -395,14 +400,18 @@ def value_candidates(goal: str, visible_text: str = "", limit: int = 14) -> list
     # line, two, three -- because where the dictation ends is not always marked ("...写下：<two lines> 写完保存。"),
     # and ranked after everything else it was cut at the candidate limit: the one value that task needed was
     # never offered.
-    dictated, block = False, []
+    # Only when what leads up to the colon asks for writing: "请依次完成下面几件事：" followed by a numbered list is a list
+    # of things to do, and offered as text to type, one of its lines became a file's new name (deskmind#26). A to-do
+    # list written INTO a file ("在 todo.txt 里写下：1. 买牛奶") still asks for writing, and is still dictated.
+    dictated, block, lead = False, [], []
     for line in goal.splitlines():
         line = line.strip()
         if dictated and line and len(line) <= 200:
             block.append(line)
         elif block:
             break
-        dictated = dictated or line.endswith(("\uff1a", ":"))
+        lead.append(line)
+        dictated = dictated or (line.endswith(("\uff1a", ":")) and bool(DICTATE.search(" ".join(lead))))
     for k in range(len(block), 0, -1):
         add("\n".join(block[:k]) + "\n", raw=True)
     for line in block:

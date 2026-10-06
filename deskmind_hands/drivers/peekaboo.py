@@ -2059,10 +2059,16 @@ class PeekabooDriver:
     #: the driver presses with cmd (select all, paste) on the user's layout. Made once per process (see _key_event).
     _key_blobs: dict = {}
     _letter_codes: dict = {}
+    _letters_read_at = 0.0
+    #: How long the layout's letters are trusted: a user may switch keyboards during a run, and reading them again
+    #: costs a child process, so not before every shortcut.
+    LAYOUT_TTL_S = 30.0
 
     @classmethod
     def _keycode(cls, Q, letter: str) -> int:
         """The key code that types `letter` with cmd held on the current keyboard layout (drivers/keys.py)."""
+        if cls._key_blobs and time.monotonic() - cls._letters_read_at > cls.LAYOUT_TTL_S:
+            cls._key_blobs = {}                          # read again: the user may have switched keyboards
         cls._load_keys()
         return cls._letter_codes.get(letter, keys.ANSI[letter])
 
@@ -2077,6 +2083,12 @@ class PeekabooDriver:
                                             text=True, timeout=20).stdout)
             cls._key_blobs = {k: base64.b64decode(v) for k, v in out["events"].items()}
             cls._letter_codes = keys.pick_keycodes({int(k): v for k, v in out["table"].items()}, "av")
+            cls._letters_read_at = time.monotonic()
+            if not out["table"] and not cls.__dict__.get("_said_no_layout"):
+                # Said once, not silently: on a non-US layout the US positions may press another shortcut (#21).
+                cls._said_no_layout = True
+                print("hands: the keyboard layout could not be read; cmd+A / cmd+V use the US key positions",
+                      file=sys.stderr)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             cls._key_blobs = {"failed": b""}
             # Said once: from here the keys are made in this process, and the Dock tiles come back with them.

@@ -29,14 +29,54 @@ class PickKeycodes(unittest.TestCase):
         self.assertEqual(keys.pick_keycodes({30: "A", 12: "a"}, "a"), {"a": 12})   # the lowest code that types it
 
     def test_the_driver_presses_the_layouts_codes(self):
-        saved = (PeekabooDriver._key_blobs, PeekabooDriver._letter_codes)
+        import time
+        saved = (PeekabooDriver._key_blobs, PeekabooDriver._letter_codes, PeekabooDriver._letters_read_at)
         try:
             PeekabooDriver._key_blobs, PeekabooDriver._letter_codes = {"loaded": b""}, {"a": 12, "v": 9}
+            PeekabooDriver._letters_read_at = time.monotonic()                        # just read
             self.assertEqual((PeekabooDriver._keycode(None, "a"), PeekabooDriver._keycode(None, "v")), (12, 9))
             PeekabooDriver._letter_codes = {}
             self.assertEqual(PeekabooDriver._keycode(None, "a"), 0)                  # not read: ANSI
         finally:
-            PeekabooDriver._key_blobs, PeekabooDriver._letter_codes = saved
+            PeekabooDriver._key_blobs, PeekabooDriver._letter_codes, PeekabooDriver._letters_read_at = saved
+
+
+class Refresh(unittest.TestCase):
+    """A layout switched during a run is read again; one that cannot be read is said, once."""
+
+    def setUp(self):
+        self.saved = (PeekabooDriver._key_blobs, PeekabooDriver._letter_codes, PeekabooDriver._letters_read_at)
+
+    def tearDown(self):
+        PeekabooDriver._key_blobs, PeekabooDriver._letter_codes, PeekabooDriver._letters_read_at = self.saved
+        PeekabooDriver.__dict__.get("_said_no_layout") and delattr(PeekabooDriver, "_said_no_layout")
+
+    def run_child(self, tables):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+        outs = [mock.Mock(stdout=json.dumps({"table": t, "events": {"36:1": ""}})) for t in tables]
+        err = io.StringIO()
+        with mock.patch("deskmind_hands.drivers.peekaboo.subprocess.run", side_effect=outs) as run, redirect_stderr(err):
+            yield run, err
+
+    def test_read_again_after_the_ttl(self):
+        from unittest import mock
+        PeekabooDriver._key_blobs = {}
+        runs = self.run_child([{"0": "a", "9": "v"}, {"0": "q", "12": "a", "9": "v"}])
+        run, _ = next(runs)
+        with mock.patch("deskmind_hands.drivers.peekaboo.time.monotonic", side_effect=[100.0, 110.0, 200.0, 200.0]):
+            self.assertEqual(PeekabooDriver._keycode(None, "a"), 0)    # US, read at 100
+            self.assertEqual(PeekabooDriver._keycode(None, "a"), 0)    # 10 s later: not read again
+            self.assertEqual(PeekabooDriver._keycode(None, "a"), 12)   # 100 s later: switched to French, read again
+        self.assertEqual(run.call_count, 2)
+
+    def test_an_unreadable_layout_is_said_once(self):
+        PeekabooDriver._key_blobs = {}
+        runs = self.run_child([{}])
+        _, err = next(runs)
+        self.assertEqual(PeekabooDriver._keycode(None, "v"), 9)
+        self.assertIn("could not be read", err.getvalue())
 
 
 def _child(layout: str) -> dict[str, int]:

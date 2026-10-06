@@ -140,6 +140,8 @@ class ReplaySnapshots(unittest.TestCase):
         dumped = harness_replay.corpus([root])
         self.assertEqual(list(dumped.values())[0]["requests"], [harness_replay.normalize(q) for q in sent])
         self.assertNotIn("hands-replay-", json.dumps(dumped), "the scratch folder's name is not in the dump")
+        self.assertEqual(list(dumped.values())[0]["task_sha"], harness_replay._sha(task_file),
+                         "a task edited between two dumps is told apart from a code change")
 
     def test_a_changed_option_is_a_divergence(self):
         """The recorded choice missing from the options is reported, not guessed around."""

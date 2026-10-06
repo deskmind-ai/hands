@@ -14,8 +14,11 @@ planner, since it is a change to what the model sees.
 Every run recorded on this machine is a check too (`hands do`, bench and gym runs alike; they stay here, never in the
 repository): dump them before a change that should leave what the planner sees alone, and compare after it.
 
-    python tools/harness_replay.py corpus runs/ --out /tmp/before.json
-    python tools/harness_replay.py corpus runs/ --against /tmp/before.json   # exit 1 on any difference
+    python tools/harness_replay.py corpus runs/ --out runs/corpus-before.json
+    python tools/harness_replay.py corpus runs/ --against runs/corpus-before.json   # exit 1 on any difference
+
+A dump holds the screen text of every run in it: keep it under runs/ (ignored by git), never in /tmp or anywhere
+shared, and delete it when the comparison is done.
 """
 from __future__ import annotations
 
@@ -147,6 +150,16 @@ def gaps(only: list[str] | None = None) -> dict[str, list[str]]:
     return {k: sorted(every[k] - set(seen[k])) for k in every}
 
 
+def manifest_task(run: Path) -> Path | None:
+    f = json.loads((run / "manifest.json").read_text(encoding="utf-8")).get("task_file")
+    return Path(f) if f and Path(f).exists() else None
+
+
+def _sha(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+
+
 def corpus(runs: list[Path], env: dict[str, str] | None = None) -> dict[str, dict]:
     """Every run under `runs` that can be replayed, replayed: its requests, normalized, and its outcome. Not a
     snapshot -- recorded runs from the desktop stay on the machine that made them -- but the same comparison over many
@@ -163,7 +176,9 @@ def corpus(runs: list[Path], env: dict[str, str] | None = None) -> dict[str, dic
             continue
         # The replay's scratch folder is new every time, and the grade's words name it.
         result = json.loads(re.sub(r"[^\"' ]*hands-replay-[^/\"' ]+", "<scratch>", json.dumps(r.to_json())))
-        out[str(run)] = {"result": result, "requests": [normalize(q) for q in r.requests]}
+        out[str(run)] = {"result": result, "requests": [normalize(q) for q in r.requests],
+                         # A task file edited between two dumps moves the requests too; this tells it from a code change.
+                         **({"task_sha": _sha(manifest_task(run))} if manifest_task(run) else {})}
     return out
 
 

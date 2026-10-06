@@ -446,13 +446,18 @@ def run_task(
             ctx = TurnContext(task=task, observation=_filter(obs, cfg.channels),
                               history=history[-10:], channels=cfg.channels,
                               dialogue=[(d["question"], d["reply"]) for d in dialogue],
-                              notice=notice, ineffective=tuple(ineffective))
+                              notice=notice, ineffective=tuple(ineffective), run_id=run_id, step=len(steps) + 1)
             notice = None
 
             t0 = time.perf_counter()
             times["t_decide_start"] = round(time.time(), 3)
             proposal = adapter.propose(ctx)
             times["t_decide_end"] = round(time.time(), 3)
+            # The requests this decision took, by id and the form their options went in: what joins this step to the
+            # server's log (protocol: Request identity). Kept with the step's times, so every record of it has them.
+            sent = getattr(adapter, "sent", None)
+            if sent:
+                times["requests"] = list(sent)
             # The exact planner request (state + questions as sent), for building offline probes from real
             # failures. Opt-in: HANDS_LOG_REQUESTS=1; sandbox tasks only, since the state carries screen text.
             req = getattr(adapter, "last_request", None)

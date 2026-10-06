@@ -55,6 +55,50 @@ class ReplaySnapshots(unittest.TestCase):
         first = json.loads((case / "expected.json").read_text(encoding="utf-8"))["requests"][0]["questions"]
         self.assertEqual(next(iter(first)), "operation", f"{case.name}: the snapshot is in the order sent")
 
+    def test_no_setting_of_the_callers_reaches_the_replay(self):
+        """deskmind#58 step 0: HANDS_COMPLETION_CHECK was not among the switches turned off for a replay, so set in
+        the caller's shell it added a goal_complete question to every request after the first, and the snapshots
+        failed on one machine and passed on another."""
+        import harness_replay
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"HANDS_COMPLETION_CHECK": "0.5", "HANDS_DONE_CHECK": "1",
+                                          "HANDS_PROGRESS": "1", "HANDS_PRIOR_READ": "1"}):
+            failures = harness_replay.check()
+        self.assertEqual(failures, [], "\n".join(f"{n}: {d}" for n, d in failures))
+
+    def test_an_answer_is_replayed(self):
+        """An ANSWER ends the run: its step has no action and keeps the answer in its text. The replay read the text
+        from the (missing) action and reported every recorded answer as not offered."""
+        from deskmind_hands.replay import FollowAdapter
+        a = FollowAdapter([{"kind": "done", "text": "answer: Meeting time: 14:00",
+                            "decision": '{"operation": "ANSWER", "answer": "Meeting time: 14:00"}'}])
+        answers = a._ask({"elements": []}, {
+            "operation": {"type": "choice", "criteria": {"CLICK": "", "ANSWER": "", "DONE": ""}},
+            "answer_value": {"type": "choice", "criteria": {"1": {"value": "Offsite venue"},
+                                                            "2": {"value": "Meeting time: 14:00"}}}})
+        self.assertEqual(a.divergences, [])
+        self.assertEqual(answers["answer_value"]["choice"], "2")
+
+    def test_the_completion_check_is_answered_as_recorded(self):
+        """Answered with its first option ("yes"), the completion check ended every replay of a run recorded with
+        HANDS_COMPLETION_CHECK at its second step."""
+        from deskmind_hands.replay import FollowAdapter
+        q = {"operation": {"type": "choice", "criteria": {"CLICK": "", "DONE": ""}},
+             "goal_complete": {"type": "choice", "criteria": {"yes": "", "no": ""}}}
+        a = FollowAdapter([{"decision": '{"operation": "CLICK"}', "action": {"kind": "click"}},
+                           {"decision": '{"operation": "DONE", "stop_by": "check"}', "kind": "done"}])
+        self.assertEqual(a._ask({"elements": []}, q)["goal_complete"]["choice"], "no")
+        self.assertEqual(a._ask({"elements": []}, q)["goal_complete"]["choice"], "yes")
+
+    def test_what_no_case_reaches_is_known(self):
+        """deskmind#58 step 0: the refactor may move only code the snapshots pin. What no case puts to the planner
+        is listed here; a new case that reaches one of these takes it off the list."""
+        import harness_replay
+        self.assertEqual(harness_replay.gaps(), {
+            "questions": ["focus_app_target", "rename_target"],
+            "operations": ["FOCUS_APP", "RENAME", "TYPE_FOCUSED"],
+        })
+
     def test_a_changed_option_is_a_divergence(self):
         """The recorded choice missing from the options is reported, not guessed around."""
         from deskmind_hands.replay import FollowAdapter

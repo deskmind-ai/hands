@@ -2067,8 +2067,11 @@ class PeekabooDriver:
     @classmethod
     def _keycode(cls, Q, letter: str) -> int:
         """The key code that types `letter` with cmd held on the current keyboard layout (drivers/keys.py)."""
-        if cls._key_blobs and time.monotonic() - cls._letters_read_at > cls.LAYOUT_TTL_S:
-            cls._key_blobs = {}                          # read again: the user may have switched keyboards
+        # Read again when old: the user may have switched keyboards. Not after a failed read, which stays failed for
+        # the run -- a child that hangs would cost its 20 s timeout every 30 s.
+        if (cls._key_blobs and "failed" not in cls._key_blobs
+                and time.monotonic() - cls._letters_read_at > cls.LAYOUT_TTL_S):
+            cls._key_blobs = {}
         cls._load_keys()
         return cls._letter_codes.get(letter, keys.ANSI[letter])
 

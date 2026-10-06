@@ -71,6 +71,19 @@ class Refresh(unittest.TestCase):
             self.assertEqual(PeekabooDriver._keycode(None, "a"), 12)   # 100 s later: switched to French, read again
         self.assertEqual(run.call_count, 2)
 
+    def test_a_failed_read_stays_failed(self):
+        import io, subprocess as sp
+        from contextlib import redirect_stderr
+        from unittest import mock
+        PeekabooDriver._key_blobs = {}
+        err = io.StringIO()
+        with mock.patch("deskmind_hands.drivers.peekaboo.subprocess.run", side_effect=sp.TimeoutExpired("python", 20)) as run, \
+                mock.patch("deskmind_hands.drivers.peekaboo.time.monotonic", side_effect=[100.0, 500.0, 900.0]), \
+                redirect_stderr(err):
+            self.assertEqual([PeekabooDriver._keycode(None, "a") for _ in range(3)], [0, 0, 0])
+        self.assertEqual(run.call_count, 1)                    # not tried again every 30 s
+        self.assertEqual(err.getvalue().count("could not be made"), 1)
+
     def test_an_unreadable_layout_is_said_once(self):
         PeekabooDriver._key_blobs = {}
         runs = self.run_child([{}])

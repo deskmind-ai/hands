@@ -292,8 +292,9 @@ def replay(run_dir: Path) -> ReplayResult:
     from .runtime.loop import RunConfig, run_task
 
     manifest, records = load_trace(run_dir)
-    if not manifest.get("live"):
-        raise ValueError(f"{run_dir}: only `hands do` runs can be replayed so far")
+    task_file = Path(manifest.get("task_file") or "")
+    if not manifest.get("live") and not (manifest.get("task_file") and task_file.exists()):
+        raise ValueError(f"{run_dir}: only `hands do` runs, and task runs whose task file is here, can be replayed")
     obs_recs = [r for r in records if r.get("t") == "obs"]
     step_recs = [r for r in records if r.get("t") == "step"]
     summary = next((r for r in reversed(records) if r.get("t") == "summary"), {})
@@ -303,16 +304,33 @@ def replay(run_dir: Path) -> ReplayResult:
                 "unsupported": s.get("unsupported"), "indeterminate": s.get("indeterminate")}
                for s in step_recs if s.get("action")]
     replies = [(s.get("reply") or "", True) for s in step_recs if s.get("question")]
-    target = Path(manifest["target"]) if manifest.get("target") else None
-    app = manifest.get("app") or _first_app(obs_recs, manifest)
     budget = manifest.get("budget") or {}
-    task = live_task(manifest["goal"], target, app=app, apps=manifest.get("apps") or {},
-                     max_actions=budget.get("max_actions", 30), wall_clock_s=10 ** 9)
+    if manifest.get("live"):
+        target = Path(manifest["target"]) if manifest.get("target") else None
+        app = manifest.get("app") or _first_app(obs_recs, manifest)
+        task = live_task(manifest["goal"], target, app=app, apps=manifest.get("apps") or {},
+                         max_actions=budget.get("max_actions", 30), wall_clock_s=10 ** 9)
+    else:
+        # A task run (bench, gym): the task as its file says, with no clock. What the planner is shown depends on
+        # the goal, the observations and the results, all recorded; the workspace is only graded, here meaninglessly.
+        from deskmind_bench.task import load_task
+        task = load_task(task_file)
+        task.budget.max_actions = max(task.budget.max_actions, len(planned) + 1)
+        task.budget.wall_clock_s = 10 ** 9
+        task.changes = []
     driver = ReplayDriver([observation(r) for r in obs_recs], results)
     adapter = FollowAdapter(planned)
     scratch = Path(tempfile.mkdtemp(prefix="hands-replay-"))
-    ws = LiveWorkspace(root=scratch, ws=scratch / "ws", fixtures_dir=scratch)
-    (scratch / "ws").mkdir()
+    if manifest.get("live"):
+        ws = LiveWorkspace(root=scratch, ws=scratch / "ws", fixtures_dir=scratch)
+        (scratch / "ws").mkdir()
+    else:
+        # The task's own fixture where its repository has it (only the grade at the end reads the workspace).
+        from .env.workspace import Workspace
+        fixtures = task_file.resolve().parents[2] / "fixtures"
+        if not (task.fixture and (fixtures / task.fixture).exists()):
+            task.fixture = None
+        ws = Workspace.create(scratch, fixtures if fixtures.exists() else scratch)
     notes = []
     if obs_recs and not all(k in obs_recs[0] for k in FULL_TRACE_KEYS):
         notes.append("trace predates window titles and window lists: FOCUS_WINDOW options are empty")

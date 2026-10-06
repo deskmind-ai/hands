@@ -52,6 +52,30 @@ class Ask(unittest.TestCase):
         again = ask.build(ctx, state, mem=mem, seen={ctx.task.goal: first.seen_now}, prior=[], text_helper=None)
         self.assertIsNone(again.seen_now, "nothing new on screen: nothing to keep")
 
+    def test_ask_is_offered_with_a_text_helper(self):
+        """Replays never set a text helper, so the corpus does not reach this (review of #27)."""
+        ctx = context()
+        mem, state = rendered(ctx)
+        without = ask.build(ctx, state, mem=mem, seen={}, prior=[], text_helper=None)
+        self.assertNotIn("ASK", without.questions["operation"]["criteria"], "S01's goal is not ambiguous")
+        helped = ask.build(ctx, state, mem=mem, seen={}, prior=[], text_helper="http://helper.invalid")
+        self.assertIn("ASK", helped.questions["operation"]["criteria"])
+        ctx.asked = 1
+        once = ask.build(ctx, state, mem=mem, seen={}, prior=[], text_helper="http://helper.invalid")
+        self.assertNotIn("ASK", once.questions["operation"]["criteria"], "asked once already")
+
+    def test_what_an_earlier_phase_read_comes_first_among_the_values(self):
+        """HANDS_PRIOR_READ: lines read before this phase, offered whole and line by line, ahead of the rest. Replays
+        never set it either (review of #27)."""
+        ctx = context()
+        mem, state = rendered(ctx)
+        prior = [{"source": "Safari", "lines": ["Order R-3307", "Due 10/12"]}]
+        got = ask.build(ctx, state, mem=mem, seen={}, prior=prior, text_helper=None)
+        self.assertEqual(got.candidates[:3], ["Order R-3307\nDue 10/12\n", "Order R-3307", "Due 10/12"])
+        values = got.questions["type_text_value"]["criteria"]
+        self.assertEqual(values["2"], {"value": "Order R-3307"})
+        self.assertLessEqual(len(got.candidates), 24)
+
     def test_the_adapter_asks_what_the_stage_builds(self):
         from deskmind_hands.adapters.systemone import SystemOneAdapter
 

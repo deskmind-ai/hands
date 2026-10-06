@@ -20,6 +20,7 @@ Named by what the action targets, not by what the model meant:
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from ..actions import Action, ActionKind
 
@@ -95,6 +96,31 @@ _KINDS = (("send", r"发送|发 送|send|sends it"), ("delete", r"删除|废纸�
 def kind(what: str) -> str:
     """send / delete / pay / publish / share: a step and the confirmation it opens are one approval."""
     return next((k for k, pat in _KINDS if re.search(pat, what or "", re.I)), what)
+
+
+@dataclass
+class Approval:
+    """A person's yes to one step, and what it covers (protocol: approvals, deskmind#36 item 7). It is the harness's:
+    never in the planner's prompt, never made by the planner. It covers the step it was given for, on the observation
+    it was given on, and the confirmation that step opens -- the very next step, of the same kind in the same app, with
+    a dialog up that was not up when it was given (hands#14). Nothing else: not a later step of the same kind, not a
+    reply to a question the planner asked."""
+    what: str             # the step, as the person was asked about it
+    kind: str             # send / delete / pay / publish / share (kind())
+    app: str
+    step: int             # the trace's step count when it was given
+    observation_id: str
+    action: dict          # the action as it was to be carried out
+    dialog_before: bool   # a dialog was already up: a confirmation must be a new one
+
+    def covers(self, what: str, app: str, step: int, obs) -> bool:
+        """Whether this approval covers a step about to be taken: only its own confirmation."""
+        return (kind(what), app) == (self.kind, self.app) and step - self.step == 1 \
+            and dialog_up(obs) and not self.dialog_before
+
+    def record(self) -> dict:
+        """For the trace: what the person was asked to approve, and on which observation."""
+        return {"observation": self.observation_id, "action": self.action, "app": self.app}
 
 
 #: Roles a confirmation comes in, beside the driver's own flag for a modal alert or sheet.

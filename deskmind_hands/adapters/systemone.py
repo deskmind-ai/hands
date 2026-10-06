@@ -1622,7 +1622,7 @@ class SystemOneAdapter:
         # Asking is an action, not a failure. Without it the chooser answered BLOCKED on the one task written to
         # test exactly this: two orders match "Zhang Wei's order" and the goal names one.
         seen_text = ((state.get("page") or {}).get("text", "") + "\n" + self._seen_text.get(goal, ""))
-        asked = bool(ctx.dialogue)
+        asked = ctx.asked > 0   # its own questions; a yes to the harness's approval is not one (G16)
         if ctx.task.budget.max_dialogue_turns > 0 and not asked and (
                 self.text_helper or ambiguity_question(goal, seen_text)):
             operations["ASK"] = OPERATION_LABELS["ASK"]

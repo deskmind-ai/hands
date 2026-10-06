@@ -43,6 +43,7 @@ from ..geometry import (ImageTransform, Point, Rect, ScreenGeometry, Size,
 from ..apps import APPS
 from ..grounding import VOCAB, name_unnamed
 from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, vision_elements
+from . import keys
 from .base import (USER_BUSY, Driver, DriverUnavailable, Element, ExecResult, Observation, effect_notes,
                    WindowRef)
 
@@ -2054,15 +2055,33 @@ class PeekabooDriver:
             Q.CGEventPost(Q.kCGHIDEventTap, ev)
             time.sleep(0.05 if count == 1 else 0.02)
 
-    #: The key codes this driver presses: A and V (with cmd: select all, paste), Return.
-    _KEY_CODES = (0, 9, 36)
-    #: The key events, serialized: "<key code>:<1 down | 0 up>" -> bytes. Made once per process (see _key_event).
+    #: The key events, serialized: "<key code>:<1 down | 0 up>" -> bytes, and the key code that types each letter
+    #: the driver presses with cmd (select all, paste) on the user's layout. Made once per process (see _key_event).
     _key_blobs: dict = {}
-    _KEY_CHILD = (
-        "import base64, json, Quartz as Q\n"
-        "print(json.dumps({f'{k}:{int(d)}': base64.b64encode(bytes(Q.CGEventCreateData(None,"
-        " Q.CGEventCreateKeyboardEvent(None, k, d)))).decode() for k in %r for d in (True, False)}))\n"
-    )
+    _letter_codes: dict = {}
+
+    @classmethod
+    def _keycode(cls, Q, letter: str) -> int:
+        """The key code that types `letter` with cmd held on the current keyboard layout (drivers/keys.py)."""
+        cls._load_keys()
+        return cls._letter_codes.get(letter, keys.ANSI[letter])
+
+    @classmethod
+    def _load_keys(cls) -> None:
+        """The key events and the layout's letters, from a child process, once per process (see _key_event)."""
+        if cls._key_blobs:
+            return
+        import base64
+        try:
+            out = json.loads(subprocess.run([sys.executable, "-c", keys.CHILD], capture_output=True,
+                                            text=True, timeout=20).stdout)
+            cls._key_blobs = {k: base64.b64decode(v) for k, v in out["events"].items()}
+            cls._letter_codes = keys.pick_keycodes({int(k): v for k, v in out["table"].items()}, "av")
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            cls._key_blobs = {"failed": b""}
+            # Said once: from here the keys are made in this process, and the Dock tiles come back with them.
+            print(f"hands: key events could not be made in a child process ({type(exc).__name__}: {exc}); "
+                  f"making them here, which registers this run as an app (Dock tiles)", file=sys.stderr)
 
     @classmethod
     def _key_event(cls, Q, keycode: int, down: bool):
@@ -2075,17 +2094,7 @@ class PeekabooDriver:
         key this driver presses, and hands the events back as data; rebuilding them asks nothing. An event built by
         hand (type, key code, characters) is not the same thing: cmd+A and cmd+V built that way did nothing in a web
         view. If the child cannot be run, the events are made here as before."""
-        if not cls._key_blobs:
-            import base64
-            try:
-                out = subprocess.run([sys.executable, "-c", cls._KEY_CHILD % (cls._KEY_CODES,)], capture_output=True,
-                                     text=True, timeout=20).stdout
-                cls._key_blobs = {k: base64.b64decode(v) for k, v in json.loads(out).items()}
-            except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                cls._key_blobs = {"failed": b""}
-                # Said once: from here the keys are made in this process, and the Dock tiles come back with them.
-                print(f"hands: key events could not be made in a child process ({type(exc).__name__}: {exc}); "
-                      f"making them here, which registers this run as an app (Dock tiles)", file=sys.stderr)
+        cls._load_keys()
         raw = cls._key_blobs.get(f"{keycode}:{int(down)}")
         if not raw:
             return Q.CGEventCreateKeyboardEvent(None, keycode, down)
@@ -2221,13 +2230,15 @@ class PeekabooDriver:
                     pb.setString_forType_(text, NSPasteboardTypeString)
                     self._post_click(Q, x, y)
                     time.sleep(0.2)
-                    self._post_key(Q, 0, Q.kCGEventFlagMaskCommand)  # cmd+A: replace what is there
-                    self._post_key(Q, 9, Q.kCGEventFlagMaskCommand)  # cmd+V
+                    # By the letter, not key codes 0 and 9: on a French layout key code 0 is Q, and cmd+A arrived as
+                    # cmd+Q (deskmind#21).
+                    self._post_key(Q, self._keycode(Q, "a"), Q.kCGEventFlagMaskCommand)  # cmd+A: replace what is there
+                    self._post_key(Q, self._keycode(Q, "v"), Q.kCGEventFlagMaskCommand)  # cmd+V
                     # Long enough for the paste to land and cmd to be released before Return: at 0.15 s a web
                     # page's search box took the pasted query and never searched.
                     time.sleep(0.4)
                     if submit:
-                        self._post_key(Q, 36)                        # Return: a search box searches on Enter
+                        self._post_key(Q, keys.RETURN)               # Return: a search box searches on Enter
                         time.sleep(0.4)
                 finally:
                     pb.clearContents()

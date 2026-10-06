@@ -98,7 +98,7 @@ class Replies(unittest.TestCase):
 class Positions(unittest.TestCase):
     def test_only_1_to_n_names_a_candidate(self):
         self.assertEqual([systemone.position(k, 3) for k in ("1", "2", "3")], [0, 1, 2])
-        for key in ("0", "-1", "01", "+1", "4", "", " 1", "1.0", None, 1):
+        for key in ("0", "-1", "01", "+1", "4", "", " 1", "1.0", None, 1, "١", "²", "1\n"):
             self.assertIsNone(systemone.position(key, 3), repr(key))
 
     def test_a_value_key_0_is_not_the_last_candidate(self):

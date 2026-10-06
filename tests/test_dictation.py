@@ -29,6 +29,11 @@ class Dictation(unittest.TestCase):
         self.assertEqual(value_candidates("在 todo.txt 里写下：\n1. 买牛奶\n2. 交报告")[0], "1. 买牛奶\n2. 交报告\n")
         self.assertEqual(value_candidates("Open notes.txt and write these lines:\nalpha\nbeta")[0], "alpha\nbeta\n")
 
+    def test_a_list_written_down_stays_dictated_even_when_it_names_operations(self):
+        self.assertEqual(value_candidates("在 todo.txt 里写下：\n1. 打开邮箱\n2. 保存报告")[0], "1. 打开邮箱\n2. 保存报告\n")
+        # only the colon's own line counts: "记录" earlier does not make a list of steps text
+        self.assertFalse([v for v in value_candidates("整理记录文件夹，步骤：\n1. 把 a.txt 移到 归档\n2. 新建文件夹 旧") if "把" in v])
+
     def test_messages_without_a_writing_word_stay_dictated(self):
         self.assertEqual(value_candidates("把下面这段话发给 Lisa：\n周五的会改到下午三点。")[0], "周五的会改到下午三点。\n")
         self.assertEqual(value_candidates("回复他：\n收到，明天给你。")[0], "收到，明天给你。\n")

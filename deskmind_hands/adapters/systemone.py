@@ -1052,6 +1052,10 @@ class SystemOneAdapter:
         #: This turn's identity (run, step, observation) and the requests it sent, as {"id", "form"} (_ask).
         self._turn: dict = {}
         self.sent: list[dict] = []
+        #: Every reply of the current turn as the model gave it, before anything here acts on it: each head's choice
+        #: and full probabilities, and who answered (routing). The trace keeps them for calibration (deskmind#59,
+        #: "know when it doesn't know"); the decision record keeps only the top three operations.
+        self.replies: list[dict] = []
         self._value_cache: dict[tuple, str] = {}
         self._seen_text: dict[str, str] = {}
         self._read_by_window: dict[str, dict[str, str]] = {}
@@ -1141,6 +1145,10 @@ class SystemOneAdapter:
             # by position is the last candidate): a reply like that is not one to guess from (protocol review 10-06).
             raise AdapterUnavailable(f"system one endpoint {self.url} answered outside what it was asked: {bad}")
         answers = {k: a for k, a in answers.items() if k in asked}
+        self.replies.append({"id": ident["request_id"], **({"routing": self._routing} if self._routing else {}),
+                             "answers": {k: {f: a[f] for f in ("choice", "probabilities", "scored") if f in a}
+                                         for k, a in answers.items() if isinstance(a, dict)},
+                             **({"filled_here": sorted(fixed)} if fixed else {})})
         for k, q in fixed.items():
             only = next(iter(q["criteria"]))
             answers[k] = {"type": "choice", "choice": only, "confidence": 1.0, "probabilities": {only: 1.0}}
@@ -1558,6 +1566,7 @@ class SystemOneAdapter:
     def propose(self, ctx: TurnContext) -> Proposal:
         """One request, all heads: the operation and a target head per operation, exactly as the /v1/systemone protocol asks."""
         self.sent = []
+        self.replies = []
         self._turn = {k: v for k, v in (("session_id", ctx.run_id), ("step", ctx.step),
                                         ("observation_id", ctx.observation.id)) if v}
         self._keep_ledger(ctx)

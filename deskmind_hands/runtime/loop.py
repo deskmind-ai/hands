@@ -264,7 +264,8 @@ def run_task(
     digests: list[str] = []
     ineffective: list[str] = []
     last_typed_label: str | None = None          # the field the last successful TYPE_TEXT wrote into
-    just_approved: tuple[str, str, int] | None = None  # (kind, app, step count) of the last approval
+    # (kind, app, step count, a dialog was up) of the last approval: what its confirmation must match
+    just_approved: tuple[str, str, int, bool] | None = None
     fired: set[int] = set()
     state = RunState.PREPARING
     failure = Failure(FailureClass.NONE)
@@ -564,14 +565,18 @@ def run_task(
             what = (risk.risky(action, obs, last_typed_label, renames=cfg.confirm_renames)
                     if (cfg.approve_risky or cfg.refuse_risky) else None)
             # An approval is for one step, in one app: approving one "click 'Send'" once covered every later Send of
-            # the run, whatever it sent and in whichever app (10-02 review). The confirmation a just-approved step
-            # opens ("Delete" -> the dialog's "Delete message") is the same decision: not asked twice when it
-            # follows within two steps in the same app.
+            # the run, whatever it sent and in whichever app (10-02 review). The one step it also covers is the
+            # confirmation it opens itself ("Delete" -> the dialog's "Delete message"): the very next step, of the
+            # same kind in the same app, with a dialog up that was not up before. Anything else is asked again:
+            # "same kind, same app, within two steps" let approving "delete A" cover deleting B after a step in
+            # between (protocol review, 10-06).
             app_now = obs.focused_app or task.app or ""
-            if what and just_approved and just_approved[:2] == (risk.kind(what), app_now) \
-                    and len(steps) - just_approved[2] <= 2:
-                what = None
-                just_approved = None
+            if just_approved:
+                kind_, app_, at, dialog_before = just_approved
+                just_approved = None   # one chance: the next step is its confirmation, or nothing is
+                if what and (risk.kind(what), app_now) == (kind_, app_) and len(steps) - at == 1 \
+                        and risk.dialog_up(obs) and not dialog_before:
+                    what = None
             if what and not cfg.approve_risky:
                 # Nobody to ask: the step is not carried out, and the planner is told why (10-02 review: a CLI run
                 # without --ask sent and deleted unasked).
@@ -603,7 +608,7 @@ def run_task(
                     notice = (f"The user declined: {what}. It was not done. Do not try it another way; finish with "
                               f"what is done, or stop if nothing else is left to do.")
                     continue
-                just_approved = (risk.kind(what), app_now, len(steps))
+                just_approved = (risk.kind(what), app_now, len(steps), risk.dialog_up(obs))
             times["t_act_start"] = round(time.time(), 3)
             res: ExecResult = driver.execute(action)
             times["t_act_end"] = round(time.time(), 3)

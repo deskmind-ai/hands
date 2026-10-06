@@ -16,6 +16,7 @@ wrong field and reports success.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -967,6 +968,38 @@ def top_operations(answers: dict, k: int = 3) -> list[list]:
     return [[op, round(float(p), 2)] for op, p in sorted(probs.items(), key=lambda kv: -float(kv[1]))[:k]]
 
 
+def position(key, n: int) -> int | None:
+    """The 0-based candidate a 1-based position key names: exactly "1".."n". Not int(key) - 1, which reads "0" as
+    the last candidate and "-1" as the one before it, and takes "01" and "+1" as the first (protocol review 10-06)."""
+    if not isinstance(key, str) or not re.fullmatch(r"[1-9][0-9]*", key) or not int(key) <= n:
+        return None   # isdigit() would take "١" (Arabic-Indic one) and "²", which int() reads or chokes on
+    return int(key) - 1
+
+
+def unoffered(asked: dict, answers: dict) -> str | None:
+    """Why a reply is not about what was asked, or None. Every probability must be for an option the question
+    offered, and a finite number from 0 to 1; a choice must be offered too. hands acts on the probabilities, so a
+    reply whose choice is fine but whose mass sits on an option nobody offered is not fine."""
+    for qid, q in asked.items():
+        a = answers.get(qid)
+        if a is None or not isinstance(q, dict) or q.get("type") != "choice":
+            continue
+        offered = set(q.get("criteria") or ())
+        if not isinstance(a, dict):
+            return f"{qid}: the answer is not an object"
+        probs = a.get("probabilities") or {}
+        if not isinstance(probs, dict):
+            return f"{qid}: probabilities are not an object"
+        for key, p in probs.items():
+            if key not in offered:
+                return f"{qid}: a probability for {key!r}, which was not offered"
+            if isinstance(p, bool) or not isinstance(p, (int, float)) or not math.isfinite(p) or not 0 <= p <= 1:
+                return f"{qid}: probability {p!r} for {key!r}"
+        if "choice" in a and a["choice"] not in offered:
+            return f"{qid}: chose {a['choice']!r}, which was not offered"
+    return None
+
+
 class SystemOneAdapter:
     """Typed-choice planner. Text channel only: it never receives the screenshot."""
 
@@ -1034,6 +1067,12 @@ class SystemOneAdapter:
         except Exception as exc:
             said = server_message(exc)
             raise AdapterUnavailable(f"system one endpoint {self.url} failed: {exc}" + (f" -- {said}" if said else "")) from exc
+        bad = unoffered(asked, answers)
+        if bad:
+            # Acted on, an answer about an option that was not offered becomes some other option (a key "0" read
+            # by position is the last candidate): a reply like that is not one to guess from (protocol review 10-06).
+            raise AdapterUnavailable(f"system one endpoint {self.url} answered outside what it was asked: {bad}")
+        answers = {k: a for k, a in answers.items() if k in asked}
         for k, q in fixed.items():
             only = next(iter(q["criteria"]))
             answers[k] = {"type": "choice", "choice": only, "confidence": 1.0, "probabilities": {only: 1.0}}
@@ -1755,10 +1794,10 @@ class SystemOneAdapter:
         answer = None
         if op == "ANSWER":
             key, a_conf = self._pick(answers.get("answer_value", {}))
-            try:
-                answer = answer_cands[int(key) - 1]
-            except (TypeError, ValueError, IndexError):
+            i = position(key, len(answer_cands))
+            if i is None:
                 return self._refuse("planner chose an answer that was not offered", answers, t0)
+            answer = answer_cands[i]
             confidence = min(op_conf, a_conf)
             stop_by = "answer"
             action = Action(kind=ActionKind.DONE, text=f"answer: {answer}", binding=b, raw=answers)
@@ -1919,10 +1958,8 @@ class SystemOneAdapter:
     def _chosen_value(answers: dict, candidates: list[str]) -> str | None:
         """The candidate the model picked, or None when it was not asked or picked nothing offered."""
         index, _ = SystemOneAdapter._pick(answers.get("type_text_value", {}))
-        try:
-            return candidates[int(index) - 1]
-        except (TypeError, ValueError, IndexError):
-            return None
+        i = position(index, len(candidates))
+        return None if i is None else candidates[i]
 
     def _field_value(self, goal: str, element: dict, state: dict) -> str | None:
         """Ask the text helper for the exact string to type. Returns None when it declines or is not configured.

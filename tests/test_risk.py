@@ -109,7 +109,8 @@ class LoopTest(unittest.TestCase):
     def test_approved_steps_run(self):
         user = User(approve=True)
         res, ws = self.run_s01(user)
-        self.assertEqual(len(user.asked), 1, "the same step, once approved, is not asked again")
+        # Selecting the row and pressing Rename are two steps, each asked once; neither is asked twice.
+        self.assertEqual(len(user.asked), 2)
         self.assertTrue(all(approval for _, approval in user.asked))
         self.assertTrue((ws.ws / "final.txt").exists())
 
@@ -138,9 +139,11 @@ class LoopTest(unittest.TestCase):
 
 class OneStepApprovals(unittest.TestCase):
     """An approval covers one step: approving one "click 'Send'" covered every later Send of the run, whatever it
-    sent (10-02 review). The confirmation right after an approved step is still the same decision."""
+    sent (10-02 review). The one step it also covers is the confirmation that step opens itself: approving "delete A"
+    then covered deleting B after a step in between, because only the kind, the app and "within two steps" were
+    compared (protocol review, 10-06)."""
 
-    def run_actions(self, actions):
+    def run_actions(self, actions, confirms=False):
         import tempfile
         from deskmind_hands.adapters.scripted import ReplayAdapter
         from deskmind_hands.drivers.mock import MockDriver
@@ -151,30 +154,61 @@ class OneStepApprovals(unittest.TestCase):
         task = load_task(repo / "tasks" / "smoke" / "S01-rename.yaml")
         ws = Workspace.create(Path(tempfile.mkdtemp()), repo / "fixtures")
         user = User(approve=True)
+        driver = MockDriver(render=False)
+        if confirms:   # deleting a row opens a confirmation, as Mail's "Delete" does
+            execute = driver.execute
+
+            def with_confirmation(action):
+                res = execute(action)
+                if action.kind is ActionKind.CLICK and (action.binding.element_id or "").startswith("row:") and res.ok:
+                    driver.inject("modal", {"text": "Delete this item?"})
+                return res
+            driver.execute = with_confirmation
+        risky = {"row:draft.txt": "click 'Delete'", "row:notes.txt": "click 'Delete'", "btn:modal_ok": "click 'Delete message'"}
         real = risk.risky
-        risk.risky = lambda a, o, last=None, **kw: ("click 'Send'" if a.kind is ActionKind.CLICK
-                                              and a.binding.element_id == "row:draft.txt" else None)
+        risk.risky = lambda a, o, last=None, **kw: (risky.get(a.binding.element_id) if a.kind is ActionKind.CLICK
+                                                    else None)
         try:
-            run_task(task, MockDriver(render=False), ReplayAdapter(actions), ws,
-                     config=RunConfig(user=user, approve_risky=True))
+            run_task(task, driver, ReplayAdapter(actions), ws, config=RunConfig(user=user, approve_risky=True))
         finally:
             risk.risky = real
-        return user.asked
+        return [q for q, _ in user.asked]
 
-    CLICK = {"kind": "click", "binding": {"element_id": "row:draft.txt"}}
-    WAIT = {"kind": "click", "binding": {"element_id": "row:notes.txt"}}   # not risky: a step in between
+    A = {"kind": "click", "binding": {"element_id": "row:draft.txt"}}
+    B = {"kind": "click", "binding": {"element_id": "row:notes.txt"}}
+    OK = {"kind": "click", "binding": {"element_id": "btn:modal_ok"}}
+    STEP = {"kind": "click", "binding": {"element_id": "row:report.txt"}}   # not risky: a step in between
+    DONE = {"kind": "done"}
 
     def test_a_later_send_is_asked_again(self):
-        asked = self.run_actions([self.CLICK, self.WAIT, self.WAIT, self.WAIT, self.CLICK, {"kind": "done"}])
-        self.assertEqual(len(asked), 2)
+        self.assertEqual(len(self.run_actions([self.A, self.STEP, self.STEP, self.STEP, self.A, self.DONE])), 2)
 
-    def test_the_confirmation_right_after_is_not_asked_twice(self):
-        asked = self.run_actions([self.CLICK, self.CLICK, {"kind": "done"}])
-        self.assertEqual(len(asked), 1)
+    def test_the_confirmation_it_opens_is_not_asked_twice(self):
+        asked = self.run_actions([self.A, self.OK, self.DONE], confirms=True)
+        self.assertEqual(len(asked), 1, asked)
 
-    def test_one_confirmation_per_approval(self):
-        asked = self.run_actions([self.CLICK, self.CLICK, self.CLICK, {"kind": "done"}])
-        self.assertEqual(len(asked), 2)
+    def test_another_target_after_a_step_in_between_is_asked(self):
+        """The review's case: approve deleting A, one other step, then delete B -- same kind, same app, two steps."""
+        self.assertEqual(len(self.run_actions([self.A, self.STEP, self.B, self.DONE])), 2)
+
+    def test_the_next_step_without_a_confirmation_is_asked(self):
+        """No dialog came up: the next delete is another deletion, not the confirmation of the first."""
+        self.assertEqual(len(self.run_actions([self.A, self.B, self.DONE])), 2)
+        self.assertEqual(len(self.run_actions([self.A, self.A, self.A, self.DONE])), 3)
+
+    def test_the_dialog_must_be_one_the_step_opened(self):
+        from deskmind_hands.runtime import risk as r
+
+        class Obs:
+            dialog, elements = False, []
+        self.assertFalse(r.dialog_up(Obs()))
+        Obs.dialog = True
+        self.assertTrue(r.dialog_up(Obs()))
+
+        class El:
+            role = "AXSheet"
+        Obs.dialog, Obs.elements = False, [El()]
+        self.assertTrue(r.dialog_up(Obs()), "a sheet counts as the dialog")
 
 
 class AskRecord(unittest.TestCase):

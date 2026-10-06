@@ -971,8 +971,8 @@ def top_operations(answers: dict, k: int = 3) -> list[list]:
 def position(key, n: int) -> int | None:
     """The 0-based candidate a 1-based position key names: exactly "1".."n". Not int(key) - 1, which reads "0" as
     the last candidate and "-1" as the one before it, and takes "01" and "+1" as the first (protocol review 10-06)."""
-    if not isinstance(key, str) or not key.isdigit() or key.startswith("0") or not 1 <= int(key) <= n:
-        return None
+    if not isinstance(key, str) or not re.fullmatch(r"[1-9][0-9]*", key) or not int(key) <= n:
+        return None   # isdigit() would take "١" (Arabic-Indic one) and "²", which int() reads or chokes on
     return int(key) - 1
 
 

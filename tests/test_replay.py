@@ -5,6 +5,7 @@ difference; if the change is meant, `python tools/harness_replay.py check --upda
 change to what the planner sees -- tell whoever trains it)."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import unittest
@@ -37,6 +38,22 @@ class ReplaySnapshots(unittest.TestCase):
                 self.assertEqual(systemone.HOME_NAME, name, "the replay puts the login name back")
         finally:
             systemone.HOME_NAME = saved
+
+    def test_a_reordering_is_a_difference(self):
+        """The order of a question's options sets the letters the planner answers with (brain#8: re-sorted, the same
+        model fell from 220 to about 130 of 223 valid steps). The snapshots were written and compared with sorted
+        keys, so a harness change that reordered the options passed."""
+        import harness_replay
+        from deskmind_hands.replay import normalize
+        want = {"criteria": {"1": "a", "2": "b", "10": "c"}}
+        got = {"criteria": {"1": "a", "10": "c", "2": "b"}}
+        self.assertEqual(harness_replay.first_difference(want, got),
+                         "/criteria: key 2 is '2' expected, '10' now")
+        self.assertIsNone(harness_replay.first_difference(want, want))
+        self.assertEqual(list(normalize(want)["criteria"]), ["1", "2", "10"], "normalize keeps the order")
+        case = next(p for p in harness_replay.CASES.iterdir() if (p / "expected.json").exists())
+        first = json.loads((case / "expected.json").read_text(encoding="utf-8"))["requests"][0]["questions"]
+        self.assertEqual(next(iter(first)), "operation", f"{case.name}: the snapshot is in the order sent")
 
     def test_a_changed_option_is_a_divergence(self):
         """The recorded choice missing from the options is reported, not guessed around."""

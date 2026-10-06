@@ -42,6 +42,10 @@ class TurnContext:
     #: Element ids that were acted on without changing the screen, since the last real change. A chooser adapter
     #: should stop offering them; a text adapter gets the same fact through ``notice``.
     ineffective: tuple[str, ...] = ()
+    #: Which run and which step this decision is for (protocol: Request identity): the trace's own numbering, so a
+    #: server's log and the run's trace can be joined.
+    run_id: str = ""
+    step: int = 0
 
 
 @dataclass

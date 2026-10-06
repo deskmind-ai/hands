@@ -15,6 +15,7 @@ wrong field and reports success.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -23,6 +24,7 @@ from pathlib import Path
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 from ..actions import Action, ActionError, ActionKind, Binding
 from ..apps import APPS
@@ -1047,6 +1049,9 @@ class SystemOneAdapter:
         self.text_helper = text_helper
         self._labels: dict[str, str] = {}
         self._forms: tuple[str, ...] | None = None   # the criteria forms the server reads (_criteria_forms)
+        #: This turn's identity (run, step, observation) and the requests it sent, as {"id", "form"} (_ask).
+        self._turn: dict = {}
+        self.sent: list[dict] = []
         self._value_cache: dict[tuple, str] = {}
         self._seen_text: dict[str, str] = {}
         self._read_by_window: dict[str, dict[str, str]] = {}
@@ -1106,10 +1111,16 @@ class SystemOneAdapter:
                  if local_only and q.get("type") == "choice" and len(q.get("criteria") or {}) == 1}
         asked = fit_choices({k: q for k, q in questions.items() if k not in fixed})
         self.last_request = {"state": state, "model": self.model, "questions": asked}
+        # Which run, step and observation this is for (protocol: Request identity); a server that does not read
+        # them ignores them. Not in last_request: that is what replays compare, and a request id is new every time.
+        form = "list" if "list" in self._criteria_forms() else "object"
+        ident = {"request_id": uuid.uuid4().hex, **self._turn,
+                 "state_digest": "sha256:" + hashlib.sha256(json.dumps(state, ensure_ascii=False,
+                                                                        separators=(",", ":")).encode()).hexdigest()}
+        self.sent.append({"id": ident["request_id"], "form": form})
         # The options go as a list where the server reads one, so their order is the request's and nothing on the
         # way can sort it; what is recorded and checked here stays the object form.
-        wire = ({**self.last_request, "questions": list_form(asked)} if "list" in self._criteria_forms()
-                else self.last_request)
+        wire = {**self.last_request, **ident, **({"questions": list_form(asked)} if form == "list" else {})}
         body = json.dumps(wire).encode()
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -1546,6 +1557,9 @@ class SystemOneAdapter:
 
     def propose(self, ctx: TurnContext) -> Proposal:
         """One request, all heads: the operation and a target head per operation, exactly as the /v1/systemone protocol asks."""
+        self.sent = []
+        self._turn = {k: v for k, v in (("session_id", ctx.run_id), ("step", ctx.step),
+                                        ("observation_id", ctx.observation.id)) if v}
         self._keep_ledger(ctx)
         state = self._state(ctx)
         elements = state["elements"]

@@ -3,6 +3,7 @@ first passes, when a state holds -- each once, done to the environment and recor
 the user says reaches the planner as the user's own words. A task without changes runs exactly as before."""
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -30,33 +31,34 @@ class Seeing:
         return {}
 
 
-def run(changes, checks=()):
+def run(changes, checks=(), adapter=None):
     from deskmind_bench.task import Change, Checkpoint, load_task
     from deskmind_hands.env.workspace import Workspace
+    from deskmind_hands.record.recorder import Recorder
     from deskmind_hands.runtime.loop import RunConfig, run_task
     task = load_task(REPO / "tasks" / "smoke" / "S01-rename.yaml")
     task.changes = [Change(id=c, type=t, trigger=trig, effect=eff) for c, t, trig, eff in changes]
     task.checkpoints = task.checkpoints + [Checkpoint(name=n, check=c) for n, c in checks]
     ws = Workspace.create(Path(tempfile.mkdtemp()), REPO / "fixtures")
-    adapter = Seeing()
-    res = run_task(task, MockDriver(render=False), adapter, ws, config=RunConfig())
+    ws.rec = Recorder(ws.root / "run")
+    adapter = adapter or Seeing()
+    try:
+        res = run_task(task, MockDriver(render=False), adapter, ws, config=RunConfig(), recorder=ws.rec)
+    finally:
+        ws.rec.close()
     return res, ws, adapter
 
 
-def fired_at(res) -> dict[str, int]:
-    """change id -> how many actions had been taken when it fired."""
-    out, acted = {}, 0
-    for s in res.steps:
-        if "change" in s:
-            out[s["change"]] = acted
-        elif "action" in s:
-            acted += 1
-    return out
+def fired_at(res, ws) -> dict[str, int]:
+    """change id -> how many actions had been taken when it fired, from the trace."""
+    trace = [json.loads(line) for line in (ws.rec.dir / "trace.jsonl").read_text().splitlines()]
+    acted = lambda n: sum(1 for s in res.steps if "action" in s and s["n"] < n)   # noqa: E731
+    return {r["change"]: acted(r["n"]) for r in trace if r.get("t") == "change"}
 
 
 def record(ws):
     from deskmind_bench.dyn import events as ev
-    return ev.read(ws.root / "changes.jsonl")
+    return ev.read(ws.rec.dir / "changes.jsonl")
 
 
 TOUCH = lambda name: [{"fs": {"op": "touch", "path": f"$WS/{name}"}}]   # noqa: E731
@@ -65,18 +67,18 @@ TOUCH = lambda name: [{"fs": {"op": "touch", "path": f"$WS/{name}"}}]   # noqa: 
 class Triggers(unittest.TestCase):
     def test_at_start_fires_before_the_first_action(self):
         res, ws, _ = run([("c1", "file_moved", {"at_start": True}, TOUCH("early.txt"))])
-        self.assertEqual(fired_at(res), {"c1": 0})
+        self.assertEqual(fired_at(res, ws), {"c1": 0})
         self.assertTrue((ws.ws / "early.txt").exists())
         self.assertEqual([(r["t"], r["change_id"]) for r in record(ws)], [("change_fired", "c1")])
 
     def test_at_action_fires_before_that_action_is_carried_out(self):
         res, ws, _ = run([("c2", "file_moved", {"at_action": 2}, TOUCH("mid.txt"))])
-        self.assertEqual(fired_at(res), {"c2": 2})
+        self.assertEqual(fired_at(res, ws), {"c2": 2})
         self.assertEqual(len(record(ws)), 1, "fired once")
 
     def test_at_checkpoint_fires_once_the_checkpoint_passes(self):
         res, ws, _ = run([("c3", "file_moved", {"at_checkpoint": "renamed"}, TOUCH("late.txt"))])
-        self.assertEqual(fired_at(res), {"c3": 4}, "right after the rename (the 4th action), before `done`")
+        self.assertEqual(fired_at(res, ws), {"c3": 4}, "right after the rename (the 4th action), before `done`")
         self.assertEqual(res.state.value, "completed", res.failure)
 
     def test_an_unknown_checkpoint_is_an_error_not_a_silent_skip(self):
@@ -90,7 +92,7 @@ class Triggers(unittest.TestCase):
     def test_at_state_fires_when_the_state_holds(self):
         res, ws, _ = run([("c4", "file_moved", {"at_state": {"file_absent": {"path": "$WS/draft.txt"}}},
                            TOUCH("gone.txt"))])
-        self.assertEqual(fired_at(res), {"c4": 4})
+        self.assertEqual(fired_at(res, ws), {"c4": 4})
 
     def test_what_the_user_says_reaches_the_planner_as_theirs(self):
         res, ws, adapter = run([("u1", "user_amend", {"at_action": 1}, [{"user_says": "名字用 final.txt 就行"}])])
@@ -99,17 +101,63 @@ class Triggers(unittest.TestCase):
         self.assertNotIn(("（用户主动说）", "名字用 final.txt 就行"), adapter.seen[1])
         self.assertIn(("（用户主动说）", "名字用 final.txt 就行"), adapter.seen[2], "shown on the next turn")
 
-    def test_the_final_grade_sees_the_run_directory(self):
-        res, ws, _ = run([("c5", "file_moved", {"at_start": True}, TOUCH("early.txt"))],
-                         checks=[("nothing_after", {"no_mutation_after": {"change": "c5"}})])
-        self.assertFalse(res.grade.error, res.grade.error)
-        cp = res.grade.checkpoints["nothing_after"]
-        self.assertTrue(cp.ok, cp.detail)          # the rename came after the change; nothing reads as a write here
+    def test_changes_are_not_steps(self):
+        """Review of #22: a change in `steps` read as the agent's own step to the repetition and back-and-forth
+        checks and moved the approval's step numbers. The steps of a run are the same with or without changes."""
+        plain, _, _ = run([])
+        res, ws, _ = run([("c1", "file_moved", {"at_start": True}, TOUCH("a.txt")),
+                          ("c2", "file_moved", {"at_action": 2}, TOUCH("b.txt"))])
+        shape = lambda r: [(s["n"], s.get("describe") or s.get("kind")) for s in r.steps]   # noqa: E731
+        self.assertEqual(shape(res), shape(plain))
+        self.assertEqual(len(record(ws)), 2)
+
+    def test_a_dialog_is_closed_however_the_run_ends(self):
+        """An interrupted run still closes the dialog it put up and records it as not handled."""
+        from unittest import mock
+
+        class Open:
+            def __init__(self, *a, **k):
+                self.killed, self.stdout = False, None
+
+            def poll(self):
+                return 0 if self.killed else None
+
+            def kill(self):
+                self.killed = True
+
+        class Interrupted(Seeing):
+            def propose(self, ctx):
+                if len(self.seen) == 2:
+                    raise KeyboardInterrupt
+                return super().propose(ctx)
+
+        procs = []
+        with mock.patch("deskmind_bench.dyn.inject.subprocess.Popen", side_effect=lambda *a, **k: procs.append(Open()) or procs[-1]):
+            with self.assertRaises(KeyboardInterrupt):
+                run([("p1", "popup", {"at_start": True}, [{"dialog": {"text": "?", "buttons": ["好"]}}])],
+                    adapter=Interrupted())
+        self.assertTrue(procs and procs[0].killed, "the dialog was closed")
+
+    def test_a_refused_change_ends_the_run_as_an_error_not_a_crash(self):
+        res, ws, _ = run([("bad", "file_moved", {"at_start": True}, [{"fs": {"op": "rm", "path": "$WS"}}])])
+        self.assertEqual(res.state.value, "errored")
+        self.assertIn("workspace itself", res.failure.detail)
+        self.assertTrue((ws.ws / "draft.txt").exists())
+
+    def test_the_final_grade_reads_the_run(self):
+        """The dyn checks get the run directory: the rename is a write after a change at the start, and none after
+        a change fired once the rename was done."""
+        for trigger, want in (({"at_start": True}, False), ({"at_checkpoint": "renamed"}, True)):
+            res, ws, _ = run([("c5", "file_moved", trigger, TOUCH("x.txt"))],
+                             checks=[("nothing_after", {"no_mutation_after": {"change": "c5"}})])
+            self.assertFalse(res.grade.error, res.grade.error)
+            cp = res.grade.checkpoints["nothing_after"]
+            self.assertEqual(cp.ok, want, cp.detail)
 
     def test_a_task_without_changes_records_nothing(self):
         res, ws, _ = run([])
-        self.assertEqual(fired_at(res), {})
-        self.assertFalse((ws.root / "changes.jsonl").exists())
+        self.assertEqual(fired_at(res, ws), {})
+        self.assertFalse((ws.rec.dir / "changes.jsonl").exists())
         self.assertEqual(res.state.value, "completed", res.failure)
 
 

@@ -349,19 +349,18 @@ def run_task(
             if c.id in injector.fired or not _change_due(c, ctx, m.actions, by_name):
                 continue
             said = injector.fire(c)
-            entry = {"n": len(steps) + 1, "change": c.id, "type": c.type}
-            steps.append(entry)
+            # In the trace, by the step it came before -- never in `steps`: the repetition and back-and-forth checks
+            # and the approval's step arithmetic read those as the agent's own steps.
             if recorder:
-                recorder.step(entry)
+                recorder._write({"t": "change", "n": len(steps) + 1, "change": c.id, "type": c.type})
             for text in said:
-                dialogue.append({"n": len(steps), "kind": "user_says", "question": INTERJECTION[lang],
+                dialogue.append({"n": len(steps) + 1, "kind": "user_says", "question": INTERJECTION[lang],
                                  "reply": text, "by": "user"})
-
-    fire_changes()
 
     t_start = time.perf_counter()
     state = RunState.RUNNING
     try:
+        fire_changes()   # inside the try: a change the injector refuses ends the run as an error, not a crash
         while True:
             if m.total_s or True:
                 m.total_s = time.perf_counter() - t_start
@@ -793,14 +792,17 @@ def run_task(
         cls = (FailureClass.ENVIRONMENT if classify(text) in (Kind.ENVIRONMENT, Kind.TRANSIENT)
                else FailureClass.HARNESS_BUG)
         failure = Failure(cls, text, auto=True)
+    finally:
+        # How each injected dialog was answered, or that it was left open -- and an open one closed, however the
+        # run ended (an interrupt included): a dialog left up would sit on the user's screen.
+        if injector is not None:
+            try:
+                injector.close()
+            except Exception:  # noqa: BLE001 - bookkeeping must not fail a run
+                pass
 
     m.total_s = time.perf_counter() - t_start
     m.user_wait_s = asked_s + float(getattr(driver, "user_wait_s", 0.0) or 0.0)
-    if injector is not None:
-        try:
-            injector.close()   # how each injected dialog was answered, or that it was left open
-        except Exception:  # noqa: BLE001 - bookkeeping must not fail a run
-            pass
 
     try:
         final_driver_state = driver.state()

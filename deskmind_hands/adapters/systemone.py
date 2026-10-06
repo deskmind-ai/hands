@@ -369,9 +369,11 @@ def replace_edit(goal: str, full: str, old: str, new: str) -> str | None:
     return None if old == new else full.replace(old, new, 1)
 
 
-#: Words that ask for text to be written, before a dictated block: "逐字写入下面两行：", "write these lines:".
-DICTATE = re.compile(r"写|输入|填|录入|记下|记录|粘贴|内容|文字|一行|两行|几行|\btype\b|\bwrite\b|\benter\b|\bfill\b|\bpaste\b|"
-                     r"\brecord\b|\bnote\b|\btext\b|\blines?\b", re.I)
+#: A numbered or bulleted step ("1.", "2)", "-", "•", "一、"), and a file operation named in it: a goal's list of
+#: things to do, not lines to type (value_candidates).
+STEP = re.compile(r"^\s*(?:\d{1,2}[.)、．]|[-•*]|[一二三四五六七八九十]、)\s*")
+STEP_OP = re.compile(r"把|改名|重命名|移到|移动|放进|放到|新建|创建|删除|删掉|复制|拷贝|打开|关闭|保存|"
+                     r"\b(?:rename|move|put|create|make|delete|remove|copy|open|close|save)\b", re.I)
 
 
 def value_candidates(goal: str, visible_text: str = "", limit: int = 14) -> list[str]:
@@ -400,18 +402,20 @@ def value_candidates(goal: str, visible_text: str = "", limit: int = 14) -> list
     # line, two, three -- because where the dictation ends is not always marked ("...写下：<two lines> 写完保存。"),
     # and ranked after everything else it was cut at the candidate limit: the one value that task needed was
     # never offered.
-    # Only when what leads up to the colon asks for writing: "请依次完成下面几件事：" followed by a numbered list is a list
-    # of things to do, and offered as text to type, one of its lines became a file's new name (deskmind#26). A to-do
-    # list written INTO a file ("在 todo.txt 里写下：1. 买牛奶") still asks for writing, and is still dictated.
-    dictated, block, lead = False, [], []
+    dictated, block = False, []
     for line in goal.splitlines():
         line = line.strip()
         if dictated and line and len(line) <= 200:
             block.append(line)
         elif block:
             break
-        lead.append(line)
-        dictated = dictated or (line.endswith(("\uff1a", ":")) and bool(DICTATE.search(" ".join(lead))))
+        dictated = dictated or line.endswith(("\uff1a", ":"))
+    # Except a list of steps: "请依次完成下面几件事：\n1. 把 记录-81.txt 改名为 …" is things to do, not text, and offered
+    # as values, one of its lines became a file's new name (deskmind#26). Only when every line is a numbered step
+    # naming a file operation, so dictation that names no writing ("回复他：", "Send this message:") and a to-do list
+    # written into a file ("写下：\n1. 买牛奶") stay dictated.
+    if block and all(STEP.match(line) and STEP_OP.search(line) for line in block):
+        block = []
     for k in range(len(block), 0, -1):
         add("\n".join(block[:k]) + "\n", raw=True)
     for line in block:

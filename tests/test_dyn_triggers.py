@@ -154,6 +154,24 @@ class Triggers(unittest.TestCase):
             cp = res.grade.checkpoints["nothing_after"]
             self.assertEqual(cp.ok, want, cp.detail)
 
+    def test_a_write_and_a_change_a_fraction_of_a_millisecond_apart_keep_their_order(self):
+        """CI, #22: the rename's start was rounded to the millisecond -- up, past the change that fired a fraction
+        of a millisecond after it -- and the write read as made after the change. A clock that moves 10 us per
+        reading, from just past a half millisecond, puts the whole run in the gap."""
+        import itertools
+        from unittest import mock
+        from deskmind_bench.dyn.inject import Injector
+        tick = itertools.count()
+        clock = lambda: 1_791_300_000.0005 + next(tick) * 0.00001   # noqa: E731
+        with mock.patch("time.time", clock), mock.patch.dict(Injector.__init__.__kwdefaults__, {"clock": clock}):
+            res, ws, _ = run([("c5", "file_moved", {"at_checkpoint": "renamed"}, TOUCH("x.txt"))],
+                             checks=[("nothing_after", {"no_mutation_after": {"change": "c5"}})])
+        rename = next(s for s in res.steps if (s.get("detail") or "").startswith("renamed"))
+        fired = next(r["ts"] for r in record(ws) if r["t"] == "change_fired")
+        self.assertLess(rename["t_act_start"], fired)
+        cp = res.grade.checkpoints["nothing_after"]
+        self.assertTrue(cp.ok, cp.detail)
+
     def test_a_task_without_changes_records_nothing(self):
         res, ws, _ = run([])
         self.assertEqual(fired_at(res, ws), {})

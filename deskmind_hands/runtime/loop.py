@@ -381,8 +381,10 @@ def run_task(
                 break
 
             # Wall-clock times of each part of the step (epoch seconds), for lining a recording of the screen up with
-            # the trace: when the look began, when the planner was asked and answered, when the action ran.
-            times = {"t_obs_start": round(time.time(), 3)}
+            # the trace: when the look began, when the planner was asked and answered, when the action ran. Not
+            # rounded: the dyn checks order these against the injector's change times, and a write rounded up past a
+            # change that fired half a millisecond later read as a write after it (#22, CI).
+            times = {"t_obs_start": time.time()}
             try:
                 obs = driver.observe()
             except DriverUnavailable as exc:
@@ -516,9 +518,9 @@ def run_task(
             notice = None
 
             t0 = time.perf_counter()
-            times["t_decide_start"] = round(time.time(), 3)
+            times["t_decide_start"] = time.time()
             proposal = adapter.propose(ctx)
-            times["t_decide_end"] = round(time.time(), 3)
+            times["t_decide_end"] = time.time()
             # The requests this decision took, by id and the form their options went in: what joins this step to the
             # server's log (protocol: Request identity). Kept with the step's times, so every record of it has them.
             sent = getattr(adapter, "sent", None)
@@ -684,9 +686,9 @@ def run_task(
                               f"what is done, or stop if nothing else is left to do.")
                     continue
                 just_approved = approval
-            times["t_act_start"] = round(time.time(), 3)
+            times["t_act_start"] = time.time()
             res: ExecResult = driver.execute(action)
-            times["t_act_end"] = round(time.time(), 3)
+            times["t_act_end"] = time.time()
             res.effect, res.evidence = classify_effect(res)
             # Where the action landed, on the screen (after it ran: a generic control is placed while acting).
             screen_rect = getattr(driver, "screen_rect", None)

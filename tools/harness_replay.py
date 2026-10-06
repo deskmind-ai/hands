@@ -43,12 +43,16 @@ def _sanitize(text: str) -> str:
 #: recorded with (env.json) and every other one off, whatever the caller's environment: a run recorded through the
 #: app, with the DONE check on, replayed without it built two requests fewer.
 SWITCHES = ("HANDS_EFFECT_NOTES", "HANDS_ENV_SECTIONS", "HANDS_MARK_NEW", "HANDS_PROGRESS", "HANDS_LESSONS",
-            "HANDS_DONE_CHECK")
+            "HANDS_DONE_CHECK", "HANDS_COMPLETION_CHECK")
 
 
 def expected_of(case: Path) -> dict:
     env = json.loads((case / "env.json").read_text(encoding="utf-8")) if (case / "env.json").exists() else {}
-    with mock.patch.dict(os.environ, {k: "0" for k in SWITCHES} | env):
+    # No HANDS_* setting of the caller's reaches the replay, listed or not: HANDS_COMPLETION_CHECK, set in a shell,
+    # added a question to every request after the first, and a snapshot passed or failed by whose machine it ran on.
+    # (A switch read when a module is imported is out of reach here; none of those changes a request today.)
+    outside = {k: v for k, v in os.environ.items() if not k.startswith("HANDS_")}
+    with mock.patch.dict(os.environ, outside | {k: "0" for k in SWITCHES} | env, clear=True):
         r = replay(case)
     return {"result": r.to_json() | {"run": case.name},
             "requests": [normalize(q) for q in r.requests]}
@@ -106,6 +110,36 @@ def check(update: bool = False, only: list[str] | None = None) -> list[tuple[str
     return failures
 
 
+def coverage(only: list[str] | None = None) -> dict[str, dict[str, int]]:
+    """What the cases put to the planner, from their snapshots: how many requests asked each question, and offered
+    each operation. A path no case reaches is one a refactor can change unseen (deskmind#58, step 0)."""
+    heads: dict[str, int] = {}
+    ops: dict[str, int] = {}
+    for case in sorted(p for p in CASES.iterdir() if (p / "expected.json").exists()):
+        if only and case.name not in only:
+            continue
+        for req in json.loads((case / "expected.json").read_text(encoding="utf-8"))["requests"]:
+            for key, q in req["questions"].items():
+                heads[key] = heads.get(key, 0) + 1
+                if key == "operation":
+                    crit = q.get("criteria") or {}
+                    for op in (crit if isinstance(crit, dict) else [c.get("key") for c in crit]):
+                        ops[op] = ops.get(op, 0) + 1
+    return {"questions": heads, "operations": ops}
+
+
+def every_path() -> dict[str, set[str]]:
+    """Every question and operation the adapter can put to the planner."""
+    from deskmind_hands.adapters import systemone
+    heads = {"operation", "goal_complete", *(h for hs in systemone.HEADS.values() for h in hs)}
+    return {"questions": heads, "operations": set(systemone.OPERATION_LABELS) | set(systemone.HEADS)}
+
+
+def gaps(only: list[str] | None = None) -> dict[str, list[str]]:
+    seen, every = coverage(only), every_path()
+    return {k: sorted(every[k] - set(seen[k])) for k in every}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -117,7 +151,15 @@ def main() -> int:
     c = sub.add_parser("check")
     c.add_argument("--update", action="store_true")
     c.add_argument("cases", nargs="*")
+    sub.add_parser("coverage", help="which questions and operations the cases reach, and which none does")
     args = ap.parse_args()
+    if args.cmd == "coverage":
+        seen = coverage()
+        for kind, counts in seen.items():
+            print(f"{kind}: " + ", ".join(f"{k} {n}" for k, n in sorted(counts.items(), key=lambda kv: -kv[1])))
+        for kind, missing in gaps().items():
+            print(f"no case reaches these {kind}: {', '.join(missing) or 'none'}")
+        return 0
     os.environ.setdefault("HANDS_EFFECT_NOTES", "0")
     if args.cmd == "add":
         env = dict(e.split("=", 1) for e in args.env)

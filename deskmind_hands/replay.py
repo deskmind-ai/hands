@@ -185,7 +185,8 @@ class FollowAdapter(SystemOneAdapter):
     def _target(self, rec: dict, op: str, state: dict, questions: dict, answers: dict) -> None:
         action = rec.get("action") or {}
         eid = (action.get("binding") or {}).get("element_id")
-        text = action.get("text")
+        # An answer ends the run: its step has no action, and the text ("answer: ...") is on the step itself.
+        text = action.get("text") if action else rec.get("text")
 
         def pick(key: str, value, what: str) -> None:
             crit = (questions.get(key) or {}).get("criteria") or {}

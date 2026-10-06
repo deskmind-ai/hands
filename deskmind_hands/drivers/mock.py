@@ -224,7 +224,8 @@ class MockDriver:
             transform=ImageTransform.fit(PIXELS, 1456),
             screenshot_png=self._screenshot(els) if self._render else None,
             elements=els,
-            focused_app=self.modal and "Files(modal)" or self.focused_app,
+            focused_app="Files" if self.modal else self.focused_app,   # the dialog is Files', as on a real Mac
+            dialog=bool(self.modal),
             window_title=self.ws.name,
             windows=self._window_refs(),
             layout_version=self.layout_version,

@@ -97,6 +97,16 @@ def kind(what: str) -> str:
     return next((k for k, pat in _KINDS if re.search(pat, what or "", re.I)), what)
 
 
+#: Roles a confirmation comes in, beside the driver's own flag for a modal alert or sheet.
+_DIALOG_ROLES = {"dialog", "sheet", "alert", "axdialog", "axsheet", "axalert"}
+
+
+def dialog_up(obs) -> bool:
+    """A dialog or sheet is open: where the confirmation of an approved step appears."""
+    return bool(getattr(obs, "dialog", False)) or any((e.role or "").lower() in _DIALOG_ROLES
+                                                     for e in getattr(obs, "elements", None) or [])
+
+
 def question(what: str, app: str, goal: str) -> str:
     """The approval question, in the goal's language."""
     if re.search(r"[一-鿿]", goal or ""):

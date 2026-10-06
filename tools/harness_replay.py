@@ -62,13 +62,13 @@ def add(run: Path, name: str, env: dict[str, str] | None = None) -> Path:
     if env:
         (case / "env.json").write_text(json.dumps(env, indent=1, sort_keys=True) + "\n", encoding="utf-8")
     exp = expected_of(case)
-    (case / "expected.json").write_text(json.dumps(exp, ensure_ascii=False, indent=1, sort_keys=True) + "\n",
-                                        encoding="utf-8")
+    (case / "expected.json").write_text(json.dumps(exp, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     return case
 
 
 def first_difference(a, b, path: str = "") -> str | None:
-    """Where two JSON values first differ, as a path and the two values."""
+    """Where two JSON values first differ, as a path and the two values. Objects differ in key order too: the order
+    of a question's options sets the letters the planner answers with."""
     if type(a) is not type(b):
         return f"{path or '/'}: {json.dumps(a, ensure_ascii=False)[:160]} != {json.dumps(b, ensure_ascii=False)[:160]}"
     if isinstance(a, dict):
@@ -78,7 +78,8 @@ def first_difference(a, b, path: str = "") -> str | None:
             d = first_difference(a[k], b[k], f"{path}/{k}")
             if d:
                 return d
-        return None
+        i = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
+        return None if i is None else f"{path or '/'}: key {i + 1} is {list(a)[i]!r} expected, {list(b)[i]!r} now"
     if isinstance(a, list):
         for i, (x, y) in enumerate(zip(a, b)):
             d = first_difference(x, y, f"{path}[{i}]")
@@ -95,11 +96,10 @@ def check(update: bool = False, only: list[str] | None = None) -> list[tuple[str
         if only and case.name not in only:
             continue
         want = json.loads((case / "expected.json").read_text(encoding="utf-8"))
-        got = json.loads(json.dumps(expected_of(case), ensure_ascii=False, sort_keys=True))
+        got = json.loads(json.dumps(expected_of(case), ensure_ascii=False))
         diff = first_difference(want, got)
         if diff and update:
-            (case / "expected.json").write_text(json.dumps(got, ensure_ascii=False, indent=1, sort_keys=True) + "\n",
-                                                encoding="utf-8")
+            (case / "expected.json").write_text(json.dumps(got, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
             print(f"updated  {case.name}: {diff}")
         elif diff:
             failures.append((case.name, diff))

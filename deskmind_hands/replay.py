@@ -343,8 +343,10 @@ _VOLATILE = re.compile(r"(?:obs|elem)[-_]\d+|\b\d{10}(?:\.\d+)?\b|/private/tmp/[
 
 def normalize(request: dict) -> dict:
     """A request as it is compared across runs of the replay: element ids, timestamps and temporary paths stand
-    for themselves by position, so a diff shows what the planner was shown, not incidental numbering."""
-    text = json.dumps(request, ensure_ascii=False, sort_keys=True)
+    for themselves by position, so a diff shows what the planner was shown, not incidental numbering. Key order is
+    kept: the order of the options and of the state is part of what the planner is shown (brain#8: the same model
+    re-sorted fell from 220 to about 130 of 223 valid steps)."""
+    text = json.dumps(request, ensure_ascii=False)
     ids: dict[str, str] = {}
 
     def sub(m: re.Match) -> str:

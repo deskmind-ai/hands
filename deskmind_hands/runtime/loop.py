@@ -28,7 +28,7 @@ from .. import done_check
 from . import risk
 from ..env.workspace import Workspace
 from deskmind_bench.failures import Failure, FailureClass, no_progress
-from deskmind_bench.graders.primitives import GradeContext
+from deskmind_bench.graders.primitives import GradeContext, evaluate as grade_check
 from deskmind_bench.graders.score import Grade, grade as run_grader
 from deskmind_bench.task import Injection, Task
 from ..adapters.base import Adapter, AdapterUnavailable, Proposal, Turn, TurnContext
@@ -224,6 +224,36 @@ def _due_injections(task: Task, mutating_count: int, fired: set[int]) -> list[tu
     return out
 
 
+def _run_info(task: Task, workspace, recorder) -> dict:
+    """What a dynamic task's checks read beside the workspace (deskmind_bench.dyn): the run directory, where the
+    change record is, and the pristine fixture, to tell what the run changed."""
+    return {"dir": str(recorder.dir) if recorder else str(workspace.root),
+            "fixture_dir": str(workspace.fixtures_dir / task.fixture) if task.fixture else None}
+
+
+def _change_due(change, ctx: GradeContext, mutating_count: int, by_name: dict) -> bool:
+    """Whether a dynamic task's change should fire now. The loop fires the triggers it can see -- at start, before
+    the Nth write, when a checkpoint first passes, when a state holds; before_subgoal and on_ask belong to an
+    orchestrator."""
+    t = change.trigger
+    if "at_start" in t:
+        return True
+    if "at_action" in t:
+        return mutating_count >= int(t["at_action"])
+    if "at_checkpoint" in t:
+        cp = by_name.get(t["at_checkpoint"])
+        if cp is None:
+            raise ValueError(f"change {change.id}: no checkpoint named {t['at_checkpoint']!r}")
+        return grade_check(cp.check, ctx).ok
+    if "at_state" in t:
+        return grade_check(t["at_state"], ctx).ok
+    return False
+
+
+#: How a user's unprompted message appears among the answers the planner is shown, by the goal's language.
+INTERJECTION = {"zh": "（用户主动说）", "en": "(the user, unprompted)"}
+
+
 def _goal_met(task: Task, workspace, driver, sentinels) -> bool | None:
     try:
         ctxg = GradeContext(workspace=workspace.ws, vars=task.vars, clipboard=driver.clipboard(),
@@ -297,9 +327,40 @@ def run_task(
             driver.inject(inj.event, inj.params)
             fired.add(i)
 
+    # A dynamic task's changes (deskmind#62) are done to the environment by the bench's injector, never through the
+    # driver, and recorded in the run's changes.jsonl. What the user says is delivered as the user's own message.
+    injector = None
+    if getattr(task, "changes", None):
+        from deskmind_bench.dyn.inject import Injector
+        injector = Injector(workspace.ws, Path(_run_info(task, workspace, recorder)["dir"]), run_id,
+                            apps=tuple({task.app, *task.reset_apps}))
+    by_name = {c.name: c for c in task.checkpoints}
+    lang = "zh" if re.search(r"[\u4e00-\u9fff]", task.goal or "") else "en"
+
+    def fire_changes(states_only: bool = False) -> None:
+        """Fire what is due. Right after an action only the changes waiting on a state are looked at: a checkpoint
+        that just passed fires before the planner looks again, even when its next word is `done`."""
+        if injector is None:
+            return
+        ctx = GradeContext(workspace=workspace.ws, vars=task.vars, run=_run_info(task, workspace, recorder))
+        for c in task.changes:
+            if states_only and not {"at_checkpoint", "at_state"} & c.trigger.keys():
+                continue
+            if c.id in injector.fired or not _change_due(c, ctx, m.actions, by_name):
+                continue
+            said = injector.fire(c)
+            # In the trace, by the step it came before -- never in `steps`: the repetition and back-and-forth checks
+            # and the approval's step arithmetic read those as the agent's own steps.
+            if recorder:
+                recorder._write({"t": "change", "n": len(steps) + 1, "change": c.id, "type": c.type})
+            for text in said:
+                dialogue.append({"n": len(steps) + 1, "kind": "user_says", "question": INTERJECTION[lang],
+                                 "reply": text, "by": "user"})
+
     t_start = time.perf_counter()
     state = RunState.RUNNING
     try:
+        fire_changes()   # inside the try: a change the injector refuses ends the run as an error, not a crash
         while True:
             if m.total_s or True:
                 m.total_s = time.perf_counter() - t_start
@@ -320,8 +381,10 @@ def run_task(
                 break
 
             # Wall-clock times of each part of the step (epoch seconds), for lining a recording of the screen up with
-            # the trace: when the look began, when the planner was asked and answered, when the action ran.
-            times = {"t_obs_start": round(time.time(), 3)}
+            # the trace: when the look began, when the planner was asked and answered, when the action ran. Not
+            # rounded: the dyn checks order these against the injector's change times, and a write rounded up past a
+            # change that fired half a millisecond later read as a write after it (#22, CI).
+            times = {"t_obs_start": time.time()}
             try:
                 obs = driver.observe()
             except DriverUnavailable as exc:
@@ -455,9 +518,9 @@ def run_task(
             notice = None
 
             t0 = time.perf_counter()
-            times["t_decide_start"] = round(time.time(), 3)
+            times["t_decide_start"] = time.time()
             proposal = adapter.propose(ctx)
-            times["t_decide_end"] = round(time.time(), 3)
+            times["t_decide_end"] = time.time()
             # The requests this decision took, by id and the form their options went in: what joins this step to the
             # server's log (protocol: Request identity). Kept with the step's times, so every record of it has them.
             sent = getattr(adapter, "sent", None)
@@ -549,6 +612,7 @@ def run_task(
 
             # Injections fire between decision and execution, so the world can
             # change underneath an action the model already committed to.
+            fire_changes()
             for idx, inj in _due_injections(task, m.actions, fired):
                 fired.add(idx)
                 if inj.event in ("cancel", "pause", "restart"):
@@ -622,9 +686,9 @@ def run_task(
                               f"what is done, or stop if nothing else is left to do.")
                     continue
                 just_approved = approval
-            times["t_act_start"] = round(time.time(), 3)
+            times["t_act_start"] = time.time()
             res: ExecResult = driver.execute(action)
-            times["t_act_end"] = round(time.time(), 3)
+            times["t_act_end"] = time.time()
             res.effect, res.evidence = classify_effect(res)
             # Where the action landed, on the screen (after it ran: a generic control is placed while acting).
             screen_rect = getattr(driver, "screen_rect", None)
@@ -705,6 +769,7 @@ def run_task(
             history.append(Turn(action.to_json(), res.ok, res.detail, effect=res.effect))
             if recorder:
                 recorder.step(entry)
+            fire_changes(states_only=True)
 
     except AdapterUnavailable as exc:
         # The model or its provider dropped out mid-run. Reported as availability
@@ -729,6 +794,14 @@ def run_task(
         cls = (FailureClass.ENVIRONMENT if classify(text) in (Kind.ENVIRONMENT, Kind.TRANSIENT)
                else FailureClass.HARNESS_BUG)
         failure = Failure(cls, text, auto=True)
+    finally:
+        # How each injected dialog was answered, or that it was left open -- and an open one closed, however the
+        # run ended (an interrupt included): a dialog left up would sit on the user's screen.
+        if injector is not None:
+            try:
+                injector.close()
+            except Exception:  # noqa: BLE001 - bookkeeping must not fail a run
+                pass
 
     m.total_s = time.perf_counter() - t_start
     m.user_wait_s = asked_s + float(getattr(driver, "user_wait_s", 0.0) or 0.0)
@@ -739,7 +812,7 @@ def run_task(
         final_driver_state = {}
     ctxg = GradeContext(workspace=workspace.ws, vars=task.vars,
                         clipboard=driver.clipboard(), driver_state=final_driver_state,
-                        run={"state": state.value, "metrics": m.to_json()})
+                        run={"state": state.value, "metrics": m.to_json(), **_run_info(task, workspace, recorder)})
     g = run_grader(task, ctxg, sentinel_digests=sentinels)
 
     if g.error:

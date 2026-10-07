@@ -31,7 +31,7 @@ from ..apps import APPS
 from .base import AdapterUnavailable, Proposal, Turn, TurnContext
 from ..drivers.base import effect_notes, env_sections, mark_new
 from .. import lessons as lessons_store
-from ..pipeline import ask, render
+from ..pipeline import ask, policy, render
 
 
 #: Quote pairs that survive a Chinese keyboard, plus backticks. What sits inside one is almost always the exact
@@ -1094,6 +1094,8 @@ class SystemOneAdapter:
                     data = (json.load(r).get("data") or [{}])[0]
                 forms = data.get("criteria_forms") if isinstance(data, dict) else None
                 self._forms = tuple(forms) if isinstance(forms, list) else ("object",)
+                # The floors this model's calibration supports, where the server says (pipeline.policy).
+                self._floors = policy.Floors.from_server(data.get("floors") if isinstance(data, dict) else None)
             except urllib.error.HTTPError:
                 self._forms = ("object",)
             except Exception:
@@ -1308,6 +1310,7 @@ class SystemOneAdapter:
             return self._refuse(f"the model did not choose {', '.join(unscored)} for {op}; a placeholder is not acted on",
                                 answers, t0)
         answer = None
+        written: dict = {}   # the p of the value actually written, where it is not the head's top (pipeline.policy)
         if op == "ANSWER":
             key, a_conf = self._pick(answers.get("answer_value", {}))
             i = position(key, len(answer_cands))
@@ -1349,8 +1352,10 @@ class SystemOneAdapter:
                 return self._refuse(f"ASK without a question: {self._helper_error or 'no text helper'}", answers, t0)
             action = Action(kind=ActionKind.ASK_USER, text=question, options=tuple(options), binding=b, raw=answers)
         elif op == "TYPE_FOCUSED":
-            text = self._chosen_value(answers, candidates) or self._field_value(
-                goal, {"role": "the item being renamed"}, state)
+            text = self._chosen_value(answers, candidates)
+            if text is None:                          # a value the text helper made: no head chose it
+                written["type_text_value"] = None
+                text = self._field_value(goal, {"role": "the item being renamed"}, state)
             if text is None:
                 return self._refuse(f"TYPE_FOCUSED without a value: {self._helper_error or 'no text helper'}",
                                     answers, t0)
@@ -1393,6 +1398,8 @@ class SystemOneAdapter:
                     if edited is not None:
                         if rank:
                             overrode = f"REPLACE pair #{rank + 1} (first valid)"
+                        written = {"replace_from": float(p_old.get(str(i + 1), 0.0)),
+                                   "type_text_value": float(p_new.get(str(j + 1), 0.0))}
                         break
                 if edited is None:
                     return self._refuse("no offered pair of old text and new value is a valid edit of that field",
@@ -1421,6 +1428,7 @@ class SystemOneAdapter:
             elif op in ("TYPE_TEXT", "APPEND_TEXT"):
                 text = self._chosen_value(answers, candidates)
                 if text is None:                      # nothing offered fitted: fall back to the helper
+                    written["type_text_value"] = None
                     text = self._field_value(goal, chosen, state)
                 if text is None:
                     return self._refuse(f"TYPE_TEXT without a value: {self._helper_error or 'no text helper'}",
@@ -1459,7 +1467,15 @@ class SystemOneAdapter:
             or "\n" in (target.value or ""))
         self._pending_write = ((ctx.observation.window_title or "").split(" (")[0].strip(), action.text or "") \
             if action.kind is ActionKind.TYPE_TEXT and into_document and not eid.startswith("syn:") else None
-        return Proposal(action=action, raw_text=json.dumps({"top": top, "operation": op,
+        # Whether the step, decided, is carried out as it stands (pipeline.policy, deskmind#63 part 2).
+        target_row = next((e for e in state["elements"] if e.get("id") == eid), None) if eid else None
+        if action.kind is ActionKind.KEY:   # a chord reaches the focused element
+            target_row = next((e for e in state["elements"] if e.get("focused")), None)
+        doubt = policy.unsure(op, answers, HEADS.get(op, ()), getattr(self, "_floors", None) or policy.Floors.local(),
+                              target=target_row, chord="+".join(action.keys or ()) if action.kind is ActionKind.KEY else "",
+                              written=written)
+        return Proposal(unsure=doubt, action=action, raw_text=json.dumps({"top": top, "operation": op,
+                                                             **({"unsure": doubt} if doubt else {}),
                                                              "confidence": round(confidence, 3),
                                                              **({"overrode": overrode} if overrode else {}),
                                                              **({"stop_by": stop_by} if stop_by else {}),

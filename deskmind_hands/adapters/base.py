@@ -60,6 +60,9 @@ class Proposal:
     output_tokens: int = 0
     cost_usd: float | None = None
     parse_error: str | None = None
+    #: Why this step, decided, is not to be carried out as it stands (pipeline.policy): a write or a commit the model
+    #: was not sure enough of. The loop looks again, then asks the user, else stops.
+    unsure: str | None = None
 
     def to_json(self) -> dict:
         return {

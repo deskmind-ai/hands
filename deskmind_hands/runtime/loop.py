@@ -13,6 +13,7 @@ refused instead of clicking wherever those coordinates now point.
 
 from __future__ import annotations
 
+import json
 import os
 
 import re
@@ -89,6 +90,8 @@ class Metrics:
     stale_refusals: int = 0
     indeterminate_actions: int = 0
     parse_errors: int = 0
+    #: Steps not carried out because the model was not sure enough of a write or a commit (pipeline.policy).
+    unsure_refusals: int = 0
     failed_actions: int = 0
     model_latency_s: float = 0.0
     input_tokens: int = 0
@@ -303,6 +306,7 @@ def run_task(
     failure = Failure(FailureClass.NONE)
     cancel_requested = False
     consecutive_failures = 0
+    declined_unsure: set[str] = set()   # doubtful steps the user said no to (pipeline.policy)
     observe_failures = 0
     done_blocks = 0
     asked_s = 0.0                                # spent waiting for the user's answers
@@ -413,7 +417,7 @@ def run_task(
             if history and history[-1].result_ok and len(digests) >= 2 and digests[-1] != digests[-2]:
                 ineffective.clear()
             if len(digests) >= 2 and digests[-1] == digests[-2] and steps and not steps[-1].get("deferred") \
-                    and steps[-1].get("kind") != "done_blocked":
+                    and steps[-1].get("kind") not in ("done_blocked", "refused_unsure"):
                 last = steps[-1]
                 if history:
                     history[-1].changed = False
@@ -447,7 +451,8 @@ def run_task(
             # Twice is already worth saying for an action that changes the world; scrolling and waiting are
             # legitimately repeated, so those get the longer rope.
             # Steps left undone while the user was busy are not repetitions: nothing happened.
-            acted = [st for st in steps if not st.get("deferred")]
+            # A step refused before it ran (pipeline.policy) did nothing: it is not one the repetition checks count.
+            acted = [st for st in steps if not st.get("deferred") and st.get("kind") != "refused_unsure"]
             need = 3 if (acted and (acted[-1].get("action") or {}).get("kind") in ("scroll", "wait")) else 2
             if len(acted) >= need:
                 sig = [((st.get("action") or {}).get("kind"),
@@ -642,8 +647,47 @@ def run_task(
                     recorder.step(steps[-1])
                 break
 
+            # A write or a commit the model was not sure enough of (pipeline.policy, deskmind#63 part 2) is not carried
+            # out. The first time, the planner looks again; the second time running, the user is asked, as for a risky
+            # step, where there is someone to ask -- and where there is not, the run stops rather than guess.
+            doubt = getattr(proposal, "unsure", None)
+            # The step as a whole, for "the same step again" and "the step the user said no to".
+            doubt_key = json.dumps({"kind": action.kind.value, "text": action.text, "keys": list(action.keys or ()),
+                                    "element": action.binding.element_id if action.binding else None},
+                                   ensure_ascii=False, sort_keys=True)
+            if doubt_key in declined_unsure and not doubt:
+                # Turned down by the user once, and proposed again -- however sure the planner is now.
+                doubt = "the user said no to this step"
+            if doubt:
+                # "Again" is the same step proposed straight after it was refused: another step in between, or another
+                # target, and it is a first time.
+                again = bool(steps) and steps[-1].get("kind") == "refused_unsure" and steps[-1].get("key") == doubt_key
+                if doubt_key in declined_unsure or not again or not cfg.approve_risky:
+                    m.unsure_refusals += 1
+                    entry = {"n": len(steps) + 1, "obs": obs.id, "kind": "refused_unsure", "text": doubt,
+                             "key": doubt_key, "action": action.to_json(),
+                             "decision": (proposal.raw_text or "")[:300], **times}
+                    steps.append(entry)
+                    if recorder:
+                        recorder.step(entry)
+                    history.append(Turn(action.to_json(), False, f"not done: {doubt}"))
+                    if again or doubt_key in declined_unsure:
+                        # The planner's own doubt, said twice with nobody to ask -- or about a step the user already
+                        # turned down: a planning outcome, kept in its own words.
+                        state = RunState.GAVE_UP
+                        failure = Failure(FailureClass.PLANNING,
+                                          (f"the user said no to this step: {doubt}" if doubt_key in declined_unsure
+                                           else f"not sure enough to act, twice running: {doubt}"), auto=True)
+                        break
+                    notice = (f"That step was not done: {doubt}. Look at the screen again and choose again; if you "
+                              f"still cannot be sure, ask the user.")
+                    continue
             what = (risk.risky(action, obs, last_typed_label, renames=cfg.confirm_renames)
                     if (cfg.approve_risky or cfg.refuse_risky) else None)
+            if doubt:
+                # The second time running, the user decides -- told what the doubt is, whether or not the step is
+                # risky in itself.
+                what = f"{what or action.describe()} ({doubt})"
             # An approval is for one step, in one app: approving one "click 'Send'" once covered every later Send of
             # the run, whatever it sent and in whichever app (10-02 review). The one step it also covers is the
             # confirmation it opens itself ("Delete" -> the dialog's "Delete message"): the very next step, of the
@@ -652,7 +696,8 @@ def run_task(
             # between (protocol review, 10-06).
             app_now = obs.focused_app or task.app or ""
             if just_approved:
-                covered = bool(what) and just_approved.covers(what, app_now, len(steps), obs)
+                # Never a step with a doubt of its own: an approval covers its confirmation, not a guess.
+                covered = bool(what) and not doubt and just_approved.covers(what, app_now, len(steps), obs)
                 just_approved = None   # one chance: the next step is its confirmation, or nothing is
                 if covered:
                     what = None
@@ -685,6 +730,8 @@ def run_task(
                 if recorder:
                     recorder.step(entry)
                 if not ok_:
+                    if doubt:
+                        declined_unsure.add(doubt_key)
                     history.append(Turn(action.to_json(), False, f"the user did not approve this ({what}); it was "
                                                                   f"not done"))
                     notice = (f"The user declined: {what}. It was not done. Do not try it another way; finish with "

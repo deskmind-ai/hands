@@ -58,12 +58,43 @@ class Rule(unittest.TestCase):
                                  target={"label": "Send", "role": "checkbox"}), "a control that does not act")
         self.assertIsNotNone(unsure("KEY", ans("KEY", 0.6, key_target=0.99), ("key_target",), Floors(), chord="cmd+s"))
 
-    def test_the_server_sets_the_floors_where_it_says(self):
-        self.assertEqual(Floors.from_server({"consequential": 0.8, "value": 0.3}), Floors(0.8, 0.3))
-        self.assertEqual(Floors.from_server({"consequential": 7, "value": "x"}), Floors())
+    def test_a_server_may_only_raise_the_floors(self):
+        """Review of #30: {"consequential": 0} from a server turned the rule off, and a bool passed as a number."""
+        self.assertEqual(Floors.from_server({"consequential": 0.95, "value": 0.6}), Floors(0.95, 0.6))
+        self.assertEqual(Floors.from_server({"consequential": 0, "value": 0}), Floors(0.90, 0.5))
+        self.assertEqual(Floors.from_server({"consequential": True, "value": "x"}), Floors())
+        self.assertEqual(Floors.from_server({"consequential": 7}), Floors())
         self.assertEqual(Floors.from_server(None), Floors(0.90, 0.5))
-        self.assertIsNone(unsure("TYPE_TEXT", ans("TYPE_TEXT", 0.85, type_text_target=0.99, type_text_value=0.99),
-                                 ("type_text_target", "type_text_value"), Floors.from_server({"consequential": 0.8})))
+        with mock.patch.dict(os.environ, {"HANDS_FLOORS": "consequential=0.8,value=0.3"}):
+            self.assertEqual(Floors.from_server(None), Floors(0.8, 0.3), "lowering is a local setting")
+            self.assertEqual(Floors.from_server({"consequential": 0.85}), Floors(0.85, 0.3))
+
+    def test_chords_that_write_or_remove_are_held_to_it(self):
+        """Review of #30: delete, Return and Finder's move were offered as chords and passed ungated."""
+        for chord in ("delete", "return", "option+cmd+v", "cmd+backspace", "cmd+v", "cmd+shift+n"):
+            self.assertIsNotNone(unsure("KEY", ans("KEY", 0.6, key_target=0.99), ("key_target",), Floors(),
+                                        chord=chord), chord)
+        for chord in ("cmd+c", "cmd+f", "escape", "tab", "cmd+up"):
+            self.assertIsNone(unsure("KEY", ans("KEY", 0.6, key_target=0.99), ("key_target",), Floors(),
+                                     chord=chord), chord)
+
+    def test_the_value_floor_reads_the_value_written(self):
+        """Review of #30: REPLACE_TEXT writes the first valid pair; when that is not the top pair, its p decides."""
+        a = ans("REPLACE_TEXT", 0.97, replace_text_target=0.99, replace_from=0.95, type_text_value=0.95)
+        heads = ("replace_text_target", "replace_from", "type_text_value")
+        self.assertIsNone(unsure("REPLACE_TEXT", a, heads, Floors()))
+        why = unsure("REPLACE_TEXT", a, heads, Floors(), written={"replace_from": 0.05, "type_text_value": 0.05})
+        self.assertIn("0.05", why)
+
+    def test_no_probability_is_no_certainty(self):
+        """Review of #30: a choice-only answer counted as 1.0, and a value no head chose (the text helper's) skipped
+        the value floor."""
+        choice_only = {"operation": {"choice": "TYPE_TEXT"}, "type_text_target": {"choice": "1"},
+                       "type_text_value": {"choice": "1"}}
+        self.assertIsNotNone(unsure("TYPE_TEXT", choice_only, ("type_text_target", "type_text_value"), Floors()))
+        helper = ans("TYPE_TEXT", 0.97, type_text_target=0.99)
+        self.assertIn("not chosen by the model", unsure("TYPE_TEXT", helper, ("type_text_target", "type_text_value"),
+                                                         Floors(), written={"type_text_value": None}))
 
     def test_the_commit_words_match_brains(self):
         """hands' policy and brain's router decide commits from one list; where brain is importable, they agree."""
@@ -73,16 +104,20 @@ class Rule(unittest.TestCase):
         import subprocess
         src = os.environ.get("DESKMIND_BRAIN_SRC") or str(REPO.parent / "brain" / "src")
         out = subprocess.run([sys.executable, "-c", "import json, sys; sys.path.insert(0, sys.argv[1]); "
-                              "from deskmind_brain import router; print(json.dumps(getattr(router, 'COMMIT_WORDS', None)))",
+                              "from deskmind_brain import router; print(json.dumps([getattr(router, 'COMMIT_WORDS', None), "
+                              "getattr(getattr(router, '_NOT_COMMIT', None), 'pattern', None), "
+                              "sorted(getattr(router, '_NOT_ACTIONS', ()))]))",
                               src], capture_output=True, text=True)
         if out.returncode != 0:
             self.skipTest("deskmind_brain not importable")
-        brain_words = json.loads(out.stdout)
+        brain_words, not_commit, not_actions = json.loads(out.stdout)
         if brain_words is None:
-            self.skipTest("this brain predates commit routing")
+            self.skipTest("this brain predates commit routing (set DESKMIND_BRAIN_SRC to a brain on next)")
         from deskmind_hands.runtime.risk import RISKY_WORDS
         self.assertTrue(set(RISKY_WORDS) <= set(brain_words), set(RISKY_WORDS) - set(brain_words))
         self.assertEqual(set(policy.COMMIT_WORDS), set(brain_words))
+        self.assertEqual(policy._NOT_COMMIT.pattern, not_commit, "the look-alikes")
+        self.assertEqual(sorted(policy._NOT_ACTIONS), not_actions, "the roles that do not act")
 
 
 class Loop(unittest.TestCase):
@@ -144,10 +179,12 @@ class Loop(unittest.TestCase):
     def test_twice_unsure_the_user_decides(self):
         res, ws, asked = self.run_s01(2, True)
         self.assertEqual(res.state.value, "completed", res.failure)
-        self.assertTrue(any("not sure enough" in q or "below" in q for q in asked), asked)
-        res, ws, _ = self.run_s01(99, False)   # every time it proposes the write, it is unsure, and the user says no
+        self.assertTrue(any("0.80" in q for q in asked), f"the question says what the doubt is: {asked}")
+        res, ws, asked = self.run_s01(99, False)   # every time it proposes the write it is unsure; the user says no
         self.assertNotEqual(res.state.value, "completed")
         self.assertFalse((ws.ws / "final.txt").exists())
+        self.assertIn("said no", res.failure.detail, "the same step after a no ends the run, not another question")
+        self.assertEqual(len(asked), 1, "asked once")
 
 
 if __name__ == "__main__":

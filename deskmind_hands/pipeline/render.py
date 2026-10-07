@@ -348,6 +348,14 @@ def ranked(elements):
     return [e for _, e in kept]
 
 
+#: Controls whose value is a position or a level, not text on the screen: a scroll bar's 0.1851851791143417, a
+#: slider's 0.5. Read as text they became values to type: in TextEdit the two scroll bars' positions were two of the
+#: three values offered on a replace-all task, one was chosen at 0.10, and it was typed over the document's first
+#: line on every step (deskmind#63). Their names stay; their values are not text.
+POSITION_ROLES = frozenset({"AXScrollBar", "AXValueIndicator", "AXSlider", "AXSplitter", "AXProgressIndicator",
+                            "AXLevelIndicator", "AXIncrementor"})
+
+
 def page_text(obs, limit: int = 2500) -> str:
     """The window's visible text, in reading order, deduplicated -- the channel their model was trained on."""
     seen, out, n = set(), [], 0
@@ -357,6 +365,9 @@ def page_text(obs, limit: int = 2500) -> str:
         # A vision control hands placed itself ("向上滚动页面", "搜索框") has a name, not text on the screen: an
         # ANSWER once chose "向上滚动页面". What it holds (the search box's query) is on the screen.
         pieces = (e.value,) if (e.id or "").startswith("icon:") else (e.label, e.value)
+        if e.ax_role in POSITION_ROLES:
+            # The value is not text, nor is a label that only repeats it (a scroll bar is named by its position).
+            pieces = tuple(p for p in (e.label,) if p and p != e.value)
         for piece in pieces:
             piece = (piece or "").strip()
             if not piece or piece in seen:

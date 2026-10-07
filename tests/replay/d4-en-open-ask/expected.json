@@ -16,7 +16,7 @@
     "page": {
      "url": "文本编辑",
      "title": "打开",
-     "text": "增页面按钮\n返回\n前进\n位置：\n⁨文本编辑⁩ — iCloud\n搜索\n新建文稿\n显示选项\n取消\n打开\n搜索文本栏\n移动\n时钟\n两个人\nApp Store字母A图标\n矩形上带程序坞的菜单栏\n文档页面\n箭头向下圆圈\niCloud\n主页\n小圆圈标记\n小圆圈标记，实心\n两个小圆圈标记\n音符\n照片\n电影\n组\n分离组\n滚动区\n边栏\n外框行\n单元格\n文本编辑\n最近使用\n共享\n个人收藏\n应用程序\n桌面\n文稿\nDownloads\n位置\niCloud云盘\nuser\n标签\n工作\n重要\n绿色\n黄色\n蓝色\n灰色\n红色\n所有标签…\n媒体\n音乐\n影片\n栏\n0\n图标视图\n节\n网格视图\n一乘二线条网格下方的三乘一正方形网格\n保存\n关闭\n新建纯文本文稿\n另存为：文件名\n另存为：位置\n（请选择）\n另存为\nledger.csv\nrecords.txt"
+     "text": "增页面按钮\n返回\n前进\n位置：\n⁨文本编辑⁩ — iCloud\n搜索\n新建文稿\n显示选项\n取消\n打开\n搜索文本栏\n移动\n时钟\n两个人\nApp Store字母A图标\n矩形上带程序坞的菜单栏\n文档页面\n箭头向下圆圈\niCloud\n主页\n小圆圈标记\n小圆圈标记，实心\n两个小圆圈标记\n音符\n照片\n电影\n组\n分离组\n滚动区\n边栏\n外框行\n单元格\n文本编辑\n最近使用\n共享\n个人收藏\n应用程序\n桌面\n文稿\nDownloads\n位置\niCloud云盘\nuser\n标签\n工作\n重要\n绿色\n黄色\n蓝色\n灰色\n红色\n所有标签…\n媒体\n音乐\n影片\n栏\n图标视图\n节\n网格视图\n一乘二线条网格下方的三乘一正方形网格\n保存\n关闭\n新建纯文本文稿\n另存为：文件名\n另存为：位置\n（请选择）\n另存为\nledger.csv\nrecords.txt"
     },
     "elements": [
      {
@@ -1055,7 +1055,7 @@
     "page": {
      "url": "文本编辑",
      "title": "records.txt",
-     "text": "关闭按钮\n全屏幕按钮\n最小化按钮\nDate,Customer,Order,Amount,Status\n2026-09-02,Mark Chen,R-1180,560,Paid\n2026-09-04,Amy Park,R-4402,275,Paid\n2026-09-05,Lisa Wong,R-2291,1340,Paid\n2026-09-08,David Kim,R-2615,88,Pending\n2026-09-10,Sara Lopez,R-2740,412,Paid\n2026-09-12,Tom Baker,R-2893,1020,Paid\n2026-09-15,Lisa Wang,R-3012,640,Paid\n2026-09-17,Mark Chen,R-3054,199,Refunded\n2026-09-19,Nina Patel,R-3120,730,Paid\n2026-09-22,Amy Park,R-3188,57,Paid\n2026-09-24,Omar Aziz,R-3241,905,Pending\n2026-09-27,Lisa Wong,R-3307,96,Paid\n2026-09-28,Grace Liu,R-3325,318,Paid\n2026-09-29,Tom Baker,R-3340,264,Paid\nrecords.txt\n组\n滚动区\n0.1851851791143417\n0\n保存\n关闭\n新建纯文本文稿\n另存为：文件名\n另存为：位置\n（请选择）\n另存为\nledger.csv"
+     "text": "关闭按钮\n全屏幕按钮\n最小化按钮\nDate,Customer,Order,Amount,Status\n2026-09-02,Mark Chen,R-1180,560,Paid\n2026-09-04,Amy Park,R-4402,275,Paid\n2026-09-05,Lisa Wong,R-2291,1340,Paid\n2026-09-08,David Kim,R-2615,88,Pending\n2026-09-10,Sara Lopez,R-2740,412,Paid\n2026-09-12,Tom Baker,R-2893,1020,Paid\n2026-09-15,Lisa Wang,R-3012,640,Paid\n2026-09-17,Mark Chen,R-3054,199,Refunded\n2026-09-19,Nina Patel,R-3120,730,Paid\n2026-09-22,Amy Park,R-3188,57,Paid\n2026-09-24,Omar Aziz,R-3241,905,Pending\n2026-09-27,Lisa Wong,R-3307,96,Paid\n2026-09-28,Grace Liu,R-3325,318,Paid\n2026-09-29,Tom Baker,R-3340,264,Paid\nrecords.txt\n组\n滚动区\n保存\n关闭\n新建纯文本文稿\n另存为：文件名\n另存为：位置\n（请选择）\n另存为\nledger.csv"
     },
     "elements": [
      {
@@ -1519,7 +1519,7 @@
     "page": {
      "url": "文本编辑",
      "title": "records.txt",
-     "text": "关闭按钮\n全屏幕按钮\n最小化按钮\nDate,Customer,Order,Amount,Status\n2026-09-02,Mark Chen,R-1180,560,Paid\n2026-09-04,Amy Park,R-4402,275,Paid\n2026-09-05,Lisa Wong,R-2291,1340,Paid\n2026-09-08,David Kim,R-2615,88,Pending\n2026-09-10,Sara Lopez,R-2740,412,Paid\n2026-09-12,Tom Baker,R-2893,1020,Paid\n2026-09-15,Lisa Wang,R-3012,640,Paid\n2026-09-17,Mark Chen,R-3054,199,Refunded\n2026-09-19,Nina Patel,R-3120,730,Paid\n2026-09-22,Amy Park,R-3188,57,Paid\n2026-09-24,Omar Aziz,R-3241,905,Pending\n2026-09-27,Lisa Wong,R-3307,96,Paid\n2026-09-28,Grace Liu,R-3325,318,Paid\n2026-09-29,Tom Baker,R-3340,264,Paid\nrecords.txt\n组\n滚动区\n0.1851851791143417\n0\n保存\n关闭\n新建纯文本文稿\n另存为：文件名\n另存为：位置\n（请选择）\n另存为\nledger.csv"
+     "text": "关闭按钮\n全屏幕按钮\n最小化按钮\nDate,Customer,Order,Amount,Status\n2026-09-02,Mark Chen,R-1180,560,Paid\n2026-09-04,Amy Park,R-4402,275,Paid\n2026-09-05,Lisa Wong,R-2291,1340,Paid\n2026-09-08,David Kim,R-2615,88,Pending\n2026-09-10,Sara Lopez,R-2740,412,Paid\n2026-09-12,Tom Baker,R-2893,1020,Paid\n2026-09-15,Lisa Wang,R-3012,640,Paid\n2026-09-17,Mark Chen,R-3054,199,Refunded\n2026-09-19,Nina Patel,R-3120,730,Paid\n2026-09-22,Amy Park,R-3188,57,Paid\n2026-09-24,Omar Aziz,R-3241,905,Pending\n2026-09-27,Lisa Wong,R-3307,96,Paid\n2026-09-28,Grace Liu,R-3325,318,Paid\n2026-09-29,Tom Baker,R-3340,264,Paid\nrecords.txt\n组\n滚动区\n保存\n关闭\n新建纯文本文稿\n另存为：文件名\n另存为：位置\n（请选择）\n另存为\nledger.csv"
     },
     "elements": [
      {
@@ -2012,7 +2012,7 @@
     "page": {
      "url": "文本编辑",
      "title": "ledger.csv",
-     "text": "关闭按钮\n全屏幕按钮\n最小化按钮\nDate,Customer,Order,Amount\n2026-09-02,Mark Chen,R-1180,560\n2026-09-04,Amy Park,R-4402,275\n2026-09-10,Sara Lopez,R-2740,412\nledger.csv\n组\n滚动区\n0.1851851791143417\n0.615384578704834\n保存\n关闭\n新建纯文本文稿\n另存为：文件名\n另存为：位置\n（请选择）\n另存为\nrecords.txt"
+     "text": "关闭按钮\n全屏幕按钮\n最小化按钮\nDate,Customer,Order,Amount\n2026-09-02,Mark Chen,R-1180,560\n2026-09-04,Amy Park,R-4402,275\n2026-09-10,Sara Lopez,R-2740,412\nledger.csv\n组\n滚动区\n保存\n关闭\n新建纯文本文稿\n另存为：文件名\n另存为：位置\n（请选择）\n另存为\nrecords.txt"
     },
     "elements": [
      {
@@ -2666,7 +2666,7 @@
     "page": {
      "url": "文本编辑",
      "title": "ledger.csv",
-     "text": "关闭按钮\n全屏幕按钮\n最小化按钮\nDate,Customer,Order,Amount\n2026-09-02,Mark Chen,R-1180,560\n2026-09-04,Amy Park,R-4402,275\n2026-09-10,Sara Lopez,R-2740,412\n2026-09-27,Lisa Wong,R-3307,96\nledger.csv\n组\n滚动区\n0.1851851791143417\n0.615384578704834\n保存\n关闭\n新建纯文本文稿\n另存为：文件名\n另存为：位置\n（请选择）\n另存为\nrecords.txt"
+     "text": "关闭按钮\n全屏幕按钮\n最小化按钮\nDate,Customer,Order,Amount\n2026-09-02,Mark Chen,R-1180,560\n2026-09-04,Amy Park,R-4402,275\n2026-09-10,Sara Lopez,R-2740,412\n2026-09-27,Lisa Wong,R-3307,96\nledger.csv\n组\n滚动区\n保存\n关闭\n新建纯文本文稿\n另存为：文件名\n另存为：位置\n（请选择）\n另存为\nrecords.txt"
     },
     "elements": [
      {
@@ -3354,7 +3354,7 @@
     "page": {
      "url": "文本编辑",
      "title": "ledger.csv",
-     "text": "关闭按钮\n全屏幕按钮\n最小化按钮\nDate,Customer,Order,Amount\n2026-09-02,Mark Chen,R-1180,560\n2026-09-04,Amy Park,R-4402,275\n2026-09-10,Sara Lopez,R-2740,412\n2026-09-27,Lisa Wong,R-3307,96\nledger.csv\n组\n滚动区\n0.1851851791143417\n0.615384578704834\n保存\n关闭\n新建纯文本文稿\n另存为：文件名\n另存为：位置\n（请选择）\n另存为\nrecords.txt"
+     "text": "关闭按钮\n全屏幕按钮\n最小化按钮\nDate,Customer,Order,Amount\n2026-09-02,Mark Chen,R-1180,560\n2026-09-04,Amy Park,R-4402,275\n2026-09-10,Sara Lopez,R-2740,412\n2026-09-27,Lisa Wong,R-3307,96\nledger.csv\n组\n滚动区\n保存\n关闭\n新建纯文本文稿\n另存为：文件名\n另存为：位置\n（请选择）\n另存为\nrecords.txt"
     },
     "elements": [
      {

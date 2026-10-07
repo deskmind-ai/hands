@@ -2162,8 +2162,27 @@ class SystemOneAdapter:
             self._ledger.wrote(*self._pending_write)
         self._pending_write = None
         if last is not None and last.result_ok:
-            for m in re.finditer(r"saved '(.+?)'", last.result_detail or ""):
-                self._ledger.was_saved(m.group(1))
+            detail = last.result_detail or ""
+            # A name typed into a Save As sheet: the document whose sheet it is will be saved under it.
+            m = re.match(r"save-as name set to '(.+?)'", detail)
+            if m:
+                self._save_as = (m.group(1), (ctx.observation.window_title or "").split(" (")[0].strip())
+            for m in re.finditer(r"saved '(.+?)'", detail):
+                pending = getattr(self, "_save_as", None)
+                if pending:
+                    # Saved through the sheet: whichever name the driver reports (the new file's, or the untitled
+                    # document's), what was written into the document is now the named file.
+                    typed, document = pending
+                    old = m.group(1) if m.group(1) in self._ledger.written else document
+                    title = (ctx.observation.window_title or "").split(" (")[0].strip()
+                    # The name the file got: the driver's, unless it is the old one; else the window's, when it is
+                    # the typed name with the extension the app added ("draft" -> "draft.txt"); else as typed.
+                    new = (m.group(1) if m.group(1) != old else
+                           title if title.startswith(typed) and title != old else typed)
+                    self._ledger.saved_as(old, new)
+                    self._save_as = None
+                else:
+                    self._ledger.was_saved(m.group(1))
             for m in re.finditer(r"closed '(.+?)'", last.result_detail or ""):
                 self._ledger.was_closed(m.group(1))
 

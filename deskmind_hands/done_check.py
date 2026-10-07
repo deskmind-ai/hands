@@ -63,6 +63,15 @@ class Ledger:
         self.unsaved.discard(document)
         self.saved.add(document)
 
+    def saved_as(self, old: str, new: str) -> None:
+        """Save As: what was written into `old` is now `new`, saved. A new document is written as "未命名-2" and
+        saved as draft.txt; kept under its old name, the check held the run back over a file written and saved."""
+        if old in self.written and old != new:
+            self.written[new] = self.written.get(new, []) + self.written.pop(old)
+            self.unsaved.discard(old)
+            self.saved.discard(old)
+        self.was_saved(new)
+
     def was_closed(self, document: str) -> None:
         if document in self.written:
             self.closed.add(document)

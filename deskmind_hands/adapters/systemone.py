@@ -31,7 +31,7 @@ from ..apps import APPS
 from .base import AdapterUnavailable, Proposal, Turn, TurnContext
 from ..drivers.base import effect_notes, env_sections, mark_new
 from .. import lessons as lessons_store
-from ..pipeline import ask, render
+from ..pipeline import ask, policy, render
 
 
 #: Quote pairs that survive a Chinese keyboard, plus backticks. What sits inside one is almost always the exact
@@ -1092,6 +1092,8 @@ class SystemOneAdapter:
                     data = (json.load(r).get("data") or [{}])[0]
                 forms = data.get("criteria_forms") if isinstance(data, dict) else None
                 self._forms = tuple(forms) if isinstance(forms, list) else ("object",)
+                # The floors this model's calibration supports, where the server says (pipeline.policy).
+                self._floors = policy.Floors.from_server(data.get("floors") if isinstance(data, dict) else None)
             except urllib.error.HTTPError:
                 self._forms = ("object",)
             except Exception:
@@ -1457,7 +1459,12 @@ class SystemOneAdapter:
             or "\n" in (target.value or ""))
         self._pending_write = ((ctx.observation.window_title or "").split(" (")[0].strip(), action.text or "") \
             if action.kind is ActionKind.TYPE_TEXT and into_document and not eid.startswith("syn:") else None
-        return Proposal(action=action, raw_text=json.dumps({"top": top, "operation": op,
+        # Whether the step, decided, is carried out as it stands (pipeline.policy, deskmind#63 part 2).
+        target_row = next((e for e in state["elements"] if e.get("id") == eid), None) if eid else None
+        doubt = policy.unsure(op, answers, HEADS.get(op, ()), getattr(self, "_floors", None) or policy.Floors(),
+                              target=target_row, chord="+".join(action.keys or ()) if action.kind is ActionKind.KEY else "")
+        return Proposal(unsure=doubt, action=action, raw_text=json.dumps({"top": top, "operation": op,
+                                                             **({"unsure": doubt} if doubt else {}),
                                                              "confidence": round(confidence, 3),
                                                              **({"overrode": overrode} if overrode else {}),
                                                              **({"stop_by": stop_by} if stop_by else {}),

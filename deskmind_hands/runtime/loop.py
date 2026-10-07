@@ -89,6 +89,8 @@ class Metrics:
     stale_refusals: int = 0
     indeterminate_actions: int = 0
     parse_errors: int = 0
+    #: Steps not carried out because the model was not sure enough of a write or a commit (pipeline.policy).
+    unsure_refusals: int = 0
     failed_actions: int = 0
     model_latency_s: float = 0.0
     input_tokens: int = 0
@@ -303,6 +305,7 @@ def run_task(
     failure = Failure(FailureClass.NONE)
     cancel_requested = False
     consecutive_failures = 0
+    unsure_streak = 0
     observe_failures = 0
     done_blocks = 0
     asked_s = 0.0                                # spent waiting for the user's answers
@@ -642,8 +645,35 @@ def run_task(
                     recorder.step(steps[-1])
                 break
 
+            # A write or a commit the model was not sure enough of (pipeline.policy, deskmind#63 part 2) is not carried
+            # out. The first time, the planner looks again; the second time running, the user is asked, as for a risky
+            # step, where there is someone to ask -- and where there is not, the run stops rather than guess.
+            doubt = getattr(proposal, "unsure", None)
+            if doubt:
+                unsure_streak += 1
+                if unsure_streak == 1 or not cfg.approve_risky:
+                    m.unsure_refusals += 1
+                    entry = {"n": len(steps) + 1, "obs": obs.id, "kind": "refused_unsure", "text": doubt,
+                             "action": action.to_json(), "decision": (proposal.raw_text or "")[:300], **times}
+                    steps.append(entry)
+                    if recorder:
+                        recorder.step(entry)
+                    history.append(Turn(action.to_json(), False, f"not done: {doubt}"))
+                    if unsure_streak >= 2:
+                        state = RunState.GAVE_UP
+                        # The planner's own doubt, said twice: a planning outcome, kept in its own words.
+                        failure = Failure(FailureClass.PLANNING, f"not sure enough to act, twice running: {doubt}",
+                                          auto=True)
+                        break
+                    notice = (f"That step was not done: {doubt}. Look at the screen again and choose again; if you "
+                              f"still cannot be sure, ask the user.")
+                    continue
+            else:
+                unsure_streak = 0
             what = (risk.risky(action, obs, last_typed_label, renames=cfg.confirm_renames)
                     if (cfg.approve_risky or cfg.refuse_risky) else None)
+            if doubt and not what:
+                what = f"{action.describe()} ({doubt})"   # the second time running: the user decides
             # An approval is for one step, in one app: approving one "click 'Send'" once covered every later Send of
             # the run, whatever it sent and in whichever app (10-02 review). The one step it also covers is the
             # confirmation it opens itself ("Delete" -> the dialog's "Delete message"): the very next step, of the

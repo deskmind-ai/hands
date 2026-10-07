@@ -1084,6 +1084,8 @@ class SystemOneAdapter:
         from ..done_check import Ledger
         self._ledger = Ledger()
         self._pending_write: tuple[str, str] | None = None
+        #: (the name typed into a Save As sheet, the document whose sheet it is), until the save it leads to.
+        self._save_as: tuple[str, str] | None = None
 
     # -- wire -------------------------------------------------------------
 
@@ -2161,14 +2163,20 @@ class SystemOneAdapter:
         if last is not None and last.result_ok and self._pending_write:
             self._ledger.wrote(*self._pending_write)
         self._pending_write = None
+        if last is not None and not last.result_ok:
+            self._save_as = None      # a step of the sheet that failed: the sheet is not to be trusted to have saved
         if last is not None and last.result_ok:
             detail = last.result_detail or ""
             # A name typed into a Save As sheet: the document whose sheet it is will be saved under it.
             m = re.match(r"save-as name set to '(.+?)'", detail)
             if m:
                 self._save_as = (m.group(1), (ctx.observation.window_title or "").split(" (")[0].strip())
+            elif not re.match(r"save-as \w+ set to |saved '", detail):
+                # The sheet's steps run straight into its save. Anything else in between -- the sheet cancelled, a
+                # click elsewhere -- and a later save is a plain one: renaming then would credit a file never written.
+                self._save_as = None
             for m in re.finditer(r"saved '(.+?)'", detail):
-                pending = getattr(self, "_save_as", None)
+                pending = self._save_as
                 if pending:
                     # Saved through the sheet: whichever name the driver reports (the new file's, or the untitled
                     # document's), what was written into the document is now the named file.

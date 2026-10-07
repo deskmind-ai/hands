@@ -60,5 +60,33 @@ class SaveAs(unittest.TestCase):
         self.assertIn("未命名-2", a._ledger.unsaved)
 
 
+class CancelledSheet(unittest.TestCase):
+    def test_a_cancelled_sheet_does_not_rename_a_later_plain_save(self):
+        """Review of #31: the typed name stayed pending after the sheet was cancelled, and a later plain save of the
+        document took it -- the ledger would then say draft.txt was written and saved when it never was."""
+        a = SystemOneAdapter(url="http://127.0.0.1:9")
+        a._pending_write = ("notes.txt", "x")
+        a._keep_ledger(ctx("set 1 chars", "notes.txt"))
+        a._keep_ledger(ctx("save-as name set to 'draft.txt'", "notes.txt"))
+        a._keep_ledger(ctx("pressed escape", "notes.txt"))            # the sheet cancelled
+        a._keep_ledger(ctx("clicked 'Edit'", "notes.txt"))
+        a._keep_ledger(ctx("saved 'notes.txt'", "notes.txt"))         # a plain cmd+s, later
+        self.assertEqual(set(a._ledger.written), {"notes.txt"})
+        self.assertEqual(a._ledger.saved, {"notes.txt"})
+        self.assertNotIn("draft.txt", a._ledger.saved)
+
+    def test_a_failed_sheet_step_clears_it_too(self):
+        a = SystemOneAdapter(url="http://127.0.0.1:9")
+        a._pending_write = ("notes.txt", "x")
+        a._keep_ledger(ctx("set 1 chars", "notes.txt"))
+        a._keep_ledger(ctx("save-as name set to 'draft.txt'", "notes.txt"))
+        a._keep_ledger(ctx("the Save button is not there", "notes.txt", ok=False))
+        a._keep_ledger(ctx("saved 'notes.txt'", "notes.txt"))
+        self.assertEqual(set(a._ledger.written), {"notes.txt"})
+
+    def test_the_new_adapter_has_nothing_pending(self):
+        self.assertIsNone(SystemOneAdapter(url="http://127.0.0.1:9")._save_as)
+
+
 if __name__ == "__main__":
     unittest.main()

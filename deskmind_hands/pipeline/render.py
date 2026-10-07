@@ -352,8 +352,9 @@ def ranked(elements):
 #: slider's 0.5. Read as text they became values to type: in TextEdit the two scroll bars' positions were two of the
 #: three values offered on a replace-all task, one was chosen at 0.10, and it was typed over the document's first
 #: line on every step (deskmind#63). Their names stay; their values are not text.
+#: Not a stepper (AXIncrementor): its value is a quantity the user reads ("份数 3"), which is content.
 POSITION_ROLES = frozenset({"AXScrollBar", "AXValueIndicator", "AXSlider", "AXSplitter", "AXProgressIndicator",
-                            "AXLevelIndicator", "AXIncrementor"})
+                            "AXLevelIndicator"})
 
 
 def page_text(obs, limit: int = 2500) -> str:

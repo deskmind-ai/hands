@@ -26,6 +26,7 @@ SCROLL = [Element(id="sb1", role="scrollBar", ax_role="AXScrollBar", label="0.18
           Element(id="vi", role="other", ax_role="AXValueIndicator", label="0.2136894824707846",
                   value="0.2136894824707846"),
           Element(id="sl", role="slider", ax_role="AXSlider", label="音量", value="0.5"),
+          Element(id="st", role="incrementor", ax_role="AXIncrementor", label="份数", value="3"),
           Element(id="doc", role="textArea", ax_role="AXTextArea", label="", settable=True,
                   value="Project Orion is ready for review.\nOrion ships in Q4.\n")]
 
@@ -48,6 +49,7 @@ class PositionValues(unittest.TestCase):
         for v in ("0.1851851791143417", "0.615384578704834", "0.2136894824707846", "0.5"):
             self.assertNotIn(v, text)
         self.assertIn("音量", text, "a slider keeps its name")
+        self.assertIn("3", text, "a stepper's value is a quantity on screen, not a position")
         self.assertIn("Project Orion is ready for review.\nOrion ships in Q4.", "\n".join(text), "content stays")
 
     def test_nor_a_value_to_type(self):

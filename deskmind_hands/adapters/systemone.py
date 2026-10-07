@@ -1469,6 +1469,8 @@ class SystemOneAdapter:
             if action.kind is ActionKind.TYPE_TEXT and into_document and not eid.startswith("syn:") else None
         # Whether the step, decided, is carried out as it stands (pipeline.policy, deskmind#63 part 2).
         target_row = next((e for e in state["elements"] if e.get("id") == eid), None) if eid else None
+        if action.kind is ActionKind.KEY:   # a chord reaches the focused element
+            target_row = next((e for e in state["elements"] if e.get("focused")), None)
         doubt = policy.unsure(op, answers, HEADS.get(op, ()), getattr(self, "_floors", None) or policy.Floors.local(),
                               target=target_row, chord="+".join(action.keys or ()) if action.kind is ActionKind.KEY else "",
                               written=written)

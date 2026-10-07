@@ -417,7 +417,7 @@ def run_task(
             if history and history[-1].result_ok and len(digests) >= 2 and digests[-1] != digests[-2]:
                 ineffective.clear()
             if len(digests) >= 2 and digests[-1] == digests[-2] and steps and not steps[-1].get("deferred") \
-                    and steps[-1].get("kind") != "done_blocked":
+                    and steps[-1].get("kind") not in ("done_blocked", "refused_unsure"):
                 last = steps[-1]
                 if history:
                     history[-1].changed = False
@@ -451,7 +451,8 @@ def run_task(
             # Twice is already worth saying for an action that changes the world; scrolling and waiting are
             # legitimately repeated, so those get the longer rope.
             # Steps left undone while the user was busy are not repetitions: nothing happened.
-            acted = [st for st in steps if not st.get("deferred")]
+            # A step refused before it ran (pipeline.policy) did nothing: it is not one the repetition checks count.
+            acted = [st for st in steps if not st.get("deferred") and st.get("kind") != "refused_unsure"]
             need = 3 if (acted and (acted[-1].get("action") or {}).get("kind") in ("scroll", "wait")) else 2
             if len(acted) >= need:
                 sig = [((st.get("action") or {}).get("kind"),
@@ -650,13 +651,16 @@ def run_task(
             # out. The first time, the planner looks again; the second time running, the user is asked, as for a risky
             # step, where there is someone to ask -- and where there is not, the run stops rather than guess.
             doubt = getattr(proposal, "unsure", None)
-            doubt_key = None
+            # The step as a whole, for "the same step again" and "the step the user said no to".
+            doubt_key = json.dumps({"kind": action.kind.value, "text": action.text, "keys": list(action.keys or ()),
+                                    "element": action.binding.element_id if action.binding else None},
+                                   ensure_ascii=False, sort_keys=True)
+            if doubt_key in declined_unsure and not doubt:
+                # Turned down by the user once, and proposed again -- however sure the planner is now.
+                doubt = "the user said no to this step"
             if doubt:
                 # "Again" is the same step proposed straight after it was refused: another step in between, or another
                 # target, and it is a first time.
-                doubt_key = json.dumps({"kind": action.kind.value, "text": action.text, "keys": list(action.keys or ()),
-                                         "element": action.binding.element_id if action.binding else None},
-                                        ensure_ascii=False, sort_keys=True)
                 again = bool(steps) and steps[-1].get("kind") == "refused_unsure" and steps[-1].get("key") == doubt_key
                 if doubt_key in declined_unsure or not again or not cfg.approve_risky:
                     m.unsure_refusals += 1
@@ -726,7 +730,7 @@ def run_task(
                 if recorder:
                     recorder.step(entry)
                 if not ok_:
-                    if doubt_key:
+                    if doubt:
                         declined_unsure.add(doubt_key)
                     history.append(Turn(action.to_json(), False, f"the user did not approve this ({what}); it was "
                                                                   f"not done"))

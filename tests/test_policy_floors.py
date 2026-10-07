@@ -78,6 +78,22 @@ class Rule(unittest.TestCase):
             self.assertIsNone(unsure("KEY", ans("KEY", 0.6, key_target=0.99), ("key_target",), Floors(),
                                      chord=chord), chord)
 
+    def test_return_in_a_search_field_and_chord_spelling(self):
+        """Review of #30: Return or Delete in a search or name field only confirms or edits it; a chord spelled with
+        its modifiers in another order is the same chord."""
+        a = ans("KEY", 0.6, key_target=0.99)
+        self.assertIsNone(unsure("KEY", a, ("key_target",), Floors(), chord="return",
+                                 target={"label": "搜索", "role": "searchField"}))
+        self.assertIsNotNone(unsure("KEY", a, ("key_target",), Floors(), chord="return",
+                                    target={"label": "回复内容", "role": "textArea"}))
+        self.assertIsNotNone(unsure("KEY", a, ("key_target",), Floors(), chord="shift+cmd+s"))
+        self.assertIsNotNone(unsure("KEY", a, ("key_target",), Floors(), chord="cmd+option+v"))
+        self.assertEqual(policy.chord_of("Shift+Command+S"), "cmd+shift+s")
+
+    def test_a_missing_target_head_is_not_certain(self):
+        a = {"operation": {"choice": "CLICK", "probabilities": {"CLICK": 0.97}}}
+        self.assertIsNotNone(unsure("CLICK", a, ("click_target",), Floors(), target={"label": "Send", "role": "button"}))
+
     def test_the_value_floor_reads_the_value_written(self):
         """Review of #30: REPLACE_TEXT writes the first valid pair; when that is not the top pair, its p decides."""
         a = ans("REPLACE_TEXT", 0.97, replace_text_target=0.99, replace_from=0.95, type_text_value=0.95)
@@ -185,6 +201,47 @@ class Loop(unittest.TestCase):
         self.assertFalse((ws.ws / "final.txt").exists())
         self.assertIn("said no", res.failure.detail, "the same step after a no ends the run, not another question")
         self.assertEqual(len(asked), 1, "asked once")
+
+
+class AfterARefusal(unittest.TestCase):
+    setUp = Loop.setUp
+    run_s01 = Loop.run_s01
+
+    def test_a_step_the_user_turned_down_is_not_done_when_proposed_again_with_certainty(self):
+        """Review of #30: declined while unsure, then proposed again at high p with no doubt, it ran."""
+        res, ws, asked = self.run_s01(2, False)      # unsure twice: asked, "no"; the third time it is sure
+        self.assertNotEqual(res.state.value, "completed")
+        self.assertFalse((ws.ws / "final.txt").exists())
+        self.assertIn("said no", res.failure.detail)
+
+    def test_a_refused_step_is_not_read_as_one_that_ran(self):
+        """Review of #30: a refused step carried an action, and the next notice said the screen was unchanged and the
+        step not to be chosen again -- of a step that never ran."""
+        from deskmind_bench.task import load_task
+        from deskmind_hands.adapters.scripted import OracleAdapter
+        from deskmind_hands.drivers.mock import MockDriver
+        from deskmind_hands.env.workspace import Workspace
+        from deskmind_hands.runtime.loop import RunConfig, run_task
+        notices = []
+
+        class Once(OracleAdapter):
+            refused = False
+
+            def propose(self, ctx):
+                notices.append(ctx.notice or "")
+                p = super().propose(ctx)
+                if p.action.kind.value == "type_text" and not Once.refused:
+                    Once.refused = True
+                    self._i -= 1
+                    p.unsure = "this step was chosen at 0.80, below 0.90 for a step that writes or commits"
+                return p
+        task = load_task(REPO / "tasks" / "smoke" / "S01-rename.yaml")
+        ws = Workspace.create(Path(tempfile.mkdtemp()), REPO / "fixtures")
+        res = run_task(task, MockDriver(render=False), Once(), ws, config=RunConfig())
+        self.assertEqual(res.state.value, "completed", res.failure)
+        after = notices[notices.index(next(n for n in notices if "was not done" in n)):]
+        self.assertFalse([n for n in after if "unchanged" in n.lower() or "do not choose it again" in n.lower()
+                          or "times in a row" in n], after)
 
 
 if __name__ == "__main__":

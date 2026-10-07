@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from ..runtime.risk import RISKY_WORDS
+from ..runtime.risk import _BENIGN_FIELD, RISKY_WORDS
 
 #: Controls whose click commits something: the approval terms (risk.RISKY_WORDS) plus save and submit -- the same list
 #: brain's router escalates on (deskmind_brain.router.COMMIT_WORDS; a test keeps the two in step).
@@ -45,8 +45,22 @@ VALUE_HEADS = ("type_text_value", "replace_from")
 #: Chords that write, commit or remove: saving, confirming (Return), deleting, cutting, pasting, moving (Finder's
 #: option+cmd+v), making a folder.
 COMMIT_KEYS = {"cmd+s", "cmd+shift+s", "return", "enter", "kp_enter", "cmd+return", "cmd+enter", "delete",
-               "forward_delete", "backspace", "cmd+delete", "cmd+backspace", "option+cmd+v", "cmd+v", "cmd+x",
-               "cmd+shift+n"}
+               "forward_delete", "backspace", "cmd+delete", "cmd+backspace", "cmd+option+v", "cmd+v", "cmd+x",
+               "cmd+shift+n"}   # in chord_of's spelling
+#: Chords that only confirm or edit what is in the field they reach: harmless in a search or name field.
+FIELD_KEYS = {"return", "enter", "kp_enter", "delete", "forward_delete", "backspace"}
+_MODIFIERS = ("cmd", "ctrl", "option", "shift")
+
+
+def chord_of(keys: str) -> str:
+    """A chord in one spelling: modifiers in a fixed order, then the key ("shift+cmd+s" -> "cmd+shift+s")."""
+    parts = [k.strip().lower() for k in (keys or "").split("+") if k.strip()]
+    parts = ["option" if k in ("alt", "opt") else "cmd" if k in ("command", "meta") else "ctrl" if k == "control" else k
+             for k in parts]
+    mods = [m for m in _MODIFIERS if m in parts]
+    return "+".join(mods + [k for k in parts if k not in _MODIFIERS])
+
+
 #: Which heads hold the text each write puts on screen.
 WRITE_VALUES = {"TYPE_TEXT": ("type_text_value",), "APPEND_TEXT": ("type_text_value",), "RENAME": ("type_text_value",),
                 "TYPE_FOCUSED": ("type_text_value",), "REPLACE_TEXT": ("replace_from", "type_text_value")}
@@ -96,12 +110,18 @@ def commits(label: str, role: str = "") -> bool:
 
 
 def consequential(op: str, target: dict | None = None, chord: str = "") -> bool:
-    """A write, a click on a committing control, or a chord that saves."""
+    """A write, a click on a committing control, or a chord that writes or removes. For KEY, `target` is the
+    focused element: Return or Delete in a search or name field only confirms or edits it."""
     if op in WRITE_OPS:
         return True
     if op in ("CLICK", "OPEN") and target:
         return commits(str(target.get("label") or ""), str(target.get("role") or ""))
-    return op == "KEY" and chord.lower() in COMMIT_KEYS
+    if op != "KEY":
+        return False
+    chord = chord_of(chord)
+    if chord in FIELD_KEYS and target and _BENIGN_FIELD.search(str(target.get("label") or "")):
+        return False
+    return chord in COMMIT_KEYS
 
 
 def _top(answer: dict | None) -> float:
@@ -124,7 +144,8 @@ def unsure(op: str, answers: dict, heads: tuple[str, ...], floors: Floors, *, ta
     written = written or {}
     probs = (answers.get("operation") or {}).get("probabilities") or {}
     p_op = float(probs.get(op, _top(answers.get("operation"))))
-    targets = [_top(answers[h]) for h in heads if h in answers and h not in VALUE_HEADS]
+    # A head the operation needs and the answers lack is unknown, not certain.
+    targets = [_top(answers[h]) if h in answers else 0.0 for h in heads if h not in VALUE_HEADS]
     values = []
     for h in WRITE_VALUES.get(op, ()):
         p = written[h] if h in written else (_top(answers[h]) if h in answers else None)

@@ -1,0 +1,240 @@
+{
+ "ui_elements": [
+  {
+   "id": "elem_186",
+   "role": "button",
+   "ax_role": "AXButton",
+   "label": "返回",
+   "bounds": {
+    "width": 36,
+    "height": 36,
+    "x": 480,
+    "y": 164
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_187",
+   "role": "button",
+   "ax_role": "AXButton",
+   "label": "前进",
+   "bounds": {
+    "width": 37,
+    "height": 36,
+    "x": 516,
+    "y": 164
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_195",
+   "role": "button",
+   "ax_role": "AXButton",
+   "label": "共享",
+   "bounds": {
+    "height": 52,
+    "y": 155,
+    "x": 1089,
+    "width": 36
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_95",
+   "role": "textField",
+   "ax_role": "AXTextField",
+   "label": "报销单.csv",
+   "value": "报销单.csv",
+   "bounds": {
+    "width": 69,
+    "height": 18,
+    "x": 517,
+    "y": 241
+   },
+   "is_actionable": true,
+   "is_value_settable": true
+  },
+  {
+   "id": "elem_105",
+   "role": "textField",
+   "ax_role": "AXTextField",
+   "label": "发票.pdf",
+   "value": "发票.pdf",
+   "bounds": {
+    "width": 56,
+    "height": 18,
+    "x": 517,
+    "y": 261
+   },
+   "is_actionable": true,
+   "is_value_settable": true
+  },
+  {
+   "id": "elem_115",
+   "role": "textField",
+   "ax_role": "AXTextField",
+   "label": "项目",
+   "value": "项目",
+   "bounds": {
+    "width": 32,
+    "height": 18,
+    "x": 517,
+    "y": 281
+   },
+   "is_actionable": true,
+   "is_value_settable": true
+  },
+  {
+   "id": "elem_126",
+   "role": "textField",
+   "ax_role": "AXTextField",
+   "label": "budget.xlsx",
+   "value": "budget.xlsx",
+   "bounds": {
+    "width": 77,
+    "height": 18,
+    "x": 517,
+    "y": 301
+   },
+   "is_actionable": true,
+   "is_value_settable": true
+  },
+  {
+   "id": "elem_136",
+   "role": "textField",
+   "ax_role": "AXTextField",
+   "label": "notes.txt",
+   "value": "notes.txt",
+   "bounds": {
+    "width": 60,
+    "height": 18,
+    "x": 517,
+    "y": 321
+   },
+   "is_actionable": true,
+   "is_value_settable": true
+  },
+  {
+   "id": "elem_146",
+   "role": "textField",
+   "ax_role": "AXTextField",
+   "label": "readme.txt",
+   "value": "readme.txt",
+   "bounds": {
+    "width": 72,
+    "height": 18,
+    "x": 517,
+    "y": 341
+   },
+   "is_actionable": true,
+   "is_value_settable": true
+  },
+  {
+   "id": "elem_156",
+   "role": "textField",
+   "ax_role": "AXTextField",
+   "label": "todo.md",
+   "value": "todo.md",
+   "bounds": {
+    "width": 57,
+    "height": 18,
+    "x": 517,
+    "y": 361
+   },
+   "is_actionable": true,
+   "is_value_settable": true
+  },
+  {
+   "id": "elem_167",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 781,
+    "height": 28,
+    "x": 471,
+    "y": 207
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_184",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 81,
+    "height": 52,
+    "x": 475,
+    "y": 155
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_188",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 164,
+    "height": 52,
+    "x": 862,
+    "y": 155
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_198",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 40,
+    "height": 52,
+    "x": 1208,
+    "y": 155
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_202",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 14,
+    "height": 14,
+    "x": 397,
+    "y": 174
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_203",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 14,
+    "height": 14,
+    "x": 397,
+    "y": 174
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_10",
+   "role": "other",
+   "ax_role": "AXStaticText",
+   "label": "共享",
+   "value": "共享",
+   "bounds": {
+    "width": 77,
+    "height": 18,
+    "x": 377,
+    "y": 246
+   },
+   "is_actionable": false
+  }
+ ]
+}

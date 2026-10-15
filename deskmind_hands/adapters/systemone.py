@@ -2193,6 +2193,8 @@ class SystemOneAdapter:
                     self._ledger.was_saved(m.group(1))
             for m in re.finditer(r"closed '(.+?)'", last.result_detail or ""):
                 self._ledger.was_closed(m.group(1))
+            for m in re.finditer(r"moved '(.+?)' to", last.result_detail or ""):
+                self._ledger.was_moved(m.group(1))
 
     def _done_inputs(self, ctx: TurnContext) -> tuple[str, list[str], list[str]]:
         goal = ctx.task.goal

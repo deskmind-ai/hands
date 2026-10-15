@@ -12,7 +12,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from deskmind_hands.done_check import Ledger, objection, progress, rows_wanted, satisfied   # noqa: E402
+from deskmind_hands.done_check import Ledger, files_to_move, objection, progress, rows_wanted, satisfied   # noqa: E402
 
 TABLE = ["PN-7713,Ceramic capacitor,1250", "PN-2046,Schottky diode,86", "PN-5581,Precision resistor,3400"]
 
@@ -45,6 +45,17 @@ class Rules(unittest.TestCase):
         led.was_saved("parts.csv")
         self.assertIn("still open", objection("then save and close it", led, ["parts.csv"], []))
         self.assertIsNone(objection("then save and close it", led, ["records.txt"], []))
+
+    def test_move_what_the_goal_moves(self):
+        """deskmind#67: 报销 made, 报销单.csv left where it was, and DONE."""
+        goal = "新建一个「报销」文件夹，把 报销单.csv 移进去"
+        led = Ledger()
+        self.assertIn("'报销单.csv' has not been moved", objection(goal, led, [], []))
+        led.was_moved("报销单.csv")
+        self.assertIsNone(objection(goal, led, [], []))
+        self.assertEqual(files_to_move("把「a.log」移到 keep，再打开 b.txt"), ["a.log"])   # only what the verb is about
+        self.assertEqual(files_to_move("Move a.log into keep, then open b.txt"), ["a.log"])
+        self.assertEqual(files_to_move("打开 parts.csv，追加两行"), [])
 
 
 class Satisfied(unittest.TestCase):
@@ -121,6 +132,24 @@ class AdapterLedger(unittest.TestCase):
         self.assertIn("not saved", a.done_objection(ctx([wrote])))
         saved = Turn({"kind": "click"}, True, "saved 'parts.csv' (scripted, in the background)")
         self.assertIsNone(a.done_objection(ctx([wrote, saved])))
+
+    def test_moves_that_landed(self):
+        from deskmind_hands.adapters.base import Turn, TurnContext
+        from deskmind_hands.adapters.systemone import SystemOneAdapter
+        from deskmind_hands.drivers.base import Observation
+        from deskmind_hands.geometry import ImageTransform, ScreenGeometry, Size
+        from deskmind_hands.live import live_task
+        s = Size(900, 700)
+        o = Observation(id="o", geometry=ScreenGeometry(s, s), transform=ImageTransform.identity(s),
+                        focused_app="Finder", window_title="Playground")
+        task = live_task("新建一个「报销」文件夹，把 报销单.csv 移进去", None, app="com.apple.finder", max_actions=5,
+                         wall_clock_s=60)
+        a = SystemOneAdapter()
+        ctx = lambda h: TurnContext(task=task, observation=o, history=h, channels=frozenset({"ax"}))
+        made = Turn({"kind": "click"}, True, "created folder '报销' in 'Playground' (projected)")
+        self.assertIn("not been moved", a.done_objection(ctx([made])))
+        moved = Turn({"kind": "type_text"}, True, "moved '报销单.csv' to '报销' (projected)")
+        self.assertIsNone(a.done_objection(ctx([made, moved])))
 
 
 class StopsOnce(unittest.TestCase):

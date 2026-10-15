@@ -29,6 +29,16 @@ ADDS = re.compile(r"\b(?:add|append|insert|copy|write|record|log)\b|追加|添�
 CHANGES = re.compile(r"\b(?:change|replace|rewrite|edit|update|correct|fix|remove|delete|clear|empty|overwrite|sort|"
                      r"reorder|rename|keep only)\b|修改|改成|改为|替换|更新|删除|删掉|清空|覆盖|重写|排序|只保留", re.I)
 
+#: The files a goal moves: "把 报销单.csv 移进去", "move a.log into keep". Only a file the move verb is about, so "移到
+#: keep，再打开 b.txt" does not hold the run to moving b.txt.
+_FILE = r"「?([\w\u4e00-\u9fff][\w\u4e00-\u9fff.\-]*\.[A-Za-z0-9]{1,5})」?"
+MOVES = (re.compile(r"把\s*" + _FILE + r"\s*(?:移|挪|放|拖|搬)"),
+         re.compile(r"(?<![A-Za-z])move\s+(?:the\s+file\s+)?" + _FILE, re.I))
+
+
+def files_to_move(goal: str) -> list[str]:
+    return list(dict.fromkeys(m.group(1) for rx in MOVES for m in rx.finditer(goal)))
+
 
 def destination(goal: str) -> str | None:
     """The file the goal writes into (adapters.systemone.goal_files), if it names one."""
@@ -53,6 +63,7 @@ class Ledger:
     unsaved: set[str] = field(default_factory=set)                  # documents written since their last save
     saved: set[str] = field(default_factory=set)
     closed: set[str] = field(default_factory=set)                   # documents the run closed (after writing them)
+    moved: set[str] = field(default_factory=set)                    # files the run moved
 
     def wrote(self, document: str, text: str) -> None:
         if document:
@@ -75,6 +86,9 @@ class Ledger:
     def was_closed(self, document: str) -> None:
         if document in self.written:
             self.closed.add(document)
+
+    def was_moved(self, name: str) -> None:
+        self.moved.add(name)
 
     def rows_written(self) -> set[str]:
         return {line.strip() for texts in self.written.values() for t in texts for line in t.splitlines()
@@ -111,6 +125,10 @@ def objection(goal: str, ledger: Ledger, open_windows: list[str], table: list[st
             nxt = next((r for r in table if r not in ledger.rows_written()), None)
             return (f"{len(done)} of the {wanted} rows the goal asks for are written"
                     + (f"; the next one is: {nxt}" if nxt else "") + ". Write the rest before finishing.")
+    left = [f for f in files_to_move(goal) if f not in ledger.moved]
+    if left:
+        # Made the folder and said DONE with the file still where it was (deskmind#67): the move is the goal.
+        return f"{left[0]!r} has not been moved yet, and the goal asks to move it: move it before finishing."
     if CLOSE.search(goal):
         still = [d for d in ledger.written if d in open_windows]
         if still:

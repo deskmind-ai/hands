@@ -705,25 +705,28 @@ def run_task(
                 history.append(Turn(action.to_json(), False, refused_field))
                 notice = refused_field
                 continue
+            is_bar = (getattr(driver, "browser_field_is_address_bar", lambda _eid: True)(action.binding.element_id)
+                      if field_label else True)
             if field_label:
                 page = getattr(driver, "page_info", lambda: None)()
                 verdict = judge.typing(getattr(adapter, "judge_choice", None), task.goal, field_label,
-                                       action.text or "", page, _users_words(dialogue))
+                                       action.text or "", page, _users_words(dialogue), address_bar=is_bar)
                 entry = {"n": len(steps) + 1, "kind": "judged", "about": "browser_field", "field": field_label,
                          "verdict": verdict, "by": "harness"}
                 steps.append(entry)
                 if recorder:
                     recorder.step(entry)
                 if verdict == judge.DONT:
+                    sent = "what is typed there goes to a website" if is_bar else "not the page"
                     history.append(Turn(action.to_json(), False,
-                                        f"not typed into {field_label!r}: it is the browser's own field, and what is "
-                                        f"typed there goes to a website; this text does not belong there"))
-                    notice = (f"Not typed into {field_label!r}: it is the browser's own field (what is typed there "
-                              f"goes to a website), and this text does not belong there. Type into the page, or into "
-                              f"the document the goal names.")
+                                        f"not typed into {field_label!r}: it is the browser's own field ({sent}); this "
+                                        f"text does not belong there"))
+                    notice = (f"Not typed into {field_label!r}: it is the browser's own field ({sent}), and this text "
+                              f"does not belong there. Type into the page, or into the document the goal names.")
                     continue
                 if verdict == judge.ASK:
-                    field_ask = f"把「{(action.text or '').strip()[:80]}」打进 {field_label}（浏览器自带的输入框，打的字会交给网站）"
+                    field_ask = (f"把「{(action.text or '').strip()[:80]}」打进 {field_label}"
+                                 f"（{'浏览器的地址栏，打的字会交给网站' if is_bar else '浏览器自带的输入框，不在网页里'}）")
             what = (risk.risky(action, obs, last_typed_label, renames=cfg.confirm_renames)
                     if (cfg.approve_risky or cfg.refuse_risky) else None)
             # An approval is for one step, in one app: approving one "click 'Send'" once covered every later Send of

@@ -170,6 +170,27 @@ class ReviewFixes(unittest.TestCase):
                  config=RunConfig(user=user, approve_risky=True))
         self.assertEqual((adapter.asked, user.asked, driver.typed, driver.allowed), ([], [], [], []))
 
+    def test_the_find_bar_is_not_described_as_the_address_bar(self):
+        # 在页面上查找 is the browser's own field but sends nothing to a website: told so, the judgement can allow
+        # "Find 'invoice' on this web page" (review of 9f226e9).
+        class Find(Browser):
+            def browser_field_is_address_bar(self, eid):
+                return False
+        typed = {"kind": "type_text", "text": "invoice", "binding": {"element_id": "bar"}}
+        adapter = Judged([typed, DONE], typing=judge.DO)
+        from deskmind_bench.task import load_task
+        from deskmind_hands.env.workspace import Workspace
+        from deskmind_hands.runtime.loop import RunConfig, run_task
+        repo = Path(__file__).resolve().parent.parent
+        task = dataclasses.replace(load_task(repo / "tasks" / "smoke" / "S01-rename.yaml"),
+                                   goal="Find 'invoice' on this web page")
+        driver = Find(CONSOLE)
+        run_task(task, driver, adapter, Workspace.create(Path(tempfile.mkdtemp()), repo / "fixtures"),
+                 config=RunConfig(user=User(True), approve_risky=True))
+        self.assertEqual(driver.typed, ["invoice"])
+        self.assertIn(judge.FIELD_OTHER, adapter.asked[0])
+        self.assertNotIn("搜索引擎", adapter.asked[0].split("问题：")[0])
+
     def test_a_harness_approval_is_not_what_the_user_said(self):
         from deskmind_hands.runtime.loop import _users_words
         said = _users_words([{"question": "要发出去吗？", "reply": "ok", "by": "harness"},

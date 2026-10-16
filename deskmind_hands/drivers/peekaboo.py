@@ -953,6 +953,11 @@ class PeekabooDriver:
         """The run judged (or the user approved) typing into this browser field: the next TYPE_TEXT into it goes."""
         self._browser_field_allowed = eid
 
+    def browser_field_is_address_bar(self, eid: str) -> bool:
+        """Whether the browser's own field `eid` is its address bar (what is typed there goes to a website), not
+        another of its fields such as 在页面上查找: what the judgement is told about the field."""
+        return eid == WEB_SEARCH or self._address_bar_refusal(eid) is not None
+
     def _address_bar_refusal(self, eid: str) -> str | None:
         """Why typing into `eid` directly is refused whatever was judged: it is the address bar (known by its
         identifier, or the one 「在地址栏搜索」 stands for), typed into only as 「在地址栏搜索」 (_web_search: the
@@ -1014,23 +1019,18 @@ class PeekabooDriver:
             fields = axchrome.own_fields(pid, self._window_frame()) if pid else []
         except Exception:   # noqa: BLE001 -- unread structure: nothing offered
             return []
+        # Only the address bar known by its identifier: the search confirms the focus by that identifier, so a field
+        # taken for the bar by place alone (the first one outside a page) was replaced by an option that always
+        # failed, and could be the find bar (review of 9f226e9).
         known = [f for f, k in fields if k]
-        # A field outside a web area counts only for a web page, not a web area that renders something else (a mail
-        # message is one too, with a search field beside it): the page must have a web address.
-        others = ([f for f, _ in fields] if any((e.ax_role or "") == "AXWebArea" or (e.role or "").lower() == "webarea"
-                                               for e in els)
-                  and str((self.page_info() or {}).get("url") or "").startswith(("http://", "https://", "file:"))
-                  else [])
-        # The address bar known by its identifier first: a find bar is a browser-own field too, and is no address bar.
-        for frames in (known, others):
-            for e in els:
-                if e.rect and (e.ax_role or "") in axchrome.TEXT_ROLES and axchrome.at(
-                        frames, self._origin.x + e.rect.x + e.rect.w / 2, self._origin.y + e.rect.y + e.rect.h / 2):
-                    self._address_bar, self._address_bar_rect, self._address_bar_label = e.id, e.rect, e.label or ""
-                    label = f"在地址栏搜索（{e.label}）" if e.label else "在地址栏搜索"
-                    # Its value is the bar's (the page's address): the only place the planner read it.
-                    return [Element(id=WEB_SEARCH, role="textbox", label=label, value=e.value or "", settable=True,
-                                    synthetic=True, app=self._app_name, window_id=self._window_id or "")]
+        for e in els:
+            if e.rect and (e.ax_role or "") in axchrome.TEXT_ROLES and axchrome.at(
+                    known, self._origin.x + e.rect.x + e.rect.w / 2, self._origin.y + e.rect.y + e.rect.h / 2):
+                self._address_bar, self._address_bar_rect, self._address_bar_label = e.id, e.rect, e.label or ""
+                label = f"在地址栏搜索（{e.label}）" if e.label else "在地址栏搜索"
+                # Its value is the bar's (the page's address): the only place the planner read it.
+                return [Element(id=WEB_SEARCH, role="textbox", label=label, value=e.value or "", settable=True,
+                                synthetic=True, app=self._app_name, window_id=self._window_id or "")]
         return []
 
     def _web_search(self, action: Action) -> ExecResult:

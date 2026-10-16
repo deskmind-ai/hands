@@ -50,9 +50,17 @@ class Offered(unittest.TestCase):
     def tearDown(self):
         self.p.stop()
 
+    def test_a_field_outside_the_page_without_the_identifier_is_no_address_bar(self):
+        # By place alone it could be the find bar, and the search confirms the focus by the identifier: the option
+        # always failed, and the field it replaced could no longer be typed into (review of 9f226e9).
+        d = driver("com.apple.Safari")
+        self.assertEqual(d._project_browser(SAFARI), [])
+        self.assertIsNone(d._address_bar)
+
     def test_offered_in_a_browser_window(self):
         d = driver("com.apple.Safari")
-        out = d._project_browser(SAFARI)
+        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None: [(BAR, True)]):
+            out = d._project_browser(SAFARI)
         self.assertEqual([(e.id, e.label, e.settable, e.synthetic) for e in out], [(WEB_SEARCH, "在地址栏搜索（智能搜索栏）", True, True)])
         self.assertEqual(d._address_bar, "e48")
         self.assertEqual(d.browser_field(WEB_SEARCH), "智能搜索栏")

@@ -953,23 +953,49 @@ class PeekabooDriver:
         """The run judged (or the user approved) typing into this browser field: the next TYPE_TEXT into it goes."""
         self._browser_field_allowed = eid
 
-    def _browser_field_refusal(self, eid: str) -> str | None:
-        """Why typing into `eid` is refused: it is a browser's own field. Those are typed into only as 「在地址栏搜索」
-        (_web_search: the observed window, the one window at its frame, the focus checked on its address bar), never
-        by the plain routes, which check neither -- with two windows on top of each other the projection was not
-        offered, the raw bar stayed, and a judged 照做 pasted through _vision_act unchecked (review of 27b84b8). This
-        stays on every route that writes: G18b typed a parts row into Safari's address bar (09-30)."""
-        label = self.browser_field(eid)
-        if label is None or eid == WEB_SEARCH:
+    def _address_bar_refusal(self, eid: str) -> str | None:
+        """Why typing into `eid` directly is refused whatever was judged: it is the address bar (known by its
+        identifier, or the one 「在地址栏搜索」 stands for), typed into only as 「在地址栏搜索」 (_web_search: the
+        observed window, the one window at its frame, the focus checked on its address bar). The plain routes check
+        neither: with two windows on top of each other the projection was not offered, the raw bar stayed, and a judged
+        照做 pasted through _vision_act unchecked (review of 27b84b8). Other browser-own fields (Safari's 在页面上查找)
+        are not the address bar: judged, they are typed into as before (review of bd79705)."""
+        if not eid or eid == WEB_SEARCH or self.browser_field(eid) is None:
             return None
-        return (f"not typed into {label!r}: it is the browser's own field (its address bar), and what is typed there "
-                f"goes to a website; it is typed into only as 「在地址栏搜索」 when that is offered. Type into the page, "
-                f"or into the document the goal names.")
+        label = self.browser_field(eid)
+        refusal = (f"not typed into {label!r}: it is the browser's address bar, typed into only as 「在地址栏搜索」 "
+                   f"when that is offered. Type into the page, or into the document the goal names.")
+        if eid == getattr(self, "_address_bar", None):
+            return refusal
+        r = getattr(self, "_rects", {}).get(eid)
+        try:
+            from deskmind_hands.drivers import axchrome
+            pid = self._pid_of(self.app)
+            bars = axchrome.address_bars(pid) if pid and r is not None else []
+        except Exception:   # noqa: BLE001 -- unread structure: the allowance below still guards it
+            return None
+        if r is not None and axchrome.at(bars, self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2):
+            return refusal
+        return None
+
+    def _browser_field_refusal(self, eid: str) -> str | None:
+        """Why typing into `eid` is refused: the address bar always but as 「在地址栏搜索」 (_address_bar_refusal);
+        another browser-own field unless the run allowed this step (judged, or approved by the person). This stays on
+        every route that writes: G18b typed a parts row into Safari's address bar (09-30)."""
+        allowed, self._browser_field_allowed = getattr(self, "_browser_field_allowed", None), None
+        bar = self._address_bar_refusal(eid)
+        if bar:
+            return bar
+        label = None if eid == WEB_SEARCH else self.browser_field(eid)
+        if label is None or allowed == eid:
+            return None
+        return (f"not typed into {label!r}: it is the browser's own field (outside the page, like its address bar), and "
+                f"nothing judged that this text belongs there. Type into the page, or into the document the goal names.")
 
     def browser_field_refused(self, eid: str) -> str | None:
         """For the loop, before it judges or asks anything: typing into `eid` will be refused whatever the judgement
-        (a browser's own field other than 「在地址栏搜索」)."""
-        return self._browser_field_refusal(eid)
+        (the address bar other than as 「在地址栏搜索」)."""
+        return self._address_bar_refusal(eid)
 
     def _project_browser(self, els: list[Element]) -> list[Element]:
         """A browser's address bar as one plain option: 「在地址栏搜索」, a field whose value is typed into the address

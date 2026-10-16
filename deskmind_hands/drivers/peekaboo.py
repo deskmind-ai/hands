@@ -932,7 +932,7 @@ class PeekabooDriver:
         the text belongs there is the run's judgement (runtime/judge.py), not this driver's."""
         if eid == WEB_SEARCH:
             bar = getattr(self, "_address_bar", None)
-            return (getattr(self, "_labels_by_id", {}).get(bar) or "地址栏") if bar else None
+            return (getattr(self, "_address_bar_label", "") or "地址栏") if bar else None
         r = getattr(self, "_rects", {}).get(eid)
         if r is None:
             return None
@@ -968,8 +968,11 @@ class PeekabooDriver:
         known by its identifier, page or no page (a start page, a blank tab), or a field outside a web page that has a
         web address. No word of the goal decides it. Without it the planner chose the page's own search box whenever a
         page had one, and the address bar was never typed into (deskmind#73). Whether the value belongs there is
-        judged before it runs, like any typing into the browser's own field (runtime/judge.py)."""
-        self._address_bar = None
+        judged before it runs, like any typing into the browser's own field (runtime/judge.py).
+        The option carries the bar's own name (「在地址栏搜索（智能搜索栏）」) and takes the bar's place among the options
+        (see observe): offered both, a planner told to search "in the 智能搜索栏" chose the bar itself by its name,
+        which types without submitting (deskmind#73, live 10-16)."""
+        self._address_bar, self._address_bar_rect, self._address_bar_label = None, None, ""
         try:
             from deskmind_hands.drivers import axchrome
             pid = self._pid_of(self.app)
@@ -988,8 +991,9 @@ class PeekabooDriver:
             for e in els:
                 if e.rect and (e.ax_role or "") in axchrome.TEXT_ROLES and axchrome.at(
                         frames, self._origin.x + e.rect.x + e.rect.w / 2, self._origin.y + e.rect.y + e.rect.h / 2):
-                    self._address_bar = e.id
-                    return [Element(id=WEB_SEARCH, role="textbox", label="在地址栏搜索", value="", settable=True,
+                    self._address_bar, self._address_bar_rect, self._address_bar_label = e.id, e.rect, e.label or ""
+                    label = f"在地址栏搜索（{e.label}）" if e.label else "在地址栏搜索"
+                    return [Element(id=WEB_SEARCH, role="textbox", label=label, value="", settable=True,
                                     synthetic=True, app=self._app_name, window_id=self._window_id or "")]
         return []
 
@@ -1001,8 +1005,8 @@ class PeekabooDriver:
         appended to the address, and still read "verified". Only when the run allowed this step (the judgement), like
         typing there directly. Each check that fails fails the step and says why."""
         allowed, self._browser_field_allowed = getattr(self, "_browser_field_allowed", None), None
-        bar = getattr(self, "_address_bar", None)
-        if bar is None or bar not in getattr(self, "_rects", {}):
+        bar, r = getattr(self, "_address_bar", None), getattr(self, "_address_bar_rect", None)
+        if bar is None or r is None:
             return ExecResult(False, "this window shows no address bar to search from")
         if allowed != WEB_SEARCH:
             return ExecResult(False, "not searched from the address bar: what is typed there goes to a website, and "
@@ -1021,7 +1025,7 @@ class PeekabooDriver:
             return ExecResult(False, "not searched: the window this run observes was not found, and no other window "
                                      "is typed into")
         q, token = bg
-        r, text = self._rects[bar], action.text or ""
+        text = action.text or ""
         x, y = self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2
         from deskmind_hands.drivers import axchrome, skylight
         pid, frame = self._pid_of(self.app), self._window_frame()
@@ -1278,6 +1282,12 @@ class PeekabooDriver:
             if wid in getattr(self, "_unreadable", set()):
                 continue
             title = (w.get("window_title") or "").strip()
+            # A browser window that is not on screen (minimised, another Space) is not offered unless it is the one
+            # observed: a run copying a table switched to the user's own minimised Safari window and read its page
+            # (deskmind#73, live 10-16). What the user put away is not a place this task may go.
+            if (self.app.lower() in self.BROWSERS and not w.get("is_on_screen", True)
+                    and wid not in (self._pinned_window, self._window_id)):
+                continue
             # A Finder window is offered only if it shows a folder of this workspace. Anything else -- another
             # run's folder, the user's Downloads -- is not a place this task may go, and is not shown.
             if (self.app.lower() == "com.apple.finder" and title and wid != self._pinned_window
@@ -1841,7 +1851,10 @@ class PeekabooDriver:
         elif self.app.lower() == CHAT_APP:
             els = self._chat_scope(els)
         if PROJECTION and self._mcp is not None:
-            els += self._project_browser(els)
+            web = self._project_browser(els)
+            if web:
+                # One field, one option: the address bar is offered as 「在地址栏搜索（its name）」 only.
+                els = [e for e in els if e.id != self._address_bar] + web
         if PROJECTION and self._mcp is not None and self.offer_folder_files and self.app.lower() != "com.apple.finder":
             els += self._folder_documents()
         if self.app.lower() in VOCAB and getattr(self, "_shot", None) is not None:

@@ -3,7 +3,7 @@ web page but sits outside it. Found through accessibility by structure, not by a
 
 Typed into, the address bar sends what is typed to a website: G18b, copying a parts table into a file, typed a row
 into Safari's and pressed Return, and the row went to a search engine (09-30, twice). The driver refuses that unless
-the goal asks for something on the web (peekaboo.py, _browser_field_refusal).
+the run has judged that the text belongs there (runtime/judge.py; peekaboo.py, browser_field).
 
 Measured 09-30: Safari's address bar is found and the fields of the page it shows are not; TextEdit and Preview have
 none. Chrome shows no web area to accessibility until a client turns its tree on, so its address bar is not found --
@@ -56,3 +56,42 @@ def fields_outside_page(pid: int) -> list[tuple[float, float, float, float]]:
 
 def at(frames, x: float, y: float) -> bool:
     return any(fx <= x <= fx + fw and fy <= y <= fy + fh for fx, fy, fw, fh in frames)
+
+
+#: The most page text read for a judgement (runtime/judge.py shows less): a result is near the top of a page.
+PAGE_TEXT_CHARS = 4000
+
+
+def page_info(pid: int) -> dict | None:
+    """The web page the focused window shows: {"url", "title", "text"}, the text being the page's static text in
+    order; None when that window holds no web page. Read for the judgement whether a browser task's result is on the
+    page (runtime/judge.py), never to decide anything here."""
+    from ApplicationServices import AXUIElementCreateApplication
+    app = AXUIElementCreateApplication(pid)
+    win = _get(app, "AXFocusedWindow") or (_get(app, "AXWindows") or [None])[0]
+    if win is None:
+        return None
+    stack, seen, page = [win], 0, None
+    while stack and seen < MAX_NODES:
+        el = stack.pop()
+        seen += 1
+        if _get(el, "AXRole") == "AXWebArea":
+            page = el
+            break
+        stack.extend(reversed(_get(el, "AXChildren") or []))
+    if page is None:
+        return None
+    url = _get(page, "AXURL")
+    url = str(url.absoluteString()) if hasattr(url, "absoluteString") else (str(url) if url else "")
+    parts, size, stack, seen = [], 0, [page], 0
+    while stack and seen < MAX_NODES and size < PAGE_TEXT_CHARS:
+        el = stack.pop()
+        seen += 1
+        if _get(el, "AXRole") == "AXStaticText":
+            v = str(_get(el, "AXValue") or "").strip()
+            if v:
+                parts.append(v)
+                size += len(v) + 1
+        stack.extend(reversed(_get(el, "AXChildren") or []))
+    return {"url": url, "title": str(_get(win, "AXTitle") or _get(page, "AXTitle") or ""),
+            "text": " ".join(parts)[:PAGE_TEXT_CHARS]}

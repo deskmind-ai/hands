@@ -697,6 +697,14 @@ def run_task(
             field_label = (getattr(driver, "browser_field", lambda _eid: None)(action.binding.element_id)
                            if action.kind is ActionKind.TYPE_TEXT and action.binding.element_id else None)
             field_ask: str | None = None
+            # A browser's own field the driver never types into directly (only as 「在地址栏搜索」): refused before
+            # anything is judged or asked -- asking the person and then refusing helps no one.
+            refused_field = (getattr(driver, "browser_field_refused", lambda _eid: None)(action.binding.element_id)
+                             if field_label else None)
+            if refused_field:
+                history.append(Turn(action.to_json(), False, refused_field))
+                notice = refused_field
+                continue
             if field_label:
                 page = getattr(driver, "page_info", lambda: None)()
                 verdict = judge.typing(getattr(adapter, "judge_choice", None), task.goal, field_label,

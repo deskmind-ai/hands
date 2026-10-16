@@ -153,6 +153,23 @@ if __name__ == "__main__":
 
 
 class ReviewFixes(unittest.TestCase):
+    def test_a_field_the_driver_never_types_into_is_neither_judged_nor_asked(self):
+        # The raw address bar (no 「在地址栏搜索」 offered): refused before the judgement, no question to the person.
+        class Raw(Browser):
+            def browser_field_refused(self, eid):
+                return "not typed into '智能搜索栏': only as 「在地址栏搜索」" if eid == "bar" else None
+        typed = {"kind": "type_text", "text": "新加坡 天气", "binding": {"element_id": "bar"}}
+        user, adapter = User(True), Judged([typed, DONE], typing=judge.ASK)
+        from deskmind_bench.task import load_task
+        from deskmind_hands.env.workspace import Workspace
+        from deskmind_hands.runtime.loop import RunConfig, run_task
+        repo = Path(__file__).resolve().parent.parent
+        task = dataclasses.replace(load_task(repo / "tasks" / "smoke" / "S01-rename.yaml"), goal="打开 Safari，搜索新加坡的天气")
+        driver = Raw(CONSOLE)
+        run_task(task, driver, adapter, Workspace.create(Path(tempfile.mkdtemp()), repo / "fixtures"),
+                 config=RunConfig(user=user, approve_risky=True))
+        self.assertEqual((adapter.asked, user.asked, driver.typed, driver.allowed), ([], [], [], []))
+
     def test_a_harness_approval_is_not_what_the_user_said(self):
         from deskmind_hands.runtime.loop import _users_words
         said = _users_words([{"question": "要发出去吗？", "reply": "ok", "by": "harness"},

@@ -372,6 +372,19 @@ def _name_rows(els: list) -> None:
             e.label = " · ".join(t.label for t in inside)
 
 
+#: The roles a Finder item's name comes in, by view: a text field in list view, the icon itself (an AXImage
+#: titled with the name) in icon view. Only text fields were read, so in icon view no row was a file, no move was
+#: offered, and a planner told to make 报销 and move 报销单.csv into it made the folder and finished (deskmind#67).
+FINDER_ITEM_ROLES = ("textfield", "axtextfield", "image", "aximage")
+
+
+def mark_finder_items(els: list, folder: Path) -> None:
+    """Say which elements are the folder's items, and whether each is a folder or a file, whatever the window's view."""
+    for e in els:
+        if (e.role or "").lower() in FINDER_ITEM_ROLES and e.label and (folder / e.label).exists():
+            e.role = "folder" if (folder / e.label).is_dir() else "file"
+
+
 def parse_textedit_windows(out: str, root: str) -> set[tuple[str, int, int]]:
     """TextEdit's "name<TAB>path<TAB>left<TAB>top" lines -> (name, left, top) of the windows whose document is
     under root (see PeekabooDriver._open_workspace_documents)."""
@@ -1670,9 +1683,7 @@ class PeekabooDriver:
             self._window_title = data.get("window_title") or self._window_title
             folder = self._finder_folder()
             if folder is not None:
-                for e in els:
-                    if (e.role or "").lower() == "textfield" and e.label and (folder / e.label).exists():
-                        e.role = "folder" if (folder / e.label).is_dir() else "file"
+                mark_finder_items(els, folder)
                 # Pressing the window element itself raises the window -- the likeliest source of Finder sitting in
                 # front for six uncounted seconds. Windows are switched with FOCUS_WINDOW, not clicked.
                 els = [e for e in els if (e.role or "").lower() not in ("window", "axwindow")]
@@ -3140,7 +3151,13 @@ class PeekabooDriver:
             q = q.parent
             label = f"工作目录顶层 {q.name}" if q == root else f"上级文件夹 {q.name}"
             dests.append((label, q))
-        rows = [e for e in els if (e.role or "").lower() in ("folder", "file")]
+        rows = list({e.label: e for e in els if (e.role or "").lower() in ("folder", "file")}.values())
+        if not rows:
+            # Nothing on screen read as the folder's items (a view whose items come in another shape: deskmind#67 was
+            # icon view): offered from the folder itself, so moving never depends on how the window shows it.
+            rows = [Element(id=f"fs:{p.name}", role="folder" if p.is_dir() else "file", label=p.name,
+                            app=self._app_name, window_id=self._window_id or "")
+                    for p in [p for p in sorted(folder.iterdir()) if not p.name.startswith(".")][:40]]
         for e in rows:
             if (e.role or "").lower() == "folder":
                 dests.append((f"子文件夹 {e.label}", folder / e.label))

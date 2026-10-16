@@ -63,6 +63,18 @@ class Fields(unittest.TestCase):
             del APP["AXFocusedUIElement"]
         self.assertIsNone(axchrome.focused_identifier(1))
 
+    def test_an_address_bar_counts_only_in_the_observed_window(self):
+        # Every window's address bar has the same identifier (review): the focus in the user's window is not ours.
+        bar = dict(PAGE["AXChildren"][0]["AXChildren"][0], AXWindow=PAGE)
+        APP["AXFocusedUIElement"] = bar
+        try:
+            self.assertEqual(axchrome.focused_identifier(1, (900, 0, 800, 600)), "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD")
+            self.assertEqual(axchrome.focused_identifier(1, (0, 0, 800, 600)), "another window")
+            APP["AXFocusedUIElement"] = dict(bar, AXWindow=None)
+            self.assertEqual(axchrome.focused_identifier(1, (900, 0, 800, 600)), "another window")
+        finally:
+            del APP["AXFocusedUIElement"]
+
     def test_page_info_reads_the_observed_window(self):
         self.assertIsNone(axchrome.page_info(1, (0, 0, 800, 600)))          # the start page has no page
         info = axchrome.page_info(1, (900, 0, 800, 600))

@@ -1024,22 +1024,31 @@ class PeekabooDriver:
         r, text = self._rects[bar], action.text or ""
         x, y = self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2
         from deskmind_hands.drivers import axchrome, skylight
+        pid, frame = self._pid_of(self.app), self._window_frame()
+
+        def on_bar() -> str | None:
+            # The observed window's address bar, not merely an address bar: the identifier is the same in every
+            # window. No window frame, no check, no paste.
+            return axchrome.focused_identifier(pid, frame) if pid and frame else None
+
         try:
             self._post_click(q, x, y)
             time.sleep(0.2)
-            pid = self._pid_of(self.app)
-            focused = axchrome.focused_identifier(pid) if pid else None
+            focused = on_bar()
             if focused not in axchrome.ADDRESS_BAR_IDS:
-                return ExecResult(False, f"not searched: the keyboard focus is not on the address bar ({focused or 'unknown'}), "
-                                         f"so nothing was pasted")
-            self._paste_and_submit(q, text)
+                return self._settle(False, f"not searched: the keyboard focus is not on this window's address bar "
+                                           f"({focused or 'unknown'}), so nothing was pasted")
+            if not self._paste_and_submit(q, text, before_return=lambda: on_bar() in axchrome.ADDRESS_BAR_IDS):
+                return self._settle(False, "not searched: the focus left this window's address bar after the paste, "
+                                           "so Return was not pressed")
         finally:
             skylight.give_focus_back(token)
         return self._settle(True, f"searched {text!r} from the address bar (in the background)")
 
-    def _paste_and_submit(self, Q, text: str) -> None:
+    def _paste_and_submit(self, Q, text: str, before_return=None) -> bool:
         """Select all, paste `text`, Return, into the focused field; the user's clipboard, every item and type, put
-        back straight after. Pasted, not typed: an input method takes synthesized keys (see _vision_act)."""
+        back straight after. Pasted, not typed: an input method takes synthesized keys (see _vision_act). Return,
+        the step that submits, only if `before_return()` still holds; False when it did not and nothing was sent."""
         from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
         pb = NSPasteboard.generalPasteboard()
         saved = [{t: it.dataForType_(t) for t in it.types()} for it in (pb.pasteboardItems() or [])]
@@ -1049,8 +1058,11 @@ class PeekabooDriver:
             self._post_key(Q, self._keycode(Q, "a"), Q.kCGEventFlagMaskCommand)
             self._post_key(Q, self._keycode(Q, "v"), Q.kCGEventFlagMaskCommand)
             time.sleep(0.4)
+            if before_return is not None and not before_return():
+                return False
             self._post_key(Q, keys.RETURN)
             time.sleep(0.4)
+            return True
         finally:
             pb.clearContents()
             items = []

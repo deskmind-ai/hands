@@ -18,6 +18,7 @@ from deskmind_hands.geometry import Point, Rect   # noqa: E402
 from deskmind_hands.runtime import judge   # noqa: E402
 
 BAR = (275.0, 18.0, 237.0, 31.0)            # Safari's 智能搜索栏, on screen
+WIN = (0, 0, 800, 600)                        # the window the run observes
 
 
 def el(eid, role, ax, label, rect=None):
@@ -104,7 +105,8 @@ class Carried(unittest.TestCase):
         return d._execute_projected(Action(kind=ActionKind.TYPE_TEXT, text="新加坡 天气",
                                            binding=Binding(observation_id="o", app="Safari", element_id=WEB_SEARCH)))
 
-    def searchable(self, background=True, window=True, focused="WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"):
+    def searchable(self, background=True, window=True, focused="WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD", frame=None):
+        frame = WIN if frame is None else frame
         from deskmind_hands.drivers import skylight
         d = driver("com.apple.Safari")
         d._address_bar, d._projected_actions, d._rects = "e48", 0, {"e48": Rect(*BAR)}
@@ -116,8 +118,20 @@ class Carried(unittest.TestCase):
         d._settle = lambda ok, detail: ExecResult(ok, detail)
         d.events = []
         d._post_click = lambda q, x, y: d.events.append(("click", x, y))
-        d._paste_and_submit = lambda q, text: d.events.append(("paste+return", text))
-        self.patches = [mock.patch.object(axchrome, "focused_identifier", lambda pid: focused),
+
+        def paste_and_submit(q, text, before_return=None):
+            d.events.append(("paste", text))
+            if before_return is not None and not before_return():
+                return False
+            d.events.append(("return",))
+            return True
+
+        d._paste_and_submit = paste_and_submit
+        d._pid_of = lambda bundle: 7
+        d._window_frame = lambda: frame
+        seq = iter(focused if isinstance(focused, list) else [focused] * 3)
+        self.patches = [mock.patch.object(axchrome, "focused_identifier",
+                                          lambda pid, fr: next(seq) if fr == WIN else "another window"),
                         mock.patch.object(skylight, "give_focus_back", lambda token: d.events.append(("focus back",)))]
         for p in self.patches:
             p.start()
@@ -129,8 +143,8 @@ class Carried(unittest.TestCase):
         d.allow_browser_field(WEB_SEARCH)
         res = self.act(d)
         self.assertTrue(res.ok, res.detail)
-        self.assertEqual([e[0] for e in d.events], ["click", "paste+return", "focus back"])
-        self.assertEqual(d.events[1], ("paste+return", "新加坡 天气"))
+        self.assertEqual([e[0] for e in d.events], ["click", "paste", "return", "focus back"])
+        self.assertEqual(d.events[1], ("paste", "新加坡 天气"))
 
     def test_not_allowed_it_is_refused(self):
         d = self.searchable()
@@ -160,6 +174,30 @@ class Carried(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertIn("focus", res.detail)
         self.assertEqual([e[0] for e in d.events], ["click", "focus back"])
+
+    def test_an_address_bar_of_another_window_is_not_this_one(self):
+        # Every window's address bar has the same identifier: focus left in the user's own window must not pass.
+        d = self.searchable(frame=(5, 5, 10, 10))
+        d.allow_browser_field(WEB_SEARCH)
+        res = self.act(d)
+        self.assertFalse(res.ok)
+        self.assertIn("another window", res.detail)
+        self.assertEqual([e[0] for e in d.events], ["click", "focus back"])
+
+    def test_no_window_frame_no_paste(self):
+        d = self.searchable()
+        d._window_frame = lambda: None
+        d.allow_browser_field(WEB_SEARCH)
+        self.assertFalse(self.act(d).ok)
+        self.assertEqual([e[0] for e in d.events], ["click", "focus back"])
+
+    def test_focus_lost_after_the_paste_no_return(self):
+        d = self.searchable(focused=["WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD", "WEB_FIND_FIELD"])
+        d.allow_browser_field(WEB_SEARCH)
+        res = self.act(d)
+        self.assertFalse(res.ok)
+        self.assertIn("Return was not pressed", res.detail)
+        self.assertEqual([e[0] for e in d.events], ["click", "paste", "focus back"])
 
     def test_no_address_bar_on_screen(self):
         d = self.searchable()

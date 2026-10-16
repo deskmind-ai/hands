@@ -53,6 +53,23 @@ class Refusal(unittest.TestCase):
         self.assertIsNone(d._browser_field_refusal("bar"))
         self.assertIsNotNone(d._browser_field_refusal("bar"))
 
+    def test_an_allowance_does_not_outlive_its_step(self):
+        # An early return (here: no snapshot yet) or an error in the step must not leave it for the next (review).
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        d = driver("打开 Safari，搜索新加坡的天气")
+        d._mcp, d._snapshot = None, None
+        d.allow_browser_field("bar")
+        res = d.execute(Action(kind=ActionKind.CLICK, binding=Binding(observation_id="o", app="Safari",
+                                                                       element_id="field")))
+        self.assertFalse(res.ok)
+        self.assertIsNotNone(d._browser_field_refusal("bar"))
+
+    def test_page_info_is_the_observed_windows(self):
+        d = driver("打开 Safari，搜索新加坡的天气")
+        d._window_frame = lambda: (900, 0, 800, 600)
+        with mock.patch.object(axchrome, "page_info", lambda pid, frame: {"frame": frame}):
+            self.assertEqual(d.page_info(), {"frame": (900, 0, 800, 600)})
+
     def test_the_page_is_typed_into(self):
         self.assertIsNone(driver("Fill in the expense report and submit.")._browser_field_refusal("field"))
 

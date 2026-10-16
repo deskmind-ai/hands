@@ -222,6 +222,7 @@ class Carried(unittest.TestCase):
         d.allow_browser_field(WEB_SEARCH)
         self.assertFalse(self.act(d).ok)
         self.assertEqual(d.events, [])                  # not even the click (review of 2e2da77)
+
     def test_focus_lost_after_the_paste_no_return(self):
         d = self.searchable(focused=["WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD", "WEB_FIND_FIELD"])
         d.allow_browser_field(WEB_SEARCH)
@@ -235,6 +236,20 @@ class Carried(unittest.TestCase):
         d._address_bar_rect = None
         d.allow_browser_field(WEB_SEARCH)
         self.assertFalse(self.act(d).ok)
+
+
+class Bound(unittest.TestCase):
+    def test_a_first_look_keeps_the_place_of_the_window_it_binds(self):
+        # observe() kept the frame before binding the window: a first look kept none (review of 2e2da77).
+        import types
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        d._window_id, d._pinned_window, d._pin_window = None, None, True
+        bounds = {"X": 10, "Y": 20, "Width": 800, "Height": 600}
+        quartz = types.SimpleNamespace(kCGWindowListOptionIncludingWindow=8, CGWindowListCopyWindowInfo=lambda opt, wid: (
+            [{"kCGWindowBounds": bounds}] if wid == 4242 else []))
+        with mock.patch.dict(sys.modules, {"Quartz": quartz}):
+            d._bind_window({"coordinate_context": {"window": {"window_id": 4242}}})
+        self.assertEqual((d._window_id, d._pinned_window, d._seen_frame), ("4242", "4242", (10, 20, 800, 600)))
 
 
 class Values(unittest.TestCase):

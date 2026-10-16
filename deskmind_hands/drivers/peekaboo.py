@@ -1154,6 +1154,16 @@ class PeekabooDriver:
         b = info[0].get("kCGWindowBounds") if info else None
         return (round(b["X"]), round(b["Y"]), round(b["Width"]), round(b["Height"])) if b else None
 
+    def _bind_window(self, data: dict) -> None:
+        """The window this look is of, pinned on the first look if pinning, and then its place: read before the window
+        was bound, a first look (or one after FOCUS_APP) had no window id yet, kept no frame, and every movement check
+        passed (review of 2e2da77)."""
+        win = (data.get("coordinate_context") or {}).get("window") or {}
+        self._window_id = str(win.get("window_id", "")) or None
+        if self._pin_window and self._pinned_window is None:
+            self._pinned_window = self._window_id
+        self._seen_frame = self._window_frame()
+
     def _moved_since_seen(self) -> str | None:
         """Why a point taken from the last observation no longer lands where it did, or None: the window was moved or
         resized in the seconds the planner took (cua binds a coordinate click to its capture the same way)."""
@@ -1808,13 +1818,7 @@ class PeekabooDriver:
         self._snapshot = data.get("snapshot_id")
         self._app_name = data.get("application_name", "")
         self._window_title = data.get("window_title") or ""
-        win = (data.get("coordinate_context") or {}).get("window") or {}
-        self._window_id = str(win.get("window_id", "")) or None
-        if self._pin_window and self._pinned_window is None:
-            self._pinned_window = self._window_id
-        # After the window is bound: read before, a first look (or one after FOCUS_APP) had no window id yet, kept
-        # no frame, and every movement check passed (review of 2e2da77).
-        self._seen_frame = self._window_frame()
+        self._bind_window(data)
 
         png = shot.read_bytes() if shot.exists() else None
         self._shot = shot

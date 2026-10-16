@@ -954,9 +954,18 @@ class PeekabooDriver:
         self._browser_field_allowed = eid
 
     def browser_field_is_address_bar(self, eid: str) -> bool:
-        """Whether the browser's own field `eid` is its address bar (what is typed there goes to a website), not
-        another of its fields such as 在页面上查找: what the judgement is told about the field."""
-        return eid == WEB_SEARCH or self._address_bar_refusal(eid) is not None
+        """Whether the browser's own field `eid` may be its address bar (what is typed there goes to a website): what
+        the judgement is told about the field. "Another field" (在页面上查找) only when this app's address bar is known
+        by its identifier and `eid` is not it; a browser without that identifier (Chrome, Firefox) or an unread
+        structure says address bar -- told otherwise, a judgement allowed a table row into Chrome's (review)."""
+        if eid == WEB_SEARCH or self._address_bar_refusal(eid) is not None:
+            return True
+        try:
+            from deskmind_hands.drivers import axchrome
+            pid = self._pid_of(self.app)
+            return not (pid and axchrome.address_bars(pid))
+        except Exception:   # noqa: BLE001 -- unread: the address bar, the safe description
+            return True
 
     def _address_bar_refusal(self, eid: str) -> str | None:
         """Why typing into `eid` directly is refused whatever was judged: it is the address bar (known by its
@@ -977,8 +986,8 @@ class PeekabooDriver:
             from deskmind_hands.drivers import axchrome
             pid = self._pid_of(self.app)
             bars = axchrome.address_bars(pid) if pid and r is not None else []
-        except Exception:   # noqa: BLE001 -- unread structure: the allowance below still guards it
-            return None
+        except Exception:   # noqa: BLE001 -- unread: it may be the address bar, so it is refused as one (review)
+            return refusal
         if r is not None and axchrome.at(bars, self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2):
             return refusal
         return None

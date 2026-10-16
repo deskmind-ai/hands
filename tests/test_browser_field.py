@@ -70,6 +70,18 @@ class Refusal(unittest.TestCase):
             self.assertIsNone(d._browser_field_refusal("bar"))         # judged: typed
             self.assertIsNotNone(d._browser_field_refusal("bar"))      # for one step
 
+    def test_what_the_judgement_is_told_the_field_is(self):
+        # 「another field」 only beside an address bar known by its identifier; without one (Chrome, Firefox), or
+        # unread, the field may be the address bar and is described as one (review of b62652e).
+        d = driver("Find 'invoice' on this web page")
+        with mock.patch.object(axchrome, "address_bars", lambda pid: [(300, 0, 400, 30)]):
+            self.assertFalse(d.browser_field_is_address_bar("bar"))       # the bar is elsewhere: a find bar
+        self.assertTrue(d.browser_field_is_address_bar("bar"))            # no identified bar (setUp): maybe it
+        with mock.patch.object(axchrome, "address_bars", side_effect=RuntimeError("AX")):
+            self.assertTrue(d.browser_field_is_address_bar("bar"))
+        with mock.patch.object(axchrome, "address_bars", lambda pid: [BAR]):
+            self.assertTrue(d.browser_field_is_address_bar("bar"))        # it is the identified bar
+
     def test_an_allowance_does_not_outlive_its_step(self):
         # An early return (here: no snapshot yet) or an error in the step must not leave it for the next (review).
         from deskmind_hands.actions import Action, ActionKind, Binding

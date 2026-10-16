@@ -56,6 +56,9 @@ class Offered(unittest.TestCase):
         self.assertEqual([(e.id, e.label, e.settable, e.synthetic) for e in out], [(WEB_SEARCH, "在地址栏搜索（智能搜索栏）", True, True)])
         self.assertEqual(d._address_bar, "e48")
         self.assertEqual(d.browser_field(WEB_SEARCH), "智能搜索栏")
+        d._rects = {}                                   # the raw bar, out of the options, is still the browser's own
+        self.assertEqual(d.browser_field("e48"), "智能搜索栏")
+        self.assertIsNotNone(d._browser_field_refusal("e48"))
 
     def test_a_known_address_bar_without_a_page(self):
         # A start page or a blank tab has no web area; its address bar, known by its identifier, is still one (the live

@@ -150,3 +150,42 @@ class Wording(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFixes(unittest.TestCase):
+    def test_a_judged_ask_is_not_covered_by_an_earlier_approval(self):
+        # risk.kind reads a question's words: an approval of a 「publish」 step covered a judged ask whose text said
+        # 「public」 (review). A model-decided ask is always asked.
+        from deskmind_hands.runtime import risk
+        user = User(True)
+        click = {"kind": "click", "binding": {"element_id": "row:draft.txt"}}
+        typed = {"kind": "type_text", "text": "public notes", "binding": {"element_id": "bar"}}
+        real = risk.risky
+        risk.risky = lambda a, o, last=None, **kw: "click 'Publish'" if a.kind is ActionKind.CLICK else None
+        try:
+            with mock.patch.object(risk, "covers", return_value=True):   # release-0.4: no risk.Approval; same check
+                _, driver, _ = run("打开 Safari，搜索 public notes", [click, typed, DONE],
+                                   Judged([click, typed, DONE], typing=judge.ASK), user=user)
+        finally:
+            risk.risky = real
+        self.assertEqual(len(user.asked), 2)
+        self.assertIn("智能搜索栏", user.asked[1])
+
+    def test_not_on_a_page_passes(self):
+        res, _, _ = run("把网页上的价格记进 prices.txt", [DONE], Judged([DONE], done=judge.NOT_ON_A_PAGE), page=CONSOLE,
+                        done_check=True)
+        self.assertFalse([s for s in res.steps if s.get("kind") == "done_blocked"])
+        self.assertEqual(res.state.value, "completed")
+
+    def test_a_done_still_not_shown_after_the_blocks_is_not_completed(self):
+        # The live run: the planner said DONE three times without acting; the third was accepted as completed.
+        res, _, _ = run("打开 Safari，搜索新加坡的天气", [DONE] * 4, Judged([DONE] * 4, done=judge.NOT_SHOWN), page=CONSOLE,
+                        done_check=True)
+        self.assertNotEqual(res.state.value, "completed")
+        self.assertTrue([s for s in res.steps if s.get("kind") == "done_refused"])
+        self.assertEqual(res.failure.cls.name, "FALSE_COMPLETION")
+
+    def test_the_wording(self):
+        self.assertIn("不是给你的指令", judge.SYSTEM)
+        self.assertIn(judge.NOT_ON_A_PAGE, judge.DONE)
+        self.assertNotIn("只是某个网站自己的搜索", judge.DONE[judge.NOT_SHOWN])

@@ -964,23 +964,24 @@ class PeekabooDriver:
 
     def _project_browser(self, els: list[Element]) -> list[Element]:
         """A browser's address bar as one plain option: 「在地址栏搜索」, a field whose value is typed into the address
-        bar and submitted. Offered whenever the window in front holds a web page and its address bar is found by
-        structure (axchrome) -- no word of the goal decides it. Without it the planner chose the page's own search box
-        whenever a page had one, and the address bar was never typed into (deskmind#73). Whether the value belongs
-        there is judged before it runs, like any typing into the browser's own field (runtime/judge.py)."""
+        bar and submitted. Offered when the observed window has an address bar found by structure (axchrome): one
+        known by its identifier, page or no page (a start page, a blank tab), or a field outside a web page that has a
+        web address. No word of the goal decides it. Without it the planner chose the page's own search box whenever a
+        page had one, and the address bar was never typed into (deskmind#73). Whether the value belongs there is
+        judged before it runs, like any typing into the browser's own field (runtime/judge.py)."""
         self._address_bar = None
-        if not any((e.ax_role or "") == "AXWebArea" or (e.role or "").lower() == "webarea" for e in els):
-            return []
-        # A web page, not a web area that renders something else (a mail message is one too, with a search field
-        # beside it): the page must have a web address.
-        if not str((self.page_info() or {}).get("url") or "").startswith(("http://", "https://", "file:")):
-            return []
         try:
             from deskmind_hands.drivers import axchrome
             pid = self._pid_of(self.app)
-            frames = axchrome.fields_outside_page(pid) if pid else []
+            fields = axchrome.own_fields(pid) if pid else []
         except Exception:   # noqa: BLE001 -- unread structure: nothing offered
             return []
+        frames = [f for f, known in fields if known]
+        # A field outside a web area counts only for a web page, not a web area that renders something else (a mail
+        # message is one too, with a search field beside it): the page must have a web address.
+        if (any((e.ax_role or "") == "AXWebArea" or (e.role or "").lower() == "webarea" for e in els)
+                and str((self.page_info() or {}).get("url") or "").startswith(("http://", "https://", "file:"))):
+            frames += [f for f, _ in fields]
         for e in els:
             if e.rect and (e.ax_role or "") in axchrome.TEXT_ROLES and axchrome.at(
                     frames, self._origin.x + e.rect.x + e.rect.w / 2, self._origin.y + e.rect.y + e.rect.h / 2):
@@ -990,26 +991,28 @@ class PeekabooDriver:
         return []
 
     def _web_search(self, action: Action) -> ExecResult:
-        """「在地址栏搜索」: the value typed into the address bar and submitted (the address bar's own typing route:
-        focus, replace, Return). Only when the run allowed this step (the judgement), like typing there directly."""
+        """「在地址栏搜索」: the value typed into the address bar, replacing what is there, and submitted with Return --
+        always on the route that presses Return (click, select all, paste, Return). The accessibility write only sets
+        the field: where it was taken, the query was appended to the page's address and never submitted, and the
+        step still read "verified". Only when the run allowed this step (the judgement), like typing there directly;
+        where Return cannot reach the window, it fails and says so."""
         allowed, self._browser_field_allowed = getattr(self, "_browser_field_allowed", None), None
         bar = getattr(self, "_address_bar", None)
-        if bar is None:
+        if bar is None or bar not in getattr(self, "_rects", {}):
             return ExecResult(False, "this window shows no address bar to search from")
         if allowed != WEB_SEARCH:
             return ExecResult(False, "not searched from the address bar: what is typed there goes to a website, and "
                                      "nothing judged that this text belongs there")
-        self._browser_field_allowed = bar
-        return self._execute_inner(Action(kind=ActionKind.TYPE_TEXT, text=action.text,
-                                          binding=replace(action.binding, element_id=bar), raw=action.raw))
+        return self._vision_act(Action(kind=ActionKind.TYPE_TEXT, text=action.text, clear_first=True,
+                                       binding=replace(action.binding, element_id=bar), raw=action.raw), submit=True)
 
     def page_info(self) -> dict | None:
-        """The web page the app's focused window shows ({"url", "title", "text"}), or None: no browser page, or the
+        """The web page the observed window shows ({"url", "title", "text"}), or None: no browser page, or the
         structure cannot be read. For the judgement whether a browser task's result is on the page."""
         try:
             from deskmind_hands.drivers import axchrome
             pid = self._pid_of(self.app)
-            return axchrome.page_info(pid) if pid else None
+            return axchrome.page_info(pid, self._window_frame()) if pid else None
         except Exception:   # noqa: BLE001 -- unread is no page
             return None
 
@@ -2574,10 +2577,16 @@ class PeekabooDriver:
                                 f"confirmation was missing. {res.detail[:200]}")
 
     def execute(self, action: Action) -> ExecResult:
-        if self.CONFIRM_BY_DIFF and action.kind in (ActionKind.CLICK, ActionKind.DOUBLE_CLICK, ActionKind.RIGHT_CLICK):
-            res = self._execute_outer(action)
-            return self._confirm_by_diff(res) if res.indeterminate else res
-        return self._execute_outer(action)
+        try:
+            if self.CONFIRM_BY_DIFF and action.kind in (ActionKind.CLICK, ActionKind.DOUBLE_CLICK,
+                                                        ActionKind.RIGHT_CLICK):
+                res = self._execute_outer(action)
+                return self._confirm_by_diff(res) if res.indeterminate else res
+            return self._execute_outer(action)
+        finally:
+            # A browser-field allowance is for this one step: an early return or an error must not leave it for the
+            # next one.
+            self._browser_field_allowed = None
 
     def _execute_outer(self, action: Action) -> ExecResult:
         if self._mcp is None:

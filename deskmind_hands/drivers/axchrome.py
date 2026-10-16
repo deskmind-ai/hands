@@ -12,6 +12,9 @@ a known gap; the background input hands relies on is WebKit's anyway.
 from __future__ import annotations
 
 TEXT_ROLES = {"AXTextField", "AXComboBox", "AXSearchField", "AXTextArea"}
+#: Address bars by their accessibility identifier: one is the browser's own field whether or not the window shows a
+#: page yet -- a start page or a blank tab has no web area, and its address bar went unguarded (deskmind#73, live run).
+ADDRESS_BAR_IDS = {"WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"}
 MAX_NODES = 4000
 
 
@@ -32,7 +35,22 @@ def _frame(el) -> tuple[float, float, float, float] | None:
 
 
 def fields_outside_page(pid: int) -> list[tuple[float, float, float, float]]:
-    """Screen frames of the text fields that are in a window holding a web page (an AXWebArea) but not inside it."""
+    """Screen frames of a browser's own text fields: those in a window holding a web page (an AXWebArea) but not
+    inside it, and an address bar known by its identifier (ADDRESS_BAR_IDS) in any window, with a page or not."""
+    return [f for f, _ in _own_fields(pid)]
+
+
+def address_bars(pid: int) -> list[tuple[float, float, float, float]]:
+    """Screen frames of the address bars known by their identifier, in every window of the app."""
+    return [f for f, known in _own_fields(pid) if known]
+
+
+def own_fields(pid: int) -> list[tuple[tuple[float, float, float, float], bool]]:
+    """Every browser-own field as (screen frame, known address bar): one walk for both questions."""
+    return _own_fields(pid)
+
+
+def _own_fields(pid: int) -> list[tuple[tuple[float, float, float, float], bool]]:
     from ApplicationServices import AXUIElementCreateApplication
     out: list = []
     for win in _get(AXUIElementCreateApplication(pid), "AXWindows") or []:
@@ -47,10 +65,9 @@ def fields_outside_page(pid: int) -> list[tuple[float, float, float, float]]:
             elif role in TEXT_ROLES and not in_page:
                 f = _frame(el)
                 if f:
-                    fields.append(f)
+                    fields.append((f, _get(el, "AXIdentifier") in ADDRESS_BAR_IDS))
             stack.extend((c, in_page) for c in (_get(el, "AXChildren") or []))
-        if has_page:
-            out += fields
+        out += fields if has_page else [x for x in fields if x[1]]
     return out
 
 
@@ -62,13 +79,17 @@ def at(frames, x: float, y: float) -> bool:
 PAGE_TEXT_CHARS = 4000
 
 
-def page_info(pid: int) -> dict | None:
-    """The web page the focused window shows: {"url", "title", "text"}, the text being the page's static text in
-    order; None when that window holds no web page. Read for the judgement whether a browser task's result is on the
-    page (runtime/judge.py), never to decide anything here."""
+def page_info(pid: int, frame: tuple | None) -> dict | None:
+    """The web page shown by the window at `frame` (the window the run observes, from the window server): {"url",
+    "title", "text"}, the text being the page's static text in order. None when that window holds no web page, or no
+    window is at that frame -- never another window's page: read from the app's front window, the check judged the
+    user's own Safari window while the run worked in another (deskmind#73, live run). Read for the judgement whether
+    a browser task's result is on the page (runtime/judge.py), never to decide anything here."""
     from ApplicationServices import AXUIElementCreateApplication
-    app = AXUIElementCreateApplication(pid)
-    win = _get(app, "AXFocusedWindow") or (_get(app, "AXWindows") or [None])[0]
+    if frame is None:
+        return None
+    win = next((w for w in _get(AXUIElementCreateApplication(pid), "AXWindows") or []
+                if (f := _frame(w)) and all(abs(a - b) <= 2 for a, b in zip(f, frame))), None)
     if win is None:
         return None
     stack, seen, page = [win], 0, None

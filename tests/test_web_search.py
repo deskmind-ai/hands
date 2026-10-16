@@ -42,7 +42,7 @@ def driver(app):
 
 class Offered(unittest.TestCase):
     def setUp(self):
-        self.p = mock.patch.object(axchrome, "fields_outside_page", lambda pid: [BAR])
+        self.p = mock.patch.object(axchrome, "own_fields", lambda pid: [(BAR, False)])   # outside the page
         self.p.start()
 
     def tearDown(self):
@@ -55,9 +55,19 @@ class Offered(unittest.TestCase):
         self.assertEqual(d._address_bar, "e48")
         self.assertEqual(d.browser_field(WEB_SEARCH), "智能搜索栏")
 
+    def test_a_known_address_bar_without_a_page(self):
+        # A start page or a blank tab has no web area; its address bar, known by its identifier, is still one (the live
+        # run typed into the user's start page unjudged).
+        with mock.patch.object(axchrome, "own_fields", lambda pid: [(BAR, True)]):
+            d = driver("com.apple.Safari")
+            d.page_info = lambda: None
+            out = d._project_browser([e for e in SAFARI if e.ax_role != "AXWebArea"])
+        self.assertEqual([e.id for e in out], [WEB_SEARCH])
+
     def test_not_in_textedit_or_finder(self):
         for app, els in (("com.apple.TextEdit", TEXTEDIT), ("com.apple.finder", FINDER)):
             d = driver(app)
+            d.page_info = lambda: None
             self.assertEqual(d._project_browser(els), [], app)
             self.assertIsNone(d.browser_field(WEB_SEARCH), app)
 
@@ -68,7 +78,7 @@ class Offered(unittest.TestCase):
         self.assertEqual(d._project_browser(SAFARI), [])
 
     def test_not_when_no_address_bar_is_found(self):
-        with mock.patch.object(axchrome, "fields_outside_page", lambda pid: []):
+        with mock.patch.object(axchrome, "own_fields", lambda pid: []):
             self.assertEqual(driver("com.apple.Safari")._project_browser(SAFARI), [])
 
 
@@ -77,24 +87,33 @@ class Carried(unittest.TestCase):
         return d._execute_projected(Action(kind=ActionKind.TYPE_TEXT, text="新加坡 天气",
                                            binding=Binding(observation_id="o", app="Safari", element_id=WEB_SEARCH)))
 
-    def test_allowed_it_types_into_the_address_bar_and_submits(self):
+    def searchable(self):
         d = driver("com.apple.Safari")
-        d._address_bar, d._projected_actions = "e48", 0
-        typed = []
-        d._execute_inner = lambda a: (typed.append((a.binding.element_id, a.text, d._browser_field_allowed))
-                                      or ExecResult(True, "entered and pressed Return"))
+        d._address_bar, d._projected_actions, d._rects = "e48", 0, {"e48": Rect(*BAR)}
+        return d
+
+    def test_allowed_it_replaces_and_presses_return(self):
+        # The accessibility write only sets the field: the query was appended to the address and never submitted,
+        # reported "verified" (review). The search always goes the click, select-all, paste, Return route.
+        d = self.searchable()
+        sent = []
+        d._vision_act = lambda a, submit=True: (sent.append((a.binding.element_id, a.text, a.clear_first, submit))
+                                                or ExecResult(True, "entered and pressed Return"))
         d.allow_browser_field(WEB_SEARCH)
         self.assertTrue(self.act(d).ok)
-        # into the address bar itself, allowed for that one step: its route focuses it, replaces, and presses Return
-        self.assertEqual(typed, [("e48", "新加坡 天气", "e48")])
+        self.assertEqual(sent, [("e48", "新加坡 天气", True, True)])
 
     def test_not_allowed_it_is_refused(self):
-        d = driver("com.apple.Safari")
-        d._address_bar, d._projected_actions = "e48", 0
-        d._execute_inner = mock.Mock()
-        res = self.act(d)
-        self.assertFalse(res.ok)
-        d._execute_inner.assert_not_called()
+        d = self.searchable()
+        d._vision_act = mock.Mock()
+        self.assertFalse(self.act(d).ok)
+        d._vision_act.assert_not_called()
+
+    def test_no_address_bar_on_screen(self):
+        d = self.searchable()
+        d._rects = {}
+        d.allow_browser_field(WEB_SEARCH)
+        self.assertFalse(self.act(d).ok)
 
 
 class Judged(unittest.TestCase):

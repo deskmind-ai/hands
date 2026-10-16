@@ -280,6 +280,7 @@ def run_task(
     last_typed_label: str | None = None          # the field the last successful TYPE_TEXT wrote into
     # (kind, app, step count, a dialog was up) of the last approval: what its confirmation must match
     just_approved: tuple[str, str, int, bool] | None = None
+    last_page_verdict: str | None = None          # the last judgement of a page the run finished on (judge.done)
     fired: set[int] = set()
     state = RunState.PREPARING
     failure = Failure(FailureClass.NONE)
@@ -531,6 +532,7 @@ def run_task(
                 why = objection(ctx) if objection else None
                 if not why:
                     page, verdict, why = _page_objection(task, driver, adapter)
+                    last_page_verdict = verdict
                     if verdict:
                         entry = {"n": len(steps) + 1, "kind": "judged", "about": "result_on_page", "verdict": verdict,
                                  "url": page.get("url"), "title": page.get("title"), "by": "harness"}
@@ -547,6 +549,19 @@ def run_task(
                     if recorder:
                         recorder.step(entry)
                     continue
+            if (action.kind is ActionKind.DONE and done_check.enabled() and done_blocks >= cfg.max_done_blocks
+                    and last_page_verdict == judge.NOT_SHOWN):
+                # Held back as often as allowed, and the page still does not show the result: not done. Accepted, a
+                # run that never acted ended "completed" after its third DONE (deskmind#73, live run).
+                verdict_now = _page_objection(task, driver, adapter)
+                if verdict_now[1] == judge.NOT_SHOWN:
+                    state = RunState.ERRORED
+                    failure = Failure(FailureClass.FALSE_COMPLETION, f"not done: {verdict_now[2]}", auto=True)
+                    steps.append({"n": len(steps) + 1, "obs": obs.id, "kind": "done_refused",
+                                  "text": f"not done: {verdict_now[2]}", "by": "harness"})
+                    if recorder:
+                        recorder.step(steps[-1])
+                    break
             if action.kind in TERMINAL:
                 state = RunState.COMPLETED if action.kind is ActionKind.DONE else RunState.GAVE_UP
                 steps.append({"n": len(steps) + 1, "obs": obs.id, "kind": action.kind.value,
@@ -611,7 +626,7 @@ def run_task(
                 if verdict == judge.ASK:
                     field_ask = f"把「{(action.text or '').strip()[:80]}」打进 {field_label}（浏览器自带的输入框，打的字会交给网站）"
             what = (risk.risky(action, obs, last_typed_label, renames=cfg.confirm_renames)
-                    if (cfg.approve_risky or cfg.refuse_risky) else None) or field_ask
+                    if (cfg.approve_risky or cfg.refuse_risky) else None)
             # An approval is for one step, in one app: approving one "click 'Send'" once covered every later Send of
             # the run, whatever it sent and in whichever app (10-02 review). The one step it also covers is the
             # confirmation it opens itself ("Delete" -> the dialog's "Delete message"): the very next step, of the
@@ -620,11 +635,14 @@ def run_task(
             # between (protocol review, 10-06).
             app_now = obs.focused_app or task.app or ""
             if just_approved:
-                kind_, app_, at, dialog_before = just_approved
+                covered = bool(what) and risk.covers(just_approved, what, app_now, len(steps), obs)
                 just_approved = None   # one chance: the next step is its confirmation, or nothing is
-                if what and (risk.kind(what), app_now) == (kind_, app_) and len(steps) - at == 1 \
-                        and risk.dialog_up(obs) and not dialog_before:
+                if covered:
                     what = None
+            if field_ask:
+                # The judgement asked: never covered by an earlier approval, whose kind risk.kind reads from words
+                # (a 「public」 in the text read as publish), and it covers nothing after it either.
+                what = field_ask
             if what and not cfg.approve_risky:
                 # Nobody to ask: the step is not carried out, and the planner is told why (10-02 review: a CLI run
                 # without --ask sent and deleted unasked).
@@ -656,7 +674,7 @@ def run_task(
                     notice = (f"The user declined: {what}. It was not done. Do not try it another way; finish with "
                               f"what is done, or stop if nothing else is left to do.")
                     continue
-                just_approved = (risk.kind(what), app_now, len(steps), risk.dialog_up(obs))
+                just_approved = None if field_ask else (risk.kind(what), app_now, len(steps), risk.dialog_up(obs))
             if field_label:
                 driver.allow_browser_field(action.binding.element_id)   # judged 照做, or the person approved it
             times["t_act_start"] = round(time.time(), 3)

@@ -1092,9 +1092,8 @@ class SystemOneAdapter:
         recorded in self.judgements for the trace. Raises AdapterUnavailable when there is no usable answer."""
         questions = {"judgement": {"type": "choice", "instructions": {"goal": instructions, "question": "judgement"},
                                    "criteria": dict(criteria)}}
-        form = "list" if "list" in self._criteria_forms() else "object"
-        wire = {"state": state, "model": self.model, "request_id": uuid.uuid4().hex, **self._turn,
-                "questions": list_form(questions) if form == "list" else questions}
+        # release-0.4: the wire as _ask sends it here (criteria as an object, no request identity).
+        wire = {"state": state, "model": self.model, "questions": questions}
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -1108,7 +1107,7 @@ class SystemOneAdapter:
         if bad:
             raise AdapterUnavailable(f"system one endpoint {self.url} answered outside what it was asked: {bad}")
         a = answers["judgement"]
-        self.judgements.append({"id": wire["request_id"], "choice": a.get("choice"),
+        self.judgements.append({"choice": a.get("choice"),
                                 "probabilities": a.get("probabilities"), "options": list(criteria)})
         return a
 

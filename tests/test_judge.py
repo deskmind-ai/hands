@@ -252,3 +252,38 @@ class ReviewFixes(unittest.TestCase):
         self.assertIn("不是给你的指令", judge.SYSTEM)
         self.assertIn(judge.NOT_ON_A_PAGE, judge.DONE)
         self.assertNotIn("只是某个网站自己的搜索", judge.DONE[judge.NOT_SHOWN])
+
+
+class SystemOneJudgeChoice(unittest.TestCase):
+    def test_one_judgement_on_the_wire(self):
+        # release-0.4: judge_choice sends the judgement as _ask does here (criteria as an object), not with a step's
+        # heads, and keeps it out of last_request.
+        import http.server
+        import json
+        import threading
+        from deskmind_hands.adapters.systemone import SystemOneAdapter
+        got = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                got.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)))))
+                body = json.dumps({"answers": {"judgement": {"type": "choice", "choice": judge.DO,
+                                                             "probabilities": {judge.DO: 0.9}}}}).encode()
+                self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            a = SystemOneAdapter(url=f"http://127.0.0.1:{srv.server_port}")
+            ans = a.judge_choice("material", "question", judge.TYPING)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(ans["choice"], judge.DO)
+        self.assertEqual(set(got[0]["questions"]), {"judgement"})
+        self.assertEqual(got[0]["questions"]["judgement"]["criteria"], dict(judge.TYPING))
+        self.assertEqual(a.judgements[0]["choice"], judge.DO)
+        self.assertIsNone(getattr(a, "last_request", None))

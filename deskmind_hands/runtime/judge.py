@@ -66,11 +66,18 @@ def _said(context: dict, said) -> dict:
     return {**context, "用户后来说的": "\n".join(lines)} if lines else context
 
 
-def typing(ask: AskChoice | None, goal: str, field: str, text: str, page: dict | None, said=()) -> str:
+#: What the judgement is told about the field: the address bar sends what is typed to a website; another of the
+#: browser's own fields (在页面上查找) may not (review of 9f226e9).
+FIELD_ADDRESS_BAR = "浏览器自带的输入框（不在网页里），打的字会交给搜索引擎或打开网址"   # as live-tested 10-16
+FIELD_OTHER = "浏览器自带的输入框（不在网页里，也不是地址栏），例如在页面上查找"
+
+
+def typing(ask: AskChoice | None, goal: str, field: str, text: str, page: dict | None, said=(),
+           address_bar: bool = True) -> str:
     """照做 / 不做 / 先问用户 for typing `text` into a browser's own field. Without an answer: 先问用户, never 照做.
-    `said`: the user's later words, (question, reply) pairs."""
+    `said`: the user's later words, (question, reply) pairs. `address_bar`: the field is the address bar."""
     where = page or {}
-    context = {"用户原话": goal, "输入框": f"{field}：浏览器自带的输入框（不在网页里），打的字会交给搜索引擎或打开网址",
+    context = {"用户原话": goal, "输入框": f"{field}：{FIELD_ADDRESS_BAR if address_bar else FIELD_OTHER}",
                "准备打的内容": text, "当前页面": " · ".join(x for x in (where.get("title"), where.get("url")) if x) or "不知道"}
     return _choice(ask, TYPING_QUESTION, _said(context, said), TYPING) or ASK
 

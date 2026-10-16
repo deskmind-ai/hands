@@ -993,7 +993,8 @@ class PeekabooDriver:
                         frames, self._origin.x + e.rect.x + e.rect.w / 2, self._origin.y + e.rect.y + e.rect.h / 2):
                     self._address_bar, self._address_bar_rect, self._address_bar_label = e.id, e.rect, e.label or ""
                     label = f"在地址栏搜索（{e.label}）" if e.label else "在地址栏搜索"
-                    return [Element(id=WEB_SEARCH, role="textbox", label=label, value="", settable=True,
+                    # Its value is the bar's (the page's address): the only place the planner read it.
+                    return [Element(id=WEB_SEARCH, role="textbox", label=label, value=e.value or "", settable=True,
                                     synthetic=True, app=self._app_name, window_id=self._window_id or "")]
         return []
 
@@ -1327,6 +1328,9 @@ class PeekabooDriver:
                     wid = str(w["window_id"])
                     if wid in getattr(self, "_unreadable", set()):
                         continue
+                    if (bundle.lower() in self.BROWSERS and not w.get("is_on_screen", True)
+                            and wid not in (self._pinned_window, self._window_id)):
+                        continue        # put away by the user, as above
                     if (bundle.lower() == "com.apple.finder"
                             and (w.get("window_title") or "").strip() not in self._workspace_folder_names()):
                         continue

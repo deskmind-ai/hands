@@ -211,9 +211,15 @@ class Values(unittest.TestCase):
         # 「在智能搜索栏里搜索新加坡的天气」 offered only 「栏里搜索新加坡的天气」 and its pieces (live 10-16).
         from deskmind_hands.adapters.systemone import value_candidates
         got = value_candidates("打开 Safari，在智能搜索栏里搜索新加坡的天气")
-        self.assertEqual(got[:2], ["新加坡的天气", "新加坡 天气"])
-        self.assertFalse([v for v in got if "栏里" in v], got)
+        self.assertEqual(got[0], "新加坡的天气")
+        self.assertIn("新加坡 天气", got)
         self.assertEqual(value_candidates("搜索 林夏的 纸船，并播放")[:2], ["林夏 纸船", "林夏的 纸船"])
+        # A verb inside the query is part of it (review of b23238d): the whole query stays first.
+        for goal, first in (("Search for Finding Nemo and play it", "Finding Nemo"),
+                            ("search for pathfinder reviews", "pathfinder reviews"),
+                            ("搜索查找替换的用法", "查找替换的用法"),
+                            ("查找 搜索引擎 的历史", "搜索引擎 的历史")):
+            self.assertEqual(value_candidates(goal)[0], first, goal)
 
 
 class Windows(unittest.TestCase):
@@ -228,6 +234,16 @@ class Windows(unittest.TestCase):
         self.assertEqual([w.id for w in d._windows()], ["2", "3"])
         d._pinned_window = d._window_id = "1"           # the observed window itself stays, on screen or not
         self.assertIn("1", [w.id for w in d._windows()])
+
+    def test_nor_from_another_app(self):
+        # Observing TextEdit, the staged Safari's windows are listed too: a minimised one is not (review of b23238d).
+        d = driver("com.apple.TextEdit")
+        d._mcp, d._pinned_window, d._window_id, d._obs_n = object(), "9", "9", 0
+        d._stage_apps, d._home_app, d._window_app = ["Safari"], "com.apple.TextEdit", {}
+        d._run = lambda op, app=None, **kw: (True, {"windows": [] if app == "com.apple.TextEdit" else [
+            {"window_id": 1, "window_title": "新加坡 天气_百度搜索", "is_on_screen": False},
+            {"window_id": 2, "window_title": "零件清单", "is_on_screen": True}]}, "")
+        self.assertEqual([w.id for w in d._windows()], ["2"])
 
 
 class Judged(unittest.TestCase):

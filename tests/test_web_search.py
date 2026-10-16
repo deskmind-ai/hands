@@ -53,7 +53,7 @@ class Offered(unittest.TestCase):
     def test_offered_in_a_browser_window(self):
         d = driver("com.apple.Safari")
         out = d._project_browser(SAFARI)
-        self.assertEqual([(e.id, e.label, e.settable, e.synthetic) for e in out], [(WEB_SEARCH, "在地址栏搜索", True, True)])
+        self.assertEqual([(e.id, e.label, e.settable, e.synthetic) for e in out], [(WEB_SEARCH, "在地址栏搜索（智能搜索栏）", True, True)])
         self.assertEqual(d._address_bar, "e48")
         self.assertEqual(d.browser_field(WEB_SEARCH), "智能搜索栏")
 
@@ -109,7 +109,7 @@ class Carried(unittest.TestCase):
         frame = WIN if frame is None else frame
         from deskmind_hands.drivers import skylight
         d = driver("com.apple.Safari")
-        d._address_bar, d._projected_actions, d._rects = "e48", 0, {"e48": Rect(*BAR)}
+        d._address_bar, d._address_bar_rect, d._projected_actions = "e48", Rect(*BAR), 0
         d._background_input = lambda bundle: background
         d._moved_since_seen = lambda: None
         d._wait_until_still = lambda bundle, what="": None
@@ -201,9 +201,33 @@ class Carried(unittest.TestCase):
 
     def test_no_address_bar_on_screen(self):
         d = self.searchable()
-        d._rects = {}
+        d._address_bar_rect = None
         d.allow_browser_field(WEB_SEARCH)
         self.assertFalse(self.act(d).ok)
+
+
+class Values(unittest.TestCase):
+    def test_a_field_named_in_the_goal_does_not_cut_the_query(self):
+        # 「在智能搜索栏里搜索新加坡的天气」 offered only 「栏里搜索新加坡的天气」 and its pieces (live 10-16).
+        from deskmind_hands.adapters.systemone import value_candidates
+        got = value_candidates("打开 Safari，在智能搜索栏里搜索新加坡的天气")
+        self.assertEqual(got[:2], ["新加坡的天气", "新加坡 天气"])
+        self.assertFalse([v for v in got if "栏里" in v], got)
+        self.assertEqual(value_candidates("搜索 林夏的 纸船，并播放")[:2], ["林夏 纸船", "林夏的 纸船"])
+
+
+class Windows(unittest.TestCase):
+    def test_a_minimised_browser_window_is_not_offered(self):
+        # The parts run switched to the user's own minimised Safari window and read its page (live 10-16).
+        d = driver("com.apple.Safari")
+        d._mcp, d._pinned_window, d._window_id, d._obs_n = None, "2", "2", 0
+        d._run = lambda op, **kw: (True, {"windows": [
+            {"window_id": 1, "window_title": "新加坡 天气_百度搜索", "is_on_screen": False},
+            {"window_id": 2, "window_title": "零件清单", "is_on_screen": True},
+            {"window_id": 3, "window_title": "另一个", "is_on_screen": True}]}, "")
+        self.assertEqual([w.id for w in d._windows()], ["2", "3"])
+        d._pinned_window = d._window_id = "1"           # the observed window itself stays, on screen or not
+        self.assertIn("1", [w.id for w in d._windows()])
 
 
 class Judged(unittest.TestCase):

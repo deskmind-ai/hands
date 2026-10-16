@@ -222,7 +222,9 @@ def _works(goal: str) -> list[tuple[str, str]]:
     if m:
         # "白鹿乐队的安静的引擎": which 的 separates the artist from the title is not knowable from the words, so
         # every split is offered, the first 的 first (titles contain 的 more often than artists do).
-        phrase = m.group(1).strip()
+        # Everything up to the last verb goes, as above: "在智能搜索栏里搜索新加坡的天气" matched the verb inside the
+        # field's name and composed 「栏里搜索新加坡 天气」 (deskmind#73).
+        phrase = re.sub(r"^.*(?:播放|放一下|听一下|搜索|搜一下|查找)", "", m.group(1).strip())
         for k in [i for i, ch in enumerate(phrase) if ch == "的"]:
             if 0 < k < len(phrase) - 1:
                 put(phrase[:k], phrase[k + 1:])
@@ -435,10 +437,15 @@ def value_candidates(goal: str, visible_text: str = "", limit: int = 14) -> list
     # "归到一个新文件夹 reports 里" was never offered, and the folder was named "文件归到一个新文件夹".
     # What a goal says to search for, whole: "搜索 林夏的 纸船" is the query, not "林夏的" and "纸船" separately -- a
     # planner offered only the pieces searched for the title alone. The possessive is dropped as a search box wants
-    # it ("林夏 纸船").
-    for m in re.finditer(r"(?:搜索|搜一下|(?:(?<=^)|(?<=[\s，,。：:里上]))搜|查找|search(?:\s+for)?|look\s+up|find)\s*[:：]?\s*"
-                         r"([^，,。；;！!？?\n]{1,60})",
-                         goal, re.I):
+    # it ("林夏 纸船"). Every place the verb occurs, overlapping, and a query holding a later one is no query: in
+    # "在智能搜索栏里搜索新加坡的天气" the field's name has the verb in it, and only 「栏里搜索新加坡的天气」 was offered
+    # (deskmind#73, live 10-16).
+    found = list(re.finditer(r"(?=(?:搜索|搜一下|(?:(?<=^)|(?<=[\s，,。：:里上]))搜|查找|search(?:\s+for)?|look\s+up|find)"
+                             r"\s*[:：]?\s*([^，,。；;！!？?\n]{1,60}))",
+                             goal, re.I))
+    for i, m in enumerate(found):
+        if any(n.start() < m.end(1) for n in found[i + 1:]):
+            continue
         # The query ends where the goal moves on: "并/然后/and …", a dash ("… 夜空中最亮的星 — who sings …"), or the
         # question itself ("who/what/which …", "谁/哪") -- typed whole, the dash and the question went into the box.
         # "and" ends the query only when an action follows ("… and play it"): "Salt and Cedar" is a title.

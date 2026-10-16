@@ -25,7 +25,7 @@ from ..actions import Action, ActionKind, DIALOGUE, TERMINAL
 from ..drivers.base import Driver, DriverUnavailable, ExecResult, Observation, classify_effect
 from ..errors import Kind, classify
 from .. import done_check
-from . import risk
+from . import judge, risk
 from ..env.workspace import Workspace
 from deskmind_bench.failures import Failure, FailureClass, no_progress
 from deskmind_bench.graders.primitives import GradeContext, evaluate as grade_check
@@ -262,6 +262,20 @@ def _goal_met(task: Task, workspace, driver, sentinels) -> bool | None:
         return None if g.error else g.strict
     except Exception:  # noqa: BLE001 - bookkeeping must not fail a run
         return None
+
+
+def _page_objection(task: Task, driver, adapter) -> tuple[dict, str | None, str | None]:
+    """Whether a run finishing on a web page is done, as a model judged it (runtime/judge.py): (the page, the verdict,
+    why it is not done). No verdict when the app shows no web page or there is no judgement -- this never holds a run
+    back on its own. Only http(s) and file pages: a mail message is a web area too, and is no result page."""
+    page = getattr(driver, "page_info", lambda: None)() or {}
+    if not str(page.get("url") or "").startswith(("http://", "https://", "file:")):
+        return page, None, None
+    verdict = judge.done(getattr(adapter, "judge_choice", None), task.goal, page)
+    if verdict != judge.NOT_SHOWN:
+        return page, verdict, None
+    return page, verdict, (f"the page ({page.get('url')}, {page.get('title') or 'no title'}) does not show what the "
+                           f"goal asks for: check what was done, and do it where it gives that result.")
 
 
 def _target_label(obs, action) -> str | None:
@@ -594,6 +608,14 @@ def run_task(
                 # planner is told what, once or twice, and goes on.
                 objection = getattr(adapter, "done_objection", None)
                 why = objection(ctx) if objection else None
+                if not why:
+                    page, verdict, why = _page_objection(task, driver, adapter)
+                    if verdict:
+                        entry = {"n": len(steps) + 1, "kind": "judged", "about": "result_on_page", "verdict": verdict,
+                                 "url": page.get("url"), "title": page.get("title"), "by": "harness"}
+                        steps.append(entry)
+                        if recorder:
+                            recorder.step(entry)
                 if why:
                     done_blocks += 1
                     entry = {"n": len(steps) + 1, "obs": obs.id, "kind": "done_blocked", "text": why,
@@ -642,8 +664,34 @@ def run_task(
                     recorder.step(steps[-1])
                 break
 
+            # Typing into a browser's own field (its address bar) sends the text to a website: a model judges whether
+            # that is what the user wants (runtime/judge.py). 不做 is refused here; 先问用户 goes to the person like a
+            # risky step; 照做 lets the driver type there, this once (deskmind#73).
+            field_label = (getattr(driver, "browser_field", lambda _eid: None)(action.binding.element_id)
+                           if action.kind is ActionKind.TYPE_TEXT and action.binding.element_id
+                           and not action.binding.element_id.startswith("syn:") else None)
+            field_ask: str | None = None
+            if field_label:
+                page = getattr(driver, "page_info", lambda: None)()
+                verdict = judge.typing(getattr(adapter, "judge_choice", None), task.goal, field_label,
+                                       action.text or "", page)
+                entry = {"n": len(steps) + 1, "kind": "judged", "about": "browser_field", "field": field_label,
+                         "verdict": verdict, "by": "harness"}
+                steps.append(entry)
+                if recorder:
+                    recorder.step(entry)
+                if verdict == judge.DONT:
+                    history.append(Turn(action.to_json(), False,
+                                        f"not typed into {field_label!r}: it is the browser's own field, and what is "
+                                        f"typed there goes to a website; this text does not belong there"))
+                    notice = (f"Not typed into {field_label!r}: it is the browser's own field (what is typed there "
+                              f"goes to a website), and this text does not belong there. Type into the page, or into "
+                              f"the document the goal names.")
+                    continue
+                if verdict == judge.ASK:
+                    field_ask = f"把「{(action.text or '').strip()[:80]}」打进 {field_label}（浏览器自带的输入框，打的字会交给网站）"
             what = (risk.risky(action, obs, last_typed_label, renames=cfg.confirm_renames)
-                    if (cfg.approve_risky or cfg.refuse_risky) else None)
+                    if (cfg.approve_risky or cfg.refuse_risky) else None) or field_ask
             # An approval is for one step, in one app: approving one "click 'Send'" once covered every later Send of
             # the run, whatever it sent and in whichever app (10-02 review). The one step it also covers is the
             # confirmation it opens itself ("Delete" -> the dialog's "Delete message"): the very next step, of the
@@ -691,6 +739,8 @@ def run_task(
                               f"what is done, or stop if nothing else is left to do.")
                     continue
                 just_approved = approval
+            if field_label:
+                driver.allow_browser_field(action.binding.element_id)   # judged 照做, or the person approved it
             times["t_act_start"] = time.time()
             res: ExecResult = driver.execute(action)
             times["t_act_end"] = time.time()

@@ -895,11 +895,6 @@ class PeekabooDriver:
             time.sleep(0.8)
         return n
 
-    #: A goal that asks for something on the web: typing into a browser's own fields is then what it wants.
-    WEB_INTENT = re.compile(r"https?://|www\.|\.(?:com|org|net|cn)\b|\b(?:url|website|web ?page|web|online|internet|"
-                            r"google|bing|search the|look (?:it )?up|browse)\b|网址|网站|网页|上网|百度|谷歌|必应|"
-                            r"搜索引擎|在浏览器|浏览器里", re.I)
-
     def _keep_baseline(self, els) -> None:
         """A document's text as this run first saw it, per window title: what was there before the run, which is the
         user's (lines_lost protects only that -- the run may redo what it wrote itself)."""
@@ -929,24 +924,48 @@ class PeekabooDriver:
         return (f"not written: the goal only adds -- append instead; replacing the text would remove "
                 f"{len(lost)} line(s) it has, the first {lost[0]!r}")
 
-    def _browser_field_refusal(self, eid: str) -> str | None:
-        """Why typing into `eid` is refused: it is a browser's own field (the address bar), which sends what is typed to
-        a website, and the goal asks for nothing on the web. None otherwise, or when it cannot be told."""
+    def browser_field(self, eid: str) -> str | None:
+        """The label of `eid` when it is a browser's own field (its address bar: outside the web page, so what is
+        typed there goes to a website), else None -- also when the structure cannot be read. Structure only: whether
+        the text belongs there is the run's judgement (runtime/judge.py), not this driver's."""
         r = getattr(self, "_rects", {}).get(eid)
-        if r is None or self.WEB_INTENT.search(getattr(self, "goal", "") or ""):
+        if r is None:
             return None
         try:
             from deskmind_hands.drivers import axchrome
             pid = self._pid_of(self.app)
             frames = axchrome.fields_outside_page(pid) if pid else []
-        except Exception:   # noqa: BLE001 -- a structure that cannot be read is no refusal
+        except Exception:   # noqa: BLE001 -- a structure that cannot be read is no browser field
             return None
         if axchrome.at(frames, self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2):
-            label = self._labels_by_id.get(eid, eid)
-            return (f"not typed into {label!r}: it is the browser's own field (its address bar), and what is typed "
-                    f"there goes to a website, while the goal asks for nothing on the web. Type into the page, or "
-                    f"into the document the goal names.")
+            return self._labels_by_id.get(eid, eid)
         return None
+
+    def allow_browser_field(self, eid: str) -> None:
+        """The run judged (or the user approved) typing into this browser field: the next TYPE_TEXT into it goes."""
+        self._browser_field_allowed = eid
+
+    def _browser_field_refusal(self, eid: str) -> str | None:
+        """Why typing into `eid` is refused: it is a browser's own field and nothing allowed this step to type there.
+        The loop asks the judgement first (runtime/judge.py); this stays on every route that writes, for any caller
+        that did not -- G18b typed a parts row into Safari's address bar, which sent it to a search engine (09-30)."""
+        label = self.browser_field(eid)
+        allowed, self._browser_field_allowed = getattr(self, "_browser_field_allowed", None), None
+        if label is None or allowed == eid:
+            return None
+        return (f"not typed into {label!r}: it is the browser's own field (its address bar), and what is typed there "
+                f"goes to a website; nothing judged that this text belongs there. Type into the page, or into the "
+                f"document the goal names.")
+
+    def page_info(self) -> dict | None:
+        """The web page the app's focused window shows ({"url", "title", "text"}), or None: no browser page, or the
+        structure cannot be read. For the judgement whether a browser task's result is on the page."""
+        try:
+            from deskmind_hands.drivers import axchrome
+            pid = self._pid_of(self.app)
+            return axchrome.page_info(pid) if pid else None
+        except Exception:   # noqa: BLE001 -- unread is no page
+            return None
 
     def _window_frame(self) -> tuple | None:
         """Where the observed window is and how big, from the window server (cheap: no accessibility walk)."""

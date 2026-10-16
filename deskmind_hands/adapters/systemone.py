@@ -1058,6 +1058,8 @@ class SystemOneAdapter:
         self.replies: list[dict] = []
         self._value_cache: dict[tuple, str] = {}
         self._seen_text: dict[str, str] = {}
+        #: The judgements this run asked (judge_choice): what was chosen, with its probabilities.
+        self.judgements: list[dict] = []
         self._read_by_window: dict[str, dict[str, str]] = {}
         #: What an earlier phase of the same task read somewhere this adapter cannot see -- a web page read through
         #: the browser channel before the desktop phase writes it into a document (HANDS_PRIOR_READ, a JSON file
@@ -1155,6 +1157,32 @@ class SystemOneAdapter:
             only = next(iter(q["criteria"]))
             answers[k] = {"type": "choice", "choice": only, "confidence": 1.0, "probabilities": {only: 1.0}}
         return answers
+
+    def judge_choice(self, state: str, instructions: str, criteria: dict) -> dict:
+        """One judgement as a choice (runtime/judge.py): the material and question as the state, each option with
+        what it means. Sent on its own, not with a step's heads, and kept out of last_request (what replays compare);
+        recorded in self.judgements for the trace. Raises AdapterUnavailable when there is no usable answer."""
+        questions = {"judgement": {"type": "choice", "instructions": {"goal": instructions, "question": "judgement"},
+                                   "criteria": dict(criteria)}}
+        form = "list" if "list" in self._criteria_forms() else "object"
+        wire = {"state": state, "model": self.model, "request_id": uuid.uuid4().hex, **self._turn,
+                "questions": list_form(questions) if form == "list" else questions}
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(f"{self.url}/v1/systemone", data=json.dumps(wire).encode(), headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                answers = json.load(r)["answers"]
+        except Exception as exc:
+            raise AdapterUnavailable(f"system one endpoint {self.url} failed: {exc}") from exc
+        bad = unoffered(questions, answers)
+        if bad:
+            raise AdapterUnavailable(f"system one endpoint {self.url} answered outside what it was asked: {bad}")
+        a = answers["judgement"]
+        self.judgements.append({"id": wire["request_id"], "choice": a.get("choice"),
+                                "probabilities": a.get("probabilities"), "options": list(criteria)})
+        return a
 
     # -- state ------------------------------------------------------------
 

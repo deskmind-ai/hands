@@ -1,5 +1,6 @@
-"""A browser's own field (its address bar) is not typed into for a goal that asks for nothing on the web: what is typed
-there goes to a website (G18b typed a table row into Safari's, 09-30)."""
+"""A browser's own field (its address bar) is told apart by structure, and is typed into only when the run allowed it:
+what is typed there goes to a website (G18b typed a table row into Safari's, 09-30). Whether it may is a model's
+judgement in the loop (test_judge.py), not a keyword list over the goal (deskmind#73)."""
 from __future__ import annotations
 
 import sys
@@ -33,17 +34,27 @@ class Refusal(unittest.TestCase):
     def tearDown(self):
         self.p.stop()
 
-    def test_the_address_bar_for_a_goal_about_a_file(self):
+    def test_the_address_bar_is_told_apart(self):
+        self.assertEqual(driver("打开 Safari，搜索新加坡的天气").browser_field("bar"), "智能搜索栏")
+        self.assertIsNone(driver("打开 Safari，搜索新加坡的天气").browser_field("field"))
+
+    def test_refused_unless_allowed(self):
         why = driver("Copy the table's rows into parts.csv and save it.")._browser_field_refusal("bar")
         self.assertIn("address bar", why)
 
+    def test_no_goal_words_open_it(self):
+        # deskmind#73: the goal's words decide nothing here any more; only the run's judgement does.
+        for goal in ("Open https://example.com and read the title", "打开 Safari，搜索新加坡的天气"):
+            self.assertIsNotNone(driver(goal)._browser_field_refusal("bar"), goal)
+
+    def test_an_allowance_is_for_one_step(self):
+        d = driver("打开 Safari，搜索新加坡的天气")
+        d.allow_browser_field("bar")
+        self.assertIsNone(d._browser_field_refusal("bar"))
+        self.assertIsNotNone(d._browser_field_refusal("bar"))
+
     def test_the_page_is_typed_into(self):
         self.assertIsNone(driver("Fill in the expense report and submit.")._browser_field_refusal("field"))
-
-    def test_a_goal_about_the_web_may_use_it(self):
-        for goal in ("Open https://example.com and read the title", "在浏览器里打开百度搜一下天气",
-                     "Look up the weather online", "search the web for the price"):
-            self.assertIsNone(driver(goal)._browser_field_refusal("bar"), goal)
 
     def test_unreadable_structure_is_no_refusal(self):
         with mock.patch.object(axchrome, "fields_outside_page", side_effect=RuntimeError("AX")):

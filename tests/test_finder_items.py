@@ -69,6 +69,16 @@ class Views(unittest.TestCase):
         move = next(e for e in out if e.label == "移动「报销单.csv」到")
         self.assertIn("子文件夹 项目", move.options)
 
+    def test_hidden_entries_do_not_take_the_places(self):
+        """40 dot files sort ahead of every name: counted before they were left out, they took all 40 places."""
+        ws = Path(tempfile.mkdtemp())
+        for i in range(40):
+            (ws / f".hidden{i:02}").write_text("x")
+        (ws / "report.csv").write_text("x")
+        (ws / "keep").mkdir()
+        move = next(e for e in driver(ws)._project_finder(ws, []) if e.id.startswith("syn:move:"))
+        self.assertEqual((move.label, "子文件夹 keep" in move.options), ("移动「report.csv」到", True))
+
     def test_one_move_per_file(self):
         ws = workspace()
         els = [Element(**{**e.__dict__}) for e in LIST + ICON]

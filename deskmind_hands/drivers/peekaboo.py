@@ -3157,7 +3157,7 @@ class PeekabooDriver:
             # icon view): offered from the folder itself, so moving never depends on how the window shows it.
             rows = [Element(id=f"fs:{p.name}", role="folder" if p.is_dir() else "file", label=p.name,
                             app=self._app_name, window_id=self._window_id or "")
-                    for p in sorted(folder.iterdir())[:40] if not p.name.startswith(".")]
+                    for p in [p for p in sorted(folder.iterdir()) if not p.name.startswith(".")][:40]]
         for e in rows:
             if (e.role or "").lower() == "folder":
                 dests.append((f"子文件夹 {e.label}", folder / e.label))

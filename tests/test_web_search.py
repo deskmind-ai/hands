@@ -37,12 +37,13 @@ def driver(app):
     d._pid_of = lambda bundle, all_wins=None: 123
     d._labels_by_id = {"e48": "智能搜索栏"}
     d.page_info = lambda: {"url": "http://127.0.0.1:8765/", "title": "控制台", "text": ""}
+    d._window_frame = lambda: (0, 0, 800, 600)
     return d
 
 
 class Offered(unittest.TestCase):
     def setUp(self):
-        self.p = mock.patch.object(axchrome, "own_fields", lambda pid: [(BAR, False)])   # outside the page
+        self.p = mock.patch.object(axchrome, "own_fields", lambda pid, frame=None: [(BAR, False)])   # outside the page
         self.p.start()
 
     def tearDown(self):
@@ -58,11 +59,25 @@ class Offered(unittest.TestCase):
     def test_a_known_address_bar_without_a_page(self):
         # A start page or a blank tab has no web area; its address bar, known by its identifier, is still one (the live
         # run typed into the user's start page unjudged).
-        with mock.patch.object(axchrome, "own_fields", lambda pid: [(BAR, True)]):
+        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None: [(BAR, True)]):
             d = driver("com.apple.Safari")
             d.page_info = lambda: None
             out = d._project_browser([e for e in SAFARI if e.ax_role != "AXWebArea"])
         self.assertEqual([e.id for e in out], [WEB_SEARCH])
+
+    def test_the_known_address_bar_before_a_find_bar(self):
+        # A find bar is a browser-own field too; the address bar known by its identifier is the one offered.
+        find = el("e70", "textField", "AXTextField", "在页面上查找", (100, 60, 300, 24))
+        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None: [((100, 60, 300, 24), False), (BAR, True)]):
+            d = driver("com.apple.Safari")
+            d._project_browser([SAFARI[0], find, SAFARI[2]])
+        self.assertEqual(d._address_bar, "e48")
+
+    def test_only_the_observed_windows_fields(self):
+        seen = []
+        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None: seen.append(frame) or [(BAR, True)]):
+            driver("com.apple.Safari")._project_browser(SAFARI)
+        self.assertEqual(seen, [(0, 0, 800, 600)])
 
     def test_not_in_textedit_or_finder(self):
         for app, els in (("com.apple.TextEdit", TEXTEDIT), ("com.apple.finder", FINDER)):
@@ -78,36 +93,73 @@ class Offered(unittest.TestCase):
         self.assertEqual(d._project_browser(SAFARI), [])
 
     def test_not_when_no_address_bar_is_found(self):
-        with mock.patch.object(axchrome, "own_fields", lambda pid: []):
+        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None: []):
             self.assertEqual(driver("com.apple.Safari")._project_browser(SAFARI), [])
 
 
 class Carried(unittest.TestCase):
+    """Only in the background, into the observed window, once the focus is confirmed on the address bar (review)."""
+
     def act(self, d):
         return d._execute_projected(Action(kind=ActionKind.TYPE_TEXT, text="新加坡 天气",
                                            binding=Binding(observation_id="o", app="Safari", element_id=WEB_SEARCH)))
 
-    def searchable(self):
+    def searchable(self, background=True, window=True, focused="WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"):
+        from deskmind_hands.drivers import skylight
         d = driver("com.apple.Safari")
         d._address_bar, d._projected_actions, d._rects = "e48", 0, {"e48": Rect(*BAR)}
+        d._background_input = lambda bundle: background
+        d._moved_since_seen = lambda: None
+        d._wait_until_still = lambda bundle, what="": None
+        d._background_quartz = lambda bundle, observed_only=False: (("Q", "token") if window and observed_only else None)
+        d._flash = mock.Mock(side_effect=AssertionError("never the foreground route"))
+        d._settle = lambda ok, detail: ExecResult(ok, detail)
+        d.events = []
+        d._post_click = lambda q, x, y: d.events.append(("click", x, y))
+        d._paste_and_submit = lambda q, text: d.events.append(("paste+return", text))
+        self.patches = [mock.patch.object(axchrome, "focused_identifier", lambda pid: focused),
+                        mock.patch.object(skylight, "give_focus_back", lambda token: d.events.append(("focus back",)))]
+        for p in self.patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self.patches])
         return d
 
-    def test_allowed_it_replaces_and_presses_return(self):
-        # The accessibility write only sets the field: the query was appended to the address and never submitted,
-        # reported "verified" (review). The search always goes the click, select-all, paste, Return route.
+    def test_allowed_it_clicks_checks_focus_pastes_and_submits(self):
         d = self.searchable()
-        sent = []
-        d._vision_act = lambda a, submit=True: (sent.append((a.binding.element_id, a.text, a.clear_first, submit))
-                                                or ExecResult(True, "entered and pressed Return"))
         d.allow_browser_field(WEB_SEARCH)
-        self.assertTrue(self.act(d).ok)
-        self.assertEqual(sent, [("e48", "新加坡 天气", True, True)])
+        res = self.act(d)
+        self.assertTrue(res.ok, res.detail)
+        self.assertEqual([e[0] for e in d.events], ["click", "paste+return", "focus back"])
+        self.assertEqual(d.events[1], ("paste+return", "新加坡 天气"))
 
     def test_not_allowed_it_is_refused(self):
         d = self.searchable()
-        d._vision_act = mock.Mock()
         self.assertFalse(self.act(d).ok)
-        d._vision_act.assert_not_called()
+        self.assertEqual(d.events, [])
+
+    def test_no_background_route_no_search(self):
+        d = self.searchable(background=False)
+        d.allow_browser_field(WEB_SEARCH)
+        res = self.act(d)
+        self.assertFalse(res.ok)
+        self.assertIn("background", res.detail)
+        self.assertEqual(d.events, [])
+
+    def test_the_observed_window_or_nothing(self):
+        d = self.searchable(window=False)
+        d.allow_browser_field(WEB_SEARCH)
+        res = self.act(d)
+        self.assertFalse(res.ok)
+        self.assertIn("observes", res.detail)
+        self.assertEqual(d.events, [])
+
+    def test_focus_elsewhere_nothing_is_pasted(self):
+        d = self.searchable(focused="WEB_FIND_FIELD")
+        d.allow_browser_field(WEB_SEARCH)
+        res = self.act(d)
+        self.assertFalse(res.ok)
+        self.assertIn("focus", res.detail)
+        self.assertEqual([e[0] for e in d.events], ["click", "focus back"])
 
     def test_no_address_bar_on_screen(self):
         d = self.searchable()
@@ -151,3 +203,32 @@ class Judged(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ObservedWindowOnly(unittest.TestCase):
+    """_background_quartz(observed_only=True): the observed window or none -- never the app's largest window."""
+
+    def quartz(self, observed):
+        import types
+        from deskmind_hands.drivers import skylight
+        wins = [{"kCGWindowOwnerPID": 123, "kCGWindowLayer": 0, "kCGWindowNumber": 7,
+                 "kCGWindowBounds": {"X": 0, "Y": 0, "Width": 1600, "Height": 1000}},     # the user's big window
+                {"kCGWindowOwnerPID": 123, "kCGWindowLayer": 0, "kCGWindowNumber": 9,
+                 "kCGWindowBounds": {"X": 900, "Y": 0, "Width": 800, "Height": 600}}]
+        fake_q = types.SimpleNamespace(CGWindowListCopyWindowInfo=lambda opt, wid: wins, kCGWindowListOptionAll=0)
+        d = driver("com.apple.Safari")
+        d._pinned_window, d._window_id = None, observed
+        with mock.patch.dict(sys.modules, {"Quartz": fake_q, "AppKit": types.SimpleNamespace(NSRunningApplication=None)}), \
+                mock.patch.object(skylight, "focus_without_raise", lambda pid, wid: ("token", wid)), \
+                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)):
+            return d._background_quartz("com.apple.Safari", observed_only=True), \
+                d._background_quartz("com.apple.Safari")
+
+    def test_the_observed_window(self):
+        strict, _ = self.quartz("9")
+        self.assertEqual(strict[0], ("Q", 9))
+
+    def test_not_the_largest_when_the_observed_one_is_gone(self):
+        strict, loose = self.quartz("42")
+        self.assertIsNone(strict)
+        self.assertEqual(loose[0], ("Q", 7))          # what the other routes still do

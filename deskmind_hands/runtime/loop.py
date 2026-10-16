@@ -554,6 +554,12 @@ def run_task(
                 # Held back as often as allowed, and the page still does not show the result: not done. Accepted, a
                 # run that never acted ended "completed" after its third DONE (deskmind#73, live run).
                 verdict_now = _page_objection(task, driver, adapter)
+                if verdict_now[1]:
+                    steps.append({"n": len(steps) + 1, "kind": "judged", "about": "result_on_page",
+                                  "verdict": verdict_now[1], "url": verdict_now[0].get("url"),
+                                  "title": verdict_now[0].get("title"), "by": "harness", "final": True})
+                    if recorder:
+                        recorder.step(steps[-1])
                 if verdict_now[1] == judge.NOT_SHOWN:
                     state = RunState.ERRORED
                     failure = Failure(FailureClass.FALSE_COMPLETION, f"not done: {verdict_now[2]}", auto=True)

@@ -65,6 +65,8 @@ STAGE_APP_BUNDLES = {"TextEdit": "com.apple.TextEdit", "Safari": "com.apple.Safa
 #: with HANDS_PROJECTION=0, to measure a planner on the raw accessibility tree: whether desktop needs new verbs or
 #: only a new state shape is exactly the on/off difference.
 PROJECTION = os.environ.get("HANDS_PROJECTION", "1") != "0"
+#: The projected 「在地址栏搜索」 of a browser window (_project_browser): typed into the address bar and submitted.
+WEB_SEARCH = "syn:websearch"
 
 MCP_ROUTED = {"see", "see_window", "click_on", "click_on_fg"}
 
@@ -928,6 +930,9 @@ class PeekabooDriver:
         """The label of `eid` when it is a browser's own field (its address bar: outside the web page, so what is
         typed there goes to a website), else None -- also when the structure cannot be read. Structure only: whether
         the text belongs there is the run's judgement (runtime/judge.py), not this driver's."""
+        if eid == WEB_SEARCH:
+            bar = getattr(self, "_address_bar", None)
+            return (getattr(self, "_labels_by_id", {}).get(bar) or "地址栏") if bar else None
         r = getattr(self, "_rects", {}).get(eid)
         if r is None:
             return None
@@ -956,6 +961,47 @@ class PeekabooDriver:
         return (f"not typed into {label!r}: it is the browser's own field (its address bar), and what is typed there "
                 f"goes to a website; nothing judged that this text belongs there. Type into the page, or into the "
                 f"document the goal names.")
+
+    def _project_browser(self, els: list[Element]) -> list[Element]:
+        """A browser's address bar as one plain option: 「在地址栏搜索」, a field whose value is typed into the address
+        bar and submitted. Offered whenever the window in front holds a web page and its address bar is found by
+        structure (axchrome) -- no word of the goal decides it. Without it the planner chose the page's own search box
+        whenever a page had one, and the address bar was never typed into (deskmind#73). Whether the value belongs
+        there is judged before it runs, like any typing into the browser's own field (runtime/judge.py)."""
+        self._address_bar = None
+        if not any((e.ax_role or "") == "AXWebArea" or (e.role or "").lower() == "webarea" for e in els):
+            return []
+        # A web page, not a web area that renders something else (a mail message is one too, with a search field
+        # beside it): the page must have a web address.
+        if not str((self.page_info() or {}).get("url") or "").startswith(("http://", "https://", "file:")):
+            return []
+        try:
+            from deskmind_hands.drivers import axchrome
+            pid = self._pid_of(self.app)
+            frames = axchrome.fields_outside_page(pid) if pid else []
+        except Exception:   # noqa: BLE001 -- unread structure: nothing offered
+            return []
+        for e in els:
+            if e.rect and (e.ax_role or "") in axchrome.TEXT_ROLES and axchrome.at(
+                    frames, self._origin.x + e.rect.x + e.rect.w / 2, self._origin.y + e.rect.y + e.rect.h / 2):
+                self._address_bar = e.id
+                return [Element(id=WEB_SEARCH, role="textbox", label="在地址栏搜索", value="", settable=True,
+                                synthetic=True, app=self._app_name, window_id=self._window_id or "")]
+        return []
+
+    def _web_search(self, action: Action) -> ExecResult:
+        """「在地址栏搜索」: the value typed into the address bar and submitted (the address bar's own typing route:
+        focus, replace, Return). Only when the run allowed this step (the judgement), like typing there directly."""
+        allowed, self._browser_field_allowed = getattr(self, "_browser_field_allowed", None), None
+        bar = getattr(self, "_address_bar", None)
+        if bar is None:
+            return ExecResult(False, "this window shows no address bar to search from")
+        if allowed != WEB_SEARCH:
+            return ExecResult(False, "not searched from the address bar: what is typed there goes to a website, and "
+                                     "nothing judged that this text belongs there")
+        self._browser_field_allowed = bar
+        return self._execute_inner(Action(kind=ActionKind.TYPE_TEXT, text=action.text,
+                                          binding=replace(action.binding, element_id=bar), raw=action.raw))
 
     def page_info(self) -> dict | None:
         """The web page the app's focused window shows ({"url", "title", "text"}), or None: no browser page, or the
@@ -1722,6 +1768,8 @@ class PeekabooDriver:
             els += self._project_textedit()
         elif self.app.lower() == CHAT_APP:
             els = self._chat_scope(els)
+        if PROJECTION and self._mcp is not None:
+            els += self._project_browser(els)
         if PROJECTION and self._mcp is not None and self.offer_folder_files and self.app.lower() != "com.apple.finder":
             els += self._folder_documents()
         if self.app.lower() in VOCAB and getattr(self, "_shot", None) is not None:
@@ -3574,6 +3622,8 @@ class PeekabooDriver:
         if not eid.startswith("syn:"):
             return None
         self._projected_actions += 1
+        if eid == WEB_SEARCH and action.kind is ActionKind.TYPE_TEXT:
+            return self._web_search(action)
         if eid.startswith("syn:move:") and action.kind is ActionKind.TYPE_TEXT:
             spec = self._move_options.get(eid)
             dest = spec["to"].get((action.text or "").strip()) if spec else None

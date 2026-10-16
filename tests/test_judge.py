@@ -153,6 +153,13 @@ if __name__ == "__main__":
 
 
 class ReviewFixes(unittest.TestCase):
+    def test_a_harness_approval_is_not_what_the_user_said(self):
+        from deskmind_hands.runtime.loop import _users_words
+        said = _users_words([{"question": "要发出去吗？", "reply": "ok", "by": "harness"},
+                             {"question": "插话", "reply": "改成东京", "by": "user"},
+                             {"question": "搜哪里？", "reply": "东京"}])
+        self.assertEqual(said, [("插话", "改成东京"), ("搜哪里？", "东京")])
+
     def test_both_judgements_read_what_the_user_said_later(self):
         # The user changed 新加坡 to 东京: the planner got it, the judgements only the goal (review of 6b5ca85).
         class Says(User):

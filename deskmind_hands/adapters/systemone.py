@@ -222,9 +222,9 @@ def _works(goal: str) -> list[tuple[str, str]]:
     if m:
         # "白鹿乐队的安静的引擎": which 的 separates the artist from the title is not knowable from the words, so
         # every split is offered, the first 的 first (titles contain 的 more often than artists do).
-        # Everything up to the last verb goes, as above: "在智能搜索栏里搜索新加坡的天气" matched the verb inside the
-        # field's name and composed 「栏里搜索新加坡 天气」 (deskmind#73).
-        phrase = re.sub(r"^.*(?:播放|放一下|听一下|搜索|搜一下|查找)", "", m.group(1).strip())
+        # A place named before the verb goes, as in value_candidates: "在智能搜索栏里搜索新加坡的天气" matched the verb
+        # inside the field's name and composed 「栏里搜索新加坡 天气」 (deskmind#73).
+        phrase = re.sub(r"^.*[里上中]\s*(?:播放|放一下|听一下|搜索|搜一下|搜|查找)", "", m.group(1).strip())
         for k in [i for i, ch in enumerate(phrase) if ch == "的"]:
             if 0 < k < len(phrase) - 1:
                 put(phrase[:k], phrase[k + 1:])

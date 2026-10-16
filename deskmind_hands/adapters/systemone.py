@@ -2194,7 +2194,9 @@ class SystemOneAdapter:
             for m in re.finditer(r"closed '(.+?)'", last.result_detail or ""):
                 self._ledger.was_closed(m.group(1))
             for m in re.finditer(r"moved '(.+?)' to", last.result_detail or ""):
-                self._ledger.was_moved(m.group(1))
+                # An undo reports itself as a move back ("moved 'a.log' to 'source' (undo)"), as _state() reads it.
+                (self._ledger.was_moved_back if "(undo)" in (last.result_detail or "")
+                 else self._ledger.was_moved)(m.group(1))
 
     def _done_inputs(self, ctx: TurnContext) -> tuple[str, list[str], list[str]]:
         goal = ctx.task.goal

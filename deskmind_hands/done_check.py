@@ -30,14 +30,23 @@ CHANGES = re.compile(r"\b(?:change|replace|rewrite|edit|update|correct|fix|remov
                      r"reorder|rename|keep only)\b|修改|改成|改为|替换|更新|删除|删掉|清空|覆盖|重写|排序|只保留", re.I)
 
 #: The files a goal moves: "把 报销单.csv 移进去", "move a.log into keep". Only a file the move verb is about, so "移到
-#: keep，再打开 b.txt" does not hold the run to moving b.txt.
+#: keep，再打开 b.txt" does not hold the run to moving b.txt; and not one the clause says to leave ("do not move b.txt",
+#: "不要把 b.txt 移走"), which a run that moved it would have broken.
 _FILE = r"「?([\w\u4e00-\u9fff][\w\u4e00-\u9fff.\-]*\.[A-Za-z0-9]{1,5})」?"
 MOVES = (re.compile(r"把\s*" + _FILE + r"\s*(?:移|挪|放|拖|搬)"),
          re.compile(r"(?<![A-Za-z])move\s+(?:the\s+file\s+)?" + _FILE, re.I))
+CLAUSE = re.compile(r"[,，;；.。!！?？\n]|\b(?:and|then|but)\b|然后|再|并且|但")
+NOT = re.compile(r"\b(?:do not|don't|dont|never|without|no need to)\b|不要|不用|不必|别|勿|无需|不需要", re.I)
 
 
 def files_to_move(goal: str) -> list[str]:
-    return list(dict.fromkeys(m.group(1) for rx in MOVES for m in rx.finditer(goal)))
+    out = []
+    for rx in MOVES:
+        for m in rx.finditer(goal):
+            clause = CLAUSE.split(goal[:m.start()])[-1]   # what comes before the verb in its own clause
+            if not NOT.search(clause):
+                out.append(m.group(1))
+    return list(dict.fromkeys(out))
 
 
 def destination(goal: str) -> str | None:
@@ -89,6 +98,10 @@ class Ledger:
 
     def was_moved(self, name: str) -> None:
         self.moved.add(name)
+
+    def was_moved_back(self, name: str) -> None:
+        """Undone: the file is where it started, and the goal's move is not done."""
+        self.moved.discard(name)
 
     def rows_written(self) -> set[str]:
         return {line.strip() for texts in self.written.values() for t in texts for line in t.splitlines()

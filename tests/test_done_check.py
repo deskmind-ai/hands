@@ -57,6 +57,21 @@ class Rules(unittest.TestCase):
         self.assertEqual(files_to_move("Move a.log into keep, then open b.txt"), ["a.log"])
         self.assertEqual(files_to_move("打开 parts.csv，追加两行"), [])
 
+    def test_not_a_file_the_goal_says_to_leave(self):
+        for goal in ("Move a.log into keep; do not move b.txt", "Move a.log into keep, but don't move b.txt",
+                     "把 a.log 移到 keep，不要把 b.txt 移走", "把 a.log 移到 keep，别把 b.txt 挪走"):
+            self.assertEqual(files_to_move(goal), ["a.log"], goal)
+            led = Ledger()
+            led.was_moved("a.log")
+            self.assertIsNone(objection(goal, led, [], []), goal)   # credited, and never told to move b.txt
+        self.assertEqual(files_to_move("不要删除，把 a.log 移到 keep"), ["a.log"])   # a negation in another clause
+
+    def test_an_undone_move_is_not_done(self):
+        led = Ledger()
+        led.was_moved("a.log")
+        led.was_moved_back("a.log")
+        self.assertIn("'a.log' has not been moved", objection("Move a.log into keep", led, [], []))
+
 
 class Satisfied(unittest.TestCase):
     """10-01: parts.csv written, saved and closed, and G18b went on to the user's other windows instead of DONE."""
@@ -150,6 +165,8 @@ class AdapterLedger(unittest.TestCase):
         self.assertIn("not been moved", a.done_objection(ctx([made])))
         moved = Turn({"kind": "type_text"}, True, "moved '报销单.csv' to '报销' (projected)")
         self.assertIsNone(a.done_objection(ctx([made, moved])))
+        undone = Turn({"kind": "click"}, True, "moved '报销单.csv' to 'Playground' (undo)")
+        self.assertIn("not been moved", a.done_objection(ctx([made, moved, undone])))   # move -> undo -> DONE
 
 
 class StopsOnce(unittest.TestCase):

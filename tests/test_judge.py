@@ -153,6 +153,22 @@ if __name__ == "__main__":
 
 
 class ReviewFixes(unittest.TestCase):
+    def test_both_judgements_read_what_the_user_said_later(self):
+        # The user changed 新加坡 to 东京: the planner got it, the judgements only the goal (review of 6b5ca85).
+        class Says(User):
+            def respond(self, question, approval, options=()):
+                self.asked.append(question)
+                return "改成东京的天气", True, 0.0
+        ask = {"kind": "ask_user", "text": "搜哪里的天气？"}
+        typed = {"kind": "type_text", "text": "东京 天气", "binding": {"element_id": "bar"}}
+        _, _, adapter = run("打开 Safari，搜索新加坡的天气", [ask, typed, DONE],
+                            Judged([ask, typed, DONE], typing=judge.DO, done=judge.SHOWN), page=CONSOLE,
+                            user=Says(True), done_check=True)
+        self.assertEqual(len(adapter.asked), 2, adapter.asked)
+        for state in adapter.asked:
+            self.assertIn("用户后来说的", state)
+            self.assertIn("改成东京的天气", state)
+
     def test_a_judged_ask_is_not_covered_by_an_earlier_approval(self):
         # risk.kind reads a question's words: an approval of a 「publish」 step covered a judged ask whose text said
         # 「public」 (review). A model-decided ask is always asked.

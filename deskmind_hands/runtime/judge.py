@@ -59,17 +59,25 @@ def _choice(ask: AskChoice | None, question: str, context: dict, options: dict) 
     return choice if choice in options else None
 
 
-def typing(ask: AskChoice | None, goal: str, field: str, text: str, page: dict | None) -> str:
-    """照做 / 不做 / 先问用户 for typing `text` into a browser's own field. Without an answer: 先问用户, never 照做."""
+def _said(context: dict, said) -> dict:
+    """What the user said after the goal (answers, changes: "东京, not 新加坡"), in order: the judgement reads the
+    request as it stands now, as the planner does (review)."""
+    lines = [f"问：{q}　答：{a}" for q, a in said or () if a]
+    return {**context, "用户后来说的": "\n".join(lines)} if lines else context
+
+
+def typing(ask: AskChoice | None, goal: str, field: str, text: str, page: dict | None, said=()) -> str:
+    """照做 / 不做 / 先问用户 for typing `text` into a browser's own field. Without an answer: 先问用户, never 照做.
+    `said`: the user's later words, (question, reply) pairs."""
     where = page or {}
     context = {"用户原话": goal, "输入框": f"{field}：浏览器自带的输入框（不在网页里），打的字会交给搜索引擎或打开网址",
                "准备打的内容": text, "当前页面": " · ".join(x for x in (where.get("title"), where.get("url")) if x) or "不知道"}
-    return _choice(ask, TYPING_QUESTION, context, TYPING) or ASK
+    return _choice(ask, TYPING_QUESTION, _said(context, said), TYPING) or ASK
 
 
-def done(ask: AskChoice | None, goal: str, page: dict) -> str | None:
+def done(ask: AskChoice | None, goal: str, page: dict, said=()) -> str | None:
     """出来了 / 没出来 / 结果本来就不在网页上 for a run finishing on `page`, or None when there is no answer. Only 没出来
-    holds a run back."""
+    holds a run back. `said`: the user's later words, as for typing."""
     context = {"用户原话": goal, "当前网址": page.get("url") or "", "页面标题": page.get("title") or "",
                "页面文字": (page.get("text") or "")[:PAGE_TEXT_CHARS]}
-    return _choice(ask, DONE_QUESTION, context, DONE)
+    return _choice(ask, DONE_QUESTION, _said(context, said), DONE)

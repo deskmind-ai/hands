@@ -75,6 +75,23 @@ class Fields(unittest.TestCase):
         finally:
             del APP["AXFocusedUIElement"]
 
+    def test_two_windows_on_top_of_each_other_name_neither(self):
+        # Same place, same size: the frame names no window -- not the first one listed (review of 6b5ca85).
+        twin = node("AXWindow", (900, 0, 800, 600), [
+            node("AXToolbar", children=[node("AXTextField", (1175, 18, 237, 31),
+                                             AXIdentifier="WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD")])])
+        APP["AXWindows"].append(twin)
+        APP["AXFocusedUIElement"] = dict(twin["AXChildren"][0]["AXChildren"][0], AXWindow=twin)
+        try:
+            self.assertIsNone(axchrome.page_info(1, (900, 0, 800, 600)))
+            self.assertEqual(axchrome.own_fields(1, (900, 0, 800, 600)), [])
+            self.assertEqual(axchrome.focused_identifier(1, (900, 0, 800, 600)), "another window")
+            twin["AXMinimized"] = True                  # a minimised one is no candidate
+            self.assertEqual(axchrome.page_info(1, (900, 0, 800, 600))["url"], "https://www.bing.com/search?q=x")
+        finally:
+            APP["AXWindows"].remove(twin)
+            del APP["AXFocusedUIElement"]
+
     def test_page_info_reads_the_observed_window(self):
         self.assertIsNone(axchrome.page_info(1, (0, 0, 800, 600)))          # the start page has no page
         info = axchrome.page_info(1, (900, 0, 800, 600))

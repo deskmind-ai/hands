@@ -61,7 +61,7 @@ def focused_identifier(pid: int, frame: tuple | None = None) -> str | None:
         return None
     if frame is not None:
         win = _get(el, "AXWindow")
-        if win is None or not _window_at(win, frame):
+        if win is None or not _window_at(win, frame) or _the_window(pid, frame) is None:
             return "another window"
     return _get(el, "AXIdentifier")
 
@@ -71,12 +71,27 @@ def _window_at(win, frame) -> bool:
     return bool(f) and all(abs(a - b) <= 2 for a, b in zip(f, frame))
 
 
+def _the_window(pid: int, frame: tuple | None):
+    """The one window of the app at `frame`, or None: none there, or two on top of each other (same place, same size),
+    where a frame names no window -- the check read the other's page, and its address bar passed for this one's
+    (review). A minimised window is no candidate: the window a run observes is on screen."""
+    from ApplicationServices import AXUIElementCreateApplication
+    if frame is None:
+        return None
+    wins = [w for w in _get(AXUIElementCreateApplication(pid), "AXWindows") or []
+            if not _get(w, "AXMinimized") and _window_at(w, frame)]
+    return wins[0] if len(wins) == 1 else None
+
+
 def _own_fields(pid: int, frame: tuple | None = None) -> list[tuple[tuple[float, float, float, float], bool]]:
     from ApplicationServices import AXUIElementCreateApplication
     out: list = []
-    for win in _get(AXUIElementCreateApplication(pid), "AXWindows") or []:
-        if frame is not None and not _window_at(win, frame):
-            continue
+    if frame is None:
+        wins = _get(AXUIElementCreateApplication(pid), "AXWindows") or []
+    else:
+        one = _the_window(pid, frame)
+        wins = [one] if one is not None else []
+    for win in wins:
         fields, has_page, seen = [], False, 0
         stack = [(win, False)]
         while stack and seen < MAX_NODES:
@@ -108,10 +123,7 @@ def page_info(pid: int, frame: tuple | None) -> dict | None:
     window is at that frame -- never another window's page: read from the app's front window, the check judged the
     user's own Safari window while the run worked in another (deskmind#73, live run). Read for the judgement whether
     a browser task's result is on the page (runtime/judge.py), never to decide anything here."""
-    from ApplicationServices import AXUIElementCreateApplication
-    if frame is None:
-        return None
-    win = next((w for w in _get(AXUIElementCreateApplication(pid), "AXWindows") or [] if _window_at(w, frame)), None)
+    win = _the_window(pid, frame)
     if win is None:
         return None
     stack, seen, page = [win], 0, None

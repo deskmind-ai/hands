@@ -264,14 +264,19 @@ def _goal_met(task: Task, workspace, driver, sentinels) -> bool | None:
         return None
 
 
-def _page_objection(task: Task, driver, adapter) -> tuple[dict, str | None, str | None]:
+def _users_words(dialogue: list[dict]) -> list[tuple[str, str]]:
+    """The user's words after the goal, as the planner gets them: not a harness approval (G16)."""
+    return [(d["question"], d["reply"]) for d in dialogue if d.get("by") != "harness"]
+
+
+def _page_objection(task: Task, driver, adapter, said=()) -> tuple[dict, str | None, str | None]:
     """Whether a run finishing on a web page is done, as a model judged it (runtime/judge.py): (the page, the verdict,
     why it is not done). No verdict when the app shows no web page or there is no judgement -- this never holds a run
     back on its own. Only http(s) and file pages: a mail message is a web area too, and is no result page."""
     page = getattr(driver, "page_info", lambda: None)() or {}
     if not str(page.get("url") or "").startswith(("http://", "https://", "file:")):
         return page, None, None
-    verdict = judge.done(getattr(adapter, "judge_choice", None), task.goal, page)
+    verdict = judge.done(getattr(adapter, "judge_choice", None), task.goal, page, said)
     if verdict != judge.NOT_SHOWN:
         return page, verdict, None
     return page, verdict, (f"the page ({page.get('url')}, {page.get('title') or 'no title'}) does not show what the "
@@ -527,7 +532,7 @@ def run_task(
                               history=history[-10:], channels=cfg.channels,
                               # The planner's own questions and their answers. A harness approval is not one (G16):
                               # no training state ever had one in user_answers, and its yes is no answer to the goal.
-                              dialogue=[(d["question"], d["reply"]) for d in dialogue if d.get("by") != "harness"],
+                              dialogue=_users_words(dialogue),
                               notice=notice, ineffective=tuple(ineffective), run_id=run_id, step=len(steps) + 1,
                               asked=planner_questions)
             notice = None
@@ -610,7 +615,7 @@ def run_task(
                 objection = getattr(adapter, "done_objection", None)
                 why = objection(ctx) if objection else None
                 if not why:
-                    page, verdict, why = _page_objection(task, driver, adapter)
+                    page, verdict, why = _page_objection(task, driver, adapter, _users_words(dialogue))
                     last_page_verdict = verdict
                     if verdict:
                         entry = {"n": len(steps) + 1, "kind": "judged", "about": "result_on_page", "verdict": verdict,
@@ -632,7 +637,7 @@ def run_task(
                     and last_page_verdict == judge.NOT_SHOWN):
                 # Held back as often as allowed, and the page still does not show the result: not done. Accepted, a
                 # run that never acted ended "completed" after its third DONE (deskmind#73, live run).
-                verdict_now = _page_objection(task, driver, adapter)
+                verdict_now = _page_objection(task, driver, adapter, _users_words(dialogue))
                 if verdict_now[1]:
                     steps.append({"n": len(steps) + 1, "kind": "judged", "about": "result_on_page",
                                   "verdict": verdict_now[1], "url": verdict_now[0].get("url"),
@@ -695,7 +700,7 @@ def run_task(
             if field_label:
                 page = getattr(driver, "page_info", lambda: None)()
                 verdict = judge.typing(getattr(adapter, "judge_choice", None), task.goal, field_label,
-                                       action.text or "", page)
+                                       action.text or "", page, _users_words(dialogue))
                 entry = {"n": len(steps) + 1, "kind": "judged", "about": "browser_field", "field": field_label,
                          "verdict": verdict, "by": "harness"}
                 steps.append(entry)

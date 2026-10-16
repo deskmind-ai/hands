@@ -45,15 +45,30 @@ def address_bars(pid: int) -> list[tuple[float, float, float, float]]:
     return [f for f, known in _own_fields(pid) if known]
 
 
-def own_fields(pid: int) -> list[tuple[tuple[float, float, float, float], bool]]:
-    """Every browser-own field as (screen frame, known address bar): one walk for both questions."""
-    return _own_fields(pid)
+def own_fields(pid: int, frame: tuple | None = None) -> list[tuple[tuple[float, float, float, float], bool]]:
+    """The browser-own fields of the window at `frame` (the window the run observes) as (screen frame, known address
+    bar): one walk for both questions. Another window's fields are not this window's options."""
+    return _own_fields(pid, frame) if frame is not None else []
 
 
-def _own_fields(pid: int) -> list[tuple[tuple[float, float, float, float], bool]]:
+def focused_identifier(pid: int) -> str | None:
+    """The accessibility identifier of the app's focused element: where a paste would land."""
+    from ApplicationServices import AXUIElementCreateApplication
+    el = _get(AXUIElementCreateApplication(pid), "AXFocusedUIElement")
+    return _get(el, "AXIdentifier") if el is not None else None
+
+
+def _window_at(win, frame) -> bool:
+    f = _frame(win)
+    return bool(f) and all(abs(a - b) <= 2 for a, b in zip(f, frame))
+
+
+def _own_fields(pid: int, frame: tuple | None = None) -> list[tuple[tuple[float, float, float, float], bool]]:
     from ApplicationServices import AXUIElementCreateApplication
     out: list = []
     for win in _get(AXUIElementCreateApplication(pid), "AXWindows") or []:
+        if frame is not None and not _window_at(win, frame):
+            continue
         fields, has_page, seen = [], False, 0
         stack = [(win, False)]
         while stack and seen < MAX_NODES:
@@ -88,8 +103,7 @@ def page_info(pid: int, frame: tuple | None) -> dict | None:
     from ApplicationServices import AXUIElementCreateApplication
     if frame is None:
         return None
-    win = next((w for w in _get(AXUIElementCreateApplication(pid), "AXWindows") or []
-                if (f := _frame(w)) and all(abs(a - b) <= 2 for a, b in zip(f, frame))), None)
+    win = next((w for w in _get(AXUIElementCreateApplication(pid), "AXWindows") or [] if _window_at(w, frame)), None)
     if win is None:
         return None
     stack, seen, page = [win], 0, None

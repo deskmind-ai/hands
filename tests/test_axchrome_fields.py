@@ -46,10 +46,22 @@ class Fields(unittest.TestCase):
             p.stop()
 
     def test_a_known_address_bar_counts_without_a_page(self):
-        own = axchrome.own_fields(1)
-        self.assertIn(((275, 18, 237, 31), True), own)
-        self.assertNotIn(((600, 18, 120, 31), False), own)        # an unknown toolbar field of a pageless window
+        own = axchrome.own_fields(1, (0, 0, 800, 600))
+        self.assertEqual(own, [((275, 18, 237, 31), True)])     # not the unknown toolbar field of a pageless window
         self.assertIn((275, 18, 237, 31), axchrome.fields_outside_page(1))
+
+    def test_own_fields_are_the_observed_windows_only(self):
+        self.assertEqual(axchrome.own_fields(1, (900, 0, 800, 600)), [((1175, 18, 237, 31), True)])
+        self.assertEqual(axchrome.own_fields(1, None), [])
+        self.assertEqual(axchrome.own_fields(1, (5, 5, 10, 10)), [])
+
+    def test_the_focused_elements_identifier(self):
+        APP["AXFocusedUIElement"] = PAGE["AXChildren"][0]["AXChildren"][0]
+        try:
+            self.assertEqual(axchrome.focused_identifier(1), "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD")
+        finally:
+            del APP["AXFocusedUIElement"]
+        self.assertIsNone(axchrome.focused_identifier(1))
 
     def test_page_info_reads_the_observed_window(self):
         self.assertIsNone(axchrome.page_info(1, (0, 0, 800, 600)))          # the start page has no page

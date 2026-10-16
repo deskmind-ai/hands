@@ -973,29 +973,33 @@ class PeekabooDriver:
         try:
             from deskmind_hands.drivers import axchrome
             pid = self._pid_of(self.app)
-            fields = axchrome.own_fields(pid) if pid else []
+            fields = axchrome.own_fields(pid, self._window_frame()) if pid else []
         except Exception:   # noqa: BLE001 -- unread structure: nothing offered
             return []
-        frames = [f for f, known in fields if known]
+        known = [f for f, k in fields if k]
         # A field outside a web area counts only for a web page, not a web area that renders something else (a mail
         # message is one too, with a search field beside it): the page must have a web address.
-        if (any((e.ax_role or "") == "AXWebArea" or (e.role or "").lower() == "webarea" for e in els)
-                and str((self.page_info() or {}).get("url") or "").startswith(("http://", "https://", "file:"))):
-            frames += [f for f, _ in fields]
-        for e in els:
-            if e.rect and (e.ax_role or "") in axchrome.TEXT_ROLES and axchrome.at(
-                    frames, self._origin.x + e.rect.x + e.rect.w / 2, self._origin.y + e.rect.y + e.rect.h / 2):
-                self._address_bar = e.id
-                return [Element(id=WEB_SEARCH, role="textbox", label="在地址栏搜索", value="", settable=True,
-                                synthetic=True, app=self._app_name, window_id=self._window_id or "")]
+        others = ([f for f, _ in fields] if any((e.ax_role or "") == "AXWebArea" or (e.role or "").lower() == "webarea"
+                                               for e in els)
+                  and str((self.page_info() or {}).get("url") or "").startswith(("http://", "https://", "file:"))
+                  else [])
+        # The address bar known by its identifier first: a find bar is a browser-own field too, and is no address bar.
+        for frames in (known, others):
+            for e in els:
+                if e.rect and (e.ax_role or "") in axchrome.TEXT_ROLES and axchrome.at(
+                        frames, self._origin.x + e.rect.x + e.rect.w / 2, self._origin.y + e.rect.y + e.rect.h / 2):
+                    self._address_bar = e.id
+                    return [Element(id=WEB_SEARCH, role="textbox", label="在地址栏搜索", value="", settable=True,
+                                    synthetic=True, app=self._app_name, window_id=self._window_id or "")]
         return []
 
     def _web_search(self, action: Action) -> ExecResult:
-        """「在地址栏搜索」: the value typed into the address bar, replacing what is there, and submitted with Return --
-        always on the route that presses Return (click, select all, paste, Return). The accessibility write only sets
-        the field: where it was taken, the query was appended to the page's address and never submitted, and the
-        step still read "verified". Only when the run allowed this step (the judgement), like typing there directly;
-        where Return cannot reach the window, it fails and says so."""
+        """「在地址栏搜索」: the value typed into the address bar, replacing what is there, and submitted with Return.
+        Only in the background, into the window the run observes -- never the app's largest window, never by bringing
+        it forward -- and only once the keyboard focus is confirmed on the address bar itself (its identifier), so
+        the paste cannot land anywhere else. The accessibility write is not used: it set the field without submitting,
+        appended to the address, and still read "verified". Only when the run allowed this step (the judgement), like
+        typing there directly. Each check that fails fails the step and says why."""
         allowed, self._browser_field_allowed = getattr(self, "_browser_field_allowed", None), None
         bar = getattr(self, "_address_bar", None)
         if bar is None or bar not in getattr(self, "_rects", {}):
@@ -1003,8 +1007,61 @@ class PeekabooDriver:
         if allowed != WEB_SEARCH:
             return ExecResult(False, "not searched from the address bar: what is typed there goes to a website, and "
                                      "nothing judged that this text belongs there")
-        return self._vision_act(Action(kind=ActionKind.TYPE_TEXT, text=action.text, clear_first=True,
-                                       binding=replace(action.binding, element_id=bar), raw=action.raw), submit=True)
+        if not self._background_input(self.app):
+            return ExecResult(False, "not searched: the address bar is typed into only in the background, and this "
+                                     "app's windows do not take background input here")
+        moved = self._moved_since_seen()
+        if moved:
+            return ExecResult(False, moved, stale=True)
+        waited = self._wait_until_still(self.app, "search from the address bar")
+        if waited is not None:
+            return ExecResult(False, waited)       # the user is busy: deferred, as any step that waits for them
+        bg = self._background_quartz(self.app, observed_only=True)
+        if bg is None:
+            return ExecResult(False, "not searched: the window this run observes was not found, and no other window "
+                                     "is typed into")
+        q, token = bg
+        r, text = self._rects[bar], action.text or ""
+        x, y = self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2
+        from deskmind_hands.drivers import axchrome, skylight
+        try:
+            self._post_click(q, x, y)
+            time.sleep(0.2)
+            pid = self._pid_of(self.app)
+            focused = axchrome.focused_identifier(pid) if pid else None
+            if focused not in axchrome.ADDRESS_BAR_IDS:
+                return ExecResult(False, f"not searched: the keyboard focus is not on the address bar ({focused or 'unknown'}), "
+                                         f"so nothing was pasted")
+            self._paste_and_submit(q, text)
+        finally:
+            skylight.give_focus_back(token)
+        return self._settle(True, f"searched {text!r} from the address bar (in the background)")
+
+    def _paste_and_submit(self, Q, text: str) -> None:
+        """Select all, paste `text`, Return, into the focused field; the user's clipboard, every item and type, put
+        back straight after. Pasted, not typed: an input method takes synthesized keys (see _vision_act)."""
+        from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
+        pb = NSPasteboard.generalPasteboard()
+        saved = [{t: it.dataForType_(t) for t in it.types()} for it in (pb.pasteboardItems() or [])]
+        try:
+            pb.clearContents()
+            pb.setString_forType_(text, NSPasteboardTypeString)
+            self._post_key(Q, self._keycode(Q, "a"), Q.kCGEventFlagMaskCommand)
+            self._post_key(Q, self._keycode(Q, "v"), Q.kCGEventFlagMaskCommand)
+            time.sleep(0.4)
+            self._post_key(Q, keys.RETURN)
+            time.sleep(0.4)
+        finally:
+            pb.clearContents()
+            items = []
+            for d in saved:
+                item = NSPasteboardItem.alloc().init()
+                for t, data in d.items():
+                    if data is not None:
+                        item.setData_forType_(data, t)
+                items.append(item)
+            if items:
+                pb.writeObjects_(items)
 
     def page_info(self) -> dict | None:
         """The web page the observed window shows ({"url", "title", "text"}), or None: no browser page, or the
@@ -2068,9 +2125,10 @@ class PeekabooDriver:
             self._resumed()
         return None
 
-    def _background_quartz(self, bundle: str):
-        """A Quartz stand-in that delivers to `bundle`'s window (the pinned one, else its largest), focused without
-        being raised; None when the app or window cannot be found."""
+    def _background_quartz(self, bundle: str, observed_only: bool = False):
+        """A Quartz stand-in that delivers to `bundle`'s window (the pinned one, else its largest -- with
+        `observed_only`, the observed one or none), focused without being raised; None when the app or window cannot
+        be found."""
         import Quartz
         from AppKit import NSRunningApplication
         from deskmind_hands.drivers import skylight
@@ -2083,7 +2141,7 @@ class PeekabooDriver:
             return None
         wins = [w for w in all_wins if w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowLayer") == 0]
         pinned = [w for w in wins if str(w.get("kCGWindowNumber")) == str(self._pinned_window or self._window_id)]
-        if not (pinned or wins):
+        if not (pinned or wins) or (observed_only and not pinned):
             return None
         w = (pinned or sorted(wins, key=lambda w: -w["kCGWindowBounds"]["Width"] * w["kCGWindowBounds"]["Height"]))[0]
         wid, b = int(w["kCGWindowNumber"]), w["kCGWindowBounds"]

@@ -47,11 +47,13 @@ class Refusal(unittest.TestCase):
         for goal in ("Open https://example.com and read the title", "打开 Safari，搜索新加坡的天气"):
             self.assertIsNotNone(driver(goal)._browser_field_refusal("bar"), goal)
 
-    def test_an_allowance_is_for_one_step(self):
+    def test_an_allowance_does_not_open_the_raw_field(self):
+        # Only 「在地址栏搜索」 types into the browser's own field: a judged 照做 on the raw bar is still refused, the
+        # plain routes check neither the window nor the focus (review of 27b84b8).
         d = driver("打开 Safari，搜索新加坡的天气")
         d.allow_browser_field("bar")
-        self.assertIsNone(d._browser_field_refusal("bar"))
         self.assertIsNotNone(d._browser_field_refusal("bar"))
+        self.assertIn("在地址栏搜索", d.browser_field_refused("bar"))
 
     def test_an_allowance_does_not_outlive_its_step(self):
         # An early return (here: no snapshot yet) or an error in the step must not leave it for the next (review).
@@ -62,7 +64,7 @@ class Refusal(unittest.TestCase):
         res = d.execute(Action(kind=ActionKind.CLICK, binding=Binding(observation_id="o", app="Safari",
                                                                        element_id="field")))
         self.assertFalse(res.ok)
-        self.assertIsNotNone(d._browser_field_refusal("bar"))
+        self.assertIsNone(getattr(d, "_browser_field_allowed", None))
 
     def test_page_info_is_the_observed_windows(self):
         d = driver("打开 Safari，搜索新加坡的天气")

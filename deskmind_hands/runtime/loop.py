@@ -587,9 +587,9 @@ def run_task(
             # Typing into a browser's own field (its address bar) sends the text to a website: a model judges whether
             # that is what the user wants (runtime/judge.py). 不做 is refused here; 先问用户 goes to the person like a
             # risky step; 照做 lets the driver type there, this once (deskmind#73).
+            # The projected 「在地址栏搜索」 (syn:websearch) is the same field, and judged the same way.
             field_label = (getattr(driver, "browser_field", lambda _eid: None)(action.binding.element_id)
-                           if action.kind is ActionKind.TYPE_TEXT and action.binding.element_id
-                           and not action.binding.element_id.startswith("syn:") else None)
+                           if action.kind is ActionKind.TYPE_TEXT and action.binding.element_id else None)
             field_ask: str | None = None
             if field_label:
                 page = getattr(driver, "page_info", lambda: None)()

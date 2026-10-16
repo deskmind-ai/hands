@@ -29,9 +29,12 @@ def driver(goal):
 class Refusal(unittest.TestCase):
     def setUp(self):
         self.p = mock.patch.object(axchrome, "fields_outside_page", lambda pid: [BAR])
+        self.q = mock.patch.object(axchrome, "address_bars", lambda pid: [])     # tests that need one patch it
         self.p.start()
+        self.q.start()
 
     def tearDown(self):
+        self.q.stop()
         self.p.stop()
 
     def test_the_address_bar_is_told_apart(self):
@@ -47,13 +50,25 @@ class Refusal(unittest.TestCase):
         for goal in ("Open https://example.com and read the title", "打开 Safari，搜索新加坡的天气"):
             self.assertIsNotNone(driver(goal)._browser_field_refusal("bar"), goal)
 
-    def test_an_allowance_does_not_open_the_raw_field(self):
-        # Only 「在地址栏搜索」 types into the browser's own field: a judged 照做 on the raw bar is still refused, the
-        # plain routes check neither the window nor the focus (review of 27b84b8).
+    def test_an_allowance_does_not_open_the_address_bar(self):
+        # Only 「在地址栏搜索」 types into the address bar: a judged 照做 on the raw bar is still refused, the plain
+        # routes check neither the window nor the focus (review of 27b84b8).
         d = driver("打开 Safari，搜索新加坡的天气")
-        d.allow_browser_field("bar")
-        self.assertIsNotNone(d._browser_field_refusal("bar"))
-        self.assertIn("在地址栏搜索", d.browser_field_refused("bar"))
+        with mock.patch.object(axchrome, "address_bars", lambda pid: [BAR]):
+            d.allow_browser_field("bar")
+            self.assertIsNotNone(d._browser_field_refusal("bar"))
+            self.assertIn("在地址栏搜索", d.browser_field_refused("bar"))
+
+    def test_another_browser_field_is_typed_into_once_allowed(self):
+        # Safari's 在页面上查找 is the browser's own field, not the address bar: judged, it is typed into, once
+        # (review of bd79705: refusing it left "Find 'invoice' on this web page" with no way to do it).
+        d = driver("Find 'invoice' on this web page")
+        with mock.patch.object(axchrome, "address_bars", lambda pid: []):
+            self.assertIsNone(d.browser_field_refused("bar"))
+            self.assertIsNotNone(d._browser_field_refusal("bar"))      # not judged: refused
+            d.allow_browser_field("bar")
+            self.assertIsNone(d._browser_field_refusal("bar"))         # judged: typed
+            self.assertIsNotNone(d._browser_field_refusal("bar"))      # for one step
 
     def test_an_allowance_does_not_outlive_its_step(self):
         # An early return (here: no snapshot yet) or an error in the step must not leave it for the next (review).

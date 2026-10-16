@@ -157,6 +157,17 @@ class Carried(unittest.TestCase):
         self.assertEqual([e[0] for e in d.events], ["click", "paste", "return", "focus back"])
         self.assertEqual(d.events[1], ("paste", "新加坡 天气"))
 
+    def test_moved_while_waiting_for_the_user_nothing_is_sent(self):
+        # The window moved during the wait: the click would land at the old place, in the page (review of c2b9b08).
+        d = self.searchable()
+        seq = iter([None, "the window moved since it was observed"])
+        d._moved_since_seen = lambda: next(seq)
+        d.allow_browser_field(WEB_SEARCH)
+        res = self.act(d)
+        self.assertFalse(res.ok)
+        self.assertTrue(res.stale)
+        self.assertEqual(d.events, [])
+
     def test_not_allowed_it_is_refused(self):
         d = self.searchable()
         self.assertFalse(self.act(d).ok)

@@ -556,9 +556,10 @@ def run_task(
                         recorder.step(entry)
                     continue
             if (action.kind is ActionKind.DONE and done_check.enabled() and done_blocks >= cfg.max_done_blocks
-                    and last_page_verdict == judge.NOT_SHOWN):
+                    and last_page_verdict not in (judge.SHOWN, judge.NOT_ON_A_PAGE)):
                 # Held back as often as allowed, and the page still does not show the result: not done. Accepted, a
-                # run that never acted ended "completed" after its third DONE (deskmind#73, live run).
+                # run that never acted ended "completed" after its third DONE (deskmind#73, live run). Also when the
+                # blocks were spent by another check and the page was never judged (review of c2b9b08): judged now.
                 verdict_now = _page_objection(task, driver, adapter, _users_words(dialogue))
                 if verdict_now[1]:
                     steps.append({"n": len(steps) + 1, "kind": "judged", "about": "result_on_page",

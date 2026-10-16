@@ -1065,6 +1065,11 @@ class PeekabooDriver:
         waited = self._wait_until_still(self.app, "search from the address bar")
         if waited is not None:
             return ExecResult(False, waited)       # the user is busy: deferred, as any step that waits for them
+        # Again after the wait (up to a minute): a window moved or resized meanwhile put the click at the old place,
+        # into the page (review of c2b9b08).
+        moved = self._moved_since_seen()
+        if moved:
+            return ExecResult(False, moved, stale=True)
         bg = self._background_quartz(self.app, observed_only=True)
         if bg is None:
             return ExecResult(False, "not searched: the window this run observes was not found, and no other window "

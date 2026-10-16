@@ -65,6 +65,8 @@ STAGE_APP_BUNDLES = {"TextEdit": "com.apple.TextEdit", "Safari": "com.apple.Safa
 #: with HANDS_PROJECTION=0, to measure a planner on the raw accessibility tree: whether desktop needs new verbs or
 #: only a new state shape is exactly the on/off difference.
 PROJECTION = os.environ.get("HANDS_PROJECTION", "1") != "0"
+#: The projected 「在地址栏搜索」 of a browser window (_project_browser): typed into the address bar and submitted.
+WEB_SEARCH = "syn:websearch"
 
 MCP_ROUTED = {"see", "see_window", "click_on", "click_on_fg"}
 
@@ -895,11 +897,6 @@ class PeekabooDriver:
             time.sleep(0.8)
         return n
 
-    #: A goal that asks for something on the web: typing into a browser's own fields is then what it wants.
-    WEB_INTENT = re.compile(r"https?://|www\.|\.(?:com|org|net|cn)\b|\b(?:url|website|web ?page|web|online|internet|"
-                            r"google|bing|search the|look (?:it )?up|browse)\b|网址|网站|网页|上网|百度|谷歌|必应|"
-                            r"搜索引擎|在浏览器|浏览器里", re.I)
-
     def _keep_baseline(self, els) -> None:
         """A document's text as this run first saw it, per window title: what was there before the run, which is the
         user's (lines_lost protects only that -- the run may redo what it wrote itself)."""
@@ -929,24 +926,213 @@ class PeekabooDriver:
         return (f"not written: the goal only adds -- append instead; replacing the text would remove "
                 f"{len(lost)} line(s) it has, the first {lost[0]!r}")
 
-    def _browser_field_refusal(self, eid: str) -> str | None:
-        """Why typing into `eid` is refused: it is a browser's own field (the address bar), which sends what is typed to
-        a website, and the goal asks for nothing on the web. None otherwise, or when it cannot be told."""
+    def browser_field(self, eid: str) -> str | None:
+        """The label of `eid` when it is a browser's own field (its address bar: outside the web page, so what is
+        typed there goes to a website), else None -- also when the structure cannot be read. Structure only: whether
+        the text belongs there is the run's judgement (runtime/judge.py), not this driver's."""
+        if eid == WEB_SEARCH:
+            bar = getattr(self, "_address_bar", None)
+            return (getattr(self, "_address_bar_label", "") or "地址栏") if bar else None
+        if eid and eid == getattr(self, "_address_bar", None):
+            # Taken out of the options for 「在地址栏搜索」, so not in _rects: still the browser's own field (review).
+            return getattr(self, "_address_bar_label", "") or "地址栏"
         r = getattr(self, "_rects", {}).get(eid)
-        if r is None or self.WEB_INTENT.search(getattr(self, "goal", "") or ""):
+        if r is None:
             return None
         try:
             from deskmind_hands.drivers import axchrome
             pid = self._pid_of(self.app)
             frames = axchrome.fields_outside_page(pid) if pid else []
-        except Exception:   # noqa: BLE001 -- a structure that cannot be read is no refusal
+        except Exception:   # noqa: BLE001 -- a structure that cannot be read is no browser field
             return None
         if axchrome.at(frames, self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2):
-            label = self._labels_by_id.get(eid, eid)
-            return (f"not typed into {label!r}: it is the browser's own field (its address bar), and what is typed "
-                    f"there goes to a website, while the goal asks for nothing on the web. Type into the page, or "
-                    f"into the document the goal names.")
+            return self._labels_by_id.get(eid, eid)
         return None
+
+    def allow_browser_field(self, eid: str) -> None:
+        """The run judged (or the user approved) typing into this browser field: the next TYPE_TEXT into it goes."""
+        self._browser_field_allowed = eid
+
+    def browser_field_is_address_bar(self, eid: str) -> bool:
+        """Whether the browser's own field `eid` may be its address bar (what is typed there goes to a website): what
+        the judgement is told about the field. "Another field" (在页面上查找) only when this app's address bar is known
+        by its identifier and `eid` is not it; a browser without that identifier (Chrome, Firefox) or an unread
+        structure says address bar -- told otherwise, a judgement allowed a table row into Chrome's (review)."""
+        if eid == WEB_SEARCH or self._address_bar_refusal(eid) is not None:
+            return True
+        try:
+            from deskmind_hands.drivers import axchrome
+            pid = self._pid_of(self.app)
+            return not (pid and axchrome.address_bars(pid))
+        except Exception:   # noqa: BLE001 -- unread: the address bar, the safe description
+            return True
+
+    def _address_bar_refusal(self, eid: str) -> str | None:
+        """Why typing into `eid` directly is refused whatever was judged: it is the address bar (known by its
+        identifier, or the one 「在地址栏搜索」 stands for), typed into only as 「在地址栏搜索」 (_web_search: the
+        observed window, the one window at its frame, the focus checked on its address bar). The plain routes check
+        neither: with two windows on top of each other the projection was not offered, the raw bar stayed, and a judged
+        照做 pasted through _vision_act unchecked (review of 27b84b8). Other browser-own fields (Safari's 在页面上查找)
+        are not the address bar: judged, they are typed into as before (review of bd79705)."""
+        if not eid or eid == WEB_SEARCH or self.browser_field(eid) is None:
+            return None
+        label = self.browser_field(eid)
+        refusal = (f"not typed into {label!r}: it is the browser's address bar, typed into only as 「在地址栏搜索」 "
+                   f"when that is offered. Type into the page, or into the document the goal names.")
+        if eid == getattr(self, "_address_bar", None):
+            return refusal
+        r = getattr(self, "_rects", {}).get(eid)
+        try:
+            from deskmind_hands.drivers import axchrome
+            pid = self._pid_of(self.app)
+            bars = axchrome.address_bars(pid) if pid and r is not None else []
+        except Exception:   # noqa: BLE001 -- unread: it may be the address bar, so it is refused as one (review)
+            return refusal
+        if r is not None and axchrome.at(bars, self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2):
+            return refusal
+        return None
+
+    def _browser_field_refusal(self, eid: str) -> str | None:
+        """Why typing into `eid` is refused: the address bar always but as 「在地址栏搜索」 (_address_bar_refusal);
+        another browser-own field unless the run allowed this step (judged, or approved by the person). This stays on
+        every route that writes: G18b typed a parts row into Safari's address bar (09-30)."""
+        allowed, self._browser_field_allowed = getattr(self, "_browser_field_allowed", None), None
+        bar = self._address_bar_refusal(eid)
+        if bar:
+            return bar
+        label = None if eid == WEB_SEARCH else self.browser_field(eid)
+        if label is None or allowed == eid:
+            return None
+        return (f"not typed into {label!r}: it is the browser's own field (outside the page, like its address bar), and "
+                f"nothing judged that this text belongs there. Type into the page, or into the document the goal names.")
+
+    def browser_field_refused(self, eid: str) -> str | None:
+        """For the loop, before it judges or asks anything: typing into `eid` will be refused whatever the judgement
+        (the address bar other than as 「在地址栏搜索」)."""
+        return self._address_bar_refusal(eid)
+
+    def _project_browser(self, els: list[Element]) -> list[Element]:
+        """A browser's address bar as one plain option: 「在地址栏搜索」, a field whose value is typed into the address
+        bar and submitted. Offered when the observed window has an address bar found by structure (axchrome): one
+        known by its identifier, page or no page (a start page, a blank tab), or a field outside a web page that has a
+        web address. No word of the goal decides it. Without it the planner chose the page's own search box whenever a
+        page had one, and the address bar was never typed into (deskmind#73). Whether the value belongs there is
+        judged before it runs, like any typing into the browser's own field (runtime/judge.py).
+        The option carries the bar's own name (「在地址栏搜索（智能搜索栏）」) and takes the bar's place among the options
+        (see observe): offered both, a planner told to search "in the 智能搜索栏" chose the bar itself by its name,
+        which types without submitting (deskmind#73, live 10-16)."""
+        self._address_bar, self._address_bar_rect, self._address_bar_label = None, None, ""
+        try:
+            from deskmind_hands.drivers import axchrome
+            pid = self._pid_of(self.app)
+            fields = axchrome.own_fields(pid, self._window_frame()) if pid else []
+        except Exception:   # noqa: BLE001 -- unread structure: nothing offered
+            return []
+        # Only the address bar known by its identifier: the search confirms the focus by that identifier, so a field
+        # taken for the bar by place alone (the first one outside a page) was replaced by an option that always
+        # failed, and could be the find bar (review of 9f226e9).
+        known = [f for f, k in fields if k]
+        for e in els:
+            if e.rect and (e.ax_role or "") in axchrome.TEXT_ROLES and axchrome.at(
+                    known, self._origin.x + e.rect.x + e.rect.w / 2, self._origin.y + e.rect.y + e.rect.h / 2):
+                self._address_bar, self._address_bar_rect, self._address_bar_label = e.id, e.rect, e.label or ""
+                label = f"在地址栏搜索（{e.label}）" if e.label else "在地址栏搜索"
+                # Its value is the bar's (the page's address): the only place the planner read it.
+                return [Element(id=WEB_SEARCH, role="textbox", label=label, value=e.value or "", settable=True,
+                                synthetic=True, app=self._app_name, window_id=self._window_id or "")]
+        return []
+
+    def _web_search(self, action: Action) -> ExecResult:
+        """「在地址栏搜索」: the value typed into the address bar, replacing what is there, and submitted with Return.
+        Only in the background, into the window the run observes -- never the app's largest window, never by bringing
+        it forward -- and only once the keyboard focus is confirmed on the address bar itself (its identifier), so
+        the paste cannot land anywhere else. The accessibility write is not used: it set the field without submitting,
+        appended to the address, and still read "verified". Only when the run allowed this step (the judgement), like
+        typing there directly. Each check that fails fails the step and says why."""
+        allowed, self._browser_field_allowed = getattr(self, "_browser_field_allowed", None), None
+        bar, r = getattr(self, "_address_bar", None), getattr(self, "_address_bar_rect", None)
+        if bar is None or r is None:
+            return ExecResult(False, "this window shows no address bar to search from")
+        if allowed != WEB_SEARCH:
+            return ExecResult(False, "not searched from the address bar: what is typed there goes to a website, and "
+                                     "nothing judged that this text belongs there")
+        if not self._background_input(self.app):
+            return ExecResult(False, "not searched: the address bar is typed into only in the background, and this "
+                                     "app's windows do not take background input here")
+        moved = self._moved_since_seen()
+        if moved:
+            return ExecResult(False, moved, stale=True)
+        waited = self._wait_until_still(self.app, "search from the address bar")
+        if waited is not None:
+            return ExecResult(False, waited)       # the user is busy: deferred, as any step that waits for them
+        bg = self._background_quartz(self.app, observed_only=True)
+        if bg is None:
+            return ExecResult(False, "not searched: the window this run observes was not found, and no other window "
+                                     "is typed into")
+        q, token = bg
+        text = action.text or ""
+        x, y = self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2
+        from deskmind_hands.drivers import axchrome, skylight
+        pid, frame = self._pid_of(self.app), self._window_frame()
+
+        def on_bar() -> str | None:
+            # The observed window's address bar, not merely an address bar: the identifier is the same in every
+            # window. No window frame, no check, no paste.
+            return axchrome.focused_identifier(pid, frame) if pid and frame else None
+
+        try:
+            self._post_click(q, x, y)
+            time.sleep(0.2)
+            focused = on_bar()
+            if focused not in axchrome.ADDRESS_BAR_IDS:
+                return self._settle(False, f"not searched: the keyboard focus is not on this window's address bar "
+                                           f"({focused or 'unknown'}), so nothing was pasted")
+            if not self._paste_and_submit(q, text, before_return=lambda: on_bar() in axchrome.ADDRESS_BAR_IDS):
+                return self._settle(False, "not searched: the focus left this window's address bar after the paste, "
+                                           "so Return was not pressed")
+        finally:
+            skylight.give_focus_back(token)
+        return self._settle(True, f"searched {text!r} from the address bar (in the background)")
+
+    def _paste_and_submit(self, Q, text: str, before_return=None) -> bool:
+        """Select all, paste `text`, Return, into the focused field; the user's clipboard, every item and type, put
+        back straight after. Pasted, not typed: an input method takes synthesized keys (see _vision_act). Return,
+        the step that submits, only if `before_return()` still holds; False when it did not and nothing was sent."""
+        from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
+        pb = NSPasteboard.generalPasteboard()
+        saved = [{t: it.dataForType_(t) for t in it.types()} for it in (pb.pasteboardItems() or [])]
+        try:
+            pb.clearContents()
+            pb.setString_forType_(text, NSPasteboardTypeString)
+            self._post_key(Q, self._keycode(Q, "a"), Q.kCGEventFlagMaskCommand)
+            self._post_key(Q, self._keycode(Q, "v"), Q.kCGEventFlagMaskCommand)
+            time.sleep(0.4)
+            if before_return is not None and not before_return():
+                return False
+            self._post_key(Q, keys.RETURN)
+            time.sleep(0.4)
+            return True
+        finally:
+            pb.clearContents()
+            items = []
+            for d in saved:
+                item = NSPasteboardItem.alloc().init()
+                for t, data in d.items():
+                    if data is not None:
+                        item.setData_forType_(data, t)
+                items.append(item)
+            if items:
+                pb.writeObjects_(items)
+
+    def page_info(self) -> dict | None:
+        """The web page the observed window shows ({"url", "title", "text"}), or None: no browser page, or the
+        structure cannot be read. For the judgement whether a browser task's result is on the page."""
+        try:
+            from deskmind_hands.drivers import axchrome
+            pid = self._pid_of(self.app)
+            return axchrome.page_info(pid, self._window_frame()) if pid else None
+        except Exception:   # noqa: BLE001 -- unread is no page
+            return None
 
     def _window_frame(self) -> tuple | None:
         """Where the observed window is and how big, from the window server (cheap: no accessibility walk)."""
@@ -1141,6 +1327,12 @@ class PeekabooDriver:
             if wid in getattr(self, "_unreadable", set()):
                 continue
             title = (w.get("window_title") or "").strip()
+            # A browser window that is not on screen (minimised, another Space) is not offered unless it is the one
+            # observed: a run copying a table switched to the user's own minimised Safari window and read its page
+            # (deskmind#73, live 10-16). What the user put away is not a place this task may go.
+            if (self.app.lower() in self.BROWSERS and not w.get("is_on_screen", True)
+                    and wid not in (self._pinned_window, self._window_id)):
+                continue
             # A Finder window is offered only if it shows a folder of this workspace. Anything else -- another
             # run's folder, the user's Downloads -- is not a place this task may go, and is not shown.
             if (self.app.lower() == "com.apple.finder" and title and wid != self._pinned_window
@@ -1180,6 +1372,9 @@ class PeekabooDriver:
                     wid = str(w["window_id"])
                     if wid in getattr(self, "_unreadable", set()):
                         continue
+                    if (bundle.lower() in self.BROWSERS and not w.get("is_on_screen", True)
+                            and wid not in (self._pinned_window, self._window_id)):
+                        continue        # put away by the user, as above
                     if (bundle.lower() == "com.apple.finder"
                             and (w.get("window_title") or "").strip() not in self._workspace_folder_names()):
                         continue
@@ -1703,6 +1898,11 @@ class PeekabooDriver:
             els += self._project_textedit()
         elif self.app.lower() == CHAT_APP:
             els = self._chat_scope(els)
+        if PROJECTION and self._mcp is not None:
+            web = self._project_browser(els)
+            if web:
+                # One field, one option: the address bar is offered as 「在地址栏搜索（its name）」 only.
+                els = [e for e in els if e.id != self._address_bar] + web
         if PROJECTION and self._mcp is not None and self.offer_folder_files and self.app.lower() != "com.apple.finder":
             els += self._folder_documents()
         if self.app.lower() in VOCAB and getattr(self, "_shot", None) is not None:
@@ -1998,9 +2198,10 @@ class PeekabooDriver:
             self._resumed()
         return None
 
-    def _background_quartz(self, bundle: str):
-        """A Quartz stand-in that delivers to `bundle`'s window (the pinned one, else its largest), focused without
-        being raised; None when the app or window cannot be found."""
+    def _background_quartz(self, bundle: str, observed_only: bool = False):
+        """A Quartz stand-in that delivers to `bundle`'s window (the pinned one, else its largest -- with
+        `observed_only`, the observed one or none), focused without being raised; None when the app or window cannot
+        be found."""
         import Quartz
         from AppKit import NSRunningApplication
         from deskmind_hands.drivers import skylight
@@ -2013,7 +2214,7 @@ class PeekabooDriver:
             return None
         wins = [w for w in all_wins if w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowLayer") == 0]
         pinned = [w for w in wins if str(w.get("kCGWindowNumber")) == str(self._pinned_window or self._window_id)]
-        if not (pinned or wins):
+        if not (pinned or wins) or (observed_only and not pinned):
             return None
         w = (pinned or sorted(wins, key=lambda w: -w["kCGWindowBounds"]["Width"] * w["kCGWindowBounds"]["Height"]))[0]
         wid, b = int(w["kCGWindowNumber"]), w["kCGWindowBounds"]
@@ -2507,10 +2708,16 @@ class PeekabooDriver:
                                 f"confirmation was missing. {res.detail[:200]}")
 
     def execute(self, action: Action) -> ExecResult:
-        if self.CONFIRM_BY_DIFF and action.kind in (ActionKind.CLICK, ActionKind.DOUBLE_CLICK, ActionKind.RIGHT_CLICK):
-            res = self._execute_outer(action)
-            return self._confirm_by_diff(res) if res.indeterminate else res
-        return self._execute_outer(action)
+        try:
+            if self.CONFIRM_BY_DIFF and action.kind in (ActionKind.CLICK, ActionKind.DOUBLE_CLICK,
+                                                        ActionKind.RIGHT_CLICK):
+                res = self._execute_outer(action)
+                return self._confirm_by_diff(res) if res.indeterminate else res
+            return self._execute_outer(action)
+        finally:
+            # A browser-field allowance is for this one step: an early return or an error must not leave it for the
+            # next one.
+            self._browser_field_allowed = None
 
     def _execute_outer(self, action: Action) -> ExecResult:
         if self._mcp is None:
@@ -3555,6 +3762,8 @@ class PeekabooDriver:
         if not eid.startswith("syn:"):
             return None
         self._projected_actions += 1
+        if eid == WEB_SEARCH and action.kind is ActionKind.TYPE_TEXT:
+            return self._web_search(action)
         if eid.startswith("syn:move:") and action.kind is ActionKind.TYPE_TEXT:
             spec = self._move_options.get(eid)
             dest = spec["to"].get((action.text or "").strip()) if spec else None

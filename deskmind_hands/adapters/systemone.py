@@ -224,7 +224,9 @@ def _works(goal: str) -> list[tuple[str, str]]:
     if m:
         # "白鹿乐队的安静的引擎": which 的 separates the artist from the title is not knowable from the words, so
         # every split is offered, the first 的 first (titles contain 的 more often than artists do).
-        phrase = m.group(1).strip()
+        # A place named before the verb goes, as in value_candidates: "在智能搜索栏里搜索新加坡的天气" matched the verb
+        # inside the field's name and composed 「栏里搜索新加坡 天气」 (deskmind#73).
+        phrase = re.sub(r"^.*[里上中]\s*(?:播放|放一下|听一下|搜索|搜一下|搜|查找)", "", m.group(1).strip())
         for k in [i for i, ch in enumerate(phrase) if ch == "的"]:
             if 0 < k < len(phrase) - 1:
                 put(phrase[:k], phrase[k + 1:])
@@ -454,19 +456,23 @@ def value_candidates(goal: str, visible_text: str = "", limit: int = 14) -> list
     # "归到一个新文件夹 reports 里" was never offered, and the folder was named "文件归到一个新文件夹".
     # What a goal says to search for, whole: "搜索 林夏的 纸船" is the query, not "林夏的" and "纸船" separately -- a
     # planner offered only the pieces searched for the title alone. The possessive is dropped as a search box wants
-    # it ("林夏 纸船").
+    # it ("林夏 纸船"). A place named before the verb ("在智能搜索栏里搜索新加坡的天气") can hold the verb itself: the
+    # match then starts inside the field's name and only 「栏里搜索新加坡的天气」 was offered (deskmind#73, live 10-16).
+    # What follows 里/上/中 and the verb is offered first; the whole stays after it.
     for m in re.finditer(r"(?:搜索|搜一下|(?:(?<=^)|(?<=[\s，,。：:里上]))搜|查找|search(?:\s+for)?|look\s+up|find)\s*[:：]?\s*"
                          r"([^，,。；;！!？?\n]{1,60})",
                          goal, re.I):
-        # The query ends where the goal moves on: "并/然后/and …", a dash ("… 夜空中最亮的星 — who sings …"), or the
-        # question itself ("who/what/which …", "谁/哪") -- typed whole, the dash and the question went into the box.
-        # "and" ends the query only when an action follows ("… and play it"): "Salt and Cedar" is a title.
-        q = re.sub(r"\s*(?:并|然后|\band\s+(?:then\s+)?(?:play|start|open|listen|tell|show|add|save)\b|and then|"
-                   r"[—–]|\s-\s|\b(?:who|what|which|where|when|how)\b|是谁|哪).*$", "",
-                   m.group(1), flags=re.I).strip(" 「」“”\"'《》")
-        if q:
-            add(re.sub(r"(\S)的\s+", r"\1 ", q))
-            add(q)
+        inner = re.search(r"[里上中]\s*(?:搜索|搜一下|搜|查找)\s*[:：]?\s*(.+)$", m.group(1))
+        for raw in ([inner.group(1)] if inner else []) + [m.group(1)]:
+            # The query ends where the goal moves on: "并/然后/and …", a dash ("… 夜空中最亮的星 — who sings …"), or the
+            # question itself ("who/what/which …", "谁/哪") -- typed whole, the dash and the question went into the box.
+            # "and" ends the query only when an action follows ("… and play it"): "Salt and Cedar" is a title.
+            q = re.sub(r"\s*(?:并|然后|\band\s+(?:then\s+)?(?:play|start|open|listen|tell|show|add|save)\b|and then|"
+                       r"[—–]|\s-\s|\b(?:who|what|which|where|when|how)\b|是谁|哪).*$", "",
+                       raw, flags=re.I).strip(" 「」“”\"'《》")
+            if q:
+                add(re.sub(r"(\S)的\s+", r"\1 ", q))
+                add(q)
     # A work the goal names and who made it, composed into what one types into a search box: "Play Paper Boats by
     # Sable Fox in Tunebox" offered only 'Play Paper Boats', 'Sable Fox' and 'Tunebox', and "在声海里播放苏晚的《安静的
     # 引擎》" only '在声海里播放苏晚的' -- no query that finds the song. "<artist> <title>" first, then the title alone.
@@ -1058,6 +1064,8 @@ class SystemOneAdapter:
         self.replies: list[dict] = []
         self._value_cache: dict[tuple, str] = {}
         self._seen_text: dict[str, str] = {}
+        #: The judgements this run asked (judge_choice): what was chosen, with its probabilities.
+        self.judgements: list[dict] = []
         self._read_by_window: dict[str, dict[str, str]] = {}
         #: What an earlier phase of the same task read somewhere this adapter cannot see -- a web page read through
         #: the browser channel before the desktop phase writes it into a document (HANDS_PRIOR_READ, a JSON file
@@ -1155,6 +1163,32 @@ class SystemOneAdapter:
             only = next(iter(q["criteria"]))
             answers[k] = {"type": "choice", "choice": only, "confidence": 1.0, "probabilities": {only: 1.0}}
         return answers
+
+    def judge_choice(self, state: str, instructions: str, criteria: dict) -> dict:
+        """One judgement as a choice (runtime/judge.py): the material and question as the state, each option with
+        what it means. Sent on its own, not with a step's heads, and kept out of last_request (what replays compare);
+        recorded in self.judgements for the trace. Raises AdapterUnavailable when there is no usable answer."""
+        questions = {"judgement": {"type": "choice", "instructions": {"goal": instructions, "question": "judgement"},
+                                   "criteria": dict(criteria)}}
+        form = "list" if "list" in self._criteria_forms() else "object"
+        wire = {"state": state, "model": self.model, "request_id": uuid.uuid4().hex, **self._turn,
+                "questions": list_form(questions) if form == "list" else questions}
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(f"{self.url}/v1/systemone", data=json.dumps(wire).encode(), headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                answers = json.load(r)["answers"]
+        except Exception as exc:
+            raise AdapterUnavailable(f"system one endpoint {self.url} failed: {exc}") from exc
+        bad = unoffered(questions, answers)
+        if bad:
+            raise AdapterUnavailable(f"system one endpoint {self.url} answered outside what it was asked: {bad}")
+        a = answers["judgement"]
+        self.judgements.append({"id": wire["request_id"], "choice": a.get("choice"),
+                                "probabilities": a.get("probabilities"), "options": list(criteria)})
+        return a
 
     # -- state ------------------------------------------------------------
 

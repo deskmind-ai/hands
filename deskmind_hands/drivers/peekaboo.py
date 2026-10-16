@@ -933,6 +933,9 @@ class PeekabooDriver:
         if eid == WEB_SEARCH:
             bar = getattr(self, "_address_bar", None)
             return (getattr(self, "_address_bar_label", "") or "地址栏") if bar else None
+        if eid and eid == getattr(self, "_address_bar", None):
+            # Taken out of the options for 「在地址栏搜索」, so not in _rects: still the browser's own field (review).
+            return getattr(self, "_address_bar_label", "") or "地址栏"
         r = getattr(self, "_rects", {}).get(eid)
         if r is None:
             return None

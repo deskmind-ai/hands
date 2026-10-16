@@ -51,11 +51,19 @@ def own_fields(pid: int, frame: tuple | None = None) -> list[tuple[tuple[float, 
     return _own_fields(pid, frame) if frame is not None else []
 
 
-def focused_identifier(pid: int) -> str | None:
-    """The accessibility identifier of the app's focused element: where a paste would land."""
+def focused_identifier(pid: int, frame: tuple | None = None) -> str | None:
+    """The accessibility identifier of the app's focused element: where a paste would land. With `frame`, only an
+    element of the window at `frame` counts: every window's address bar has the same identifier, so a focus left in
+    another window (the user's own) must not read as this window's address bar. That reads as "another window"."""
     from ApplicationServices import AXUIElementCreateApplication
     el = _get(AXUIElementCreateApplication(pid), "AXFocusedUIElement")
-    return _get(el, "AXIdentifier") if el is not None else None
+    if el is None:
+        return None
+    if frame is not None:
+        win = _get(el, "AXWindow")
+        if win is None or not _window_at(win, frame):
+            return "another window"
+    return _get(el, "AXIdentifier")
 
 
 def _window_at(win, frame) -> bool:

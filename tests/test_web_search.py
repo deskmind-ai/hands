@@ -123,6 +123,7 @@ class Carried(unittest.TestCase):
         d._address_bar, d._address_bar_rect, d._projected_actions = "e48", Rect(*BAR), 0
         d._background_input = lambda bundle: background
         d._moved_since_seen = lambda: None
+        d._seen_frame = frame
         d._wait_until_still = lambda bundle, what="": None
         d._background_quartz = lambda bundle, observed_only=False: (("Q", "token") if window and observed_only else None)
         d._flash = mock.Mock(side_effect=AssertionError("never the foreground route"))
@@ -159,13 +160,22 @@ class Carried(unittest.TestCase):
 
     def test_moved_while_waiting_for_the_user_nothing_is_sent(self):
         # The window moved during the wait: the click would land at the old place, in the page (review of c2b9b08).
+        # The real check after the wait, against the frame kept by the look (review of 2e2da77: not stubbed).
         d = self.searchable()
-        seq = iter([None, "the window moved since it was observed"])
-        d._moved_since_seen = lambda: next(seq)
+        d._seen_frame = WIN
+        d._window_frame = lambda: (40, 0, 800, 600)
         d.allow_browser_field(WEB_SEARCH)
         res = self.act(d)
         self.assertFalse(res.ok)
         self.assertTrue(res.stale)
+        self.assertEqual(d.events, [])
+
+    def test_no_frame_kept_by_the_look_nothing_is_sent(self):
+        d = self.searchable()
+        d._seen_frame = None
+        d.allow_browser_field(WEB_SEARCH)
+        res = self.act(d)
+        self.assertFalse(res.ok)
         self.assertEqual(d.events, [])
 
     def test_not_allowed_it_is_refused(self):
@@ -211,8 +221,7 @@ class Carried(unittest.TestCase):
         d._window_frame = lambda: None
         d.allow_browser_field(WEB_SEARCH)
         self.assertFalse(self.act(d).ok)
-        self.assertEqual([e[0] for e in d.events], ["click", "focus back"])
-
+        self.assertEqual(d.events, [])                  # not even the click (review of 2e2da77)
     def test_focus_lost_after_the_paste_no_return(self):
         d = self.searchable(focused=["WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD", "WEB_FIND_FIELD"])
         d.allow_browser_field(WEB_SEARCH)

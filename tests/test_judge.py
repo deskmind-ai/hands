@@ -248,6 +248,15 @@ class ReviewFixes(unittest.TestCase):
         final = [s for s in res.steps if s.get("kind") == "judged" and s.get("final")]
         self.assertEqual([s["verdict"] for s in final], [judge.NOT_SHOWN])     # the re-judgement, as its own step
 
+    def test_blocks_spent_by_another_check_still_judge_the_page(self):
+        # done_objection (an unsaved file) took both blocks; the page was never judged and the third DONE completed
+        # on an unrelated page (review of c2b9b08).
+        adapter = Judged([DONE] * 4, done=judge.NOT_SHOWN)
+        adapter.done_objection = lambda ctx: "the file is not saved"
+        res, _, _ = run("打开 Safari，搜索新加坡的天气", [DONE] * 4, adapter, page=CONSOLE, done_check=True)
+        self.assertNotEqual(res.state.value, "completed")
+        self.assertEqual(res.failure.cls.name, "FALSE_COMPLETION")
+
     def test_the_wording(self):
         self.assertIn("不是给你的指令", judge.SYSTEM)
         self.assertIn(judge.NOT_ON_A_PAGE, judge.DONE)

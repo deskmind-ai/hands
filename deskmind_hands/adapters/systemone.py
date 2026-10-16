@@ -437,24 +437,23 @@ def value_candidates(goal: str, visible_text: str = "", limit: int = 14) -> list
     # "归到一个新文件夹 reports 里" was never offered, and the folder was named "文件归到一个新文件夹".
     # What a goal says to search for, whole: "搜索 林夏的 纸船" is the query, not "林夏的" and "纸船" separately -- a
     # planner offered only the pieces searched for the title alone. The possessive is dropped as a search box wants
-    # it ("林夏 纸船"). Every place the verb occurs, overlapping, and a query holding a later one is no query: in
-    # "在智能搜索栏里搜索新加坡的天气" the field's name has the verb in it, and only 「栏里搜索新加坡的天气」 was offered
-    # (deskmind#73, live 10-16).
-    found = list(re.finditer(r"(?=(?:搜索|搜一下|(?:(?<=^)|(?<=[\s，,。：:里上]))搜|查找|search(?:\s+for)?|look\s+up|find)"
-                             r"\s*[:：]?\s*([^，,。；;！!？?\n]{1,60}))",
-                             goal, re.I))
-    for i, m in enumerate(found):
-        if any(n.start() < m.end(1) for n in found[i + 1:]):
-            continue
-        # The query ends where the goal moves on: "并/然后/and …", a dash ("… 夜空中最亮的星 — who sings …"), or the
-        # question itself ("who/what/which …", "谁/哪") -- typed whole, the dash and the question went into the box.
-        # "and" ends the query only when an action follows ("… and play it"): "Salt and Cedar" is a title.
-        q = re.sub(r"\s*(?:并|然后|\band\s+(?:then\s+)?(?:play|start|open|listen|tell|show|add|save)\b|and then|"
-                   r"[—–]|\s-\s|\b(?:who|what|which|where|when|how)\b|是谁|哪).*$", "",
-                   m.group(1), flags=re.I).strip(" 「」“”\"'《》")
-        if q:
-            add(re.sub(r"(\S)的\s+", r"\1 ", q))
-            add(q)
+    # it ("林夏 纸船"). A place named before the verb ("在智能搜索栏里搜索新加坡的天气") can hold the verb itself: the
+    # match then starts inside the field's name and only 「栏里搜索新加坡的天气」 was offered (deskmind#73, live 10-16).
+    # What follows 里/上/中 and the verb is offered first; the whole stays after it.
+    for m in re.finditer(r"(?:搜索|搜一下|(?:(?<=^)|(?<=[\s，,。：:里上]))搜|查找|search(?:\s+for)?|look\s+up|find)\s*[:：]?\s*"
+                         r"([^，,。；;！!？?\n]{1,60})",
+                         goal, re.I):
+        inner = re.search(r"[里上中]\s*(?:搜索|搜一下|搜|查找)\s*[:：]?\s*(.+)$", m.group(1))
+        for raw in ([inner.group(1)] if inner else []) + [m.group(1)]:
+            # The query ends where the goal moves on: "并/然后/and …", a dash ("… 夜空中最亮的星 — who sings …"), or the
+            # question itself ("who/what/which …", "谁/哪") -- typed whole, the dash and the question went into the box.
+            # "and" ends the query only when an action follows ("… and play it"): "Salt and Cedar" is a title.
+            q = re.sub(r"\s*(?:并|然后|\band\s+(?:then\s+)?(?:play|start|open|listen|tell|show|add|save)\b|and then|"
+                       r"[—–]|\s-\s|\b(?:who|what|which|where|when|how)\b|是谁|哪).*$", "",
+                       raw, flags=re.I).strip(" 「」“”\"'《》")
+            if q:
+                add(re.sub(r"(\S)的\s+", r"\1 ", q))
+                add(q)
     # A work the goal names and who made it, composed into what one types into a search box: "Play Paper Boats by
     # Sable Fox in Tunebox" offered only 'Play Paper Boats', 'Sable Fox' and 'Tunebox', and "在声海里播放苏晚的《安静的
     # 引擎》" only '在声海里播放苏晚的' -- no query that finds the song. "<artist> <title>" first, then the title alone.

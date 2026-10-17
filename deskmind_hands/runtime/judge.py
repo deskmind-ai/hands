@@ -125,12 +125,15 @@ def done(ask: AskChoice | None, goal: str, page: dict, said=()) -> str | None:
     return _choice(ask, DONE_QUESTION, _said(context, said), DONE)
 
 
-def done_unseen(ask: AskChoice | None, goal: str, app: str, said=(), done=(), acted: bool = True) -> str | None:
+def done_unseen(ask: AskChoice | None, goal: str, app: str, said=(), done=(), acted: bool = True,
+                why: str = "") -> str | None:
     """结果本来就不需要窗口 / 没出来 for a run finishing with no window of `app` seen, or None when there is no answer.
     Only 没出来 holds a run back, as for a page. `done`: what the run's last actions did, in the driver's words.
     `acted`: whether a step that changes something went through; if not, the question is whether the state was
-    already there (一开始就已经是这样 / 没出来)."""
-    context = {"用户原话": goal, "看到的": f"{app}：没有能看到内容的窗口（没有打开的窗口，或者窗口里什么也读不到）",
+    already there (一开始就已经是这样 / 没出来). `why`: what the driver knows of why there is no window (macOS did not
+    let the run open one, say), shown with what was seen."""
+    seen = f"{app}：没有能看到内容的窗口（没有打开的窗口，或者窗口里什么也读不到）" + (f"。{why}" if why else "")
+    context = {"用户原话": goal, "看到的": seen,
                "助手做过的事": "\n".join(done) or "什么也没做"}
     if not acted:
         return _choice(ask, DONE_UNSEEN_IDLE_QUESTION, _said(context, said), DONE_UNSEEN_IDLE)

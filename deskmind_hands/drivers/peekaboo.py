@@ -60,6 +60,172 @@ CAPTURE = ["--capture-engine", "modern"]
 STAGE_APP_BUNDLES = {"TextEdit": "com.apple.TextEdit", "Safari": "com.apple.Safari", "Finder": "com.apple.finder",
                      "Notes": "com.apple.Notes", "Preview": "com.apple.Preview"}
 
+#: Browsers by the names a staging command or a FOCUS_APP uses (lower case), for the run's own window (see
+#: PeekabooDriver._own_browser_window). A table of app names, never read from the user's words.
+BROWSER_BUNDLES = {"safari": "com.apple.Safari", "safari浏览器": "com.apple.Safari",
+                   "google chrome": "com.google.Chrome", "chrome": "com.google.Chrome",
+                   "microsoft edge": "com.microsoft.edgemac", "brave browser": "com.brave.Browser",
+                   "firefox": "org.mozilla.firefox", "arc": "company.thebrowser.Browser"}
+
+#: `open -a App ...` / `open -b bundle ...` in a staging command, as (app name, bundle, the rest).
+_STAGE_OPEN = re.compile(r'^\s*open\s+(?:-g\s+)?(?:-a\s+(?:"([^"]+)"|(\S+))|-b\s+(\S+))(.*)$')
+
+
+#: The one line the run's new window shows until its page is loaded: what the window is, to the user, and a page
+#: body, so a read of it is never taken for a page still loading (_page_not_read).
+MARKER_TEXT = "DeskMind 的窗口"
+
+
+def marker_page(marker: str) -> str:
+    """The data: page a new Safari window of the run's is made on: titled exactly `marker`, with one line of text."""
+    from urllib.parse import quote
+    return f"data:text/html;charset=utf-8,<title>{marker}</title><p>{quote(MARKER_TEXT)}</p>"
+
+
+def _new_window_script(bundle: str, url: str = "", marker: str = "") -> str | None:
+    """AppleScript that opens a new window of the browser `bundle` without activating it or touching any window it
+    already has, and returns the window's id; None for a browser with no such command. On a running app `open` is a
+    reopen, which un-minimises the user's window (deskmind#73, live 10-17), so no `open` is sent instead.
+
+    Safari: the document is made on a page titled `marker` (a run's random `dm-...`, which no window of the user's
+    carries) and the window is found by that title, waited for up to 5 s (a Safari just launched is slow) -- not the front window (one the user opens in between is in
+    front), and not by its document (`whose document is d` fails with -1700, and two start pages compare equal; live
+    10-17). The id returned is the window server's. The page `url` is loaded only after that, by
+    _load_in_own_window, so its title cannot get in the way. Chromium: `make new window` returns the window made; its
+    id is the browser's own, so its place is returned too ("id|left,top,right,bottom")."""
+    b = bundle.lower()
+    u = url.replace("\\", "\\\\").replace('"', '\\"')
+    if b == "com.apple.safari":
+        if not re.fullmatch(r"dm-[0-9a-f]{8,32}", marker or ""):
+            raise ValueError(f"not a window marker: {marker!r}")   # plain ASCII by construction: nothing to escape
+        return (f'tell application id "com.apple.Safari"\n'
+                f'  make new document with properties {{URL:"{marker_page(marker)}"}}\n'
+                f'  repeat 50 times\n'
+                f'    try\n'
+                f'      return id of (first window whose name is "{marker}")\n'
+                f'    end try\n'
+                f'    delay 0.1\n'
+                f'  end repeat\n'
+                f'  return "none"\nend tell')
+    if b in {"com.google.chrome", "com.microsoft.edgemac", "com.brave.browser"}:
+        nav = f'  set URL of active tab of w to "{u}"\n' if url else ""
+        return (f'tell application id "{bundle}"\n  set w to make new window\n{nav}  set b to bounds of w\n'
+                f'  return (id of w as text) & "|" & (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & '
+                f'"," & (item 4 of b)\nend tell')
+    return None
+
+
+class PageServer:
+    """One folder served over http on 127.0.0.1 only, on a free port, from a thread of this process: a staged local
+    page reaches the run's Safari window as http://127.0.0.1:<port>/<file>, since Safari does not open file:// pages
+    sent by script (live 10-17). Only files inside the folder are served (a path that leaves it, by .. or a link, is a
+    404), no hidden file or folder (a segment starting with "."), no folder is listed, only a request whose Host is
+    127.0.0.1:<port> or localhost:<port> is answered (421 otherwise: DNS rebinding), and nothing is logged to stdout,
+    which carries the run's protocol lines."""
+
+    def __init__(self, folder: Path) -> None:
+        import http.server
+        import threading
+        root = Path(os.path.realpath(str(folder)))
+
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, directory=str(root), **kw)
+
+            def send_head(self):
+                # Only a request addressed to this server by name: a page elsewhere that rebinds its own host name to
+                # 127.0.0.1 (DNS rebinding) sends its own Host, and is refused.
+                if (self.headers.get("Host") or "").strip().lower() not in server.hosts:
+                    self.send_error(421)
+                    return None
+                # No hidden file or folder (".hands/...", ".git/..."), by any segment of the path as asked.
+                from urllib.parse import unquote, urlsplit
+                if any(seg.startswith(".") for seg in unquote(urlsplit(self.path).path).split("/") if seg):
+                    self.send_error(404)
+                    return None
+                # Only a file inside the folder, after links are followed; a folder itself is not listed either.
+                p = Path(os.path.realpath(self.translate_path(self.path)))
+                if root not in p.parents or not p.is_file() or any(
+                        part.startswith(".") for part in p.relative_to(root).parts):
+                    self.send_error(404)
+                    return None
+                return super().send_head()
+
+            def list_directory(self, path):
+                self.send_error(404)
+                return None
+
+            def log_message(self, *args):
+                pass
+
+        server = self
+        self.root = root
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
+        self.port = self.httpd.server_address[1]
+        #: The Host values a request may carry: this server by address or by localhost, with its port.
+        self.hosts = {f"127.0.0.1:{self.port}", f"localhost:{self.port}"}
+        self.thread = threading.Thread(target=self.httpd.serve_forever, name="hands-page-server", daemon=True)
+        self.thread.start()
+
+    def url(self, file: Path) -> str:
+        from urllib.parse import quote
+        rel = Path(os.path.realpath(str(file))).relative_to(self.root)
+        return f"http://127.0.0.1:{self.port}/{quote(rel.as_posix())}"
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+
+#: Where a person allows one app to control another, said the way System Settings shows it.
+#: The helper is listed there, and in macOS's prompt, as "DeskMind Hands" (not the app, "DeskMind").
+AUTOMATION_SETTING = "System Settings › Privacy & Security › Automation › DeskMind Hands › {app}"
+
+
+def _automation_reason(bundle: str, out: str) -> str:
+    """Why the script that opens the run's window failed, in words the user can act on: macOS's Automation prompt went
+    unanswered (the script timed out while it waited), or the user said no (-1743); else the script's own words."""
+    app = next((n for n, b in STAGE_APP_BUNDLES.items() if b.lower() == bundle.lower()), None) or next(
+        (n.title() for n, b in BROWSER_BUNDLES.items() if b.lower() == bundle.lower() and n.isascii()), bundle)
+    setting = AUTOMATION_SETTING.format(app=app)
+    low = (out or "").lower()
+    if "-1743" in low or "not authorized" in low or "not allowed to send" in low:
+        return (f"macOS does not allow DeskMind Hands to control {app}, so the run could not open a window of its own in "
+                f"it; turn it on in {setting}")
+    if "timed out" in low or "timeout" in low:
+        return (f"macOS asked whether DeskMind Hands may control {app} and no answer came in time, so the run could not "
+                f"open a window of its own in it; answer Allow, or turn it on in {setting}")
+    return f"{app}: no window of the run's own could be opened ({(out or '').strip()[:200]})"
+
+
+def app_bundle(name: str) -> str:
+    """The bundle id for an app name a staging command or the planner uses ("Safari", "Google Chrome"), else the name
+    as given (already a bundle id, or an app this table does not know)."""
+    return STAGE_APP_BUNDLES.get(name) or BROWSER_BUNDLES.get(name.lower()) or name
+
+
+def _browser_stage(cmd: str, browsers: set[str]) -> tuple[str, str] | None:
+    """(bundle, what it opens) when the staging command `cmd` is a plain `open` of a browser, else None. Compound
+    commands (an operator outside quotes) are not taken apart."""
+    import shlex
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        if any(t and set(t) <= set(";&|()<>") for t in lex) or "`" in cmd or "$(" in cmd:
+            return None
+    except ValueError:
+        return None
+    m = _STAGE_OPEN.match(cmd)
+    if not m:
+        return None
+    name = m.group(1) or m.group(2)
+    bundle = m.group(3) or app_bundle(name or "")
+    if (bundle or "").lower() not in browsers:
+        return None
+    return bundle, m.group(4).strip()
+
 #: Commands the live MCP session carries when the driver runs with transport="mcp". Everything else is
 #: already background-safe through the CLI (window lists, dialogs) or has no snapshot to lose.
 #: The projection layer (synthetic "move to" dropdowns, new-folder name + create, save button) can be switched off
@@ -771,13 +937,30 @@ class PeekabooDriver:
                 self._osa('tell application "Safari" to close (every document whose URL contains "/hands/runs/")')
         # TextEdit windows that exist before this run are not this run's, whatever they are called: a leftover
         # "未命名-1" from an earlier run shares its title with this run's scratch document, and a planner switched to
-        # it and ended on its unreadable accessibility tree.
+        # it and ended on its unreadable accessibility tree. A browser's likewise (below), every one of them.
         self._preexisting: set[str] = set()
+        #: The window this run opened in each browser (bundle, lower case -> window id): the only browser windows it
+        #: starts in (_own_browser_window). Why one could not be opened, for the run's summary.
+        self._own_browser: dict[str, str] = {}
+        #: Why the run has no window of its own, per browser (lower-case bundle): cleared when one is opened, so a later
+        #: look never repeats an old reason (a timed-out prompt answered since).
+        self._own_browser_misses: dict[str, str] = {}
+        #: The browser windows this run may use, and only these: the ones it made itself (_own_browser_window). Not
+        #: "every window but the user's at the start", and no window that merely came up during one of the run's steps:
+        #: a session Safari restores late needs no input and can coincide with any step, and nothing ties a window to
+        #: the step that preceded it (Codex review). A pop-up the run's own click opens (a sign-in window) is not the
+        #: run's either: the planner stops or asks.
+        self._run_windows: set[str] = set()
+        self._own_browser_wanted: set[str] = set()
+        self._pending_url: dict[str, str] = {}
+        self._stop_page_server()            # a reused driver (a task set): the last run's page is not this one's
+        self._load_misses: dict[str, str] = {}
+        self._own_browser_retried = False
         #: Finder windows open before staging: a staged folder's window is one that was not there before. Title and
         #: position cannot tell it apart -- every new Finder window opens at the same place, and one task's 「桌面」
         #: window had a twin left from the run before, same title, same bounds.
         self._pre_finder = self._window_ids() if self.app.lower() == "com.apple.finder" else set()
-        for bundle in {self.app} | {STAGE_APP_BUNDLES.get(n, n) for n in self._stage_apps}:
+        for bundle in {self.app} | {app_bundle(n) for n in self._stage_apps}:
             if bundle.lower() == "com.apple.textedit":
                 ok_w, data_w, _ = self._run("window_list", app=bundle)
                 # Except the documents of this run's own folder: a request made from the app often starts with the
@@ -786,7 +969,32 @@ class PeekabooDriver:
                 ours = self._open_workspace_documents() if _app_running("TextEdit") else set()
                 self._preexisting |= {str(w.get("window_id")) for w in ((data_w or {}).get("windows") or [])
                                       if ok_w and w.get("window_id") is not None and window_key(w) not in ours}
+        # A browser is never staged with `open`. On a running browser `open -b`, with or without -g, is a reopen:
+        # with Safari's only window minimised it un-minimised it, and the run searched in the user's tab (deskmind#73,
+        # 0.4.3-rc.2). And the window a read of the app picks is the front one, which can be the user's own. So the
+        # run works in a window it opens itself, in the background, and every browser window there before it is the
+        # user's: recorded here (minimised ones and those a launch restores included), never observed or offered.
+        browser_stage: dict[str, str] = {}
+        rest = []
         for cmd in self.stage_commands:
+            hit = _browser_stage(cmd, self.BROWSERS)
+            if hit:
+                browser_stage.setdefault(hit[0].lower(), hit[1])
+            else:
+                rest.append(cmd)
+        task_bundles = [self.app] + [app_bundle(n) for n in self._stage_apps]
+        seen: set[str] = set()
+        for bundle in task_bundles + [b for b in browser_stage]:
+            key = bundle.lower()
+            if key not in self.BROWSERS or key in seen:
+                continue
+            seen.add(key)
+            if key in browser_stage or key in {b.lower() for b in task_bundles[1:]}:
+                # Asked to be staged (the start app's `open`, or another app of the task): a window of the run's own.
+                self._own_browser_window(bundle, self._stage_url(browser_stage.get(key, "")))
+            else:
+                self._preexisting |= self._app_window_ids(bundle) or set()
+        for cmd in rest:
             # Task files open documents with `open -a App file`; add -g so staging never raises the app. Written
             # here rather than in thirteen task files so a new task cannot forget it.
             cmd = re.sub(r"(^|[;&|]\s*)open\s+(?!-g)", r"\1open -g ", cmd)
@@ -797,7 +1005,10 @@ class PeekabooDriver:
             subprocess.run(["/bin/sh", "-c", cmd], cwd=str(self.ws), capture_output=True,
                            timeout=30, env={**os.environ, "WS": str(self.ws)})
             time.sleep(1.2)
-        if self.stage_commands:
+        if self.app.lower() in self.BROWSERS:
+            # The window the run opened, or none: never the one a read of the app would pick (above).
+            self._pinned_window = self._own_browser.get(self.app.lower())
+        elif self.stage_commands:
             # Whatever the staging opened is what we observe; pin its window.
             shot = self.scratch / "_stage.png"
             ok, data, _ = self._run("see", app=self.app, path=str(shot)) if self.app.lower() != "com.apple.finder" \
@@ -864,13 +1075,288 @@ class PeekabooDriver:
         # and when the user had switched apps themselves in between it "gave the front back" -- pulling them away
         # from the app they had just chosen, eight times in one round, and counting each as ours. The user's own
         # switches are not touched and not counted.
-        ours = {self.app.lower()} | {STAGE_APP_BUNDLES.get(n, n).lower() for n in self._stage_apps}
+        ours = {self.app.lower()} | {app_bundle(n).lower() for n in self._stage_apps}
         ours_names = {"finder", "访达", "textedit", "文本编辑", "safari", "safari浏览器"}
         taken = front_after and front_after != front_before and (
             front_after.lower() in ours_names or front_after.lower() in ours)
         if taken and front_before and self._mcp is not None:
             self._foreground_actions += 1
             self._osa(f'tell application "{self._q(front_before)}" to activate')
+
+    def _stage_url(self, arg: str) -> str:
+        """What a browser staging command opens (`"$WS/page.html"`, a URL), as a URL; "" for nothing."""
+        if not arg or arg.startswith("-"):
+            return ""
+        try:
+            out = subprocess.run(["/bin/sh", "-c", f'printf "%s\\n" {arg}'], capture_output=True, text=True,
+                                 timeout=5, cwd=str(self.ws), env={**os.environ, "WS": str(self.ws)}).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        first = (out.splitlines() or [""])[0].strip()
+        if not first or "://" in first:
+            return first
+        p = Path(first)
+        return (p if p.is_absolute() else Path(self.ws) / p).resolve().as_uri()
+
+    def _app_window_ids(self, bundle: str) -> set[str] | None:
+        """Every window `bundle` has, minimised ones and those on other Spaces included, as the window server and
+        Peekaboo each list them; None when neither list could be read."""
+        ids: set[str] = set()
+        read = False
+        try:
+            import Quartz
+            all_wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionAll, 0) or []
+            pid = self._pid_of(bundle, all_wins)
+            read = True
+            ids |= {str(w.get("kCGWindowNumber")) for w in all_wins
+                    if pid and w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowNumber") is not None}
+        except Exception:   # noqa: BLE001 -- no window server answer: Peekaboo's list alone
+            pass
+        ok, data, _ = self._run("window_list", app=bundle)
+        if ok:
+            read = True
+            ids |= {str(w["window_id"]) for w in (data.get("windows") or []) if w.get("window_id") is not None}
+        return ids if read else None
+
+    def _app_is_running(self, bundle: str) -> bool:
+        """Whether `bundle` is running. Unknown is running: the launch is then left to the scripting interface,
+        never to an `open` that would reopen a running app."""
+        try:
+            if self._pid_of(bundle) is not None:
+                return True
+        except Exception:   # noqa: BLE001
+            pass
+        try:
+            from AppKit import NSRunningApplication
+            return bool(NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle))
+        except Exception:   # noqa: BLE001
+            return True
+
+    def _launch_in_background(self, bundle: str) -> None:
+        """Start a browser that is not running, in the background and without restoring its windows where the app
+        lets that be switched off; then wait for the windows a launch brings up anyway, which are recorded as the
+        user's (a restored session holds the user's tabs)."""
+        # Safari reads -ApplePersistenceIgnoreState; a Chromium browser would take "YES" for a page to open.
+        extra = ["--args", "-ApplePersistenceIgnoreState", "YES"] if bundle.lower() == "com.apple.safari" else []
+        subprocess.run(["/usr/bin/open", "-g", "-b", bundle, *extra], capture_output=True, timeout=15)
+        for _ in range(20):
+            if self._app_is_running(bundle):
+                break
+            time.sleep(0.25)
+        # Until two reads of its windows agree: a session is restored a window at a time, and one restored after
+        # the list was taken would pass for the run's own.
+        last = None
+        for _ in range(8):
+            time.sleep(0.5)
+            now = self._app_window_ids(bundle)
+            if now is not None and now == last:
+                break
+            last = now
+
+    def _own_browser_window(self, bundle: str, url: str = "") -> str | None:
+        """The window this run works in in the browser `bundle`: the one it opened earlier if it is still there, else
+        a new one, opened in the background through the app's scripting interface (_new_window_script) -- the app is
+        not activated, and no window it has is reopened, un-minimised or navigated. Every window there before it is
+        added to the user's (_preexisting). None, with the reason kept for the summary, when no window could be
+        opened or told apart from the user's: the run then has no browser window, never the user's."""
+        key = bundle.lower()
+        own = self.__dict__.setdefault("_own_browser", {})
+        pre = self.__dict__.setdefault("_preexisting", set())
+        # The page staging asked for stays wanted until it is loaded or a clear reason is kept why not: a retry (the
+        # user allowing Automation late) opens the window on it too, not on the marker page alone (Codex review).
+        pending = self.__dict__.setdefault("_pending_url", {})
+        if url:
+            pending[key] = url
+        url = url or pending.get(key, "")
+        if own.get(key):
+            if self._still_open(bundle, own[key]):
+                return own[key]
+            # Closed since: a new one. Every window there now counts as the user's from here on, including any the run
+            # opened itself meanwhile (a pop-up): the safe side.
+            del own[key]
+        import secrets
+        marker = f"dm-{secrets.token_hex(6)}"
+        self.__dict__.setdefault("_markers", set()).add(marker)
+        script = _new_window_script(bundle, url, marker)
+        if script is None:
+            pre |= self._app_window_ids(bundle) or set()
+            self._set_miss(bundle, f"{bundle}: no way to open a window of the run's own in the background")
+            return None
+        if not self._app_is_running(bundle):
+            self._launch_in_background(bundle)
+        before = self._app_window_ids(bundle)
+        if before is None:
+            self._set_miss(bundle, f"{bundle}: its windows could not be listed, so a new one could not be told apart")
+            return None
+        pre |= before
+        self.__dict__.setdefault("_own_browser_wanted", set()).add(key)
+        ok, out = self._osa(script)
+        if not ok:
+            self._set_miss(bundle, _automation_reason(bundle, out))
+            return None
+        rows: list[dict] = []
+        last: list[str] | None = None
+        for _ in range(12):
+            ok_w, data_w, _ = self._run("window_list", app=bundle)
+            rows = [w for w in ((data_w or {}).get("windows") or []) if ok_w and w.get("window_id") is not None
+                    and str(w["window_id"]) not in before and not self._ghost(w)]
+            fresh = sorted(str(w["window_id"]) for w in rows)
+            # Decided on two reads that agree: a window still coming up (a launch restoring one) is in neither or both.
+            if fresh and fresh == last:
+                break
+            last = fresh
+            time.sleep(0.3)
+        if not rows:
+            self._set_miss(bundle, f"{bundle}: the new window did not show up in its window list")
+            return None
+        # Only the window the script made: by its id (Safari's is the window server's), or for a Chromium browser by
+        # its place, matched to exactly one new window. Not "the only new window" and not the newest: one the user
+        # opened in the same moment, or one a launch restored, is new as well. No match, no window (Codex review).
+        hint, script_id = (out or "").strip(), ""
+        if "|" in hint:
+            script_id, _, place = hint.partition("|")
+            try:
+                l, t, r, b = (float(v) for v in place.split(","))
+                at = lambda w: [(w.get("bounds") or {}).get(k, -1e9) for k in ("x", "y", "width", "height")]
+                same = [str(w["window_id"]) for w in rows
+                        if all(abs(a - e) <= 2 for a, e in zip(at(w), (l, t, r - l, b - t)))]
+            except ValueError:
+                same = []
+            wid = same[0] if len(same) == 1 else None
+        else:
+            wid = hint if hint in {str(w["window_id"]) for w in rows} else None
+        if wid is None:
+            self._set_miss(bundle, f"{bundle}: the window the script made ({hint or 'no answer'}) is not one of the "
+                                   f"{len(rows)} new window(s), so none is taken")
+            return None
+        own[key] = wid
+        # No longer missing a window: that reason goes. One why a staged page is not loaded stays until it loads.
+        misses = self.__dict__.setdefault("_own_browser_misses", {})
+        misses.pop(key, None)
+        if key in getattr(self, "_load_misses", {}):
+            misses[key] = self._load_misses[key]
+        if url and key == "com.apple.safari":
+            self._load_in_own_window(wid, url)          # bound first, by its marker title; the page after
+            pending.pop(key, None)                      # loaded, or a clear reason kept why not
+        self.__dict__.setdefault("_run_windows", set()).add(wid)
+        self._apart_from_others(bundle, wid, script_id or hint)
+        return wid
+
+    def _still_open(self, bundle: str, wid: str) -> bool:
+        """Whether the run's window `wid` is still a window to work in: listed, on screen and no ghost. A Safari window
+        closed through AppleScript stays listed as an off-screen entry with no tabs and the same id (live 10-17; the
+        tabless leftover the rc.1 read tripped on), and a window the user minimised is put away: neither is reused."""
+        ok, data, _ = self._run("window_list", app=bundle)
+        row = next((w for w in ((data or {}).get("windows") or []) if ok and str(w.get("window_id")) == str(wid)), None)
+        return row is not None and bool(row.get("is_on_screen", True)) and not self._ghost(row)
+
+    #: Why a staged file:// page is not opened (live 10-17): Safari takes `set URL` to a file:// page, answers success,
+    #: and stays where it was; `make new document` on one gives an empty 「未命名」 window. `open -a Safari <file>` is not
+    #: a way round it: it opens the file in a tab of the front window, which can be the user's.
+    FILE_PAGE_MISS = ("Safari does not open file:// pages sent by script, and {url} could not be served over "
+                      "http://127.0.0.1 either ({why}), so it was not loaded")
+
+    def _load_in_own_window(self, wid: str, url: str) -> bool:
+        """Load `url` in the run's own Safari window, found by its id (the window server's, which Safari's is), and
+        check that it went: the tab's URL has left the marker page within a few seconds. osascript says success
+        whether or not anything loads (live 10-17). A file:// page is not tried (FILE_PAGE_MISS). A load that does not
+        go is kept as Safari's miss, which every look of it carries in its notes; the window stays the run's."""
+        if url.lower().startswith("file:"):
+            served = self._serve_page(url)
+            if served.startswith("!"):
+                self._load_miss(self.FILE_PAGE_MISS.format(url=url, why=served[1:]))
+                return False
+            url = served                        # the same page, over http from this process (PageServer)
+        u = url.replace("\\", "\\\\").replace('"', '\\"')
+        target = f'current tab of window id {int(wid)}'
+        ok, out = self._osa(f'tell application id "com.apple.Safari" to set URL of {target} to "{u}"')
+        if not ok:
+            self._load_miss(f"Safari: the run's window opened, but {url} could not be loaded in it "
+                            f"({(out or '').strip()[:200]})")
+            return False
+        for _ in range(10):
+            ok_u, now = self._osa(f'tell application id "com.apple.Safari" to get URL of {target}')
+            if ok_u and now.strip() and not now.strip().lower().startswith("data:"):
+                self.__dict__.setdefault("_load_misses", {}).pop("com.apple.safari", None)
+                return True
+            time.sleep(0.3)
+        self._load_miss(f"Safari: the run's window opened, but {url} could not be loaded in it "
+                        f"(it stayed on its first page)")
+        return False
+
+    def _serve_page(self, url: str) -> str:
+        """The http://127.0.0.1 URL a staged local page is served at (PageServer, started here for its folder), or
+        "!<why not>": no such file, or no server could be started."""
+        from urllib.parse import urlparse
+        from urllib.request import url2pathname
+        path = Path(url2pathname(urlparse(url).path))
+        if not path.is_file():
+            return f"!there is no file {path}"
+        self._stop_page_server()
+        try:
+            self._page_server = PageServer(path.parent)
+            return self._page_server.url(path)
+        except (OSError, ValueError) as exc:
+            self._page_server = None
+            return f"!{exc}"
+
+    def _stop_page_server(self) -> None:
+        server, self._page_server = getattr(self, "_page_server", None), None
+        if server is not None:
+            try:
+                server.close()
+            except Exception:   # noqa: BLE001 -- a server that will not stop is a daemon thread; the process ends it
+                pass
+
+    def _load_miss(self, why: str) -> None:
+        """Why the staged page is not in the run's Safari window: Safari's miss, kept apart so that a window made later
+        does not clear it while the page is still not there."""
+        self.__dict__.setdefault("_load_misses", {})["com.apple.safari"] = why
+        self._set_miss("com.apple.Safari", why)
+
+    def _miss_note(self) -> str:
+        """The observed browser's miss, as an observation note, or "" (a non-browser, or nothing missing)."""
+        miss = getattr(self, "_own_browser_misses", {}).get(self.app.lower(), "")
+        return f"No window of this run's own in {self.app}, or not as staged: {miss}" if miss else ""
+
+    def _set_miss(self, bundle: str, why: str) -> None:
+        self.__dict__.setdefault("_own_browser_misses", {})[bundle.lower()] = why
+
+    def _apart_from_others(self, bundle: str, wid: str, script_id: str) -> None:
+        """Move the run's new window a little in from its top-left corner when another window of the browser on
+        screen has exactly its place and size (a user's window zoomed to fill the screen): checks that find a window by
+        its frame cannot tell two such apart, and refused the search (axchrome._the_window). Shrunk, not moved, so it
+        stays on the screen."""
+        try:
+            import Quartz
+            all_wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionAll, 0) or []
+            pid = self._pid_of(bundle, all_wins)
+        except Exception:   # noqa: BLE001
+            return
+        frame = lambda w: tuple(round((w.get("kCGWindowBounds") or {}).get(k, 0)) for k in ("X", "Y", "Width", "Height"))
+        mine = next((w for w in all_wins if str(w.get("kCGWindowNumber")) == wid), None)
+        if mine is None or not pid:
+            return
+        f = frame(mine)
+        same = [w for w in all_wins if w is not mine and w.get("kCGWindowOwnerPID") == pid
+                and w.get("kCGWindowLayer") == 0 and w.get("kCGWindowIsOnscreen", False)
+                and all(abs(a - b) <= 2 for a, b in zip(frame(w), f))]
+        if not same:
+            return
+        x, y, w_, h = f
+        target = wid if bundle.lower() == "com.apple.safari" else script_id   # the id each app's script knows
+        if not str(target).isdigit():
+            return
+        self._osa(f'tell application id "{bundle}" to set bounds of window id {target} to '
+                  f'{{{x + 24}, {y + 24}, {x + w_}, {y + h}}}')
+
+    def _may_use(self, bundle: str, wid: str) -> bool:
+        """Whether the run may observe, offer, switch to or type into window `wid` of `bundle`: a browser's only if the
+        run made it (_run_windows); another app's unless it was there before the run (_preexisting; the
+        TextEdit rules on titles are applied where the windows are listed)."""
+        if bundle.lower() in self.BROWSERS:
+            return str(wid) in getattr(self, "_run_windows", set())
+        return str(wid) not in getattr(self, "_preexisting", set())
 
     def _runs_roots(self) -> list[str]:
         """The runs directory every staged workspace lives in (DESKMIND_RUNS_DIR, else the workspace's nearest
@@ -1046,7 +1532,7 @@ class PeekabooDriver:
         try:
             from deskmind_hands.drivers import axchrome
             pid = self._pid_of(self.app)
-            fields = axchrome.own_fields(pid, self._window_frame()) if pid else []
+            fields = axchrome.own_fields(pid, self._window_frame(), wid=self._observed_id()) if pid else []
         except Exception:   # noqa: BLE001 -- unread structure: nothing offered
             return []
         # Only the address bar known by its identifier: the search confirms the focus by that identifier, so a field
@@ -1106,7 +1592,7 @@ class PeekabooDriver:
         def on_bar() -> str | None:
             # The observed window's address bar, not merely an address bar: the identifier is the same in every
             # window. No window frame, no check, no paste.
-            return axchrome.focused_identifier(pid, frame) if pid and frame else None
+            return axchrome.focused_identifier(pid, frame, wid=self._observed_id()) if pid and frame else None
 
         try:
             self._post_click(q, x, y)
@@ -1158,9 +1644,14 @@ class PeekabooDriver:
         try:
             from deskmind_hands.drivers import axchrome
             pid = self._pid_of(self.app)
-            return axchrome.page_info(pid, self._window_frame()) if pid else None
+            return axchrome.page_info(pid, self._window_frame(), wid=self._observed_id()) if pid else None
         except Exception:   # noqa: BLE001 -- unread is no page
             return None
+
+    def _observed_id(self) -> str | None:
+        """The observed window's window-server id, for telling it from another window at the same frame (axchrome)."""
+        wid = getattr(self, "_pinned_window", None) or getattr(self, "_window_id", None)
+        return str(wid) if wid and str(wid).isdigit() else None
 
     def _window_frame(self) -> tuple | None:
         """Where the observed window is and how big, from the window server (cheap: no accessibility walk)."""
@@ -1394,7 +1885,7 @@ class PeekabooDriver:
         if self._mcp is not None:
             home = {v.lower(): k for k, v in STAGE_APP_BUNDLES.items()}.get(self._home_app.lower(), self._home_app)
             for name in dict.fromkeys(self._stage_apps + [home]):
-                bundle = STAGE_APP_BUNDLES.get(name, name)
+                bundle = app_bundle(name)
                 if bundle.lower() == self.app.lower():
                     continue
                 ok2, data2, _ = self._run("window_list", app=bundle)
@@ -1409,6 +1900,8 @@ class PeekabooDriver:
                     if (bundle.lower() in self.BROWSERS and not w.get("is_on_screen", True)
                             and wid not in (self._pinned_window, self._window_id)):
                         continue        # put away by the user, as above
+                    if bundle.lower() in self.BROWSERS and not self._may_use(bundle, wid):
+                        continue        # not one of the run's, as above
                     if (bundle.lower() == "com.apple.finder"
                             and (w.get("window_title") or "").strip() not in self._workspace_folder_names()):
                         continue
@@ -1441,6 +1934,10 @@ class PeekabooDriver:
             # (deskmind#73, live 10-16). What the user put away is not a place this task may go.
             if (self.app.lower() in self.BROWSERS and not w.get("is_on_screen", True)
                     and wid not in (self._pinned_window, self._window_id)):
+                continue
+            # Nor any browser window but the run's own (_run_windows), on screen or not: the user's, and a web search
+            # in one of them navigates the user's tab away (deskmind#73).
+            if self.app.lower() in self.BROWSERS and not self._may_use(self.app, wid):
                 continue
             # A Finder window is offered only if it shows a folder of this workspace. Anything else -- another
             # run's folder, the user's Downloads -- is not a place this task may go, and is not shown.
@@ -1584,6 +2081,8 @@ class PeekabooDriver:
         self._pinned_window = wid
 
     def close(self) -> None:
+        # The page server of a staged local page: stopped first, so nothing below that fails can leave it running.
+        self._stop_page_server()
         # Close only what this driver opened. Leaving them behind poisons the
         # next run's focus and, on a developer's own machine, is just litter.
         if self._staged_window:
@@ -1803,6 +2302,8 @@ class PeekabooDriver:
         """Whether a successful read of a browser window holds its controls only, not the page."""
         if self.app.lower() not in self.BROWSERS or not data:
             return False
+        if (data.get("window_title") or "").strip() in getattr(self, "_markers", set()):
+            return False        # the run's new window on its marker page: nothing is still to load
         roles = [(e.get("role") or "").replace("AX", "").lower() for e in (data.get("ui_elements") or [])]
         return bool(roles) and all(r in self.BROWSER_CHROME_ROLES for r in roles)
 
@@ -1851,6 +2352,19 @@ class PeekabooDriver:
                 self._pinned_window = self._window_to_observe(largest=True, rows=rows)
             none_allowed = rows == []
         chosen: str | None = None    # read by its id: the app-target read found no window (_window_to_observe)
+        key = self.app.lower()
+        if (self._pinned_window is None and key in self.BROWSERS and key in getattr(self, "_own_browser_wanted", set())
+                and key not in getattr(self, "_own_browser", {}) and not getattr(self, "_own_browser_retried", False)):
+            # The run's window could not be opened at the start -- macOS's Automation prompt was still up, say, and the
+            # user clicked Allow late. Tried once more on a look, since a one-app run is offered no FOCUS_APP to retry.
+            self._own_browser_retried = True
+            self._pinned_window = self._own_browser_window(self.app)
+        if self._pinned_window is None and not none_allowed and self.app.lower() in self.BROWSERS:
+            # A browser is never read by app: Peekaboo then picks the front window itself, and that can be the user's
+            # own (deskmind#73). Only a window this task may use is read, by its id; none, or a list that cannot be
+            # read, is no window.
+            chosen = self._window_to_observe()
+            none_allowed = chosen is None
         ok, data, detail = False, {}, "WINDOW_NOT_FOUND: no window of this app that the run may observe"
         for attempt in range(1, 0 if none_allowed else attempts + 1):
             if FAULTS.once("capture_error", self._obs_n):
@@ -1890,6 +2404,9 @@ class PeekabooDriver:
             # A double-click on a folder opened it in a second Finder window, and every read of the first came back
             # "AX tree incomplete" until the run ended as an environment failure -- nine diag runs in one night.
             fresh = fresh_windows(self._window_ids(), getattr(self, "_seen_windows", set()), self._pinned_window)
+            # Never one that was there before the run (the user's): on a first look nothing was seen yet, and every
+            # window of the app, the user's minimised browser window among them, passed for new (review).
+            fresh = [w for w in fresh if self._may_use(self.app, w)]
             if fresh:
                 self._followed_windows = getattr(self, "_followed_windows", 0) + 1   # reported in usage()
                 self._pinned_window = fresh[-1]
@@ -1915,11 +2432,15 @@ class PeekabooDriver:
                 self._labels_by_id = {e.id: e.label or "" for e in docs}
                 self._element_role = {e.id: e.role or "" for e in docs}
                 self._rects, self._element_value = {}, {e.id: "" for e in docs}
+                miss = self._miss_note()
                 return Observation(
                     id=obs_id,
                     geometry=ScreenGeometry(fallback, fallback),
                     transform=ImageTransform.identity(fallback),
                     screenshot_png=None, elements=docs,
+                    # Why, when the driver knows: the planner and the done judge can stop with it, and the user can
+                    # act on it (an Automation permission), instead of a bare "(no window open)".
+                    notes=[miss] if miss else [],
                     focused_app=f"{self.app} (no window open)",
                     # The windows it may switch to, other apps' among them: with none listed, nothing could be
                     # chosen but DONE or BLOCKED on an empty screen (deskmind#73, live 10-17). On screen only: never
@@ -1956,7 +2477,7 @@ class PeekabooDriver:
             window_title=data.get("window_title") or "",
             windows=self._windows(on_screen_only=no_window),
             dialog=bool(data.get("is_dialog")),
-            notes=[n for n in (ax_truncation_note(data),) if n],
+            notes=[n for n in (ax_truncation_note(data), self._miss_note()) if n],
             accepts_keys=not self._vision_app(),
             no_window=no_window,
             # Peekaboo mints a new snapshot id per observation; reusing an old
@@ -2176,6 +2697,11 @@ class PeekabooDriver:
                 finally:
                     skylight.give_focus_back(token)
                 return True, f"{detail} (in the background, {bundle} not brought forward, {time.time() - t0:.1f}s)"
+        if bundle.lower() in self.BROWSERS:
+            # The foreground route brings the app forward with `open -b`: a reopen, which un-minimises the user's
+            # browser window and raises theirs over the run's (deskmind#73). Not taken for a browser.
+            return False, (f"not done: {bundle} is never brought to the front, and the step could not be delivered "
+                           f"to the run's own window in the background")
         allowed = {b.strip().lower() for b in os.environ.get("HANDS_FLASH_APPS", "").split(",") if b.strip()}
         if bundle.lower() not in allowed:
             return False, f"{bundle} only responds in the foreground, which this run is not allowed to use"
@@ -2354,7 +2880,11 @@ class PeekabooDriver:
         pid = self._pid_of(bundle, all_wins)
         if pid is None:
             return None
-        wins = [w for w in all_wins if w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowLayer") == 0]
+        # A browser's input goes to the window the run observes or nowhere: its largest window can be the user's, and
+        # with no window of the run's own (Firefox, or one that could not be opened) it was (review).
+        observed_only = observed_only or bundle.lower() in self.BROWSERS
+        wins = [w for w in all_wins if w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowLayer") == 0
+                and self._may_use(bundle, str(w.get("kCGWindowNumber")))]
         pinned = [w for w in wins if str(w.get("kCGWindowNumber")) == str(self._pinned_window or self._window_id)]
         if not (pinned or wins) or (observed_only and not pinned):
             return None
@@ -2955,6 +3485,32 @@ class PeekabooDriver:
 
         if k is ActionKind.FOCUS_APP:
             target = (action.text or "").strip()
+            browser = app_bundle(target)
+            if browser.lower() in self.BROWSERS:
+                # A browser is gone to in a window of the run's own, never by `open` (a reopen, which un-minimises
+                # the user's window) nor by activating it: the same as staging one (_start). In either transport.
+                # Before the check below: the start browser with no window of its own yet may try again.
+                own = getattr(self, "_own_browser", {}).get(browser.lower())
+                if browser.lower() == self.app.lower() and own and self._pinned_window == own \
+                        and not self._still_open(browser, own):
+                    # The run's window was closed (or put away) since: not "already observing" -- the pin is stale,
+                    # and the switch opens a new window of the run's (Codex review).
+                    self._pinned_window = self._window_id = None
+                if browser.lower() == self.app.lower() and own and self._pinned_window == own:
+                    return ExecResult(False, f"already observing {target}; that action cannot change anything -- "
+                                             f"choose a different target or a different operation")
+                wid = self._own_browser_window(browser)
+                if wid is None:
+                    why = getattr(self, "_own_browser_misses", {}).get(browser.lower(), "")
+                    return ExecResult(False, f"not switched to {target}: no window of this run's own could be opened "
+                                             f"({why}), and the user's windows are not used")
+                self.app = browser
+                self._target_pid = None
+                self._pinned_window = wid
+                self._window_id = wid
+                self._snapshot = None
+                return ExecResult(True, f"now observing {target}, in a window of this run's own; it was not brought "
+                                        f"forward")
             if target.lower() == self.app.lower():
                 # Reported as a success this was a no-op the loop could not see: one run switched to the window it
                 # was already on 188 times, each call "confirmed", until the wall clock ended it. An action that
@@ -3022,6 +3578,9 @@ class PeekabooDriver:
                 self._window_id = target
                 return self._settle(True, f"now observing window {target} ({known[target].title}); it was not "
                                           f"brought forward")
+            if self.app.lower() in self.BROWSERS:
+                return ExecResult(False, f"not switched: a {self.app} window is never brought to the front; this "
+                                         f"transport has no background switch")
             ok, _, detail = self._run("window_focus", window=target)
             if ok:
                 # Re-pin rather than unpin. The pin is what keeps a second
@@ -3039,9 +3598,11 @@ class PeekabooDriver:
             ok, _, detail = self._run("menu_click", app=self.app, path=path)
             if not ok:
                 # A half-traversed menu is left hanging open and blocks the next
-                # action, so close it before saying anything else.
-                self._run("press_fg", chord="escape", app=self.app)
-                self._foreground_actions += 1
+                # action, so close it before saying anything else -- but not into a browser window that is not the
+                # run's: an Escape there stops the user's page loading (review).
+                if self._foreground_refusal() is None:
+                    self._run("press_fg", chord="escape", app=self.app)
+                    self._foreground_actions += 1
                 detail = f"{detail} {self._menu_options(path)}".strip()
             return self._settle(ok, detail or f"menu {path}")
 
@@ -3289,6 +3850,8 @@ class PeekabooDriver:
             # and no folder appeared. Worse, they are not dropped but queued -- pressing in the background and then
             # escalating delivered both, and the run created two folders where the task wanted one. macOS routes a
             # command chord through the frontmost app, so when the foreground is permitted, that is the only route.
+            if self.allow_foreground and self.app.lower() in self.BROWSERS:
+                return ExecResult(False, f"{chord} not pressed: a {self.app} window is never brought to the front")
             if self.allow_foreground:
                 self._foreground_actions += 1
                 ok, data, detail = self._run("press_fg_window", chord=chord, app=self.app,
@@ -3328,6 +3891,34 @@ class PeekabooDriver:
                               unsupported=True)
         return ExecResult(True, f"{k.value} noted")
 
+    def _foreground_refusal(self) -> str | None:
+        """Why input sent to whatever holds the keyboard focus is refused: the run is in a browser (its windows never
+        take the foreground route: _flash), or the front window is a browser window that is not the run's -- the
+        user's, where a paste would land in their page or address bar. None otherwise. Front window unknown: refused
+        only for a browser run."""
+        if self.app.lower() in self.BROWSERS:
+            return f"not done: {self.app} is never typed into through the foreground, which could be the user's window"
+        front = self._front_window()
+        if front and front[0].lower() in self.BROWSERS and not self._may_use(front[0], front[1]):
+            return (f"not done: the keyboard focus is in a {front[0]} window that is not this run's (the user's), "
+                    f"and nothing is typed there")
+        return None
+
+    def _front_window(self) -> tuple[str, str] | None:
+        """(bundle, window id) of the frontmost ordinary window on screen, or None when it cannot be read."""
+        try:
+            import Quartz
+            from AppKit import NSRunningApplication
+            wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly
+                                                     | Quartz.kCGWindowListExcludeDesktopElements, 0) or []
+            w = next((w for w in wins if w.get("kCGWindowLayer") == 0), None)
+            if w is None:
+                return None
+            app = NSRunningApplication.runningApplicationWithProcessIdentifier_(w.get("kCGWindowOwnerPID"))
+            return str(app.bundleIdentifier() or ""), str(w.get("kCGWindowNumber"))
+        except Exception:   # noqa: BLE001
+            return None
+
     def _type_foreground(self, text: str, clear_first: bool = False, element_bound: bool = True) -> ExecResult:
         """Type into whatever holds keyboard focus, then prove it landed.
 
@@ -3343,6 +3934,9 @@ class PeekabooDriver:
         # edit mode after all, cmd+A selects the window's files instead of the field's text and the paste then
         # writes files into the folder -- one run left two "已粘贴 ....txt" behind that way. A wrong name is
         # recoverable; inventing files in the user's directory is not the kind of mistake this driver gets to make.
+        refused = self._foreground_refusal()
+        if refused:
+            return ExecResult(False, refused)
         self._foreground_actions += 1
         # Paste, not keystrokes. A Chinese input method turns synthesized typing into pinyin composition: the
         # folder name came out as "a'r'chi'v'e". `paste` sets the clipboard, sends cmd+V and restores the previous
@@ -3827,7 +4421,7 @@ class PeekabooDriver:
 
     def _opener(self, path: Path) -> str | None:
         """The run's own app that opens `path`, if one does: only the apps the request names, never another."""
-        allowed = {self.app.lower()} | {STAGE_APP_BUNDLES.get(n, n).lower() for n in self._stage_apps}
+        allowed = {self.app.lower()} | {app_bundle(n).lower() for n in self._stage_apps}
         for bundle, exts in self.DOCUMENT_OPENERS.items():
             if bundle.lower() in allowed and path.suffix.lower() in exts:
                 return bundle
@@ -4058,7 +4652,11 @@ class PeekabooDriver:
                 "session_unread": getattr(self, "_session_unread", 0),
                 # Reads of the app that found no window, and the window then read by its id (_window_to_observe).
                 "observed_by_id": getattr(self, "_observed_by_id", 0),
-                "app_read_miss": getattr(self, "_app_read_miss", "")}
+                "app_read_miss": getattr(self, "_app_read_miss", ""),
+                # The browser windows this run opened to work in, and why one could not be (_own_browser_window).
+                "own_browser_windows": dict(getattr(self, "_own_browser", {})),
+                "own_browser_miss": "; ".join(getattr(self, "_own_browser_misses", {}).values()),
+                "preexisting_windows": len(getattr(self, "_preexisting", set()))}
 
     def clipboard(self) -> str | None:
         try:

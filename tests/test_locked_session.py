@@ -197,7 +197,9 @@ class LockedRun(unittest.TestCase):
         res, driver = run_live(planner, [UNLOCKED])
         self.assertEqual(res.state.value, "completed", res.failure)
         self.assertEqual(planner.turns, 1)
-        self.assertIn(("peekaboo", "see"), driver.calls)
+        # Safari is read only by the id of a window the run may use, never by app (the front window can be the user's).
+        self.assertIn(("peekaboo", "window_list"), driver.calls)
+        self.assertNotIn(("peekaboo", "see"), driver.calls)
         self.assertEqual(driver.state()["session_unread"], 0)
 
     def test_an_unreadable_session_does_not_crash_or_stop_the_run(self):

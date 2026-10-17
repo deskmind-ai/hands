@@ -44,6 +44,7 @@ from ..apps import APPS
 from ..grounding import VOCAB, name_unnamed
 from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, vision_elements
 from . import keys
+from .session import MESSAGES as SESSION_BLOCKED, gui_session, require_usable
 from .base import (USER_BUSY, Driver, DriverUnavailable, Element, ExecResult, Observation, effect_notes,
                    WindowRef)
 
@@ -636,6 +637,10 @@ class PeekabooDriver:
         self._obs_n = 0
         self._app_name = ""
         self._clipboard_saved: str | None = None
+        #: Why nothing can be read or done this run: the GUI session was locked when it started (see _start).
+        self._session_refused: str | None = None
+        #: Times the session's lock state could not be read (drivers/session.py): reported in state(), never a stop.
+        self._session_unread = 0
         # A host that has already verified Screen Recording for itself (the DeskMind helper, whose child Peekaboo
         # inherits its TCC identity) says so, and the 1.2 s `peekaboo permissions` round trip is skipped.
         if os.environ.get("HANDS_PERMISSIONS_VERIFIED") != "1":
@@ -720,6 +725,17 @@ class PeekabooDriver:
         self._pinned_window = None
         self._window_id = None
         self._obs_n = 0
+        # A locked screen, or another user's session in front, is found before anything is staged: staging closes and
+        # opens windows on a screen nobody can see. Nothing is raised here -- start() runs outside the loop's error
+        # handling -- so the run ends at its first observation as the environment's, the way a capture refused on a
+        # locked screen ends (drivers/session.py). It ends so even if the screen is unlocked by then: nothing was staged.
+        self._session_refused = None
+        self._session_unread = 0
+        self._clipboard_saved = None
+        state = gui_session()
+        if state in SESSION_BLOCKED:
+            self._session_refused = f"{SESSION_BLOCKED[state]} (it was when the run started, so nothing was staged)"
+            return
         # The user's clipboard is theirs. Save now, restore in close(), so a
         # benchmark run can never cost someone what they had copied.
         self._clipboard_saved = self.clipboard()
@@ -1508,7 +1524,7 @@ class PeekabooDriver:
         if self._staged_window:
             self._close_window(self._staged_window)
             self._staged_window = None
-        if self.stage_commands and _app_running("TextEdit"):
+        if self.stage_commands and not getattr(self, "_session_refused", None) and _app_running("TextEdit"):
             # The documents a staged task opened in its sandbox. Each task closed the ones before it at its start, so
             # the last task of a set left its own open: bench G13's source.txt stayed in TextEdit, and a later run
             # from the app, its own document closed, went on to that window and typed its rows into it (10-01).
@@ -1725,7 +1741,20 @@ class PeekabooDriver:
         roles = [(e.get("role") or "").replace("AX", "").lower() for e in (data.get("ui_elements") or [])]
         return bool(roles) and all(r in self.BROWSER_CHROME_ROLES for r in roles)
 
+    def _require_session(self) -> None:
+        """Before an observation is taken and before an action is made: the GUI session can be seen and used. A locked
+        screen hides every window, and the accessibility tree of a locked Mac reads as apps with no window open -- a
+        screen a planner said DONE on (deskmind#73). Raises DriverUnavailable with the session's state, which the loop
+        ends the run on as the environment's (deskmind_hands/errors.py). A state that cannot be read stops nothing and
+        is counted, not taken as unlocked (drivers/session.py)."""
+        if getattr(self, "_session_refused", None):
+            raise DriverUnavailable(self._session_refused)
+        if require_usable() is None:
+            self._session_unread = getattr(self, "_session_unread", 0) + 1
+
     def observe(self) -> Observation:
+        # Every observation passes here, the loop's and the driver's own, so the planner never sees a locked screen.
+        self._require_session()
         self._obs_n += 1
         FAULTS.observed(self._obs_n)
         obs_id = f"obs-{self._obs_n:04d}"
@@ -2721,6 +2750,7 @@ class PeekabooDriver:
                                 f"confirmation was missing. {res.detail[:200]}")
 
     def execute(self, action: Action) -> ExecResult:
+        self._require_session()      # nothing is done on a locked screen, however the action was chosen
         try:
             if self.CONFIRM_BY_DIFF and action.kind in (ActionKind.CLICK, ActionKind.DOUBLE_CLICK,
                                                         ActionKind.RIGHT_CLICK):
@@ -3924,7 +3954,8 @@ class PeekabooDriver:
                 "transport": self.transport,
                 "focus_escalations": self._escalations,
                 "incomplete_reads": self._incomplete_reads,
-                "followed_new_windows": getattr(self, "_followed_windows", 0)}
+                "followed_new_windows": getattr(self, "_followed_windows", 0),
+                "session_unread": getattr(self, "_session_unread", 0)}
 
     def clipboard(self) -> str | None:
         try:

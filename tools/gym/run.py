@@ -95,39 +95,93 @@ def host_args(urls: list[str], env=os.environ) -> list[str]:
     return [*shown, *urls]
 
 
-def _open_host(url: str | list[str], timeout: float = 15.0) -> int:
-    """Open the page in GymHost and wake its accessibility tree; returns how many elements its window has.
+#: The smallest logical frame a gym window may have when a run starts. On a virtual display the host window once came
+#: up 1 pt wide (deskmind#64): WebKit then stopped exposing the mail list as a table, its rows came through with role
+#: "other", and the oracle found no row to label.
+MIN_WINDOW_W, MIN_WINDOW_H = 400, 300
+
+
+def readiness(windows: list[dict] | None, rows: int = 0) -> str | None:
+    """Why GymHost is not ready for a run's first observation, or None when it is.
+
+    `windows`: the host's windows, each {"title", "w", "h", "elements", "rows"} -- logical size, how many
+    accessibility elements it has and how many of them are AXRow; None when the host is not running. `rows`: how many
+    list rows the task's pages show at the start (list_rows), 0 when they have no list."""
+    if not windows:
+        return "GymHost has no window"
+    if sum(w["elements"] for w in windows) < 20:   # the frame alone is under 10
+        return "the page's accessibility tree did not come up"
+    for w in windows:
+        if w["w"] < MIN_WINDOW_W or w["h"] < MIN_WINDOW_H:
+            return (f"window {w['title']!r} is {w['w']:g} x {w['h']:g} pt, under the "
+                    f"{MIN_WINDOW_W} x {MIN_WINDOW_H} a run needs")
+    have = sum(w["rows"] for w in windows)
+    if have < rows:
+        return f"{have} of the page's {rows} list rows are rows in the accessibility tree"
+    return None
+
+
+def list_rows(task: dict) -> int:
+    """How many list rows the task's pages show when a run starts: the mail inbox's messages, which the oracle finds
+    by their row (a page without such a list has none)."""
+    pages = task.get("pages") or {"": task.get("page") or {}}
+    return sum(len(pg.get("inbox") or []) for pg in pages.values())
+
+
+def _host_windows() -> list[dict] | None:
+    """GymHost's windows as readiness() reads them, or None when it is not running.
 
     WebKit builds the page's tree only once an assistive client has walked into it: until then Peekaboo sees the
     window's frame and an empty group (and hands falls back to screenshots). One walk of the window is enough, and
     the tree then follows the page as it changes. Only the window is walked -- the menu bar lists recent items."""
-    from ApplicationServices import AXUIElementCopyAttributeValue, AXUIElementCreateApplication
+    from ApplicationServices import (AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXValueGetValue,
+                                     kAXValueCGSizeType)
 
     def get(e, attr):
         err, v = AXUIElementCopyAttributeValue(e, attr, None)
         return v if err == 0 else None
 
-    def count(e) -> int:
-        return 1 + sum(count(c) for c in get(e, "AXChildren") or [])
+    def walk(e, tally: dict) -> None:
+        tally["elements"] += 1
+        tally["rows"] += get(e, "AXRole") == "AXRow"
+        for c in get(e, "AXChildren") or []:
+            walk(c, tally)
 
+    pids = subprocess.run(["pgrep", "-f", "GymHost.app/Contents/MacOS/GymHost"],
+                          capture_output=True, text=True).stdout.split()
+    if not pids:
+        return None
+    out = []
+    for win in get(AXUIElementCreateApplication(int(pids[0])), "AXWindows") or []:
+        size = get(win, "AXSize")
+        ok, s = AXValueGetValue(size, kAXValueCGSizeType, None) if size is not None else (False, None)
+        tally = {"elements": 0, "rows": 0}
+        walk(win, tally)
+        out.append({"title": get(win, "AXTitle") or "", "w": s.width if ok else 0.0, "h": s.height if ok else 0.0,
+                    **tally})
+    return out
+
+
+def wait_ready(rows: int = 0, timeout: float = 15.0, windows=_host_windows, clock=time.monotonic,
+               sleep=time.sleep) -> tuple[list[dict] | None, str | None]:
+    """Polls the host until it is ready (readiness() is None) or `timeout` passes: its last windows, and why it is
+    not ready (None when it is)."""
+    end = clock() + timeout
+    while True:
+        seen = windows()
+        why = readiness(seen, rows)
+        if why is None or clock() >= end:
+            return seen, why
+        sleep(0.5)
+
+
+def _open_host(url: str | list[str], rows: int = 0, timeout: float = 15.0) -> tuple[list[dict] | None, str | None]:
+    """Open the page in GymHost and wait until it is ready for a run: see wait_ready()."""
     subprocess.run(["pkill", "-f", "GymHost.app/Contents/MacOS/GymHost"], capture_output=True)
     urls = [url] if isinstance(url, str) else list(url)
     subprocess.run(["/usr/bin/open", "-g", "-n", str(HOST_APP), "--args", *host_args(urls)], capture_output=True,
                    timeout=20)
-    end, n = time.time() + timeout, 0
-    while time.time() < end:
-        time.sleep(1.0)
-        pids = subprocess.run(["pgrep", "-f", "GymHost.app/Contents/MacOS/GymHost"],
-                              capture_output=True, text=True).stdout.split()
-        if not pids:
-            continue
-        app = AXUIElementCreateApplication(int(pids[0]))
-        n = sum(count(w) for w in get(app, "AXWindows") or [])
-        if n >= 20:   # the frame alone is under 10
-            break
-    return n
-
-
+    return wait_ready(rows, timeout)
 
 
 def _waited() -> float:
@@ -289,7 +343,7 @@ def main() -> int:
     if a.approve != "off":
         cli_mod.StdinUser = StandInUser
 
-    passed = 0
+    passed = env_failed = 0
     for seed in _seeds(a.seeds):
         task = gym_app.make_task(seed, a.split)
         run = f"{a.app}-{seed}-{int(time.time())}"
@@ -309,8 +363,21 @@ def main() -> int:
         # sidebar, which ended up in rows.
         mode = "vision" if random.Random(f"vision-{seed}").random() < a.vision else "ax"
         lesson_mode, lesson_texts = _stage_lessons(a, seed, run)
-        if _open_host(url) < 20:
-            print(f"seed {seed}: the page's accessibility tree did not come up; skipped", flush=True)
+        host_windows, not_ready = _open_host(url, list_rows(task))
+        if not_ready:
+            # Not the model's failure: the run never started. It is recorded with cause "environment", so a pass rate
+            # is not quietly computed over a degraded host (deskmind#64), and no DAgger rows are written for it.
+            env_failed += 1
+            print(f"seed {seed}: GymHost not ready ({not_ready}); failed as environment", flush=True)
+            if a.summary:
+                with open(a.summary, "a") as fh:
+                    fh.write(json.dumps({"task": f"gym-{a.app}-{task['app'].lower()}-s{seed:04d}", "app": a.app,
+                                         "seed": seed, "split": task["split"], "mode": mode, "goal": task["goal"],
+                                         "kind": task.get("kind"), "passed": False, "cause": "environment",
+                                         "environment": not_ready, "host_windows": host_windows,
+                                         "split_version": task.get("split_version", 1),
+                                         "template_id": task.get("template_id")}, ensure_ascii=False) + "\n")
+            subprocess.run(["pkill", "-f", "GymHost.app/Contents/MacOS/GymHost"], capture_output=True)
             continue
         # A family with a real app beside the page (the expense receipt in Preview) stages it: its apps join
         # --apps, and the ones read by pixels join the vision apps.
@@ -346,7 +413,8 @@ def main() -> int:
                                      "template_id": task.get("template_id"),
                                      "approvals": list(asked), "final": final,
                                      "unreachable": list(current.get("unreachable") or []),
-                                     "apps_seen": _apps_seen(started)}, ensure_ascii=False) + "\n")
+                                     "apps_seen": _apps_seen(started), "host_windows": host_windows},
+                                    ensure_ascii=False) + "\n")
         passed += ok
         with out.open("a") as fh:
             for n, c in enumerate(calls):
@@ -384,7 +452,8 @@ def main() -> int:
         if hasattr(gym_app, "unstage"):
             gym_app.unstage(task)
         subprocess.run(["pkill", "-f", "GymHost.app/Contents/MacOS/GymHost"], capture_output=True)
-    print(f"{passed}/{len(_seeds(a.seeds))} passed -> {out}")
+    env_note = f", {env_failed} failed as environment (GymHost not ready)" if env_failed else ""
+    print(f"{passed}/{len(_seeds(a.seeds))} passed{env_note} -> {out}")
     return 0
 
 

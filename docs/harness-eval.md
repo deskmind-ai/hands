@@ -49,7 +49,9 @@ Build the gitignored products before running this from a fresh clone or worktree
 - `swiftc -O tools/native/ocr.swift -o tools/native/ocr`
 - `bash tools/gym/host/build.sh`
 
-Without the OCR reader, no text is read from pixels. Without GymHost, every seed prints "accessibility tree did not come up; skipped". Both look like model or harness failures when they aren't.
+Without the OCR reader, no text is read from pixels. Without GymHost, every seed prints "GymHost not ready (the page's accessibility tree did not come up); failed as environment". Both look like model or harness failures when they aren't.
+
+Before a seed's first observation, the runner waits (polling) until GymHost is ready: every window at least 400 x 300 pt, and the task's list rows (the mail inbox's messages) present as rows in its accessibility tree. A seed whose host never gets there is not run. With `--summary`, it is written with `"cause": "environment"` and the reason, and no DAgger rows are written for it. On a virtual display the window once came up 1 pt wide and the mail rows lost their role, so the oracle labelled nothing (deskmind#64). Every summary line also records the host's windows (`host_windows`: size, element and row counts).
 
 Two controls come from OSWorld Verified and cua-bench:
 

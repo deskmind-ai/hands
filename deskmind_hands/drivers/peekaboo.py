@@ -730,6 +730,7 @@ class PeekabooDriver:
         # handling -- so the run ends at its first observation as the environment's, the way a capture refused on a
         # locked screen ends (drivers/session.py). It ends so even if the screen is unlocked by then: nothing was staged.
         self._session_refused = None
+        self._session_unread = 0
         self._clipboard_saved = None
         state = gui_session()
         if state in SESSION_BLOCKED:

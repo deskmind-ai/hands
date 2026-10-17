@@ -13,7 +13,8 @@ an observation is taken and before an action is made. What it says is one of:
 - "unlocked": the session is on the console and its screen is not locked;
 - "locked": the screen is locked (CGSSessionScreenIsLocked);
 - "off_console": another user's session is in front (fast user switching), so this one's screen is not shown;
-- None: it could not be read (no Quartz, no GUI session for this process, a value of an unexpected type). Nothing is
+- None: it could not be read (no Quartz, no GUI session for this process, no console key, a value of an unexpected
+  type). Nothing is
   concluded from that, either way: the run is not stopped for it, and it is not taken as "unlocked" either.
 """
 from __future__ import annotations
@@ -60,6 +61,11 @@ def gui_session() -> str | None:
     on_console = None if raw_console is None else _flag(raw_console)
     if locked is True:
         return "locked"
+    if on_console is None:
+        # An unlocked session always carries the console key (True), and the lock key is absent (checked with the
+        # app's bundled Python). Both keys are undocumented: a dictionary without the console key is one this code
+        # does not know, and reading it as "unlocked" would bring the false success back on a macOS that renames them.
+        return None
     if on_console is False:
         return "off_console"
     if locked is None:

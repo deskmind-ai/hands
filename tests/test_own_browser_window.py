@@ -311,6 +311,61 @@ class OwnWindow(unittest.TestCase):
         self.assertIsNone(d._pinned_window)
         self.assertIn("did not show up", d.state()["own_browser_miss"])
 
+    # -- review: the other ways a window could be picked ---------------------------------------------------------
+
+    def test_following_a_new_window_never_lands_on_the_users(self):
+        # The pinned window reads "incomplete": the run follows a window that was not there at its last look. On a
+        # first look nothing was seen yet, so every window of the app passed for new, the user's minimised one too.
+        mac = FakeMac([{"id": 19085, "title": "收藏夹", "on_screen": True, "frame": (0, 0, 1200, 800)}])
+        d = self.mac(mac)
+        own = d._pinned_window
+        base = mac.peekaboo
+
+        def incomplete(key, _extra=None, **kw):
+            if key == "see_window" and kw.get("window") == own:
+                return False, {}, "AX tree incomplete: retry once to obtain a fresh observation"
+            return base(key, _extra, **kw)
+        d._run = incomplete
+        with self.assertRaises(pk.DriverUnavailable):     # nothing else to read: the read fails as it would have
+            d.observe()
+        self.assertNotIn("19085", self.reads(mac))
+        self.assertNotEqual(d._pinned_window, "19085")
+
+    def test_background_input_into_a_browser_never_falls_back_to_its_largest_window(self):
+        # No window of the run's own (none could be opened): a key or click has nowhere to go, not the user's window.
+        mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1600, 1000)}])
+        d = self.mac(mac, stage=())
+        d._pinned_window = d._window_id = None
+        with mock.patch.object(skylight, "focus_without_raise", lambda pid, wid: self.fail(f"focused {wid}")), \
+                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)):
+            self.assertIsNone(d._background_quartz(SAFARI))
+
+    def test_focus_app_to_the_browser_already_observed_is_no_success(self):
+        # A switch that cannot change anything is refused, as for any app (one run repeated one 188 times).
+        mac = FakeMac()
+        d = self.mac(mac)
+        res = d.execute(Action(kind=ActionKind.FOCUS_APP, text="Safari"))
+        self.assertFalse(res.ok)
+        self.assertIn("already observing", res.detail)
+
+    def test_several_new_windows_without_the_scripts_id_are_none_taken(self):
+        # A launch still restoring the last session while the run's window opens: which new one is the run's is not
+        # known, so none is used.
+        mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1200, 800)}])
+        make = mac.osa
+
+        def two(script):
+            ok, out = make(script)
+            if "make new document" in script:
+                mac.new_window("恢复的标签页")
+                return ok, "not-a-window-id"
+            return ok, out
+        mac.osa = two
+        d = self.mac(mac)
+        self.assertIsNone(d._pinned_window)
+        self.assertIn("could not be told apart", d.state()["own_browser_miss"])
+        self.assertEqual(self.reads(mac), [])
+
 
 class Parsing(unittest.TestCase):
     def test_browser_staging_commands(self):

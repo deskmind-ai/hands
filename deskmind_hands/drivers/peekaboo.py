@@ -999,13 +999,18 @@ class PeekabooDriver:
         subprocess.run(["/usr/bin/open", "-g", "-b", bundle, "--args", "-ApplePersistenceIgnoreState", "YES"],
                        capture_output=True, timeout=15)
         for _ in range(20):
-            try:
-                if self._pid_of(bundle) is not None:
-                    break
-            except Exception:   # noqa: BLE001
+            if self._app_is_running(bundle):
                 break
             time.sleep(0.25)
-        time.sleep(1.0)
+        # Until two reads of its windows agree: a session is restored a window at a time, and one restored after
+        # the list was taken would pass for the run's own.
+        last = None
+        for _ in range(8):
+            time.sleep(0.5)
+            now = self._app_window_ids(bundle)
+            if now is not None and now == last:
+                break
+            last = now
 
     def _own_browser_window(self, bundle: str, url: str = "") -> str | None:
         """The window this run works in in the browser `bundle`: the one it opened earlier if it is still there, else
@@ -1019,7 +1024,9 @@ class PeekabooDriver:
         if own.get(key):
             if own[key] in (self._app_window_ids(bundle) or set()):
                 return own[key]
-            del own[key]                    # closed since: a new one
+            # Closed since: a new one. Every window there now counts as the user's from here on, including any the run
+            # opened itself meanwhile (a pop-up): the safe side.
+            del own[key]
         script = _new_window_script(bundle, url)
         if script is None:
             pre |= self._app_window_ids(bundle) or set()
@@ -1048,9 +1055,13 @@ class PeekabooDriver:
             self._own_browser_miss = f"{bundle}: the new window did not show up in its window list"
             return None
         # The id the script returned, when it is one of the new windows (Safari's is the window server's); else the
-        # newest new window. Either way never one that was there before.
+        # only new window. Several new windows and no id among them (a launch still restoring windows, a Chromium id,
+        # which is not the window server's) cannot be told apart: none is taken. Never one that was there before.
         hint = (out or "").strip()
-        wid = hint if hint in fresh else max(fresh, key=lambda s: int(s) if s.isdigit() else -1)
+        wid = hint if hint in fresh else fresh[0] if len(fresh) == 1 else None
+        if wid is None:
+            self._own_browser_miss = f"{bundle}: {len(fresh)} new windows, and the run's own could not be told apart"
+            return None
         own[key] = wid
         return wid
 
@@ -2084,6 +2095,9 @@ class PeekabooDriver:
             # A double-click on a folder opened it in a second Finder window, and every read of the first came back
             # "AX tree incomplete" until the run ended as an environment failure -- nine diag runs in one night.
             fresh = fresh_windows(self._window_ids(), getattr(self, "_seen_windows", set()), self._pinned_window)
+            # Never one that was there before the run (the user's): on a first look nothing was seen yet, and every
+            # window of the app, the user's minimised browser window among them, passed for new (review).
+            fresh = [w for w in fresh if w not in getattr(self, "_preexisting", set())]
             if fresh:
                 self._followed_windows = getattr(self, "_followed_windows", 0) + 1   # reported in usage()
                 self._pinned_window = fresh[-1]
@@ -2548,7 +2562,12 @@ class PeekabooDriver:
         pid = self._pid_of(bundle, all_wins)
         if pid is None:
             return None
-        wins = [w for w in all_wins if w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowLayer") == 0]
+        # A browser's input goes to the window the run observes or nowhere: its largest window can be the user's, and
+        # with no window of the run's own (Firefox, or one that could not be opened) it was (review).
+        observed_only = observed_only or bundle.lower() in self.BROWSERS
+        pre = getattr(self, "_preexisting", set())
+        wins = [w for w in all_wins if w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowLayer") == 0
+                and str(w.get("kCGWindowNumber")) not in pre]
         pinned = [w for w in wins if str(w.get("kCGWindowNumber")) == str(self._pinned_window or self._window_id)]
         if not (pinned or wins) or (observed_only and not pinned):
             return None
@@ -3159,6 +3178,10 @@ class PeekabooDriver:
             # `--app Finder` resolves for some commands and not others, while
             # com.apple.finder always does.
             browser = target if "." in target else BROWSER_BUNDLES.get(target.lower(), "")
+            if (browser.lower() == self.app.lower() and self._pinned_window
+                    and self._pinned_window == getattr(self, "_own_browser", {}).get(browser.lower())):
+                return ExecResult(False, f"already observing {target}; that action cannot change anything -- "
+                                         f"choose a different target or a different operation")
             if browser.lower() in self.BROWSERS:
                 # A browser is gone to in a window of the run's own, never by `open` (a reopen, which un-minimises
                 # the user's window) nor by activating it: the same as staging one (_start). In either transport.

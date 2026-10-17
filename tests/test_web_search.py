@@ -346,13 +346,15 @@ class ObservedWindowOnly(unittest.TestCase):
                 mock.patch.object(skylight, "focus_without_raise", lambda pid, wid: ("token", wid)), \
                 mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)):
             return d._background_quartz("com.apple.Safari", observed_only=True), \
-                d._background_quartz("com.apple.Safari")
+                d._background_quartz("com.apple.Safari"), d._background_quartz("ai.deskmind.gymhost")
 
     def test_the_observed_window(self):
-        strict, _ = self.quartz("9")
+        strict, _, _ = self.quartz("9")
         self.assertEqual(strict[0], ("Q", 9))
 
     def test_not_the_largest_when_the_observed_one_is_gone(self):
-        strict, loose = self.quartz("42")
+        strict, browser, other = self.quartz("42")
         self.assertIsNone(strict)
-        self.assertEqual(loose[0], ("Q", 7))          # what the other routes still do
+        # A browser's other routes are held to the observed window too: its largest can be the user's (deskmind#73).
+        self.assertIsNone(browser)
+        self.assertEqual(other[0], ("Q", 7))          # what the other routes still do in a non-browser app

@@ -312,6 +312,13 @@ def _remember_unseen(page: dict, verdict: str | None, key: tuple, held: tuple | 
     return (None if verdict is not None else held), silent
 
 
+def _look_key(obs, m, dialogue) -> tuple:
+    """What a no-window 没出来 is bound to: the look (its digest), the actions taken, and what the user has said. A
+    reply after it (「不用打开网页了，保持窗口关闭即可」) changes the request it judged, and a later no answer must not
+    bring it back (review of #42)."""
+    return obs.digest(), m.actions, len(_users_words(dialogue))
+
+
 def _unverified(steps: list, obs, why: str, recorder) -> Failure:
     """The end of a run whose DONE, with no window seen, nothing could confirm: never completed (review of #42)."""
     steps.append({"n": len(steps) + 1, "obs": obs.id, "kind": "done_unverified", "text": f"not verified: {why}",
@@ -319,6 +326,13 @@ def _unverified(steps: list, obs, why: str, recorder) -> Failure:
     if recorder:
         recorder.step(steps[-1])
     return Failure(FailureClass.PLANNING, f"not verified: {why}", auto=True)
+
+
+def _require_session(driver) -> None:
+    """The driver's check that the GUI session can be seen and used (drivers/session.py), where it has one."""
+    check = getattr(driver, "require_session", None)
+    if callable(check):
+        check()
 
 
 def _judged_about(page: dict) -> str:
@@ -619,6 +633,10 @@ def run_task(
                     recorder.step(entry)
                 continue
 
+            if action.kind is ActionKind.DONE:
+                # The screen can lock between the look and the DONE: nothing on a locked screen is taken as done. Raises
+                # DriverUnavailable with the session's state, ended as the environment's (review of #42; #40).
+                _require_session(driver)
             if action.kind is ActionKind.DONE and done_blocks < cfg.max_done_blocks and done_check.enabled():
                 # Not finished while something the goal's own words ask for is visibly left (done_check.py): the
                 # planner is told what, once or twice, and goes on.
@@ -626,7 +644,7 @@ def run_task(
                 why = objection(ctx) if objection else None
                 unverified = False
                 if not why:
-                    key = (obs.digest(), m.actions)
+                    key = _look_key(obs, m, dialogue)
                     page, verdict, why = _page_objection(task, driver, adapter, _users_words(dialogue), obs, steps,
                                                          held=unseen_held == key, ask=not judge_silent)
                     last_page_verdict = verdict
@@ -657,7 +675,7 @@ def run_task(
                 # Held back as often as allowed, and the page still does not show the result: not done. Accepted, a
                 # run that never acted ended "completed" after its third DONE (deskmind#73, live run). Also when the
                 # blocks were spent by another check and the page was never judged (review of c2b9b08): judged now.
-                key = (obs.digest(), m.actions)
+                key = _look_key(obs, m, dialogue)
                 verdict_now = _page_objection(task, driver, adapter, _users_words(dialogue), obs, steps,
                                               held=unseen_held == key, ask=not judge_silent)
                 unseen_held, judge_silent = _remember_unseen(verdict_now[0], verdict_now[1], key, unseen_held,
@@ -691,6 +709,8 @@ def run_task(
                     state, failure = RunState.GAVE_UP, _unverified(steps, obs, why, recorder)
                     break
             if action.kind in TERMINAL:
+                if action.kind is ActionKind.DONE:
+                    _require_session(driver)      # again: the judgements above take seconds
                 state = RunState.COMPLETED if action.kind is ActionKind.DONE else RunState.GAVE_UP
                 steps.append({"n": len(steps) + 1, "obs": obs.id, "kind": action.kind.value,
                               "text": action.text, "latency_s": round(proposal.latency_s or 0.0, 3),

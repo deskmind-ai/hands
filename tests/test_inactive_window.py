@@ -195,6 +195,31 @@ class Observed(unittest.TestCase):
         self.assertFalse(observe(d).no_window)
         self.assertEqual(d._pinned_window, "78")
 
+    def vision_look(self, rows):
+        # Safari read from its pixels (an empty tree sends it here on its own): OCR and the grounder stood in for.
+        import os
+        from deskmind_hands import vision
+        d = safari([TEST])
+        d.read = {**PAGE, "ui_elements": []}
+        with mock.patch.dict(os.environ, {"HANDS_VISION_APPS": "com.apple.safari"}), \
+                mock.patch.object(vision, "ocr", lambda shot: [dict(r) for r in rows]), \
+                mock.patch.object(vision, "_icons", lambda *a, **k: {}), \
+                mock.patch.object(vision, "ground_one", lambda *a, **k: None):
+            return observe(d)
+
+    def test_a_picture_with_nothing_found_in_it_is_no_window(self):
+        # OCR and the grounder found nothing; the scroll buttons and generic controls are added anyway, and counted
+        # they passed for 15 elements of a window (review of #42).
+        obs = self.vision_look([])
+        self.assertTrue(obs.elements)
+        self.assertFalse([e for e in obs.elements if e.id.startswith(("ocr:", "icon:")) and "scroll" not in e.id])
+        self.assertTrue(obs.no_window)
+
+    def test_a_picture_with_words_in_it_is_a_window(self):
+        obs = self.vision_look([{"text": "新加坡 天气 28°C", "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.03, "conf": 0.9}])
+        self.assertTrue([e for e in obs.elements if e.id.startswith("ocr:")])
+        self.assertFalse(obs.no_window)
+
     def test_the_trace_keeps_it(self):
         import json
         import tempfile
@@ -333,6 +358,36 @@ class DoneOnNothingSeen(unittest.TestCase):
         self.assertFalse([s for s in res.steps if s.get("kept")])
         blocked = [s["text"] for s in res.steps if s.get("kind") == "done_blocked"]
         self.assertIn("could not be confirmed", blocked[1])       # the second DONE: unverified, not 没出来 again
+
+    def test_not_shown_is_dropped_once_the_user_changed_the_request(self):
+        # 没出来, then the user withdraws the page (「不用打开网页了，保持窗口关闭即可」), then the judge times out: the
+        # old 没出来 judged a request that no longer stands; unverified, not 没出来 again (review of #42).
+        ask = {"kind": "ask_user", "text": "要打开网页吗？"}
+
+        class Withdraws:
+            def respond(self, question, approval, options=()):
+                return "不用打开网页了，保持窗口关闭即可", True, 0.0
+
+        adapter = Sequenced([DONE, ask, DONE, DONE], [judge.NOT_SHOWN, None, None])
+        with mock.patch("test_judge.Browser", NoWindowBrowser):
+            res, _, _ = run("打开 Safari，搜索新加坡的天气", [DONE, ask, DONE, DONE], adapter, page=None,
+                            user=Withdraws(), done_check=True)
+        self.assertEqual(res.metrics.actions, 0)
+        self.assertNotEqual(res.state.value, "completed")
+        self.assertFalse([s for s in res.steps if s.get("kept")])
+        blocked = [s["text"] for s in res.steps if s.get("kind") == "done_blocked"]
+        self.assertIn("could not be confirmed", blocked[1])
+
+    def test_a_screen_locked_before_the_done_is_taken_is_not_completed(self):
+        # Observed unlocked, locked by the time the planner says DONE: the run ends as the environment's (#40).
+        from test_locked_session import LOCKED, UNLOCKED, Planner, run_live
+        locked_now = []
+        planner = Planner(on_turn=lambda n: locked_now.append(True))
+        res, _ = run_live(planner, lambda: LOCKED if locked_now else UNLOCKED)
+        self.assertEqual(planner.turns, 1)                # it saw the screen, and said DONE
+        self.assertNotEqual(res.state.value, "completed")
+        self.assertEqual(res.failure.cls.value, "environment", res.failure)
+        self.assertIn("screen is locked", res.failure.detail)
 
     def test_a_silent_judge_is_not_asked_again(self):
         adapter = Sequenced([DONE] * 3, [None, judge.NO_WINDOW_NEEDED, judge.NO_WINDOW_NEEDED])

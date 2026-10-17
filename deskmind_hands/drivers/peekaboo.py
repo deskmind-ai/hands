@@ -42,7 +42,7 @@ from ..geometry import (ImageTransform, Point, Rect, ScreenGeometry, Size,
                         clamp_to_screen, to_logical)
 from ..apps import APPS
 from ..grounding import VOCAB, name_unnamed
-from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, vision_elements
+from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, recognised, vision_elements
 from . import keys
 from .session import MESSAGES as SESSION_BLOCKED, gui_session, require_usable
 from .base import (USER_BUSY, Driver, DriverUnavailable, Element, ExecResult, Observation, effect_notes,
@@ -1785,6 +1785,11 @@ class PeekabooDriver:
         roles = [(e.get("role") or "").replace("AX", "").lower() for e in (data.get("ui_elements") or [])]
         return bool(roles) and all(r in self.BROWSER_CHROME_ROLES for r in roles)
 
+    def require_session(self) -> None:
+        """For the loop, before it takes a DONE: the session can still be seen and used. A screen locked after the last
+        look and before the DONE was accepted let the run complete on it (review of #42). Raises as _require_session."""
+        self._require_session()
+
     def _require_session(self) -> None:
         """Before an observation is taken and before an action is made: the GUI session can be seen and used. A locked
         screen hides every window, and the accessibility tree of a locked Mac reads as apps with no window open -- a
@@ -1963,7 +1968,7 @@ class PeekabooDriver:
             self._element_value = {e.id: e.value or "" for e in els}
             self._labels_by_id = {e.id: e.label or "" for e in els}
             self._element_role = {e.id: e.role or "" for e in els}
-            self._real_read = len(els)      # the words and icons found in the pixels: what this read held
+            self._real_read = recognised(els)      # the words and icons found in the pixels: what this read held
             return els
         els = self._elements(data, origin)
         #: What the read itself held, before any control of the harness's own is added below (_read_nothing): a

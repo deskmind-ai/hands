@@ -283,10 +283,13 @@ def _page_objection(task: Task, driver, adapter, said=(), obs=None, steps=(),
         if not callable(ask_fn):
             return page, None, None
         app = str(getattr(driver, "app", "") or "")
-        verdict = judge.done_unseen(ask_fn, task.goal, app, said, _what_was_done(steps)) if ask else None
+        acted = _acted(steps)
+        # A run that changed nothing is asked whether the state was already there (judge.ALREADY), not whether it
+        # did it.
+        verdict = judge.done_unseen(ask_fn, task.goal, app, said, _what_was_done(steps), acted=acted) if ask else None
         silent = verdict is None
         # Needing no window is taken only from a run that did something: with no step gone through it is no answer.
-        unbacked = verdict == judge.NO_WINDOW_NEEDED and not _acted(steps)
+        unbacked = verdict == judge.NO_WINDOW_NEEDED and not acted
         if unbacked:
             verdict = None
         kept = verdict is None and held
@@ -309,9 +312,11 @@ def _page_objection(task: Task, driver, adapter, said=(), obs=None, steps=(),
 
 
 def _acted(steps) -> bool:
-    """Whether any step of the run that changes something went through (a click, typing, a key, ...)."""
-    kinds = {k.value for k in MUTATING}
-    return any(s.get("ok") and not s.get("deferred") and (s.get("action") or {}).get("kind") in kinds for s in steps)
+    """Whether any step of the run that changes something went through (a click, typing, a key, ...): as the idle
+    count has it (a mutating step, carried out, its outcome known), and a scroll changes nothing (review of #42)."""
+    kinds = {k.value for k in MUTATING} - {ActionKind.SCROLL.value}
+    return any(s.get("ok") and not s.get("deferred") and not s.get("indeterminate")
+               and (s.get("action") or {}).get("kind") in kinds for s in steps)
 
 
 def _what_was_done(steps, last: int = 6) -> list[str]:
@@ -696,7 +701,8 @@ def run_task(
                         recorder.step(entry)
                     continue
             if (action.kind is ActionKind.DONE and done_check.enabled() and done_blocks >= cfg.max_done_blocks
-                    and last_page_verdict not in (judge.SHOWN, judge.NOT_ON_A_PAGE, judge.NO_WINDOW_NEEDED)):
+                    and last_page_verdict not in (judge.SHOWN, judge.NOT_ON_A_PAGE, judge.NO_WINDOW_NEEDED,
+                                                  judge.ALREADY)):
                 # Held back as often as allowed, and the page still does not show the result: not done. Accepted, a
                 # run that never acted ended "completed" after its third DONE (deskmind#73, live run). Also when the
                 # blocks were spent by another check and the page was never judged (review of c2b9b08): judged now.

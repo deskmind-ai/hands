@@ -151,6 +151,14 @@ class DoneInABrowser(unittest.TestCase):
         blocked = [s for s in res.steps if s.get("kind") == "done_blocked"]
         self.assertIn("no page opened in it yet", blocked[0]["text"])
 
+    def test_the_typing_judge_is_told_the_marker_page_plainly(self):
+        prompts = []
+        judge.typing(lambda p, sy, o: prompts.append(p) or {"choice": judge.DO}, self.GOAL, "智能搜索栏", "新加坡的天气",
+                     MARKER)
+        self.assertIn(judge.MARKER_TITLE, prompts[0])
+        self.assertNotIn("data:", prompts[0])
+        self.assertNotIn("dm-c087", prompts[0])
+
     def test_an_adapter_that_cannot_judge_is_as_before(self):
         # No judge_choice at all: a missing capability, recorded in the run's checks, not the planner's failure.
         unread = {"url": "", "title": "", "text": "", "browser": True, "unread": "x"}
@@ -205,8 +213,10 @@ def node(role, frame=None, children=(), **attrs):
     return {"AXRole": role, "frame": frame, "AXChildren": list(children), **attrs}
 
 
-def safari_window(x, y, w, h, sheet=False):
-    """Safari's window as accessibility shows it, sidebar open: toolbar, sidebar (the user's tab groups), the page."""
+def safari_window(x, y, w, h, sheet=False, scrolled=0, menu=None):
+    """Safari's window as accessibility shows it, sidebar open: toolbar, sidebar (the user's tab groups), the page in
+    its scroll area. `scrolled`: how far the page is scrolled down -- WebKit's web area frame is the whole document, so
+    it then starts above the window. `menu`: a menu the toolbar's tab group picker opened, at that frame."""
     toolbar = node("AXToolbar", (x, y, w, 50), [
         node("AXButton", (x + 10, y + 10, 30, 24), AXDescription="显示边栏"),
         node("AXButton", (x + 50, y + 10, 30, 24), AXDescription="后退"),
@@ -214,8 +224,12 @@ def safari_window(x, y, w, h, sheet=False):
     sidebar = node("AXGroup", (x, y + 50, 250, h - 50), [node("AXScrollArea", (x, y + 50, 250, h - 50), [
         node("AXOutline", (x, y + 50, 250, h - 50), [node("AXRow", (x + 5, y + 60, 240, 24), [
             node("AXCell", (x + 5, y + 60, 240, 24))])], AXDescription="边栏")])])
+    doc = node("AXWebArea", (x + 250, y + 50 - scrolled, w - 250, h - 50 + 3 * scrolled),
+               [node("AXStaticText", AXValue=pk.MARKER_TEXT)])
     page = node("AXTabGroup", (x + 250, y + 50, w - 250, h - 50), [node("AXGroup", (x + 250, y + 50, w - 250, h - 50), [
-        node("AXWebArea", (x + 250, y + 50, w - 250, h - 50), [node("AXStaticText", AXValue=pk.MARKER_TEXT)])])])
+        node("AXScrollArea", (x + 250, y + 50, w - 250, h - 50), [doc])])])
+    if menu:
+        toolbar["AXChildren"].append(node("AXMenuButton", (x + 90, y + 10, 30, 24), [node("AXMenu", menu)]))
     kids = [node("AXSplitGroup", (x, y + 50, w, h - 50), [sidebar, node("AXSplitter"), page]), toolbar]
     if sheet:
         kids.append(node("AXSheet", (x + 100, y + 50, 400, 200), [node("AXButton", (x + 120, y + 200, 60, 24))]))
@@ -263,6 +277,35 @@ class Regions(unittest.TestCase):
         start_page = {**r, "address_bar": [(300, 10, 300, 24)]}
         with mock.patch.object(axchrome, "regions", lambda pid, frame, wid=None: start_page):
             self.assertEqual(d._browser_scope(els, pk.Point(0, 0)), [])     # a start page: only the address bar
+
+    def test_a_scrolled_page_does_not_bring_the_toolbar_back(self):
+        # Review of de228eb: scrolled, the web area's frame starts above the window and covers the toolbar.
+        for p in fake_ax([safari_window(0, 0, 1200, 800, scrolled=2000)]):
+            p.start()
+            self.addCleanup(p.stop)
+        r = axchrome.regions(PID, (0, 0, 1200, 800))
+        self.assertEqual(r["page"], [(250, 50, 950, 750)])            # the viewport, not the document
+        self.assertTrue(axchrome.chrome(r, (1100, 10, 30, 24)))         # a toolbar button above the page's column
+        self.assertFalse(axchrome.chrome(r, (400, 300, 200, 20)))       # the page
+
+    def test_a_web_area_with_no_scroll_area_is_clipped_to_the_window(self):
+        win = node("AXWindow", (0, 0, 1200, 800), [node("AXWebArea", (0, -3000, 1200, 9000))])
+        for p in fake_ax([win]):
+            p.start()
+            self.addCleanup(p.stop)
+        self.assertEqual(axchrome.regions(PID, (0, 0, 1200, 800))["page"], [(0, 0, 1200, 800)])
+
+    def test_a_menu_the_toolbar_opened_over_the_page_is_chrome(self):
+        for p in fake_ax([safari_window(0, 0, 1200, 800, menu=(90, 34, 300, 400))]):
+            p.start()
+            self.addCleanup(p.stop)
+        r = axchrome.regions(PID, (0, 0, 1200, 800))
+        self.assertTrue(axchrome.chrome(r, (95, 300, 280, 22)))        # a tab group listed in the picker's menu
+        self.assertFalse(axchrome.chrome(r, (600, 300, 200, 20)))       # the page beside it
+
+    def test_an_edge_that_only_touches_the_page_is_not_on_it(self):
+        r = axchrome.regions(PID, (0, 0, 1200, 800))
+        self.assertTrue(axchrome.chrome(r, (700, 30, 30, 22)))          # a toolbar button 2 px over the page's top
 
     def test_no_single_window_no_regions(self):
         self.assertIsNone(axchrome.regions(PID, (5, 5, 10, 10)))
@@ -402,6 +445,7 @@ class Ask(unittest.TestCase):
         self.assertIn("ASK", planner.offered[0])
         self.assertIs(p.action.kind, ActionKind.ASK_USER)
         self.assertEqual(p.action.text, OWN_WINDOW_QUESTION["zh"])
+        self.assertIn("搜索什么", p.action.text)          # fits a search goal as well as a page the user has open
         self.assertIn("DeskMind opened for this run", planner.states[0]["note"])      # the planner sees it
 
     def test_not_offered_otherwise(self):

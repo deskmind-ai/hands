@@ -116,6 +116,8 @@ def typing(ask: AskChoice | None, goal: str, field: str, text: str, page: dict |
     """照做 / 不做 / 先问用户 for typing `text` into a browser's own field. Without an answer: 先问用户, never 照做.
     `said`: the user's later words, (question, reply) pairs. `address_bar`: the field is the address bar."""
     where = page or {}
+    if where.get("marker"):         # the run's own window with no page in it: not its data: address and random title
+        where = {"title": MARKER_TITLE, "url": MARKER_URL}
     context = {"用户原话": goal, "输入框": f"{field}：{FIELD_ADDRESS_BAR if address_bar else FIELD_OTHER}",
                "准备打的内容": text, "当前页面": " · ".join(x for x in (where.get("title"), where.get("url")) if x) or "不知道"}
     return _choice(ask, TYPING_QUESTION, _said(context, said), TYPING) or ASK

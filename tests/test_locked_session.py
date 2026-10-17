@@ -44,13 +44,20 @@ class ReadingTheSession(unittest.TestCase):
             (LOCKED, "locked"),
             ({"CGSSessionScreenIsLocked": 1}, "locked"),
             (UNLOCKED, "unlocked"),
-            ({}, "unlocked"),
             ({"CGSSessionScreenIsLocked": 0, "kCGSSessionOnConsoleKey": 1}, "unlocked"),
             ({"kCGSSessionOnConsoleKey": False}, "off_console"),
-            ({"CGSSessionScreenIsLocked": "maybe"}, None),     # a value that says nothing: can't tell
+            ({"CGSSessionScreenIsLocked": "maybe", "kCGSSessionOnConsoleKey": True}, None),   # says nothing
         ]:
             with with_session(info):
                 self.assertEqual(session.gui_session(), state, info)
+
+    def test_a_dictionary_without_the_console_key_is_cant_tell(self):
+        # The keys are undocumented. A dictionary this code does not know -- empty, or a macOS that renamed them --
+        # is never read as unlocked: that would bring the false success back.
+        for info in ({}, {"CGSSessionScreenIsLocked": False}, {"kCGSSessionUserNameKey": "someone"}):
+            with with_session(info):
+                self.assertIsNone(session.gui_session(), info)
+                self.assertIsNone(session.require_usable(), info)      # nothing raised either
 
     def test_an_unreadable_session_is_cant_tell_never_unlocked(self):
         def boom():
@@ -173,6 +180,18 @@ class LockedRun(unittest.TestCase):
         self.assertIn("nothing was staged", res.failure.detail)
         self.assertEqual(planner.turns, 0)
 
+    def test_each_run_counts_its_own_unread_states(self):
+        # The driver is reused across a task set's runs: a count left from the last run is not this one's.
+        scratch = Path(tempfile.mkdtemp())
+        with mock.patch.dict(sys.modules, {"Quartz": None}):
+            d = safari_with_no_window(scratch)
+            d.start(scratch)
+            d.observe()
+        self.assertGreaterEqual(d.state()["session_unread"], 1)
+        with with_session(LOCKED):
+            d.start(scratch)
+        self.assertEqual(d.state()["session_unread"], 0)
+
     def test_an_unlocked_session_is_unaffected(self):
         planner = Planner()
         res, driver = run_live(planner, [UNLOCKED])
@@ -182,7 +201,7 @@ class LockedRun(unittest.TestCase):
         self.assertEqual(driver.state()["session_unread"], 0)
 
     def test_an_unreadable_session_does_not_crash_or_stop_the_run(self):
-        for unreadable in (None, RuntimeError("window server unavailable"), {"CGSSessionScreenIsLocked": "?"}):
+        for unreadable in (None, RuntimeError("window server unavailable"), {"CGSSessionScreenIsLocked": "?"}, {}):
             planner = Planner()
             res, driver = run_live(planner, [unreadable])
             self.assertNotIn(res.failure.cls.value, ("harness_bug", "environment"), (unreadable, res.failure))

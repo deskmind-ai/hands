@@ -41,12 +41,14 @@ DONE = {
 #: A run that says DONE while no window of its app could be seen: there is no page to judge, and nothing on screen
 #: shows the result either. The run used to complete there by default: Safari, not in front, read as "no window open",
 #: and 「打开 Safari，搜索新加坡的天气」 ended completed in 4 s with no search made (deskmind#73, live 10-17). Two options:
-#: whether the result needed a window at all is for the model to say, from the request.
+#: whether the result needed a window at all is for the model to say, from the request and what the run did. The
+#: second option is its own: "结果本来就不在网页上" is always true of a document app, and would pass any of them (review).
+NO_WINDOW_NEEDED = "结果本来就不需要窗口"
 DONE_UNSEEN_QUESTION = ("任务执行完了，但助手最后看不到这个应用的任何窗口（见「看到的」），没法在屏幕上核对结果。"
-                        "根据用户原话，用户要的结果本该在这个应用的窗口里看到吗？")
+                        "根据用户原话和「助手做过的事」，用户要的结果本该留在这个应用的窗口里给用户看吗？")
 DONE_UNSEEN = {
-    NOT_SHOWN: "用户要的结果本该在窗口里看到，例如打开的网页、搜索结果、打开的文稿；现在一个窗口也没有，所以没做成。",
-    NOT_ON_A_PAGE: "用户要的结果本来就不需要窗口，例如写进了文件、发出了消息、改了设置、关掉了窗口或文稿。",
+    NOT_SHOWN: "用户要的结果本该在窗口里看到，例如打开的网页、搜索结果；现在一个窗口也没有，所以没做成。",
+    NO_WINDOW_NEEDED: "用户要的结果不需要留下窗口，例如写进并存好了文件、发出了消息、改了设置、按用户的要求关掉了窗口或文稿。",
 }
 
 #: The most page text a judgement is shown: enough to see a result, not the whole page.
@@ -102,8 +104,9 @@ def done(ask: AskChoice | None, goal: str, page: dict, said=()) -> str | None:
     return _choice(ask, DONE_QUESTION, _said(context, said), DONE)
 
 
-def done_unseen(ask: AskChoice | None, goal: str, app: str, said=()) -> str | None:
-    """没出来 / 结果本来就不在网页上 for a run finishing with no window of `app` seen, or None when there is no answer.
-    Only 没出来 holds a run back, as for a page."""
-    context = {"用户原话": goal, "看到的": f"{app}：没有打开的窗口，什么也看不到"}
+def done_unseen(ask: AskChoice | None, goal: str, app: str, said=(), done=()) -> str | None:
+    """没出来 / 结果本来就不需要窗口 for a run finishing with no window of `app` seen, or None when there is no answer.
+    Only 没出来 holds a run back, as for a page. `done`: what the run's last actions did, in the driver's words."""
+    context = {"用户原话": goal, "看到的": f"{app}：没有打开的窗口，什么也看不到",
+               "助手做过的事": "\n".join(done) or "什么也没做"}
     return _choice(ask, DONE_UNSEEN_QUESTION, _said(context, said), DONE_UNSEEN)

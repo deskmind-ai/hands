@@ -113,6 +113,35 @@ class Observed(unittest.TestCase):
         self.assertTrue(obs.no_window)
         self.assertEqual([w.id for w in obs.windows], ["7"])
 
+    def test_a_missing_window_index_is_the_lists_order(self):
+        d = safari([{**OWNER, "window_index": None}, {**TEST, "window_index": None}])
+        observe(d)
+        self.assertEqual(d._pinned_window, "19116")
+
+    def test_the_no_window_look_marks_no_window_current(self):
+        d = safari([OWNER])
+        d._window_id = "19085"                  # left from an earlier look
+        obs = observe(d)
+        self.assertIsNone(d._window_id)
+        self.assertEqual([w.id for w in obs.windows], [])
+
+    def test_a_document_app_picks_only_this_tasks_document(self):
+        # TextEdit not in front: the user's own document (open before the run) is never chosen, the task's is.
+        d = safari([{"window_id": 5, "window_title": "日记.txt", "window_index": 0, "is_on_screen": True},
+                    {"window_id": 6, "window_title": "parts.txt", "window_index": 1, "is_on_screen": True}],
+                   readable=("5", "6"))
+        d.app = d._home_app = "com.apple.textedit"
+        d._workspace_file_names, d._preexisting = (lambda: {"parts.txt", "日记.txt"}), {"5"}
+        observe(d)
+        self.assertEqual(d._pinned_window, "6")
+        self.assertNotIn(("see_window", "5"), d.calls)
+
+    def test_an_untitled_finder_window_is_not_chosen(self):
+        d = safari([{"window_id": 8, "window_title": "", "window_index": 0, "is_on_screen": True}], readable=("8",))
+        d.app = d._home_app = "com.apple.finder"
+        d._workspace_folder_names = lambda: {"ws"}
+        self.assertIsNone(d._window_to_observe())
+
     def test_the_trace_keeps_it(self):
         import json
         import tempfile
@@ -166,18 +195,47 @@ class DoneOnNothingSeen(unittest.TestCase):
 
     def test_a_result_that_needs_no_window_completes(self):
         # 「另存为 notes.txt，然后关掉文稿」 ends with no window by design: the judge says so and the run completes.
-        adapter = Judged([DONE], done=judge.NOT_ON_A_PAGE)
+        adapter = Judged([DONE], done=judge.NO_WINDOW_NEEDED)
         res, _, _ = run_unseen("把草稿另存为 notes.txt，然后关掉文稿", adapter, [DONE])
         self.assertEqual(res.state.value, "completed")
         self.assertEqual(len(adapter.asked), 1)
         self.assertFalse([s for s in res.steps if s.get("kind") == "done_blocked"])
 
     def test_the_two_options_only(self):
-        adapter = Judged([DONE], done=judge.NOT_ON_A_PAGE)
+        # Its own second option: "结果本来就不在网页上" is always true of a document app (review).
+        adapter = Judged([DONE], done=judge.NO_WINDOW_NEEDED)
         run_unseen("打开 Safari，搜索新加坡的天气", adapter, [DONE])
         self.assertNotIn(f"- {judge.SHOWN}:", adapter.asked[0])
+        self.assertNotIn(f"- {judge.NOT_ON_A_PAGE}:", adapter.asked[0])
         self.assertIn(f"- {judge.NOT_SHOWN}:", adapter.asked[0])
-        self.assertIn(f"- {judge.NOT_ON_A_PAGE}:", adapter.asked[0])
+        self.assertIn(f"- {judge.NO_WINDOW_NEEDED}:", adapter.asked[0])
+        self.assertIn("助手做过的事", adapter.asked[0])
+
+    def test_the_judge_is_told_what_the_run_did(self):
+        from deskmind_hands.runtime.loop import _what_was_done
+        steps = [{"describe": "type_text #t1", "ok": True, "detail": "typed 3 lines"},
+                 {"describe": "click #x", "ok": False, "detail": "refused"},
+                 {"kind": "judged"},
+                 {"describe": "close_document", "ok": True, "detail": "saved and closed 'notes.txt'"}]
+        self.assertEqual(_what_was_done(steps), ["type_text #t1：typed 3 lines",
+                                                 "close_document：saved and closed 'notes.txt'"])
+        prompt = []
+        judge.done_unseen(lambda p, s, o: prompt.append(p) or {"choice": judge.NO_WINDOW_NEEDED}, "g", "TextEdit",
+                          done=_what_was_done(steps))
+        self.assertIn("saved and closed 'notes.txt'", prompt[0])
+
+    def test_no_judgement_holds_nothing_back(self):
+        # The judge down: no verdict, and the run completes as it did (only 没出来 holds a run back).
+        res, _, _ = run_unseen("打开 Safari，搜索新加坡的天气", Judged([DONE], down=True), [DONE])
+        self.assertEqual(res.state.value, "completed")
+
+    def test_blocks_spent_by_another_check_then_no_window_needed_completes(self):
+        # done_check's own objections took both blocks; the final DONE on no window is judged once, and passes.
+        adapter = Judged([DONE] * 3, done=judge.NO_WINDOW_NEEDED)
+        adapter.done_objection = lambda ctx: "the file is not saved"
+        res, _, _ = run_unseen("把草稿另存为 notes.txt，然后关掉文稿", adapter, [DONE] * 3)
+        self.assertEqual(res.state.value, "completed")
+        self.assertEqual(len(adapter.asked), 1)
 
     def test_a_task_with_its_window_open_and_no_page_is_not_judged(self):
         # A non-web task that ends with its window on screen completes as before, without a judgement.

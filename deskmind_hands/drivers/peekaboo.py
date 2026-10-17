@@ -1448,8 +1448,10 @@ class PeekabooDriver:
         ok, data, _ = self._run("window_list", app=self.app)
         if not ok:
             return None
-        rows = [(w.get("window_index", i), wid) for i, (w, wid, _) in enumerate(self._own_windows(data))
-                if w.get("is_on_screen", True)]
+        rows = [(w.get("window_index") if isinstance(w.get("window_index"), int) else i, wid)
+                for i, (w, wid, title) in enumerate(self._own_windows(data))
+                # An untitled Finder window shows no folder this task can be sure of: listed, never chosen (review).
+                if w.get("is_on_screen", True) and (title or self.app.lower() != "com.apple.finder")]
         return min(rows)[1] if rows else None
 
     def _stage_finder_window(self) -> None:
@@ -1834,7 +1836,8 @@ class PeekabooDriver:
             if ok or not _transient_read(detail):
                 break
             if self._vision_app():
-                ok, data, detail = self._vision_capture(shot)   # no tree needed: the window's pixels are enough
+                # no tree needed: the window's pixels are enough
+                ok, data, detail = self._vision_capture(shot, self._pinned_window or chosen)
                 break
             self._incomplete_reads += 1
             if attempt == attempts:
@@ -1862,6 +1865,7 @@ class PeekabooDriver:
                 # comes back as an observation saying so rather than as an
                 # exception that would be scored as unavailability.
                 self._snapshot = None
+                self._window_id = None     # no window is the observed one now: none listed below is marked current
                 fallback = Size(1512, 982)
                 # Nothing open yet is where a request to open the folder's documents starts: they are still offered.
                 self._window_title = ""
@@ -2663,13 +2667,13 @@ class PeekabooDriver:
                                'first process whose frontmost is true'], capture_output=True, text=True,
                               timeout=10).stdout.strip()
 
-    def _vision_capture(self, shot: Path) -> tuple[bool, dict, str]:
+    def _vision_capture(self, shot: Path, wid: str | None = None) -> tuple[bool, dict, str]:
         """A screenshot of the pinned window without the accessibility read, for apps observed by their pixels.
         The music app's one-element tree sometimes came back "incomplete", and `see` then returned nothing at all: two
         runs ended as environment failures before their first step. `screencapture -l` takes a window by its id,
         in the background."""
         import Quartz
-        wid = self._pinned_window
+        wid = wid or self._pinned_window
         info = next((w for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID)
                      if str(w.get("kCGWindowNumber")) == str(wid)), None)
         if not wid or info is None:

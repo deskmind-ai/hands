@@ -41,14 +41,21 @@ DONE = {
 #: A run that says DONE while no window of its app could be seen: there is no page to judge, and nothing on screen
 #: shows the result either. The run used to complete there by default: Safari, not in front, read as "no window open",
 #: and 「打开 Safari，搜索新加坡的天气」 ended completed in 4 s with no search made (deskmind#73, live 10-17). Two options:
-#: whether the result needed a window at all is for the model to say, from the request and what the run did. The
-#: second option is its own: "结果本来就不在网页上" is always true of a document app, and would pass any of them (review).
+#: whether the run did what was asked and whether its result needed a window at all is for the model to say, from the
+#: request and what the run did. The second option is its own: "结果本来就不在网页上" is always true of a document app,
+#: and would pass any of them (review).
+#: Chosen on the 13 synthetic dev cases of the review of #42 against the app's local Brain (0.8B/4B): asked only
+#: whether the result should stay in a window, 没出来 first, 2/6 save-and-close cases passed and 6/7 that should fail
+#: failed; asked whether the steps did what was asked and whether the result then needs no window, 6/6 and 6/7 (7/7
+#: with the run guard in loop.py), the same in either order. Options go 不需要窗口 first.
 NO_WINDOW_NEEDED = "结果本来就不需要窗口"
-DONE_UNSEEN_QUESTION = ("任务执行完了，但助手最后看不到这个应用的任何窗口（见「看到的」），没法在屏幕上核对结果。"
-                        "根据用户原话和「助手做过的事」，用户要的结果本该留在这个应用的窗口里给用户看吗？")
+DONE_UNSEEN_QUESTION = ("任务执行完了，但助手最后看不到这个应用的任何窗口（见「看到的」）。对照用户原话和「助手做过的事」："
+                        "用户要的事做完了吗？做完以后，用户要的结果是不是本来就不需要留着窗口？")
 DONE_UNSEEN = {
-    NOT_SHOWN: "用户要的结果本该在窗口里看到，例如打开的网页、搜索结果；现在一个窗口也没有，所以没做成。",
-    NO_WINDOW_NEEDED: "用户要的结果不需要留下窗口，例如写进并存好了文件、发出了消息、改了设置、按用户的要求关掉了窗口或文稿。",
+    NO_WINDOW_NEEDED: "做完了，也不需要窗口：「助手做过的事」里有用户要的那几步（例如写进并存好了文件、关掉了窗口或文稿、"
+                      "发出了消息）。",
+    NOT_SHOWN: "没做完：「助手做过的事」里没有用户要的那几步，或者做的事和用户要的不一样；或者用户要的结果本该留在窗口里给用户看"
+               "（例如打开的网页、搜索结果、打开的文稿）。",
 }
 
 #: The most page text a judgement is shown: enough to see a result, not the whole page.

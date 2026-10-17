@@ -14,7 +14,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from deskmind_hands.drivers.base import Element   # noqa: E402
+from deskmind_hands.actions import ActionKind   # noqa: E402
+from deskmind_hands.drivers.base import Element, ExecResult   # noqa: E402
 from deskmind_hands.drivers.peekaboo import PeekabooDriver   # noqa: E402
 from deskmind_hands.geometry import Point   # noqa: E402
 from deskmind_hands.runtime import judge   # noqa: E402
@@ -257,6 +258,25 @@ class Observed(unittest.TestCase):
         self.assertTrue([e for e in obs.elements if e.id.startswith("ocr:")])
         self.assertFalse(obs.no_window)
 
+    def test_the_no_window_look_never_offers_a_put_away_window(self):
+        # A minimised TextEdit document (any app's, not only a browser's) is no place to send the planner (review).
+        d = safari([OWNER])
+        d._mcp, d._stage_apps = object(), ["TextEdit"]
+        d._workspace_file_names = lambda: {"parts.txt", "notes.txt"}
+        d._preexisting = set()
+        base = d._run
+
+        def run_(key, _extra=None, **kw):
+            if key == "window_list" and kw.get("app") == "com.apple.TextEdit":
+                return True, {"windows": [{"window_id": 7, "window_title": "parts.txt", "is_on_screen": True},
+                                          {"window_id": 8, "window_title": "notes.txt", "is_on_screen": False}]}, ""
+            return base(key, _extra, **kw)
+
+        d._run = run_
+        obs = observe(d)
+        self.assertTrue(obs.no_window)
+        self.assertEqual([w.id for w in obs.windows], ["7"])
+
     def test_the_trace_keeps_it(self):
         import json
         import tempfile
@@ -285,10 +305,22 @@ class NoWindowBrowser(Browser):
 
     app = "com.apple.Safari"
 
+    presses = 0
+
     def observe(self):
         obs = super().observe()
+        # Nothing to read but the picture, which a step that went through changes (the closed document is gone).
         return dataclasses.replace(obs, elements=[], windows=[], focused_app="com.apple.Safari (no window open)",
-                                   accepts_keys=False, no_window=True)
+                                   accepts_keys=False, no_window=True, screenshot_png=b"after %d" % self.presses)
+
+    def execute(self, action):
+        if action.kind is ActionKind.KEY:       # the save-and-close, as a step that went through
+            self.presses += 1
+            return ExecResult(True, f"pressed {action.keys}: saved and closed 'notes.txt'")
+        return super().execute(action)
+
+
+SAVE_CLOSE = {"kind": "key", "keys": "cmd+s"}
 
 
 def run_unseen(goal, adapter, actions, done_check=True):
@@ -325,11 +357,42 @@ class DoneOnNothingSeen(unittest.TestCase):
 
     def test_a_result_that_needs_no_window_completes(self):
         # 「另存为 notes.txt，然后关掉文稿」 ends with no window by design: the judge says so and the run completes.
-        adapter = Judged([DONE], done=judge.NO_WINDOW_NEEDED)
-        res, _, _ = run_unseen("把草稿另存为 notes.txt，然后关掉文稿", adapter, [DONE])
+        adapter = Judged([SAVE_CLOSE, DONE], done=judge.NO_WINDOW_NEEDED)
+        res, _, _ = run_unseen("把草稿另存为 notes.txt，然后关掉文稿", adapter, [SAVE_CLOSE, DONE])
         self.assertEqual(res.state.value, "completed")
         self.assertEqual(len(adapter.asked), 1)
         self.assertFalse([s for s in res.steps if s.get("kind") == "done_blocked"])
+
+    def test_no_window_needed_before_anything_was_done_is_not_taken(self):
+        # 「在 notes.txt 末尾加一行「明天开会」，保存后关闭」, DONE on the first look: the judge said the result needs no
+        # window, and the run completed with nothing written (review of #42). Taken as no answer: held once, then
+        # unverified.
+        adapter = Judged([DONE] * 3, done=judge.NO_WINDOW_NEEDED)
+        res, _, _ = run_unseen("在 notes.txt 末尾加一行「明天开会」，保存后关闭", adapter, [DONE] * 3)
+        self.assertNotEqual(res.state.value, "completed")
+        self.assertEqual(res.metrics.actions, 0)
+        blocked = [s["text"] for s in res.steps if s.get("kind") == "done_blocked"]
+        self.assertIn("no step of this run has gone through", blocked[0])
+        judged = [s for s in res.steps if s.get("kind") == "judged"]
+        self.assertTrue(judged and judged[0].get("not_taken"))
+
+    def test_not_shown_says_check_never_do_it_again(self):
+        # Told to "do it there", a run that had appended its line and closed the document would append it again.
+        adapter = Judged([SAVE_CLOSE, DONE, DONE], done=judge.NOT_SHOWN)
+        res, _, _ = run_unseen("在 notes.txt 末尾加一行「明天开会」，保存后关闭", adapter, [SAVE_CLOSE, DONE, DONE])
+        blocked = [s["text"] for s in res.steps if s.get("kind") == "done_blocked"]
+        self.assertIn("check whether it was done", blocked[0])
+        self.assertNotIn("do it there", blocked[0])
+
+    def test_a_page_on_an_empty_look_and_a_silent_judge_is_not_completed(self):
+        # The look read nothing (no_window) but a page is attached; the judge is down: unverified, not completed.
+        with mock.patch("test_judge.Browser", NoWindowBrowser):
+            from test_judge import CONSOLE
+            res, _, _ = run("打开 Safari，搜索新加坡的天气", [DONE] * 3, Judged([DONE] * 3, down=True), page=CONSOLE,
+                            done_check=True)
+        self.assertNotEqual(res.state.value, "completed")
+        self.assertTrue([s for s in res.steps if s.get("kind") == "done_blocked"
+                         and "could not be confirmed" in s["text"]])
 
     def test_the_two_options_only(self):
         # Its own second option: "结果本来就不在网页上" is always true of a document app (review).
@@ -340,6 +403,12 @@ class DoneOnNothingSeen(unittest.TestCase):
         self.assertIn(f"- {judge.NOT_SHOWN}:", adapter.asked[0])
         self.assertIn(f"- {judge.NO_WINDOW_NEEDED}:", adapter.asked[0])
         self.assertIn("助手做过的事", adapter.asked[0])
+
+    def test_the_options_go_no_window_needed_first_and_ask_what_was_done(self):
+        # The local Brain mostly took the option in first place: 没出来 first, 2 of 6 save-and-close runs passed (dev set,
+        # review of #42). Asked whether the steps did what was asked, 6/6 and 7/7 with the run guard, either order.
+        self.assertEqual(list(judge.DONE_UNSEEN), [judge.NO_WINDOW_NEEDED, judge.NOT_SHOWN])
+        self.assertIn("做完了吗", judge.DONE_UNSEEN_QUESTION)
 
     def test_the_judge_is_told_what_the_run_did(self):
         from deskmind_hands.runtime.loop import _what_was_done
@@ -454,15 +523,15 @@ class DoneOnNothingSeen(unittest.TestCase):
         self.assertIsNone(getattr(HybridAdapter(object(), object()), "judge_choice", None))
 
     def test_a_later_answer_replaces_an_earlier_not_shown(self):
-        adapter = Sequenced([DONE] * 2, [judge.NOT_SHOWN, judge.NO_WINDOW_NEEDED])
-        res, _, _ = run_unseen("把草稿另存为 notes.txt，然后关掉文稿", adapter, [DONE] * 2)
+        adapter = Sequenced([DONE, SAVE_CLOSE, DONE], [judge.NOT_SHOWN, judge.NO_WINDOW_NEEDED])
+        res, _, _ = run_unseen("把草稿另存为 notes.txt，然后关掉文稿", adapter, [DONE, SAVE_CLOSE, DONE])
         self.assertEqual(res.state.value, "completed")
 
     def test_blocks_spent_by_another_check_then_no_window_needed_completes(self):
         # done_check's own objections took both blocks; the final DONE on no window is judged once, and passes.
-        adapter = Judged([DONE] * 3, done=judge.NO_WINDOW_NEEDED)
+        adapter = Judged([DONE, DONE, SAVE_CLOSE, DONE], done=judge.NO_WINDOW_NEEDED)
         adapter.done_objection = lambda ctx: "the file is not saved"
-        res, _, _ = run_unseen("把草稿另存为 notes.txt，然后关掉文稿", adapter, [DONE] * 3)
+        res, _, _ = run_unseen("把草稿另存为 notes.txt，然后关掉文稿", adapter, [DONE, DONE, SAVE_CLOSE, DONE])
         self.assertEqual(res.state.value, "completed")
         self.assertEqual(len(adapter.asked), 1)
 

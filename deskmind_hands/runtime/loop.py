@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from ..actions import Action, ActionKind, DIALOGUE, TERMINAL
+from ..actions import MUTATING, Action, ActionKind, DIALOGUE, TERMINAL
 from ..drivers.base import Driver, DriverUnavailable, ExecResult, Observation, classify_effect
 from ..errors import Kind, classify
 from .. import done_check
@@ -276,8 +276,16 @@ def _users_words(dialogue: list[dict]) -> list[tuple[str, str]]:
 
 #: Why a DONE with no window seen is held back when the judge gave no answer: nothing on screen confirms it, and
 #: nothing judged it either. The safe side, as for typing into the address bar with no answer (review of #42).
-UNVERIFIED = ("nothing of {app} can be seen and whether the goal is done could not be confirmed: open or switch to the "
-              "window where it is done and finish there, or stop if it cannot be done.")
+UNVERIFIED = ("nothing of {app} can be seen and whether the goal is done could not be confirmed: check whether it was "
+              "done, from the steps so far, or stop if it cannot be done.")
+#: The judge's 没出来 with no window seen. It says to check, never to do it again: told to "do it there", a run that
+#: had appended its line and closed the document would append it a second time (review of #42).
+UNSEEN_NOT_SHOWN = ("no window of {app} can be seen, so nothing on screen shows the goal's result: check whether it "
+                    "was done, from the steps so far.")
+#: The judge's 结果本来就不需要窗口 before any step of the run went through: a result that needs no window is still one
+#: the run produced, and nothing did (review of #42: a DONE on the first look completed with nothing written).
+NOTHING_DONE = ("no window of {app} can be seen and no step of this run has gone through yet, so nothing shows the "
+                "goal is done: check whether it was done, or stop if it cannot be done.")
 
 
 def _page_objection(task: Task, driver, adapter, said=(), obs=None, steps=(),
@@ -306,19 +314,33 @@ def _page_objection(task: Task, driver, adapter, said=(), obs=None, steps=(),
         app = str(getattr(driver, "app", "") or "")
         verdict = judge.done_unseen(ask_fn, task.goal, app, said, _what_was_done(steps)) if ask else None
         silent = verdict is None
-        kept = silent and held
+        # Needing no window is taken only from a run that did something: with no step gone through it is no answer.
+        unbacked = verdict == judge.NO_WINDOW_NEEDED and not _acted(steps)
+        if unbacked:
+            verdict = None
+        kept = verdict is None and held
         if kept:
             verdict = judge.NOT_SHOWN
-        why = (f"no window of {app} can be seen, so nothing shows what the goal asks for: open or switch to the window "
-               f"where it is done, and do it there." if verdict == judge.NOT_SHOWN
-               else UNVERIFIED.format(app=app) if verdict is None else None)
-        marks = {**({"kept": True} if kept else {}), **({"silent": True} if silent else {})}
+        why = (UNSEEN_NOT_SHOWN.format(app=app) if verdict == judge.NOT_SHOWN
+               else (NOTHING_DONE if unbacked else UNVERIFIED).format(app=app) if verdict is None else None)
+        marks = {**({"kept": True} if kept else {}), **({"silent": True} if silent else {}),
+                 **({"unbacked": judge.NO_WINDOW_NEEDED} if unbacked else {})}
         return {"app": app, "no_window": True, **marks}, verdict, why
     verdict = judge.done(getattr(adapter, "judge_choice", None), task.goal, page, said)
+    if verdict is None and getattr(obs, "no_window", False) and callable(getattr(adapter, "judge_choice", None)):
+        # A page, but the look itself read nothing (no_window): no answer is not a pass here either (review of #42).
+        app = str(getattr(driver, "app", "") or "")
+        return {**page, "no_window": True, "silent": True}, None, UNVERIFIED.format(app=app)
     if verdict != judge.NOT_SHOWN:
         return page, verdict, None
     return page, verdict, (f"the page ({page.get('url')}, {page.get('title') or 'no title'}) does not show what the "
                            f"goal asks for: check what was done, and do it where it gives that result.")
+
+
+def _acted(steps) -> bool:
+    """Whether any step of the run that changes something went through (a click, typing, a key, ...)."""
+    kinds = {k.value for k in MUTATING}
+    return any(s.get("ok") and not s.get("deferred") and (s.get("action") or {}).get("kind") in kinds for s in steps)
 
 
 def _what_was_done(steps, last: int = 6) -> list[str]:
@@ -369,11 +391,14 @@ def _judged_about(page: dict) -> str:
     return "result_no_window" if page.get("no_window") else "result_on_page"
 
 
-def _judged_entry(n: int, page: dict, verdict: str, **extra) -> dict:
+def _judged_entry(n: int, page: dict, verdict: str | None, **extra) -> dict:
     """The trace step for a done judgement: the page's address, or no window; `kept` when no answer left an earlier
-    没出来 standing."""
-    return {"n": n, "kind": "judged", "about": _judged_about(page), "verdict": verdict, "url": page.get("url"),
-            "title": page.get("title"), "by": "harness", **({"kept": True} if page.get("kept") else {}), **extra}
+    没出来 standing; `not_taken` when the judge's 结果本来就不需要窗口 came before any step went through."""
+    unbacked = page.get("unbacked")
+    return {"n": n, "kind": "judged", "about": _judged_about(page), "verdict": verdict or unbacked,
+            "url": page.get("url"), "title": page.get("title"), "by": "harness",
+            **({"kept": True} if page.get("kept") else {}),
+            **({"not_taken": "no step of the run has gone through"} if unbacked else {}), **extra}
 
 
 def _target_label(obs, action) -> str | None:
@@ -728,7 +753,7 @@ def run_task(
                     last_page_verdict = verdict
                     unseen_held, judge_silent = _remember_unseen(page, verdict, key, unseen_held, judge_silent)
                     unverified = bool(page.get("no_window")) and verdict is None
-                    if verdict:
+                    if verdict or page.get("unbacked"):
                         entry = _judged_entry(len(steps) + 1, page, verdict)
                         steps.append(entry)
                         if recorder:
@@ -758,7 +783,7 @@ def run_task(
                                               held=unseen_held == key, ask=not judge_silent)
                 unseen_held, judge_silent = _remember_unseen(verdict_now[0], verdict_now[1], key, unseen_held,
                                                              judge_silent)
-                if verdict_now[1]:
+                if verdict_now[1] or verdict_now[0].get("unbacked"):
                     steps.append(_judged_entry(len(steps) + 1, verdict_now[0], verdict_now[1], final=True))
                     if recorder:
                         recorder.step(steps[-1])

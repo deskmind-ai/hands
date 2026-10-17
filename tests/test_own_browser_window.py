@@ -189,7 +189,7 @@ class FakeMac:
 
 
 class OwnWindow(unittest.TestCase):
-    def mac(self, mac: FakeMac, *, app=SAFARI, stage=("open -b com.apple.Safari",), stage_apps=None):
+    def mac(self, mac: FakeMac, *, app=SAFARI, stage=("open -b com.apple.Safari",), stage_apps=None, ws=None):
         """The driver as `hands do --app com.apple.Safari` builds it, started on `mac`."""
         self.scratch = Path(tempfile.mkdtemp())
         (self.scratch / "ws").mkdir()
@@ -209,7 +209,8 @@ class OwnWindow(unittest.TestCase):
         d._frontmost = lambda: "Finder"
         d._sparse_tree = lambda data: False
         d._element_cache = lambda data, origin: setattr(d, "_real_read", 1) or []
-        d.start(self.scratch / "ws")
+        d.start(ws or self.scratch / "ws")
+        self.addCleanup(lambda: d._stop_page_server() if hasattr(d, "_stop_page_server") else None)
         return d
 
     def reads(self, mac):
@@ -808,6 +809,65 @@ class OwnWindow(unittest.TestCase):
         self.assertTrue(d.execute(Action(kind=ActionKind.FOCUS_APP, text=SAFARI)).ok)
         self.assertIn("does not open file:// pages", d.state()["own_browser_miss"])
         self.assertTrue(any("http://127.0.0.1" in n for n in d.observe().notes))
+
+    # -- G03 unchanged: a staged local page served by hands itself ------------------------------------------------
+
+    def test_g03s_staging_line_ends_on_the_served_page_and_the_server_stops(self):
+        import urllib.request
+        mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1200, 800)}])
+        ws = Path(tempfile.mkdtemp())
+        (ws / "page.html").write_text("<table><tr><td>SKU-9032</td></tr></table>", encoding="utf-8")
+        d = self.mac(mac, stage=('open -a TextEdit "$WS/inventory.csv"', 'open -a Safari "$WS/page.html"'),
+                     ws=ws)
+        url = mac.find(d._pinned_window)["url"]
+        self.assertRegex(url, r"^http://127\.0\.0\.1:\d+/page\.html$")
+        self.assertEqual(d.state()["own_browser_miss"], "")
+        with urllib.request.urlopen(url, timeout=5) as r:            # the page itself, as Safari would get it
+            self.assertIn("SKU-9032", r.read().decode())
+        self.assertFalse([e for e in mac.events if e[0] == "open" and "Safari" in " ".join(e[1])])   # TextEdit's only
+        d.close()
+        with self.assertRaises(OSError):
+            urllib.request.urlopen(url, timeout=2)
+        self.assertIsNone(d._page_server)
+
+    def test_a_missing_page_is_said_it_could_not_be_served(self):
+        mac = FakeMac()
+        d = self.mac(mac, stage=('open -a Safari "$WS/page.html"',))     # no page.html in the folder
+        self.assertIn("could not be served", d.state()["own_browser_miss"])
+        self.assertIsNone(getattr(d, "_page_server", None))
+
+
+class PageServing(unittest.TestCase):
+    def setUp(self):
+        base = Path(tempfile.mkdtemp())
+        self.folder, self.secret = base / "ws", base / "secret.txt"
+        self.folder.mkdir()
+        (self.folder / "page.html").write_text("ok", encoding="utf-8")
+        (self.folder / "sub").mkdir()
+        self.secret.write_text("SECRET", encoding="utf-8")
+        (self.folder / "link.txt").symlink_to(self.secret)
+        self.server = pk.PageServer(self.folder)
+        self.addCleanup(self.server.close)
+
+    def get(self, path):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=5)
+        c.request("GET", path)
+        r = c.getresponse()
+        return r.status, r.read().decode(errors="replace")
+
+    def test_only_127_0_0_1(self):
+        self.assertEqual(self.server.httpd.server_address[0], "127.0.0.1")
+
+    def test_the_page_is_served(self):
+        self.assertEqual(self.get("/page.html"), (200, "ok"))
+
+    def test_no_path_leaves_the_folder(self):
+        for path in ("/../secret.txt", "/%2e%2e/secret.txt", "/sub/../../secret.txt", "/link.txt", "//etc/passwd",
+                     "/..%2fsecret.txt", "/", "/sub/"):
+            status, body = self.get(path)
+            self.assertEqual(status, 404, path)
+            self.assertNotIn("SECRET", body, path)
 
 
 class Parsing(unittest.TestCase):

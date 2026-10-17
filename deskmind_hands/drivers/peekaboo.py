@@ -115,6 +115,54 @@ def _new_window_script(bundle: str, url: str = "", marker: str = "") -> str | No
     return None
 
 
+class PageServer:
+    """One folder served over http on 127.0.0.1 only, on a free port, from a thread of this process: a staged local
+    page reaches the run's Safari window as http://127.0.0.1:<port>/<file>, since Safari does not open file:// pages
+    sent by script (live 10-17). Only files inside the folder are served (a path that leaves it, by .. or a link, is a
+    404), no folder is listed, and nothing is logged to stdout, which carries the run's protocol lines."""
+
+    def __init__(self, folder: Path) -> None:
+        import http.server
+        import threading
+        root = Path(os.path.realpath(str(folder)))
+
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, directory=str(root), **kw)
+
+            def send_head(self):
+                # Only a file inside the folder, after links are followed; a folder itself is not listed either.
+                p = Path(os.path.realpath(self.translate_path(self.path)))
+                if root not in p.parents or not p.is_file():
+                    self.send_error(404)
+                    return None
+                return super().send_head()
+
+            def list_directory(self, path):
+                self.send_error(404)
+                return None
+
+            def log_message(self, *args):
+                pass
+
+        self.root = root
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, name="hands-page-server", daemon=True)
+        self.thread.start()
+
+    def url(self, file: Path) -> str:
+        from urllib.parse import quote
+        rel = Path(os.path.realpath(str(file))).relative_to(self.root)
+        return f"http://127.0.0.1:{self.port}/{quote(rel.as_posix())}"
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+
 #: Where a person allows one app to control another, said the way System Settings shows it.
 #: The helper is listed there, and in macOS's prompt, as "DeskMind Hands" (not the app, "DeskMind").
 AUTOMATION_SETTING = "System Settings › Privacy & Security › Automation › DeskMind Hands › {app}"
@@ -889,6 +937,7 @@ class PeekabooDriver:
         self._run_windows: set[str] = set()
         self._own_browser_wanted: set[str] = set()
         self._pending_url: dict[str, str] = {}
+        self._stop_page_server()            # a reused driver (a task set): the last run's page is not this one's
         self._load_misses: dict[str, str] = {}
         self._own_browser_retried = False
         #: Finder windows open before staging: a staged folder's window is one that was not there before. Title and
@@ -1188,8 +1237,8 @@ class PeekabooDriver:
     #: Why a staged file:// page is not opened (live 10-17): Safari takes `set URL` to a file:// page, answers success,
     #: and stays where it was; `make new document` on one gives an empty 「未命名」 window. `open -a Safari <file>` is not
     #: a way round it: it opens the file in a tab of the front window, which can be the user's.
-    FILE_PAGE_MISS = ("Safari does not open file:// pages sent by script, so {url} was not loaded; serve the page over "
-                      "http://127.0.0.1 instead")
+    FILE_PAGE_MISS = ("Safari does not open file:// pages sent by script, and {url} could not be served over "
+                      "http://127.0.0.1 either ({why}), so it was not loaded")
 
     def _load_in_own_window(self, wid: str, url: str) -> bool:
         """Load `url` in the run's own Safari window, found by its id (the window server's, which Safari's is), and
@@ -1197,8 +1246,11 @@ class PeekabooDriver:
         whether or not anything loads (live 10-17). A file:// page is not tried (FILE_PAGE_MISS). A load that does not
         go is kept as Safari's miss, which every look of it carries in its notes; the window stays the run's."""
         if url.lower().startswith("file:"):
-            self._load_miss(self.FILE_PAGE_MISS.format(url=url))
-            return False
+            served = self._serve_page(url)
+            if served.startswith("!"):
+                self._load_miss(self.FILE_PAGE_MISS.format(url=url, why=served[1:]))
+                return False
+            url = served                        # the same page, over http from this process (PageServer)
         u = url.replace("\\", "\\\\").replace('"', '\\"')
         target = f'current tab of window id {int(wid)}'
         ok, out = self._osa(f'tell application id "com.apple.Safari" to set URL of {target} to "{u}"')
@@ -1215,6 +1267,30 @@ class PeekabooDriver:
         self._load_miss(f"Safari: the run's window opened, but {url} could not be loaded in it "
                         f"(it stayed on its first page)")
         return False
+
+    def _serve_page(self, url: str) -> str:
+        """The http://127.0.0.1 URL a staged local page is served at (PageServer, started here for its folder), or
+        "!<why not>": no such file, or no server could be started."""
+        from urllib.parse import urlparse
+        from urllib.request import url2pathname
+        path = Path(url2pathname(urlparse(url).path))
+        if not path.is_file():
+            return f"!there is no file {path}"
+        self._stop_page_server()
+        try:
+            self._page_server = PageServer(path.parent)
+            return self._page_server.url(path)
+        except (OSError, ValueError) as exc:
+            self._page_server = None
+            return f"!{exc}"
+
+    def _stop_page_server(self) -> None:
+        server, self._page_server = getattr(self, "_page_server", None), None
+        if server is not None:
+            try:
+                server.close()
+            except Exception:   # noqa: BLE001 -- a server that will not stop is a daemon thread; the process ends it
+                pass
 
     def _load_miss(self, why: str) -> None:
         """Why the staged page is not in the run's Safari window: Safari's miss, kept apart so that a window made later
@@ -1989,6 +2065,8 @@ class PeekabooDriver:
         self._pinned_window = wid
 
     def close(self) -> None:
+        # The page server of a staged local page: stopped first, so nothing below that fails can leave it running.
+        self._stop_page_server()
         # Close only what this driver opened. Leaving them behind poisons the
         # next run's focus and, on a developer's own machine, is just litter.
         if self._staged_window:

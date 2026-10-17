@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from ..actions import Action, ActionKind, DIALOGUE, TERMINAL
+from ..actions import MUTATING, Action, ActionKind, DIALOGUE, TERMINAL
 from ..drivers.base import Driver, DriverUnavailable, ExecResult, Observation, classify_effect
 from ..errors import Kind, classify
 from .. import done_check
@@ -130,6 +130,10 @@ class RunResult:
     #: disturbing you" is a product claim, and it was being counted and then thrown away: the report only showed
     #: it by grepping step details for the word "foreground".
     driver_state: dict = field(default_factory=dict)
+    #: Which of the harness's own checks this run had, where that depends on the configuration: the judgement of a DONE
+    #: with no window seen needs an adapter that can judge (judge_choice), and one that cannot keeps the behaviour from
+    #: before that check, said here rather than scored as anything (review of #42).
+    checks: dict = field(default_factory=dict)
 
     @property
     def strict(self) -> bool:
@@ -147,6 +151,7 @@ class RunResult:
             "adapter_usage": self.adapter_usage,
             "driver_state": self.driver_state,
             "dialogue": self.dialogue,
+            **({"checks": self.checks} if self.checks else {}),
         }
 
 
@@ -240,18 +245,136 @@ def _users_words(dialogue: list[dict]) -> list[tuple[str, str]]:
     return [(d["question"], d["reply"]) for d in dialogue if d.get("by") != "harness"]
 
 
-def _page_objection(task: Task, driver, adapter, said=()) -> tuple[dict, str | None, str | None]:
+#: Why a DONE with no window seen is held back when the judge gave no answer: nothing on screen confirms it, and
+#: nothing judged it either. The safe side, as for typing into the address bar with no answer (review of #42).
+UNVERIFIED = ("nothing of {app} can be seen and whether the goal is done could not be confirmed: check whether it was "
+              "done, from the steps so far, or stop if it cannot be done.")
+#: The judge's 没出来 with no window seen. It says to check, never to do it again: told to "do it there", a run that
+#: had appended its line and closed the document would append it a second time (review of #42).
+UNSEEN_NOT_SHOWN = ("no window of {app} can be seen, so nothing on screen shows the goal's result: check whether it "
+                    "was done, from the steps so far.")
+#: The judge's 结果本来就不需要窗口 before any step of the run went through: a result that needs no window is still one
+#: the run produced, and nothing did (review of #42: a DONE on the first look completed with nothing written).
+NOTHING_DONE = ("no window of {app} can be seen and no step of this run has gone through yet, so nothing shows the "
+                "goal is done: check whether it was done, or stop if it cannot be done.")
+
+
+def _page_objection(task: Task, driver, adapter, said=(), obs=None, steps=(),
+                    held: bool = False, ask: bool = True) -> tuple[dict, str | None, str | None]:
     """Whether a run finishing on a web page is done, as a model judged it (runtime/judge.py): (the page, the verdict,
     why it is not done). No verdict when the app shows no web page or there is no judgement -- this never holds a run
-    back on its own. Only http(s) and file pages: a mail message is a web area too, and is no result page."""
+    back on its own. Only http(s) and file pages: a mail message is a web area too, and is no result page.
+
+    Finishing with no window of the app seen (`obs.no_window`) is judged too: there is no page, and nothing on screen
+    shows the result either. Skipped as "no page", Safari read as "no window open" while it was not in front, and a
+    web search ended completed in 4 s with none made (deskmind#73, live 10-17). The judge is told what the run's
+    last actions did (`steps`): a document saved and then closed needs no window, and only that says so.
+
+    With no window seen, no answer is not a pass: an earlier 没出来 on this same look stands (`held`), and otherwise the
+    verdict stays None with a reason, for the caller to hold the DONE back and, insisted on, end the run unverified.
+    A judge that gave no answer once is not asked again (`ask`), and the page says the judge was silent. An adapter
+    that cannot judge at all (no judge_choice) keeps the behaviour from before this check: no verdict, no hold (the
+    run records it in RunResult.checks); a missing capability is not the planner's failure (review of #42)."""
     page = getattr(driver, "page_info", lambda: None)() or {}
     if not str(page.get("url") or "").startswith(("http://", "https://", "file:")):
-        return page, None, None
+        if not getattr(obs, "no_window", False):
+            return page, None, None
+        ask_fn = getattr(adapter, "judge_choice", None)
+        if not callable(ask_fn):
+            return page, None, None
+        app = str(getattr(driver, "app", "") or "")
+        acted = _acted(steps)
+        # A run that changed nothing is asked whether the state was already there (judge.ALREADY), not whether it
+        # did it.
+        verdict = judge.done_unseen(ask_fn, task.goal, app, said, _what_was_done(steps), acted=acted) if ask else None
+        silent = verdict is None
+        # Needing no window is taken only from a run that did something: with no step gone through it is no answer.
+        unbacked = verdict == judge.NO_WINDOW_NEEDED and not acted
+        if unbacked:
+            verdict = None
+        kept = verdict is None and held
+        if kept:
+            verdict = judge.NOT_SHOWN
+        why = (UNSEEN_NOT_SHOWN.format(app=app) if verdict == judge.NOT_SHOWN
+               else (NOTHING_DONE if unbacked else UNVERIFIED).format(app=app) if verdict is None else None)
+        marks = {**({"kept": True} if kept else {}), **({"silent": True} if silent else {}),
+                 **({"unbacked": judge.NO_WINDOW_NEEDED} if unbacked else {})}
+        return {"app": app, "no_window": True, **marks}, verdict, why
     verdict = judge.done(getattr(adapter, "judge_choice", None), task.goal, page, said)
+    if verdict is None and getattr(obs, "no_window", False) and callable(getattr(adapter, "judge_choice", None)):
+        # A page, but the look itself read nothing (no_window): no answer is not a pass here either (review of #42).
+        app = str(getattr(driver, "app", "") or "")
+        return {**page, "no_window": True, "silent": True}, None, UNVERIFIED.format(app=app)
     if verdict != judge.NOT_SHOWN:
         return page, verdict, None
     return page, verdict, (f"the page ({page.get('url')}, {page.get('title') or 'no title'}) does not show what the "
                            f"goal asks for: check what was done, and do it where it gives that result.")
+
+
+def _acted(steps) -> bool:
+    """Whether any step of the run that changes something went through (a click, typing, a key, ...): as the idle
+    count has it (a mutating step, carried out, its outcome known), and a scroll changes nothing (review of #42)."""
+    kinds = {k.value for k in MUTATING} - {ActionKind.SCROLL.value}
+    return any(s.get("ok") and not s.get("deferred") and not s.get("indeterminate")
+               and (s.get("action") or {}).get("kind") in kinds for s in steps)
+
+
+def _what_was_done(steps, last: int = 6) -> list[str]:
+    """The run's last actions that went through, each as the driver reported it, oldest first."""
+    acted = [s for s in steps if s.get("describe") and s.get("ok")]
+    return [f"{s['describe']}：{str(s.get('detail') or '')[:160]}" for s in acted[-last:]]
+
+
+def _remember_unseen(page: dict, verdict: str | None, key: tuple, held: tuple | None,
+                     silent: bool) -> tuple[tuple | None, bool]:
+    """What a done judgement leaves for the next one: the look a no-window 没出来 was given on (`key`: its digest and
+    the actions taken so far), so that no answer later keeps it only while nothing has changed since -- a 没出来, then
+    a save-and-close that went through, then a timed-out judge ended the run as a false completion (review of #42);
+    and whether a judge has been silent. A DONE judged on anything else drops the 没出来."""
+    if not page.get("no_window"):
+        return None, silent
+    silent = silent or bool(page.get("silent"))
+    if verdict == judge.NOT_SHOWN:
+        return key, silent
+    return (None if verdict is not None else held), silent
+
+
+def _look_key(obs, m, dialogue) -> tuple:
+    """What a no-window 没出来 is bound to: the look (its digest), the actions taken, and what the user has said. A
+    reply after it (「不用打开网页了，保持窗口关闭即可」) changes the request it judged, and a later no answer must not
+    bring it back (review of #42)."""
+    return obs.digest(), m.actions, len(_users_words(dialogue))
+
+
+def _unverified(steps: list, obs, why: str, recorder) -> Failure:
+    """The end of a run whose DONE, with no window seen, nothing could confirm: never completed (review of #42)."""
+    steps.append({"n": len(steps) + 1, "obs": obs.id, "kind": "done_unverified", "text": f"not verified: {why}",
+                  "by": "harness"})
+    if recorder:
+        recorder.step(steps[-1])
+    return Failure(FailureClass.PLANNING, f"not verified: {why}", auto=True)
+
+
+def _require_session(driver) -> None:
+    """The driver's check that the GUI session can be seen and used (drivers/session.py), where it has one."""
+    check = getattr(driver, "require_session", None)
+    if callable(check):
+        check()
+
+
+def _judged_about(page: dict) -> str:
+    """What a done judgement was about, for the trace: the page the run finished on, or no window at all."""
+    return "result_no_window" if page.get("no_window") else "result_on_page"
+
+
+def _judged_entry(n: int, page: dict, verdict: str | None, **extra) -> dict:
+    """The trace step for a done judgement: the page's address, or no window; `kept` when no answer left an earlier
+    没出来 standing; `not_taken` when the judge's 结果本来就不需要窗口 came before any step went through."""
+    unbacked = page.get("unbacked")
+    return {"n": n, "kind": "judged", "about": _judged_about(page), "verdict": verdict or unbacked,
+            "url": page.get("url"), "title": page.get("title"), "by": "harness",
+            **({"kept": True} if page.get("kept") else {}),
+            **({"not_taken": "no step of the run has gone through"} if unbacked else {}), **extra}
 
 
 def _target_label(obs, action) -> str | None:
@@ -287,6 +410,10 @@ def run_task(
     # (kind, app, step count, a dialog was up) of the last approval: what its confirmation must match
     just_approved: tuple[str, str, int, bool] | None = None
     last_page_verdict: str | None = None          # the last judgement of a page the run finished on (judge.done)
+    unseen_held: tuple | None = None              # the look a no-window 没出来 was given on (_remember_unseen)
+    judge_silent = False                          # a no-window judgement got no answer: not asked again
+    unverified_told = False                       # a DONE with no window seen and no judgement was held back once
+    checks: dict = {}
     fired: set[int] = set()
     state = RunState.PREPARING
     failure = Failure(FailureClass.NONE)
@@ -308,6 +435,11 @@ def run_task(
     except AttributeError:
         pass
     driver.start(workspace.ws)
+    if done_check.enabled():
+        who = getattr(adapter, "name", type(adapter).__name__)
+        checks["no_window_judge"] = ("on" if callable(getattr(adapter, "judge_choice", None)) else
+                                     f"off: the {who} adapter cannot judge; a DONE with no window seen is taken as "
+                                     f"before")
 
     # Injections with no trigger point are environment preconditions (seeding a
     # clipboard sentinel, for instance) and fire before the agent sees anything.
@@ -531,20 +663,33 @@ def run_task(
                     recorder.step(entry)
                 continue
 
+            if action.kind is ActionKind.DONE:
+                # The screen can lock between the look and the DONE: nothing on a locked screen is taken as done. Raises
+                # DriverUnavailable with the session's state, ended as the environment's (review of #42; #40).
+                _require_session(driver)
             if action.kind is ActionKind.DONE and done_blocks < cfg.max_done_blocks and done_check.enabled():
                 # Not finished while something the goal's own words ask for is visibly left (done_check.py): the
                 # planner is told what, once or twice, and goes on.
                 objection = getattr(adapter, "done_objection", None)
                 why = objection(ctx) if objection else None
+                unverified = False
                 if not why:
-                    page, verdict, why = _page_objection(task, driver, adapter, _users_words(dialogue))
+                    key = _look_key(obs, m, dialogue)
+                    page, verdict, why = _page_objection(task, driver, adapter, _users_words(dialogue), obs, steps,
+                                                         held=unseen_held == key, ask=not judge_silent)
                     last_page_verdict = verdict
-                    if verdict:
-                        entry = {"n": len(steps) + 1, "kind": "judged", "about": "result_on_page", "verdict": verdict,
-                                 "url": page.get("url"), "title": page.get("title"), "by": "harness"}
+                    unseen_held, judge_silent = _remember_unseen(page, verdict, key, unseen_held, judge_silent)
+                    unverified = bool(page.get("no_window")) and verdict is None
+                    if verdict or page.get("unbacked"):
+                        entry = _judged_entry(len(steps) + 1, page, verdict)
                         steps.append(entry)
                         if recorder:
                             recorder.step(entry)
+                if unverified and unverified_told:
+                    # Held back once already for want of a judgement, and insisted on: unverified, not completed.
+                    state, failure = RunState.GAVE_UP, _unverified(steps, obs, why, recorder)
+                    break
+                unverified_told |= unverified
                 if why:
                     done_blocks += 1
                     entry = {"n": len(steps) + 1, "obs": obs.id, "kind": "done_blocked", "text": why,
@@ -556,15 +701,18 @@ def run_task(
                         recorder.step(entry)
                     continue
             if (action.kind is ActionKind.DONE and done_check.enabled() and done_blocks >= cfg.max_done_blocks
-                    and last_page_verdict not in (judge.SHOWN, judge.NOT_ON_A_PAGE)):
+                    and last_page_verdict not in (judge.SHOWN, judge.NOT_ON_A_PAGE, judge.NO_WINDOW_NEEDED,
+                                                  judge.ALREADY)):
                 # Held back as often as allowed, and the page still does not show the result: not done. Accepted, a
                 # run that never acted ended "completed" after its third DONE (deskmind#73, live run). Also when the
                 # blocks were spent by another check and the page was never judged (review of c2b9b08): judged now.
-                verdict_now = _page_objection(task, driver, adapter, _users_words(dialogue))
-                if verdict_now[1]:
-                    steps.append({"n": len(steps) + 1, "kind": "judged", "about": "result_on_page",
-                                  "verdict": verdict_now[1], "url": verdict_now[0].get("url"),
-                                  "title": verdict_now[0].get("title"), "by": "harness", "final": True})
+                key = _look_key(obs, m, dialogue)
+                verdict_now = _page_objection(task, driver, adapter, _users_words(dialogue), obs, steps,
+                                              held=unseen_held == key, ask=not judge_silent)
+                unseen_held, judge_silent = _remember_unseen(verdict_now[0], verdict_now[1], key, unseen_held,
+                                                             judge_silent)
+                if verdict_now[1] or verdict_now[0].get("unbacked"):
+                    steps.append(_judged_entry(len(steps) + 1, verdict_now[0], verdict_now[1], final=True))
                     if recorder:
                         recorder.step(steps[-1])
                 if verdict_now[1] == judge.NOT_SHOWN:
@@ -575,7 +723,25 @@ def run_task(
                     if recorder:
                         recorder.step(steps[-1])
                     break
+                if verdict_now[0].get("no_window") and verdict_now[1] is None:
+                    # No window seen and no judgement (the judge down, or an answer off its options): held back once
+                    # with the reason, and insisted on, the run ends unverified -- never completed (review of #42).
+                    why = verdict_now[2]
+                    if not unverified_told:
+                        unverified_told = True
+                        entry = {"n": len(steps) + 1, "obs": obs.id, "kind": "done_blocked", "text": why,
+                                 "decision": (proposal.raw_text or "")[:300], **times}
+                        steps.append(entry)
+                        history.append(Turn({"kind": "done"}, False, f"not finished: {why}"))
+                        notice = f"Not finished yet: {why}"
+                        if recorder:
+                            recorder.step(entry)
+                        continue
+                    state, failure = RunState.GAVE_UP, _unverified(steps, obs, why, recorder)
+                    break
             if action.kind in TERMINAL:
+                if action.kind is ActionKind.DONE:
+                    _require_session(driver)      # again: the judgements above take seconds
                 state = RunState.COMPLETED if action.kind is ActionKind.DONE else RunState.GAVE_UP
                 steps.append({"n": len(steps) + 1, "obs": obs.id, "kind": action.kind.value,
                               "text": action.text, "latency_s": round(proposal.latency_s or 0.0, 3),
@@ -841,7 +1007,7 @@ def run_task(
     return RunResult(run_id=run_id, task_id=task.id, system_label=cfg.system_label,
                      state=state, grade=g, failure=failure, metrics=m,
                      steps=steps, dialogue=dialogue, adapter_usage=usage,
-                     driver_state=final_driver_state)
+                     driver_state=final_driver_state, checks=checks)
 
 
 def _filter(obs: Observation, channels: frozenset[str]) -> Observation:

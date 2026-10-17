@@ -198,10 +198,20 @@ def ground_one(shot: Path, width: float, height: float, description: str) -> tup
 
 def vision_elements(app: str, shot: Path, width: float, height: float, app_name: str,
                     window_id: str, absent: set[str] | None = None,
-                    fields: dict[str, Rect] | None = None) -> list[Element]:
-    """Window-local elements (points) for an app with no accessibility tree."""
+                    fields: dict[str, Rect] | None = None, found: dict | None = None) -> list[Element]:
+    """Window-local elements (points) for an app with no accessibility tree.
+
+    `found`, when given, is filled with what the picture itself gave, counted before any of it becomes an element:
+    "words", the OCR boxes with text (at the confidence a word is shown at), and "icons", the icons the grounder
+    placed. The elements cannot say it: a word inside a field becomes that field's value (icon:* or gen:搜索框), words
+    marked absent are left out, and the scroll buttons and generic controls are there whatever the picture holds --
+    counted by element, a window whose only words were 「新加坡 天气」 in its search box read as nothing, and one with
+    nothing in it as 15 elements (review of #42)."""
     out: list[Element] = []
     rows = sorted(ocr(shot), key=lambda r: (round(r["y"], 2), r["x"]))
+    if found is not None:
+        found["words"] = sum(1 for r in rows if (r.get("text") or "").strip() and r.get("conf", 1) >= 0.3)
+        found["icons"] = 0
     #: OCR rows that are a field's own text: shown as the field's value, not as something else to click. A planner
     #: that had just searched clicked the query text in the search box ten times, taking it for the result.
     in_field: set[int] = set()
@@ -226,6 +236,8 @@ def vision_elements(app: str, shot: Path, width: float, height: float, app_name:
                            rect=rect, settable=name in TYPABLE, synthetic=True,
                            value=value if name in TYPABLE else None,
                            app=app_name, window_id=window_id))
+        if found is not None:
+            found["icons"] += 1
     # Scrolling, as two buttons: a background wheel event does nothing in such an app, so it is carried out like a
     # click, in the foreground flash, over the middle of the window.
     for sid, label in (("scroll_down", "向下滚动页面"), ("scroll_up", "向上滚动页面")):

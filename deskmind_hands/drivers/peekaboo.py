@@ -1449,23 +1449,36 @@ class PeekabooDriver:
             out.append((w, wid, title))
         return out
 
-    def _window_to_observe(self) -> str | None:
+    def _window_to_observe(self, largest: bool = False, rows: list | None = None) -> str | None:
         """The window to read by its id when Peekaboo, asked for the app, finds none: the front one (the window list's
-        own order) of this app's windows that are on screen and that this task may use, or None.
+        own order) of this app's windows that are on screen and that this task may use, or None. `largest`: the
+        largest of them instead, for an app read from its pixels (see observe), except a browser, whose front window
+        is the one the user is looking at. `rows`: _windows_to_observe() already read.
 
         Asked for an app, Peekaboo picks the window itself, from those it takes to be capturable, and with Safari not
         the active app it found none: one test window open, the user's own window minimised, the run saw "no window
         open", and 「打开 Safari，搜索新加坡的天气」 ended "completed" in 4 s with nothing searched (deskmind#73, live
         10-17). The window list still showed the test window on screen, and read by its id it came back whole. A window
         off screen (minimised, another Space) is never chosen: what the user put away is not where a run starts."""
+        rows = (self._windows_to_observe() if rows is None else rows) or []
+        if not rows:
+            return None
+        if largest and self.app.lower() not in self.BROWSERS:
+            area = lambda w: (w.get("bounds") or {}).get("width", 0) * (w.get("bounds") or {}).get("height", 0)
+            return max(rows, key=lambda r: area(r[0]))[1]
+        return min((w.get("window_index") if isinstance(w.get("window_index"), int) else i, wid)
+                   for i, (w, wid) in enumerate(rows))[1]
+
+    def _windows_to_observe(self) -> list[tuple[dict, str]] | None:
+        """This app's windows a run may start observing, as (row, id) in the window list's order: on screen (never a
+        minimised one, nor one on another Space), allowed to this task (_own_windows), and for Finder titled. None
+        when the window list cannot be read."""
         ok, data, _ = self._run("window_list", app=self.app)
         if not ok:
             return None
-        rows = [(w.get("window_index") if isinstance(w.get("window_index"), int) else i, wid)
-                for i, (w, wid, title) in enumerate(self._own_windows(data))
+        return [(w, wid) for w, wid, title in self._own_windows(data)
                 # An untitled Finder window shows no folder this task can be sure of: listed, never chosen (review).
                 if w.get("is_on_screen", True) and (title or self.app.lower() != "com.apple.finder")]
-        return min(rows)[1] if rows else None
 
     def _stage_finder_window(self) -> None:
         """Put the workspace on screen in a state whose contents can be read and typed into.
@@ -1818,17 +1831,20 @@ class PeekabooDriver:
         # tries over ~6 s were not enough -- G03 was scored "environment" in two of four diag rounds for it.
         first = self._obs_n == 1
         attempts = 8 if first else 5
+        none_allowed = False         # the window list was read and holds no window this run may observe
         if self._vision_app() and self._pinned_window is None:
             # The main window, by size. The music app opened a 500x500 side window mid-session and `see` captured that
             # one from then on: every observation of four runs was the same 78 words, and the search results the
-            # planner had asked for were never on it.
-            ok_w, data_w, _ = self._run("window_list", app=self.app)
-            wins = [w for w in ((data_w or {}).get("windows") or []) if ok_w and w.get("window_id") is not None]
-            if wins:
-                big = max(wins, key=lambda w: (w.get("bounds") or {}).get("width", 0) * (w.get("bounds") or {}).get("height", 0))
-                self._pinned_window = str(big["window_id"])
+            # planner had asked for were never on it. Chosen as any first window is (_window_to_observe): on screen
+            # and the task's, never a minimised one -- by size alone, the user's own minimised Safari window was
+            # the one pinned, and Safari with an empty tree is read this way on its own (review of #42).
+            rows = self._windows_to_observe()
+            if rows:
+                self._pinned_window = self._window_to_observe(largest=True, rows=rows)
+            none_allowed = rows == []
         chosen: str | None = None    # read by its id: the app-target read found no window (_window_to_observe)
-        for attempt in range(1, attempts + 1):
+        ok, data, detail = False, {}, "WINDOW_NOT_FOUND: no window of this app that the run may observe"
+        for attempt in range(1, 0 if none_allowed else attempts + 1):
             if FAULTS.once("capture_error", self._obs_n):
                 ok, data, detail = False, {}, ("Failed to capture UI state: Desktop observation target changed during "
                                                "capture (injected fault)")

@@ -79,12 +79,18 @@ def _new_window_script(bundle: str, url: str = "") -> str | None:
     b = bundle.lower()
     u = url.replace("\\", "\\\\").replace('"', '\\"')
     if b == "com.apple.safari":
+        # The window that holds the document just made, never the front window: a window the user opens in between
+        # is in front, and is new too (Codex review). Safari's window id is the window server's.
         props = f' with properties {{URL:"{u}"}}' if url else ""
-        return (f'tell application id "com.apple.Safari"\n  make new document{props}\n'
-                f'  return id of front window\nend tell')
+        return (f'tell application id "com.apple.Safari"\n  set d to make new document{props}\n'
+                f'  return id of (first window whose document is d)\nend tell')
     if b in {"com.google.chrome", "com.microsoft.edgemac", "com.brave.browser"}:
+        # `make new window` returns the window made. Its id is Chrome's own, not the window server's, so its place is
+        # returned too ("id|left,top,right,bottom"), to find it among the new windows (_own_browser_window).
         nav = f'  set URL of active tab of w to "{u}"\n' if url else ""
-        return f'tell application id "{bundle}"\n  set w to make new window\n{nav}  return id of w\nend tell'
+        return (f'tell application id "{bundle}"\n  set w to make new window\n{nav}  set b to bounds of w\n'
+                f'  return (id of w as text) & "|" & (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & '
+                f'"," & (item 4 of b)\nend tell')
     return None
 
 
@@ -854,10 +860,11 @@ class PeekabooDriver:
         #: Why the run has no window of its own, per browser (lower-case bundle): cleared when one is opened, so a later
         #: look never repeats an old reason (a timed-out prompt answered since).
         self._own_browser_misses: dict[str, str] = {}
-        #: The browser windows this run may use, and only these: the ones it opened (_own_browser_window) and those
-        #: that came up during one of its own steps while the user did not touch anything (_note_run_windows). Not
-        #: "every window but the user's at the start": a window the user opens during the run, one a launch restores
-        #: late, or one the run could not tell apart from those, is none of the run's either.
+        #: The browser windows this run may use, and only these: the ones it made itself (_own_browser_window). Not
+        #: "every window but the user's at the start", and no window that merely came up during one of the run's steps:
+        #: a session Safari restores late needs no input and can coincide with any step, and nothing ties a window to
+        #: the step that preceded it (Codex review). A pop-up the run's own click opens (a sign-in window) is not the
+        #: run's either: the planner stops or asks.
         self._run_windows: set[str] = set()
         self._own_browser_wanted: set[str] = set()
         self._own_browser_retried = False
@@ -1090,34 +1097,45 @@ class PeekabooDriver:
         if not ok:
             self._set_miss(bundle, _automation_reason(bundle, out))
             return None
-        fresh: list[str] = []
+        rows: list[dict] = []
         last: list[str] | None = None
         for _ in range(12):
             ok_w, data_w, _ = self._run("window_list", app=bundle)
-            fresh = sorted(str(w["window_id"]) for w in ((data_w or {}).get("windows") or []) if ok_w
-                           and w.get("window_id") is not None and str(w["window_id"]) not in before
-                           and not self._ghost(w))
-            # Decided on two reads that agree: the first new window listed is not necessarily the run's (one a launch
-            # restores, or one the user opens, can be listed first; a Chromium script's id is not the window server's).
+            rows = [w for w in ((data_w or {}).get("windows") or []) if ok_w and w.get("window_id") is not None
+                    and str(w["window_id"]) not in before and not self._ghost(w)]
+            fresh = sorted(str(w["window_id"]) for w in rows)
+            # Decided on two reads that agree: a window still coming up (a launch restoring one) is in neither or both.
             if fresh and fresh == last:
                 break
             last = fresh
             time.sleep(0.3)
-        if not fresh:
+        if not rows:
             self._set_miss(bundle, f"{bundle}: the new window did not show up in its window list")
             return None
-        # The id the script returned, when it is one of the new windows (Safari's is the window server's); else the
-        # only new window. Several new windows and no id among them (a launch still restoring windows, a Chromium id,
-        # which is not the window server's) cannot be told apart: none is taken. Never one that was there before.
-        hint = (out or "").strip()
-        wid = hint if hint in fresh else fresh[0] if len(fresh) == 1 else None
+        # Only the window the script made: by its id (Safari's is the window server's), or for a Chromium browser by
+        # its place, matched to exactly one new window. Not "the only new window" and not the newest: one the user
+        # opened in the same moment, or one a launch restored, is new as well. No match, no window (Codex review).
+        hint, script_id = (out or "").strip(), ""
+        if "|" in hint:
+            script_id, _, place = hint.partition("|")
+            try:
+                l, t, r, b = (float(v) for v in place.split(","))
+                at = lambda w: [(w.get("bounds") or {}).get(k, -1e9) for k in ("x", "y", "width", "height")]
+                same = [str(w["window_id"]) for w in rows
+                        if all(abs(a - e) <= 2 for a, e in zip(at(w), (l, t, r - l, b - t)))]
+            except ValueError:
+                same = []
+            wid = same[0] if len(same) == 1 else None
+        else:
+            wid = hint if hint in {str(w["window_id"]) for w in rows} else None
         if wid is None:
-            self._set_miss(bundle, f"{bundle}: {len(fresh)} new windows, and the run's own could not be told apart")
+            self._set_miss(bundle, f"{bundle}: the window the script made ({hint or 'no answer'}) is not one of the "
+                                   f"{len(rows)} new window(s), so none is taken")
             return None
         own[key] = wid
         self.__dict__.setdefault("_own_browser_misses", {}).pop(key, None)     # no longer missing: the old reason goes
         self.__dict__.setdefault("_run_windows", set()).add(wid)
-        self._apart_from_others(bundle, wid, hint)
+        self._apart_from_others(bundle, wid, script_id or hint)
         return wid
 
     def _set_miss(self, bundle: str, why: str) -> None:
@@ -1152,44 +1170,12 @@ class PeekabooDriver:
                   f'{{{x + 24}, {y + 24}, {x + w_}, {y + h}}}')
 
     def _may_use(self, bundle: str, wid: str) -> bool:
-        """Whether the run may observe, offer, switch to or type into window `wid` of `bundle`: a browser's only if it
-        is one of the run's own (_run_windows); another app's unless it was there before the run (_preexisting; the
+        """Whether the run may observe, offer, switch to or type into window `wid` of `bundle`: a browser's only if the
+        run made it (_run_windows); another app's unless it was there before the run (_preexisting; the
         TextEdit rules on titles are applied where the windows are listed)."""
         if bundle.lower() in self.BROWSERS:
             return str(wid) in getattr(self, "_run_windows", set())
         return str(wid) not in getattr(self, "_preexisting", set())
-
-    def _quartz_window_ids(self, bundle: str) -> set[str] | None:
-        """`bundle`'s windows from the window server alone (cheap, for every step), or None."""
-        try:
-            import Quartz
-            all_wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionAll, 0) or []
-            pid = self._pid_of(bundle, all_wins)
-        except Exception:   # noqa: BLE001
-            return None
-        return {str(w.get("kCGWindowNumber")) for w in all_wins
-                if pid and w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowNumber") is not None
-                and w.get("kCGWindowLayer") == 0}      # ordinary windows only: no menus, pop-ups or tooltips
-
-    def _note_run_windows(self, bundle: str, before: set[str] | None, t0: float) -> None:
-        """A browser window that came up during one of the run's steps (a link that opens a window, ⌘N) is the run's,
-        but only if the user touched nothing during the step: a window they opened meanwhile is theirs."""
-        if before is None:
-            return
-        try:
-            # Read here, not through _hid_idle: a read that fails is "not touched" there, and here it must count as
-            # touched -- an unknown is never taken to make a window the run's.
-            import Quartz
-            idle = float(Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState,
-                                                                       Quartz.kCGAnyInputEventType))
-        except Exception:   # noqa: BLE001
-            return
-        if time.time() < FAULTS.busy_until or idle < time.time() - t0:
-            return
-        after = self._quartz_window_ids(bundle) or set()
-        new = after - before - getattr(self, "_preexisting", set())
-        if new:
-            self.__dict__.setdefault("_run_windows", set()).update(new)
 
     def _runs_roots(self) -> list[str]:
         """The runs directory every staged workspace lives in (DESKMIND_RUNS_DIR, else the workspace's nearest
@@ -3210,32 +3196,16 @@ class PeekabooDriver:
 
     def execute(self, action: Action) -> ExecResult:
         self._require_session()      # nothing is done on a locked screen, however the action was chosen
-        # A window can become the run's only through a step that put input into the run's own window: a click, a key,
-        # typing, the search. Not a wait or a look: a session Safari restores window by window kept bringing windows up
-        # during the first steps, and a WAIT adopted one (review).
-        observed = getattr(self, "_pinned_window", None) or getattr(self, "_window_id", None)
-        browser = (self.app if self.app.lower() in self.BROWSERS and action.kind in self.INPUT_KINDS
-                   and observed and self._may_use(self.app, observed) else None)
-        t0, before = time.time(), (self._quartz_window_ids(browser) if browser else None)
-        res = None
         try:
             if self.CONFIRM_BY_DIFF and action.kind in (ActionKind.CLICK, ActionKind.DOUBLE_CLICK,
                                                         ActionKind.RIGHT_CLICK):
                 res = self._execute_outer(action)
-                res = self._confirm_by_diff(res) if res.indeterminate else res
-                return res
-            res = self._execute_outer(action)
-            return res
+                return self._confirm_by_diff(res) if res.indeterminate else res
+            return self._execute_outer(action)
         finally:
             # A browser-field allowance is for this one step: an early return or an error must not leave it for the
             # next one.
             self._browser_field_allowed = None
-            if browser and res is not None and res.ok:      # a refused or failed step delivered nothing
-                self._note_run_windows(browser, before, t0)
-
-    #: Steps that deliver input to the observed window: only after one of these can a new window be the run's.
-    INPUT_KINDS = frozenset({ActionKind.CLICK, ActionKind.DOUBLE_CLICK, ActionKind.RIGHT_CLICK, ActionKind.KEY,
-                             ActionKind.TYPE_TEXT})
 
     def _execute_outer(self, action: Action) -> ExecResult:
         if self._mcp is None:

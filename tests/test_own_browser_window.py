@@ -44,7 +44,8 @@ class FakeMac:
         self.restored = [dict(w) for w in restored]   # what a launch brings back from the last session
         self.next_id = 30000
         self.events: list[tuple] = []
-        self.user_opens_during_make = False     # the user opens a window between the make and the script's answer
+        self.user_opens_during_make = False
+        self.load_fails = False     # the user opens a window between the make and the script's answer
         self.idle = 1e6          # seconds since the user last touched anything
 
     # -- what happens on the Mac
@@ -125,6 +126,8 @@ class FakeMac:
                 return True, str(hit["id"]) if hit else "none"
             return False, "unknown script"
         if "set URL of current tab of window id" in script:
+            if self.load_fails:
+                return False, "Safari got an error: AppleEvent timed out. (-1712)"
             wid = script.split("window id ", 1)[1].split()[0]
             w = self.find(wid)
             if w is None:
@@ -727,6 +730,28 @@ class OwnWindow(unittest.TestCase):
         self.assertTrue(res.ok, res.detail)
         self.assertNotEqual(d._pinned_window, own)
 
+    # -- before merge: the marker page, the load, the wait --------------------------------------------------------
+
+    def test_the_marker_page_is_never_taken_for_a_page_still_loading(self):
+        # Peekaboo listed only the toolbar on the empty marker page: eight retries, about 17 s, on the first look.
+        mac = FakeMac()
+        d = self.mac(mac)
+        own = mac.find(d._pinned_window)
+        self.assertTrue(own["title"].startswith("dm-") and "<" not in own["title"])     # titled exactly the marker
+        toolbar_only = {"window_title": own["title"], "ui_elements": [{"role": "AXButton"}, {"role": "AXTextField"}]}
+        self.assertFalse(d._page_not_read(toolbar_only))
+        self.assertTrue(d._page_not_read({**toolbar_only, "window_title": "别的页面"}))   # a real page still loading
+
+    def test_a_staged_page_that_does_not_load_is_said_in_the_notes(self):
+        mac = FakeMac()
+        mac.load_fails = True
+        d = self.mac(mac, stage=('open -a Safari "https://example.com/page"',))
+        self.assertIsNotNone(d._pinned_window)                     # the window is the run's all the same
+        self.assertIn("could not be loaded", d.state()["own_browser_miss"])
+        obs = d.observe()
+        self.assertFalse(obs.no_window)
+        self.assertTrue(any("example.com/page" in n and "could not be loaded" in n for n in obs.notes), obs.notes)
+
 
 class Parsing(unittest.TestCase):
     def test_browser_staging_commands(self):
@@ -743,7 +768,9 @@ class Parsing(unittest.TestCase):
 
     def test_scripts(self):
         safari = pk._new_window_script("com.apple.Safari", "https://a.b/x", "dm-0123abcd")
-        self.assertIn('make new document with properties {URL:"data:text/html,<title>dm-0123abcd</title>"}', safari)
+        self.assertIn('make new document with properties {URL:"data:text/html;charset=utf-8,<title>dm-0123abcd</title>'
+                      '<p>DeskMind%20%E7%9A%84%E7%AA%97%E5%8F%A3</p>"}', safari)
+        self.assertIn("repeat 50 times", safari)                    # about 5 s: a Safari just launched is slow
         self.assertIn('first window whose name is "dm-0123abcd"', safari)
         self.assertNotIn("front window", safari)
         self.assertNotIn("whose document", safari)                 # -1700 on Safari, live 10-17

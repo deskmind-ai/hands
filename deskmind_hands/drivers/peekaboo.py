@@ -1355,8 +1355,12 @@ class PeekabooDriver:
             return set()
         return {root.name} | {p.name for p in root.rglob("*") if p.is_dir()}
 
-    def _windows(self) -> list[WindowRef]:
+    def _windows(self, on_screen_only: bool = False) -> list[WindowRef]:
         """Every window of the focused app, so the pinned one is not the only one.
+
+        `on_screen_only`: none that is not on screen (minimised, another Space), of any app -- for a look with no
+        window, where every one listed is a place to go and the user's put-away TextEdit or Finder windows were offered
+        (only a browser's were left out; review of #42).
 
         Peekaboo reports a window's title as an empty string more often than not
         (``accessibility_enumeration_incomplete``), and an untitled row is not
@@ -1371,6 +1375,8 @@ class PeekabooDriver:
             data = {**data, "windows": list(data.get("windows") or []) + [dict(_GHOST)]}
         out: list[WindowRef] = []
         for w, wid, title in self._own_windows(data):
+            if on_screen_only and not w.get("is_on_screen", True):
+                continue
             out.append(WindowRef(
                 id=wid,
                 title=title or f"(untitled, index {w.get('window_index', '?')})",
@@ -1394,6 +1400,8 @@ class PeekabooDriver:
                 ok2, data2, _ = self._run("window_list", app=bundle)
                 for w in ((data2 or {}).get("windows") or []) if ok2 else []:
                     if w.get("window_id") is None or self._ghost(w):
+                        continue
+                    if on_screen_only and not w.get("is_on_screen", True):
                         continue
                     wid = str(w["window_id"])
                     if wid in getattr(self, "_unreadable", set()):
@@ -1914,8 +1922,9 @@ class PeekabooDriver:
                     screenshot_png=None, elements=docs,
                     focused_app=f"{self.app} (no window open)",
                     # The windows it may switch to, other apps' among them: with none listed, nothing could be
-                    # chosen but DONE or BLOCKED on an empty screen (deskmind#73, live 10-17).
-                    windows=self._windows(),
+                    # chosen but DONE or BLOCKED on an empty screen (deskmind#73, live 10-17). On screen only: never
+                    # a window the user put away (review of #42).
+                    windows=self._windows(on_screen_only=True),
                     accepts_keys=False, no_window=True,
                     layout_version=self._obs_n)
             raise DriverUnavailable(f"see failed: {detail}")

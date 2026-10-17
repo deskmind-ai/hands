@@ -2,9 +2,10 @@
 a browser task's result is on the page.
 
 The code decides *when* to ask, from structure alone: the field is outside the page's web area (axchrome), or the run
-is finishing on a web page. The model decides *what is right*, and the loop enforces its answer. A keyword list over
-the goal used to make the first judgement: 「打开 Safari，搜索新加坡的天气」 named none of its words, so the address bar
-was refused, and the planner typed into the page's own search box and said it was done (deskmind#73).
+is finishing on a web page, or with no window of its app to be seen. The model decides *what is right*, and the loop
+enforces its answer. A keyword list over the goal used to make the first judgement: 「打开 Safari，搜索新加坡的天气」
+named none of its words, so the address bar was refused, and the planner typed into the page's own search box and said
+it was done (deskmind#73).
 
 The wording lives here, in one place, so it can be changed once it has been evaluated on cases it was not written for.
 """
@@ -35,6 +36,40 @@ DONE = {
     SHOWN: "页面上能看到用户要的东西。",
     NOT_SHOWN: "页面不是用户要的结果：还停在别的页面、打不开、搜的词不对，或者在某个网站里搜了而用户没要求在这个网站里搜。",
     NOT_ON_A_PAGE: "用户要的结果不是一个网页，例如写进了文件、发出了消息、改了设置；这个页面不用回答它。",
+}
+
+#: A run that says DONE while no window of its app could be seen: there is no page to judge, and nothing on screen
+#: shows the result either. The run used to complete there by default: Safari, not in front, read as "no window open",
+#: and 「打开 Safari，搜索新加坡的天气」 ended completed in 4 s with no search made (deskmind#73, live 10-17). Two options:
+#: whether the run did what was asked and whether its result needed a window at all is for the model to say, from the
+#: request and what the run did. The second option is its own: "结果本来就不在网页上" is always true of a document app,
+#: and would pass any of them (review).
+#: Chosen on the 13 synthetic dev cases of the review of #42 against the app's local Brain (0.8B/4B): asked only
+#: whether the result should stay in a window, 没出来 first, 2/6 save-and-close cases passed and 6/7 that should fail
+#: failed; asked whether the steps did what was asked and whether the result then needs no window, 6/6 and 6/7 (7/7
+#: with the run guard in loop.py), the same in either order. Options go 不需要窗口 first.
+NO_WINDOW_NEEDED = "结果本来就不需要窗口"
+DONE_UNSEEN_QUESTION = ("任务执行完了，但助手最后看不到这个应用的任何窗口（见「看到的」）。对照用户原话和「助手做过的事」："
+                        "用户要的事做完了吗？做完以后，用户要的结果是不是本来就不需要留着窗口？")
+DONE_UNSEEN = {
+    NO_WINDOW_NEEDED: "做完了，也不需要窗口：「助手做过的事」里有用户要的那几步（例如写进并存好了文件、关掉了窗口或文稿、"
+                      "发出了消息）。",
+    NOT_SHOWN: "没做完：「助手做过的事」里没有用户要的那几步，或者做的事和用户要的不一样；或者用户要的结果本该留在窗口里给用户看"
+               "（例如打开的网页、搜索结果、打开的文稿）。",
+}
+
+#: The same judgement for a run in which no step that changes anything went through. "Done, and it needs no window"
+#: cannot be true of nothing done -- the 4B said it of 「加一行，保存后关闭」 with no step (review of #42) -- so it is not
+#: offered; what can be is that the state the user wants was already there when the run started (「确保 Safari 窗口已关
+#: 闭；已经关闭就不用操作」 with no window at all), and that is asked instead. Zero-step cases against the app's local
+#: Brain: dev 5/5 already-there passed and 5/5 needing work held back with 一开始就已经是这样 first (4/5 with 没出来 first,
+#: and 5/5 with one three-option question for every run); held-out 5/5 and 8/8.
+ALREADY = "一开始就已经是这样"
+DONE_UNSEEN_IDLE_QUESTION = ("助手什么也没做，最后也看不到这个应用的任何窗口（见「看到的」）。对照用户原话：用户要的状态是不是一开始"
+                             "就已经是这样，不需要做任何事？")
+DONE_UNSEEN_IDLE = {
+    ALREADY: "用户要的状态一开始就已经是这样，不需要做任何事（例如要关掉的窗口本来就没开、要退出的应用本来就没在运行）。",
+    NOT_SHOWN: "要做的事还没做：用户要的结果需要助手动手（例如写进文件、打开网页、搜索、打开文稿），而助手什么也没做。",
 }
 
 #: The most page text a judgement is shown: enough to see a result, not the whole page.
@@ -88,3 +123,15 @@ def done(ask: AskChoice | None, goal: str, page: dict, said=()) -> str | None:
     context = {"用户原话": goal, "当前网址": page.get("url") or "", "页面标题": page.get("title") or "",
                "页面文字": (page.get("text") or "")[:PAGE_TEXT_CHARS]}
     return _choice(ask, DONE_QUESTION, _said(context, said), DONE)
+
+
+def done_unseen(ask: AskChoice | None, goal: str, app: str, said=(), done=(), acted: bool = True) -> str | None:
+    """结果本来就不需要窗口 / 没出来 for a run finishing with no window of `app` seen, or None when there is no answer.
+    Only 没出来 holds a run back, as for a page. `done`: what the run's last actions did, in the driver's words.
+    `acted`: whether a step that changes something went through; if not, the question is whether the state was
+    already there (一开始就已经是这样 / 没出来)."""
+    context = {"用户原话": goal, "看到的": f"{app}：没有能看到内容的窗口（没有打开的窗口，或者窗口里什么也读不到）",
+               "助手做过的事": "\n".join(done) or "什么也没做"}
+    if not acted:
+        return _choice(ask, DONE_UNSEEN_IDLE_QUESTION, _said(context, said), DONE_UNSEEN_IDLE)
+    return _choice(ask, DONE_UNSEEN_QUESTION, _said(context, said), DONE_UNSEEN)

@@ -1,5 +1,6 @@
-"""A browser's own field (its address bar) is not typed into for a goal that asks for nothing on the web: what is typed
-there goes to a website (G18b typed a table row into Safari's, 09-30)."""
+"""A browser's own field (its address bar) is told apart by structure, and is typed into only when the run allowed it:
+what is typed there goes to a website (G18b typed a table row into Safari's, 09-30). Whether it may is a model's
+judgement in the loop (test_judge.py), not a keyword list over the goal (deskmind#73)."""
 from __future__ import annotations
 
 import sys
@@ -28,22 +29,78 @@ def driver(goal):
 class Refusal(unittest.TestCase):
     def setUp(self):
         self.p = mock.patch.object(axchrome, "fields_outside_page", lambda pid: [BAR])
+        self.q = mock.patch.object(axchrome, "address_bars", lambda pid: [])     # tests that need one patch it
         self.p.start()
+        self.q.start()
 
     def tearDown(self):
+        self.q.stop()
         self.p.stop()
 
-    def test_the_address_bar_for_a_goal_about_a_file(self):
+    def test_the_address_bar_is_told_apart(self):
+        self.assertEqual(driver("打开 Safari，搜索新加坡的天气").browser_field("bar"), "智能搜索栏")
+        self.assertIsNone(driver("打开 Safari，搜索新加坡的天气").browser_field("field"))
+
+    def test_refused_unless_allowed(self):
         why = driver("Copy the table's rows into parts.csv and save it.")._browser_field_refusal("bar")
         self.assertIn("address bar", why)
 
+    def test_no_goal_words_open_it(self):
+        # deskmind#73: the goal's words decide nothing here any more; only the run's judgement does.
+        for goal in ("Open https://example.com and read the title", "打开 Safari，搜索新加坡的天气"):
+            self.assertIsNotNone(driver(goal)._browser_field_refusal("bar"), goal)
+
+    def test_an_allowance_does_not_open_the_address_bar(self):
+        # Only 「在地址栏搜索」 types into the address bar: a judged 照做 on the raw bar is still refused, the plain
+        # routes check neither the window nor the focus (review of 27b84b8).
+        d = driver("打开 Safari，搜索新加坡的天气")
+        with mock.patch.object(axchrome, "address_bars", lambda pid: [BAR]):
+            d.allow_browser_field("bar")
+            self.assertIsNotNone(d._browser_field_refusal("bar"))
+            self.assertIn("在地址栏搜索", d.browser_field_refused("bar"))
+
+    def test_another_browser_field_is_typed_into_once_allowed(self):
+        # Safari's 在页面上查找 is the browser's own field, not the address bar: judged, it is typed into, once
+        # (review of bd79705: refusing it left "Find 'invoice' on this web page" with no way to do it).
+        d = driver("Find 'invoice' on this web page")
+        with mock.patch.object(axchrome, "address_bars", lambda pid: []):
+            self.assertIsNone(d.browser_field_refused("bar"))
+            self.assertIsNotNone(d._browser_field_refusal("bar"))      # not judged: refused
+            d.allow_browser_field("bar")
+            self.assertIsNone(d._browser_field_refusal("bar"))         # judged: typed
+            self.assertIsNotNone(d._browser_field_refusal("bar"))      # for one step
+
+    def test_what_the_judgement_is_told_the_field_is(self):
+        # 「another field」 only beside an address bar known by its identifier; without one (Chrome, Firefox), or
+        # unread, the field may be the address bar and is described as one (review of b62652e).
+        d = driver("Find 'invoice' on this web page")
+        with mock.patch.object(axchrome, "address_bars", lambda pid: [(300, 0, 400, 30)]):
+            self.assertFalse(d.browser_field_is_address_bar("bar"))       # the bar is elsewhere: a find bar
+        self.assertTrue(d.browser_field_is_address_bar("bar"))            # no identified bar (setUp): maybe it
+        with mock.patch.object(axchrome, "address_bars", side_effect=RuntimeError("AX")):
+            self.assertTrue(d.browser_field_is_address_bar("bar"))
+        with mock.patch.object(axchrome, "address_bars", lambda pid: [BAR]):
+            self.assertTrue(d.browser_field_is_address_bar("bar"))        # it is the identified bar
+
+    def test_an_allowance_does_not_outlive_its_step(self):
+        # An early return (here: no snapshot yet) or an error in the step must not leave it for the next (review).
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        d = driver("打开 Safari，搜索新加坡的天气")
+        d._mcp, d._snapshot = None, None
+        d.allow_browser_field("bar")
+        res = d.execute(Action(kind=ActionKind.CLICK, binding=Binding(observation_id="o", app="Safari",
+                                                                       element_id="field")))
+        self.assertFalse(res.ok)
+        self.assertIsNone(getattr(d, "_browser_field_allowed", None))
+
+    def test_page_info_is_the_observed_windows(self):
+        d = driver("打开 Safari，搜索新加坡的天气")
+        d._window_frame = lambda: (900, 0, 800, 600)
+        with mock.patch.object(axchrome, "page_info", lambda pid, frame: {"frame": frame}):
+            self.assertEqual(d.page_info(), {"frame": (900, 0, 800, 600)})
+
     def test_the_page_is_typed_into(self):
         self.assertIsNone(driver("Fill in the expense report and submit.")._browser_field_refusal("field"))
-
-    def test_a_goal_about_the_web_may_use_it(self):
-        for goal in ("Open https://example.com and read the title", "在浏览器里打开百度搜一下天气",
-                     "Look up the weather online", "search the web for the price"):
-            self.assertIsNone(driver(goal)._browser_field_refusal("bar"), goal)
 
     def test_unreadable_structure_is_no_refusal(self):
         with mock.patch.object(axchrome, "fields_outside_page", side_effect=RuntimeError("AX")):

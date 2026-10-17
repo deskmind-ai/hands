@@ -25,7 +25,7 @@ from ..actions import Action, ActionKind, DIALOGUE, TERMINAL
 from ..drivers.base import Driver, DriverUnavailable, ExecResult, Observation, classify_effect
 from ..errors import Kind, classify
 from .. import done_check
-from . import risk
+from . import judge, risk
 from ..env.workspace import Workspace
 from deskmind_bench.failures import Failure, FailureClass, no_progress
 from deskmind_bench.graders.primitives import GradeContext
@@ -234,6 +234,26 @@ def _goal_met(task: Task, workspace, driver, sentinels) -> bool | None:
         return None
 
 
+def _users_words(dialogue: list[dict]) -> list[tuple[str, str]]:
+    """The user's words after the goal, for the judgements: not a harness approval, whose yes is no answer to the goal
+    (G16; on release-0.4 the planner's own dialogue still lists approvals)."""
+    return [(d["question"], d["reply"]) for d in dialogue if d.get("by") != "harness"]
+
+
+def _page_objection(task: Task, driver, adapter, said=()) -> tuple[dict, str | None, str | None]:
+    """Whether a run finishing on a web page is done, as a model judged it (runtime/judge.py): (the page, the verdict,
+    why it is not done). No verdict when the app shows no web page or there is no judgement -- this never holds a run
+    back on its own. Only http(s) and file pages: a mail message is a web area too, and is no result page."""
+    page = getattr(driver, "page_info", lambda: None)() or {}
+    if not str(page.get("url") or "").startswith(("http://", "https://", "file:")):
+        return page, None, None
+    verdict = judge.done(getattr(adapter, "judge_choice", None), task.goal, page, said)
+    if verdict != judge.NOT_SHOWN:
+        return page, verdict, None
+    return page, verdict, (f"the page ({page.get('url')}, {page.get('title') or 'no title'}) does not show what the "
+                           f"goal asks for: check what was done, and do it where it gives that result.")
+
+
 def _target_label(obs, action) -> str | None:
     eid = action.binding.element_id
     if not eid:
@@ -266,6 +286,7 @@ def run_task(
     last_typed_label: str | None = None          # the field the last successful TYPE_TEXT wrote into
     # (kind, app, step count, a dialog was up) of the last approval: what its confirmation must match
     just_approved: tuple[str, str, int, bool] | None = None
+    last_page_verdict: str | None = None          # the last judgement of a page the run finished on (judge.done)
     fired: set[int] = set()
     state = RunState.PREPARING
     failure = Failure(FailureClass.NONE)
@@ -515,6 +536,15 @@ def run_task(
                 # planner is told what, once or twice, and goes on.
                 objection = getattr(adapter, "done_objection", None)
                 why = objection(ctx) if objection else None
+                if not why:
+                    page, verdict, why = _page_objection(task, driver, adapter, _users_words(dialogue))
+                    last_page_verdict = verdict
+                    if verdict:
+                        entry = {"n": len(steps) + 1, "kind": "judged", "about": "result_on_page", "verdict": verdict,
+                                 "url": page.get("url"), "title": page.get("title"), "by": "harness"}
+                        steps.append(entry)
+                        if recorder:
+                            recorder.step(entry)
                 if why:
                     done_blocks += 1
                     entry = {"n": len(steps) + 1, "obs": obs.id, "kind": "done_blocked", "text": why,
@@ -525,6 +555,26 @@ def run_task(
                     if recorder:
                         recorder.step(entry)
                     continue
+            if (action.kind is ActionKind.DONE and done_check.enabled() and done_blocks >= cfg.max_done_blocks
+                    and last_page_verdict not in (judge.SHOWN, judge.NOT_ON_A_PAGE)):
+                # Held back as often as allowed, and the page still does not show the result: not done. Accepted, a
+                # run that never acted ended "completed" after its third DONE (deskmind#73, live run). Also when the
+                # blocks were spent by another check and the page was never judged (review of c2b9b08): judged now.
+                verdict_now = _page_objection(task, driver, adapter, _users_words(dialogue))
+                if verdict_now[1]:
+                    steps.append({"n": len(steps) + 1, "kind": "judged", "about": "result_on_page",
+                                  "verdict": verdict_now[1], "url": verdict_now[0].get("url"),
+                                  "title": verdict_now[0].get("title"), "by": "harness", "final": True})
+                    if recorder:
+                        recorder.step(steps[-1])
+                if verdict_now[1] == judge.NOT_SHOWN:
+                    state = RunState.ERRORED
+                    failure = Failure(FailureClass.FALSE_COMPLETION, f"not done: {verdict_now[2]}", auto=True)
+                    steps.append({"n": len(steps) + 1, "obs": obs.id, "kind": "done_refused",
+                                  "text": f"not done: {verdict_now[2]}", "by": "harness"})
+                    if recorder:
+                        recorder.step(steps[-1])
+                    break
             if action.kind in TERMINAL:
                 state = RunState.COMPLETED if action.kind is ActionKind.DONE else RunState.GAVE_UP
                 steps.append({"n": len(steps) + 1, "obs": obs.id, "kind": action.kind.value,
@@ -562,6 +612,43 @@ def run_task(
                     recorder.step(steps[-1])
                 break
 
+            # Typing into a browser's own field (its address bar) sends the text to a website: a model judges whether
+            # that is what the user wants (runtime/judge.py). 不做 is refused here; 先问用户 goes to the person like a
+            # risky step; 照做 lets the driver type there, this once (deskmind#73).
+            # The projected 「在地址栏搜索」 (syn:websearch) is the same field, and judged the same way.
+            field_label = (getattr(driver, "browser_field", lambda _eid: None)(action.binding.element_id)
+                           if action.kind is ActionKind.TYPE_TEXT and action.binding.element_id else None)
+            field_ask: str | None = None
+            # A browser's own field the driver never types into directly (only as 「在地址栏搜索」): refused before
+            # anything is judged or asked -- asking the person and then refusing helps no one.
+            refused_field = (getattr(driver, "browser_field_refused", lambda _eid: None)(action.binding.element_id)
+                             if field_label else None)
+            if refused_field:
+                history.append(Turn(action.to_json(), False, refused_field))
+                notice = refused_field
+                continue
+            is_bar = (getattr(driver, "browser_field_is_address_bar", lambda _eid: True)(action.binding.element_id)
+                      if field_label else True)
+            if field_label:
+                page = getattr(driver, "page_info", lambda: None)()
+                verdict = judge.typing(getattr(adapter, "judge_choice", None), task.goal, field_label,
+                                       action.text or "", page, _users_words(dialogue), address_bar=is_bar)
+                entry = {"n": len(steps) + 1, "kind": "judged", "about": "browser_field", "field": field_label,
+                         "verdict": verdict, "by": "harness"}
+                steps.append(entry)
+                if recorder:
+                    recorder.step(entry)
+                if verdict == judge.DONT:
+                    sent = "what is typed there goes to a website" if is_bar else "not the page"
+                    history.append(Turn(action.to_json(), False,
+                                        f"not typed into {field_label!r}: it is the browser's own field ({sent}); this "
+                                        f"text does not belong there"))
+                    notice = (f"Not typed into {field_label!r}: it is the browser's own field ({sent}), and this text "
+                              f"does not belong there. Type into the page, or into the document the goal names.")
+                    continue
+                if verdict == judge.ASK:
+                    field_ask = (f"把「{(action.text or '').strip()[:80]}」打进 {field_label}"
+                                 f"（{'浏览器的地址栏，打的字会交给网站' if is_bar else '浏览器自带的输入框，不在网页里'}）")
             what = (risk.risky(action, obs, last_typed_label, renames=cfg.confirm_renames)
                     if (cfg.approve_risky or cfg.refuse_risky) else None)
             # An approval is for one step, in one app: approving one "click 'Send'" once covered every later Send of
@@ -572,11 +659,14 @@ def run_task(
             # between (protocol review, 10-06).
             app_now = obs.focused_app or task.app or ""
             if just_approved:
-                kind_, app_, at, dialog_before = just_approved
+                covered = bool(what) and risk.covers(just_approved, what, app_now, len(steps), obs)
                 just_approved = None   # one chance: the next step is its confirmation, or nothing is
-                if what and (risk.kind(what), app_now) == (kind_, app_) and len(steps) - at == 1 \
-                        and risk.dialog_up(obs) and not dialog_before:
+                if covered:
                     what = None
+            if field_ask:
+                # The judgement asked: never covered by an earlier approval, whose kind risk.kind reads from words
+                # (a 「public」 in the text read as publish), and it covers nothing after it either.
+                what = field_ask
             if what and not cfg.approve_risky:
                 # Nobody to ask: the step is not carried out, and the planner is told why (10-02 review: a CLI run
                 # without --ask sent and deleted unasked).
@@ -608,7 +698,9 @@ def run_task(
                     notice = (f"The user declined: {what}. It was not done. Do not try it another way; finish with "
                               f"what is done, or stop if nothing else is left to do.")
                     continue
-                just_approved = (risk.kind(what), app_now, len(steps), risk.dialog_up(obs))
+                just_approved = None if field_ask else (risk.kind(what), app_now, len(steps), risk.dialog_up(obs))
+            if field_label:
+                driver.allow_browser_field(action.binding.element_id)   # judged 照做, or the person approved it
             times["t_act_start"] = round(time.time(), 3)
             res: ExecResult = driver.execute(action)
             times["t_act_end"] = round(time.time(), 3)

@@ -107,6 +107,14 @@ def dialog_up(obs) -> bool:
                                                      for e in getattr(obs, "elements", None) or [])
 
 
+def covers(approved: tuple[str, str, int, bool], what: str, app: str, step: int, obs) -> bool:
+    """Whether an approval, (kind, app, step count, a dialog was up) when it was given, covers a step about to be
+    taken: only its own confirmation -- the very next step, of the same kind in the same app, with a dialog up that
+    was not up before."""
+    kind_, app_, at, dialog_before = approved
+    return (kind(what), app) == (kind_, app_) and step - at == 1 and dialog_up(obs) and not dialog_before
+
+
 def question(what: str, app: str, goal: str) -> str:
     """The approval question, in the goal's language."""
     if re.search(r"[一-鿿]", goal or ""):

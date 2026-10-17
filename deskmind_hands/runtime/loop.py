@@ -315,7 +315,9 @@ def _page_objection(task: Task, driver, adapter, said=(), obs=None, steps=(),
         acted = _acted(steps)
         # A run that changed nothing is asked whether the state was already there (judge.ALREADY), not whether it
         # did it.
-        verdict = judge.done_unseen(ask_fn, task.goal, app, said, _what_was_done(steps), acted=acted) if ask else None
+        no_window_why = "；".join(getattr(obs, "notes", None) or [])     # the driver's reason, if it knows one
+        verdict = judge.done_unseen(ask_fn, task.goal, app, said, _what_was_done(steps), acted=acted,
+                                    why=no_window_why) if ask else None
         silent = verdict is None
         # Needing no window is taken only from a run that did something: with no step gone through it is no answer.
         unbacked = verdict == judge.NO_WINDOW_NEEDED and not acted

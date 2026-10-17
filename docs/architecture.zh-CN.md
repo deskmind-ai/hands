@@ -30,6 +30,10 @@ flowchart LR
 - 完全不接受后台输入的应用，可以允许一次短暂的**前台闪点**（`HANDS_FLASH_APPS`，bundle id 列表）：应用被带到前台约一秒，
   点一下，指针放回原处，再把前台还给你的应用。你正在该应用里、或 3 秒内碰过键盘鼠标时，绝不会发生；
 - 每一次前台操作都记入运行记录（`driver_state`），因为“不打扰你”是一个需要被测量的承诺。
+- 浏览器任务在运行自己在后台新开的窗口里做（Safari 用 `make new document`，Chromium 系用 `make new window`）。运行开始前
+  就有的浏览器窗口，无论最小化还是在屏幕上，都是你的：不读、不列出、不输入；也不会对正在运行的浏览器发 `open`，因为那是一次
+  reopen，会把你最小化的窗口恢复出来。没有脚本新建窗口办法的浏览器（Firefox、Arc）宁可没有窗口，也不用你的。
+  `driver_state.own_browser_windows` / `own_browser_miss` 记录实际情况。
 
 ## 投影层
 

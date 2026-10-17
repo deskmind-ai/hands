@@ -44,6 +44,8 @@ def safari(windows, readable=("19116",)):
     d._sparse_tree = lambda data: False
     d._pid_of = lambda bundle, all_wins=None: None
     d.calls, d.read = [], dict(PAGE)        # `read`: what a read by id returns (the real conversion runs on it)
+    # The browser windows the run may use: the test windows, the run's own (as staging opens one); never the owner's.
+    d._run_windows = {str(w["window_id"]) for w in windows if w is not OWNER and w.get("window_id") != 19085}
 
     def fake_run(key, _extra=None, **kw):
         d.calls.append((key, kw.get("window")))
@@ -316,6 +318,18 @@ class Observed(unittest.TestCase):
 
     def test_the_run_summary_says_why(self):
         d = safari([OWNER, TEST])
+        d._foreground_actions = d._scripted_actions = d._projected_actions = 0
+        d.transport = "mcp"
+        observe(d)
+        self.assertEqual(d.state()["observed_by_id"], 1)
+        # A browser is never read by app (Peekaboo would pick its front window, maybe the user's): no miss to report.
+        self.assertNotIn(("see", None), d.calls)
+        self.assertEqual(d.state()["app_read_miss"], "")
+        # Another app's read that found no window says why.
+        d = safari([{"window_id": 6, "window_title": "parts.txt", "window_index": 0, "is_on_screen": True}],
+                   readable=("6",))
+        d.app = d._home_app = "com.apple.textedit"
+        d._workspace_file_names, d._preexisting = (lambda: {"parts.txt"}), set()
         d._foreground_actions = d._scripted_actions = d._projected_actions = 0
         d.transport = "mcp"
         observe(d)

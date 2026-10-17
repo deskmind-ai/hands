@@ -96,7 +96,7 @@ class Refusal(unittest.TestCase):
     def test_page_info_is_the_observed_windows(self):
         d = driver("打开 Safari，搜索新加坡的天气")
         d._window_frame = lambda: (900, 0, 800, 600)
-        with mock.patch.object(axchrome, "page_info", lambda pid, frame: {"frame": frame}):
+        with mock.patch.object(axchrome, "page_info", lambda pid, frame, wid=None: {"frame": frame}):
             self.assertEqual(d.page_info(), {"frame": (900, 0, 800, 600)})
 
     def test_the_page_is_typed_into(self):

@@ -240,18 +240,33 @@ def _users_words(dialogue: list[dict]) -> list[tuple[str, str]]:
     return [(d["question"], d["reply"]) for d in dialogue if d.get("by") != "harness"]
 
 
-def _page_objection(task: Task, driver, adapter, said=()) -> tuple[dict, str | None, str | None]:
+def _page_objection(task: Task, driver, adapter, said=(), obs=None) -> tuple[dict, str | None, str | None]:
     """Whether a run finishing on a web page is done, as a model judged it (runtime/judge.py): (the page, the verdict,
     why it is not done). No verdict when the app shows no web page or there is no judgement -- this never holds a run
-    back on its own. Only http(s) and file pages: a mail message is a web area too, and is no result page."""
+    back on its own. Only http(s) and file pages: a mail message is a web area too, and is no result page.
+
+    Finishing with no window of the app seen (`obs.no_window`) is judged too: there is no page, and nothing on screen
+    shows the result either. Skipped as "no page", Safari read as "no window open" while it was not in front, and a
+    web search ended completed in 4 s with none made (deskmind#73, live 10-17)."""
     page = getattr(driver, "page_info", lambda: None)() or {}
     if not str(page.get("url") or "").startswith(("http://", "https://", "file:")):
-        return page, None, None
+        if not getattr(obs, "no_window", False):
+            return page, None, None
+        app = str(getattr(driver, "app", "") or "")
+        verdict = judge.done_unseen(getattr(adapter, "judge_choice", None), task.goal, app, said)
+        why = (f"no window of {app} can be seen, so nothing shows what the goal asks for: open or switch to the window "
+               f"where it is done, and do it there." if verdict == judge.NOT_SHOWN else None)
+        return {"app": app, "no_window": True}, verdict, why
     verdict = judge.done(getattr(adapter, "judge_choice", None), task.goal, page, said)
     if verdict != judge.NOT_SHOWN:
         return page, verdict, None
     return page, verdict, (f"the page ({page.get('url')}, {page.get('title') or 'no title'}) does not show what the "
                            f"goal asks for: check what was done, and do it where it gives that result.")
+
+
+def _judged_about(page: dict) -> str:
+    """What a done judgement was about, for the trace: the page the run finished on, or no window at all."""
+    return "result_no_window" if page.get("no_window") else "result_on_page"
 
 
 def _target_label(obs, action) -> str | None:
@@ -537,11 +552,11 @@ def run_task(
                 objection = getattr(adapter, "done_objection", None)
                 why = objection(ctx) if objection else None
                 if not why:
-                    page, verdict, why = _page_objection(task, driver, adapter, _users_words(dialogue))
+                    page, verdict, why = _page_objection(task, driver, adapter, _users_words(dialogue), obs)
                     last_page_verdict = verdict
                     if verdict:
-                        entry = {"n": len(steps) + 1, "kind": "judged", "about": "result_on_page", "verdict": verdict,
-                                 "url": page.get("url"), "title": page.get("title"), "by": "harness"}
+                        entry = {"n": len(steps) + 1, "kind": "judged", "about": _judged_about(page),
+                                 "verdict": verdict, "url": page.get("url"), "title": page.get("title"), "by": "harness"}
                         steps.append(entry)
                         if recorder:
                             recorder.step(entry)
@@ -560,9 +575,9 @@ def run_task(
                 # Held back as often as allowed, and the page still does not show the result: not done. Accepted, a
                 # run that never acted ended "completed" after its third DONE (deskmind#73, live run). Also when the
                 # blocks were spent by another check and the page was never judged (review of c2b9b08): judged now.
-                verdict_now = _page_objection(task, driver, adapter, _users_words(dialogue))
+                verdict_now = _page_objection(task, driver, adapter, _users_words(dialogue), obs)
                 if verdict_now[1]:
-                    steps.append({"n": len(steps) + 1, "kind": "judged", "about": "result_on_page",
+                    steps.append({"n": len(steps) + 1, "kind": "judged", "about": _judged_about(verdict_now[0]),
                                   "verdict": verdict_now[1], "url": verdict_now[0].get("url"),
                                   "title": verdict_now[0].get("title"), "by": "harness", "final": True})
                     if recorder:

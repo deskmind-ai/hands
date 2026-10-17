@@ -145,6 +145,60 @@ def at(frames, x: float, y: float) -> bool:
     return any(fx <= x <= fx + fw and fy <= y <= fy + fh for fx, fy, fw, fh in frames)
 
 
+#: What sits over a browser window without being the browser's own controls: a sheet or a dialog (a site's sign-in
+#: prompt, a download question) and a popover. Its buttons are the next step, as the page's are.
+OVERLAY_ROLES = {"AXSheet", "AXPopover"}
+OVERLAY_SUBROLES = {"AXDialog", "AXSystemDialog"}
+
+
+def regions(pid: int, frame: tuple | None, wid=None) -> dict | None:
+    """Where the window at `frame` (the window the run observes; `wid`, its window-server id) shows the page, and what
+    else in it is not the browser's own: {"window": its frame, "page": the web areas' frames, "overlay": sheets',
+    dialogs' and popovers' frames, "address_bar": the address bars' frames}, all screen frames. Everything else inside
+    the window -- the toolbar, the tab bar, the sidebar with the user's tab groups, bookmarks and reading list -- is the
+    browser's own (chrome). None when no single window is at `frame` (_the_window). By structure only: roles and the
+    address bar's identifier, never a word on screen.
+
+    Live 10-17 (0.4.3-rc.3, run 4): in its own window, still on its marker page, a run asked to copy a table from a page
+    open in the user's window clicked 「显示边栏」 and double-clicked the sidebar's 「默认，含1个标签页的标签页组」 -- the
+    user's tab groups, which open in the window clicked and can be rearranged."""
+    win = _the_window(pid, frame, wid)
+    if win is None:
+        return None
+    out: dict = {"window": _frame(win) or tuple(frame), "page": [], "overlay": [], "address_bar": []}
+    stack, seen = list(reversed(_get(win, "AXChildren") or [])), 0
+    while stack and seen < MAX_NODES:
+        el = stack.pop()
+        seen += 1
+        role = _get(el, "AXRole")
+        if role == "AXWebArea" or role in OVERLAY_ROLES or _get(el, "AXSubrole") in OVERLAY_SUBROLES:
+            f = _frame(el)
+            if f:
+                out["page" if role == "AXWebArea" else "overlay"].append(f)
+            continue        # what is inside is the page's or the overlay's: not walked
+        if role in TEXT_ROLES and _get(el, "AXIdentifier") in ADDRESS_BAR_IDS:
+            f = _frame(el)
+            if f:
+                out["address_bar"].append(f)
+        stack.extend(reversed(_get(el, "AXChildren") or []))
+    return out
+
+
+def _overlap(a, b) -> bool:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return min(ax + aw, bx + bw) > max(ax, bx) and min(ay + ah, by + bh) > max(ay, by)
+
+
+def chrome(r: dict, rect: tuple) -> bool:
+    """Whether the screen rectangle `rect` (x, y, w, h: an element's) is one of the browser's own controls in the
+    window `r` describes (regions): inside the window, and touching none of its page, overlays or address bar. Any
+    part on the page keeps an element the page's: a row scrolled half under the toolbar is still the page's. A rect
+    wholly outside the window (a menu the page opened) is not the window's chrome."""
+    return (_overlap(rect, r["window"])
+            and not any(_overlap(rect, f) for f in r["page"] + r["overlay"] + r["address_bar"]))
+
+
 #: The most page text read for a judgement (runtime/judge.py shows less): a result is near the top of a page.
 PAGE_TEXT_CHARS = 4000
 

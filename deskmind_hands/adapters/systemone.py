@@ -939,6 +939,16 @@ KEY_CHOICES = {
     "delete": "Delete the selection",
 }
 
+#: ASK's question when the run's own browser window has no page in it (Observation.own_window_empty) and no text
+#: helper writes one: what the run can see and may use, and what would let it go on.
+OWN_WINDOW_QUESTION = {
+    "zh": "我只能在 DeskMind 自己打开的浏览器窗口里操作，这个窗口里还没有网页；你自己的浏览器窗口我不能读，也不能用。"
+          "你说的网页在哪里？可以把它的网址告诉我，我在自己的窗口里打开。",
+    "en": "I can only work in the browser window DeskMind opened for itself, and no page is open in it yet; I may not "
+          "read or use your own browser windows. Where is the page you mean? You can tell me its address, and I will "
+          "open it in my window.",
+}
+
 #: What each operation means, as the planner reads it; the harness maps them onto its own action vocabulary.
 OPERATION_LABELS = {
     "CLICK": "Click one element: a button, menu item, tab, list entry or other control. Clicking a file row only "
@@ -1668,8 +1678,12 @@ class SystemOneAdapter:
         # test exactly this: two orders match "Zhang Wei's order" and the goal names one.
         seen_text = ((state.get("page") or {}).get("text", "") + "\n" + self._seen_text.get(goal, ""))
         asked = ctx.asked > 0   # its own questions; a yes to the harness's approval is not one (G16)
+        # The run's own browser window with no page in it (Observation.own_window_empty) is a fact of the look, not a
+        # reading of the goal: asking for the page is one way on from there, and with no text helper it had none --
+        # 12 clicks on the browser's sidebar instead (0.4.3-rc.3, live 10-17, run 4).
+        own_empty = bool(getattr(ctx.observation, "own_window_empty", False))
         if ctx.task.budget.max_dialogue_turns > 0 and not asked and (
-                self.text_helper or ambiguity_question(goal, seen_text)):
+                self.text_helper or ambiguity_question(goal, seen_text) or own_empty):
             operations["ASK"] = OPERATION_LABELS["ASK"]
         # Two documents of the same app are two windows, and only the focused one is observable: the task that
         # reads sixty lines in one file and writes the answer into another had no way to reach the second.
@@ -1939,6 +1953,8 @@ class SystemOneAdapter:
         elif op == "ASK":
             found = ambiguity(goal, (state.get("page") or {}).get("text", "") + "\n" + self._seen_text.get(goal, ""))
             question, options = found if found else (self._ask_text(goal, state), [])
+            if question is None and getattr(ctx.observation, "own_window_empty", False):
+                question = OWN_WINDOW_QUESTION["zh" if re.search(f"[{HAN}]", goal) else "en"]
             if question is None:
                 return self._refuse(f"ASK without a question: {self._helper_error or 'no text helper'}", answers, t0)
             action = Action(kind=ActionKind.ASK_USER, text=question, options=tuple(options), binding=b, raw=answers)

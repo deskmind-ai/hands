@@ -71,22 +71,32 @@ BROWSER_BUNDLES = {"safari": "com.apple.Safari", "safari浏览器": "com.apple.S
 _STAGE_OPEN = re.compile(r'^\s*open\s+(?:-g\s+)?(?:-a\s+(?:"([^"]+)"|(\S+))|-b\s+(\S+))(.*)$')
 
 
-def _new_window_script(bundle: str, url: str = "") -> str | None:
-    """AppleScript that opens a new window of the browser `bundle` (on `url` if one is given) without activating it or
-    touching any window it already has, and returns the window's id; None for a browser with no such command. Safari
-    and the Chromium browsers script a new window; Firefox and Arc do not, and no `open` is sent instead: on a
-    running app `open` is a reopen, which un-minimises the user's window (deskmind#73, live 10-17)."""
+def _new_window_script(bundle: str, url: str = "", marker: str = "") -> str | None:
+    """AppleScript that opens a new window of the browser `bundle` without activating it or touching any window it
+    already has, and returns the window's id; None for a browser with no such command. On a running app `open` is a
+    reopen, which un-minimises the user's window (deskmind#73, live 10-17), so no `open` is sent instead.
+
+    Safari: the document is made on a page titled `marker` (a run's random `dm-...`, which no window of the user's
+    carries) and the window is found by that title -- not the front window (one the user opens in between is in
+    front), and not by its document (`whose document is d` fails with -1700, and two start pages compare equal; live
+    10-17). The id returned is the window server's. The page `url` is loaded only after that, by
+    _load_in_own_window, so its title cannot get in the way. Chromium: `make new window` returns the window made; its
+    id is the browser's own, so its place is returned too ("id|left,top,right,bottom")."""
     b = bundle.lower()
     u = url.replace("\\", "\\\\").replace('"', '\\"')
     if b == "com.apple.safari":
-        # The window that holds the document just made, never the front window: a window the user opens in between
-        # is in front, and is new too (Codex review). Safari's window id is the window server's.
-        props = f' with properties {{URL:"{u}"}}' if url else ""
-        return (f'tell application id "com.apple.Safari"\n  set d to make new document{props}\n'
-                f'  return id of (first window whose document is d)\nend tell')
+        if not re.fullmatch(r"dm-[0-9a-f]{8,32}", marker or ""):
+            raise ValueError(f"not a window marker: {marker!r}")   # plain ASCII by construction: nothing to escape
+        return (f'tell application id "com.apple.Safari"\n'
+                f'  make new document with properties {{URL:"data:text/html,<title>{marker}</title>"}}\n'
+                f'  repeat 20 times\n'
+                f'    try\n'
+                f'      return id of (first window whose name is "{marker}")\n'
+                f'    end try\n'
+                f'    delay 0.1\n'
+                f'  end repeat\n'
+                f'  return "none"\nend tell')
     if b in {"com.google.chrome", "com.microsoft.edgemac", "com.brave.browser"}:
-        # `make new window` returns the window made. Its id is Chrome's own, not the window server's, so its place is
-        # returned too ("id|left,top,right,bottom"), to find it among the new windows (_own_browser_window).
         nav = f'  set URL of active tab of w to "{u}"\n' if url else ""
         return (f'tell application id "{bundle}"\n  set w to make new window\n{nav}  set b to bounds of w\n'
                 f'  return (id of w as text) & "|" & (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & '
@@ -1075,12 +1085,13 @@ class PeekabooDriver:
         own = self.__dict__.setdefault("_own_browser", {})
         pre = self.__dict__.setdefault("_preexisting", set())
         if own.get(key):
-            if own[key] in (self._app_window_ids(bundle) or set()):
+            if self._still_open(bundle, own[key]):
                 return own[key]
             # Closed since: a new one. Every window there now counts as the user's from here on, including any the run
             # opened itself meanwhile (a pop-up): the safe side.
             del own[key]
-        script = _new_window_script(bundle, url)
+        import secrets
+        script = _new_window_script(bundle, url, f"dm-{secrets.token_hex(6)}")
         if script is None:
             pre |= self._app_window_ids(bundle) or set()
             self._set_miss(bundle, f"{bundle}: no way to open a window of the run's own in the background")
@@ -1133,10 +1144,25 @@ class PeekabooDriver:
                                    f"{len(rows)} new window(s), so none is taken")
             return None
         own[key] = wid
+        if url and key == "com.apple.safari":
+            self._load_in_own_window(wid, url)          # bound first, by its marker title; the page after
         self.__dict__.setdefault("_own_browser_misses", {}).pop(key, None)     # no longer missing: the old reason goes
         self.__dict__.setdefault("_run_windows", set()).add(wid)
         self._apart_from_others(bundle, wid, script_id or hint)
         return wid
+
+    def _still_open(self, bundle: str, wid: str) -> bool:
+        """Whether the run's window `wid` is still a window to work in: listed, on screen and no ghost. A Safari window
+        closed through AppleScript stays listed as an off-screen entry with no tabs and the same id (live 10-17; the
+        tabless leftover the rc.1 read tripped on), and a window the user minimised is put away: neither is reused."""
+        ok, data, _ = self._run("window_list", app=bundle)
+        row = next((w for w in ((data or {}).get("windows") or []) if ok and str(w.get("window_id")) == str(wid)), None)
+        return row is not None and bool(row.get("is_on_screen", True)) and not self._ghost(row)
+
+    def _load_in_own_window(self, wid: str, url: str) -> None:
+        """Load `url` in the run's own Safari window, found by its id (the window server's, which Safari's is)."""
+        u = url.replace("\\", "\\\\").replace('"', '\\"')
+        self._osa(f'tell application id "com.apple.Safari" to set URL of current tab of window id {int(wid)} to "{u}"')
 
     def _set_miss(self, bundle: str, why: str) -> None:
         self.__dict__.setdefault("_own_browser_misses", {})[bundle.lower()] = why

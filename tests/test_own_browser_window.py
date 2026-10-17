@@ -110,14 +110,28 @@ class FakeMac:
             if not self.running:
                 self.running = True           # AppleScript launches the app it names
             url = script.split('URL:"', 1)[1].split('"', 1)[0] if 'URL:"' in script else ""
-            made = self.new_window("新窗口", url)
+            # A data: page titled with the run's marker: the window takes that title.
+            title = url.split("<title>", 1)[1].split("</title>", 1)[0] if "<title>" in url else "起始页"
+            made = self.new_window(title, url)
             if self.user_opens_during_make:
                 self.new_window("用户刚开的窗口")            # in front now, and new as well
             if "front window" in script:
                 return True, str(self.windows[0]["id"])
             if "whose document is d" in script:
-                return True, str(made)
+                return False, "不能将“document”转换为“specifier”类型。 (-1700)"     # as Safari answered, live 10-17
+            if 'whose name is "' in script:
+                name = script.split('whose name is "', 1)[1].split('"', 1)[0]
+                hit = next((w for w in self.windows if w["title"] == name), None)
+                return True, str(hit["id"]) if hit else "none"
             return False, "unknown script"
+        if "set URL of current tab of window id" in script:
+            wid = script.split("window id ", 1)[1].split()[0]
+            w = self.find(wid)
+            if w is None:
+                return False, "no such window"
+            w["url"] = script.split(' to "', 1)[1].rsplit('"', 1)[0]
+            w["title"] = "已载入"
+            return True, ""
         if "set bounds of window id" in script:
             wid = script.split("window id ", 1)[1].split()[0]
             a, b, c, e = (int(v) for v in script.split("{", 1)[1].split("}", 1)[0].split(","))
@@ -639,7 +653,7 @@ class OwnWindow(unittest.TestCase):
         d = self.mac(mac)
         users = str(mac.windows[0]["id"])                    # in front, and new too
         self.assertNotEqual(d._pinned_window, users)
-        self.assertEqual(mac.find(d._pinned_window)["title"], "新窗口")
+        self.assertTrue(mac.find(d._pinned_window)["title"].startswith("dm-"))
         self.assertNotIn(users, [w.id for w in d.observe().windows])
 
     def test_an_id_that_is_not_a_new_window_pins_nothing(self):
@@ -675,6 +689,44 @@ class OwnWindow(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"Quartz": None}):
             self.assertIsNone(d._own_browser_window(chrome))     # no new window at that place: none
 
+    # -- live 10-17: the window found by its marker title; the page after; the closed window's ghost -------------
+
+    def test_the_staged_page_is_loaded_only_after_the_window_is_bound(self):
+        mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1200, 800)}])
+        d = self.mac(mac, stage=('open -a Safari "https://example.com/page"',))
+        scripts = [e[1] for e in mac.events if e[0] == "osascript"]
+        make = next(i for i, x in enumerate(scripts) if "make new document" in x)
+        load = next(i for i, x in enumerate(scripts) if "set URL of current tab" in x)
+        self.assertLess(make, load)
+        self.assertNotIn("example.com", scripts[make])
+        self.assertIn(f"window id {d._pinned_window} ", scripts[load])
+        self.assertEqual(mac.find(d._pinned_window)["url"], "https://example.com/page")
+        self.assertEqual(mac.find(19116)["title"], "我的银行")
+
+    def test_each_window_gets_its_own_marker(self):
+        mac = FakeMac()
+        d = self.mac(mac, app="com.apple.TextEdit", stage=())
+        d._own_browser_window(SAFARI)
+        d._own_browser.clear()
+        d._own_browser_window(SAFARI)
+        markers = [e[1].split("<title>")[1].split("<")[0] for e in mac.events
+                   if e[0] == "osascript" and "make new document" in e[1]]
+        self.assertEqual(len(set(markers)), 2)
+
+    def test_the_ghost_a_closed_window_leaves_is_never_read_or_reused(self):
+        # Closed through AppleScript, a Safari window stays listed off screen with no tabs and the same id (live 10-17).
+        mac = FakeMac()
+        d = self.mac(mac)
+        own = d._pinned_window
+        ghost = mac.find(own)
+        ghost.update(on_screen=False, title="")
+        d._pinned_window = d._window_id = None
+        self.assertTrue(d.observe().no_window)
+        self.assertNotIn(own, self.reads(mac))
+        res = d.execute(Action(kind=ActionKind.FOCUS_APP, text="Safari"))      # back to Safari: a new window
+        self.assertTrue(res.ok, res.detail)
+        self.assertNotEqual(d._pinned_window, own)
+
 
 class Parsing(unittest.TestCase):
     def test_browser_staging_commands(self):
@@ -690,14 +742,18 @@ class Parsing(unittest.TestCase):
                          ("com.apple.Safari", '"https://a.b/?x=1&y=2"'))
 
     def test_scripts(self):
-        self.assertIn("make new document", pk._new_window_script("com.apple.Safari"))
-        self.assertIn("whose document is d", pk._new_window_script("com.apple.Safari"))
-        self.assertNotIn("front window", pk._new_window_script("com.apple.Safari"))
+        safari = pk._new_window_script("com.apple.Safari", "https://a.b/x", "dm-0123abcd")
+        self.assertIn('make new document with properties {URL:"data:text/html,<title>dm-0123abcd</title>"}', safari)
+        self.assertIn('first window whose name is "dm-0123abcd"', safari)
+        self.assertNotIn("front window", safari)
+        self.assertNotIn("whose document", safari)                 # -1700 on Safari, live 10-17
+        self.assertNotIn("a.b", safari)                            # the page is loaded only once the window is bound
+        with self.assertRaises(ValueError):
+            pk._new_window_script("com.apple.Safari", "", 'dm-x" & do shell script "y')
         self.assertIn("bounds of w", pk._new_window_script("com.google.Chrome"))
-        self.assertIn('URL:"https://a.b/\\"x"', pk._new_window_script("com.apple.Safari", 'https://a.b/"x'))
         self.assertIn("make new window", pk._new_window_script("com.google.Chrome", "https://a.b"))
         self.assertIsNone(pk._new_window_script("org.mozilla.firefox"))
-        for s in (pk._new_window_script("com.apple.Safari"), pk._new_window_script("com.google.Chrome")):
+        for s in (pk._new_window_script("com.apple.Safari", "", "dm-0123abcd"), pk._new_window_script("com.google.Chrome")):
             self.assertNotIn("activate", s)
             self.assertNotIn("reopen", s)
 

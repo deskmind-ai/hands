@@ -66,6 +66,7 @@ def observation(rec: dict) -> Observation:
                            on_screen=w.get("on_screen", True)) for w in rec.get("windows") or []],
         dialog=bool(rec.get("dialog")), notes=list(rec.get("notes") or []),
         accepts_keys=bool(rec.get("accepts_keys", True)), no_window=bool(rec.get("no_window")),
+        own_window_empty=bool(rec.get("own_window_empty")),
         layout_version=rec.get("layout_version", 0), ts=rec.get("ts", 0.0))
 
 

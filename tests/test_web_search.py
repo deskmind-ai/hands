@@ -123,6 +123,7 @@ class Carried(unittest.TestCase):
         d._address_bar, d._address_bar_rect, d._projected_actions = "e48", Rect(*BAR), 0
         d._background_input = lambda bundle: background
         d._moved_since_seen = lambda: None
+        d._seen_frame = frame
         d._wait_until_still = lambda bundle, what="": None
         d._background_quartz = lambda bundle, observed_only=False: (("Q", "token") if window and observed_only else None)
         d._flash = mock.Mock(side_effect=AssertionError("never the foreground route"))
@@ -156,6 +157,26 @@ class Carried(unittest.TestCase):
         self.assertTrue(res.ok, res.detail)
         self.assertEqual([e[0] for e in d.events], ["click", "paste", "return", "focus back"])
         self.assertEqual(d.events[1], ("paste", "新加坡 天气"))
+
+    def test_moved_while_waiting_for_the_user_nothing_is_sent(self):
+        # The window moved during the wait: the click would land at the old place, in the page (review of c2b9b08).
+        # The real check after the wait, against the frame kept by the look (review of 2e2da77: not stubbed).
+        d = self.searchable()
+        d._seen_frame = WIN
+        d._window_frame = lambda: (40, 0, 800, 600)
+        d.allow_browser_field(WEB_SEARCH)
+        res = self.act(d)
+        self.assertFalse(res.ok)
+        self.assertTrue(res.stale)
+        self.assertEqual(d.events, [])
+
+    def test_no_frame_kept_by_the_look_nothing_is_sent(self):
+        d = self.searchable()
+        d._seen_frame = None
+        d.allow_browser_field(WEB_SEARCH)
+        res = self.act(d)
+        self.assertFalse(res.ok)
+        self.assertEqual(d.events, [])
 
     def test_not_allowed_it_is_refused(self):
         d = self.searchable()
@@ -200,7 +221,7 @@ class Carried(unittest.TestCase):
         d._window_frame = lambda: None
         d.allow_browser_field(WEB_SEARCH)
         self.assertFalse(self.act(d).ok)
-        self.assertEqual([e[0] for e in d.events], ["click", "focus back"])
+        self.assertEqual(d.events, [])                  # not even the click (review of 2e2da77)
 
     def test_focus_lost_after_the_paste_no_return(self):
         d = self.searchable(focused=["WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD", "WEB_FIND_FIELD"])
@@ -215,6 +236,20 @@ class Carried(unittest.TestCase):
         d._address_bar_rect = None
         d.allow_browser_field(WEB_SEARCH)
         self.assertFalse(self.act(d).ok)
+
+
+class Bound(unittest.TestCase):
+    def test_a_first_look_keeps_the_place_of_the_window_it_binds(self):
+        # observe() kept the frame before binding the window: a first look kept none (review of 2e2da77).
+        import types
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        d._window_id, d._pinned_window, d._pin_window = None, None, True
+        bounds = {"X": 10, "Y": 20, "Width": 800, "Height": 600}
+        quartz = types.SimpleNamespace(kCGWindowListOptionIncludingWindow=8, CGWindowListCopyWindowInfo=lambda opt, wid: (
+            [{"kCGWindowBounds": bounds}] if wid == 4242 else []))
+        with mock.patch.dict(sys.modules, {"Quartz": quartz}):
+            d._bind_window({"coordinate_context": {"window": {"window_id": 4242}}})
+        self.assertEqual((d._window_id, d._pinned_window, d._seen_frame), ("4242", "4242", (10, 20, 800, 600)))
 
 
 class Values(unittest.TestCase):

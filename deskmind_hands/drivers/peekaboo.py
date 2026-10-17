@@ -1065,6 +1065,13 @@ class PeekabooDriver:
         waited = self._wait_until_still(self.app, "search from the address bar")
         if waited is not None:
             return ExecResult(False, waited)       # the user is busy: deferred, as any step that waits for them
+        # Again after the wait (up to a minute): a window moved or resized meanwhile put the click at the old place,
+        # into the page (review of c2b9b08). Strict here, unlike _moved_since_seen: no frame from the look or none
+        # now is no click either (review of 2e2da77).
+        seen, now = getattr(self, "_seen_frame", None), self._window_frame()
+        if not seen or not now or seen != now:
+            return ExecResult(False, f"not searched: the window's place is not the one seen ({seen} -> {now}); "
+                                     f"observe again", stale=True)
         bg = self._background_quartz(self.app, observed_only=True)
         if bg is None:
             return ExecResult(False, "not searched: the window this run observes was not found, and no other window "
@@ -1146,6 +1153,16 @@ class PeekabooDriver:
             return None
         b = info[0].get("kCGWindowBounds") if info else None
         return (round(b["X"]), round(b["Y"]), round(b["Width"]), round(b["Height"])) if b else None
+
+    def _bind_window(self, data: dict) -> None:
+        """The window this look is of, pinned on the first look if pinning, and then its place: read before the window
+        was bound, a first look (or one after FOCUS_APP) had no window id yet, kept no frame, and every movement check
+        passed (review of 2e2da77)."""
+        win = (data.get("coordinate_context") or {}).get("window") or {}
+        self._window_id = str(win.get("window_id", "")) or None
+        if self._pin_window and self._pinned_window is None:
+            self._pinned_window = self._window_id
+        self._seen_frame = self._window_frame()
 
     def _moved_since_seen(self) -> str | None:
         """Why a point taken from the last observation no longer lands where it did, or None: the window was moved or
@@ -1798,14 +1815,10 @@ class PeekabooDriver:
         geometry, transform, origin = self._frames(data)
         self._last_geometry = geometry
         self._origin = origin
-        self._seen_frame = self._window_frame()
         self._snapshot = data.get("snapshot_id")
         self._app_name = data.get("application_name", "")
         self._window_title = data.get("window_title") or ""
-        win = (data.get("coordinate_context") or {}).get("window") or {}
-        self._window_id = str(win.get("window_id", "")) or None
-        if self._pin_window and self._pinned_window is None:
-            self._pinned_window = self._window_id
+        self._bind_window(data)
 
         png = shot.read_bytes() if shot.exists() else None
         self._shot = shot

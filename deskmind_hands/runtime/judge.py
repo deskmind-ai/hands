@@ -107,6 +107,6 @@ def done(ask: AskChoice | None, goal: str, page: dict, said=()) -> str | None:
 def done_unseen(ask: AskChoice | None, goal: str, app: str, said=(), done=()) -> str | None:
     """没出来 / 结果本来就不需要窗口 for a run finishing with no window of `app` seen, or None when there is no answer.
     Only 没出来 holds a run back, as for a page. `done`: what the run's last actions did, in the driver's words."""
-    context = {"用户原话": goal, "看到的": f"{app}：没有打开的窗口，什么也看不到",
+    context = {"用户原话": goal, "看到的": f"{app}：没有能看到内容的窗口（没有打开的窗口，或者窗口里什么也读不到）",
                "助手做过的事": "\n".join(done) or "什么也没做"}
     return _choice(ask, DONE_UNSEEN_QUESTION, _said(context, said), DONE_UNSEEN)

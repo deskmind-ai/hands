@@ -1197,10 +1197,22 @@ class PeekabooDriver:
 
     def _window_ids(self) -> set[str]:
         ok, data, _ = self._run("window_list", app=self.app)
+        #: The rows as read, for the check whether the window just read is a real one (_read_nothing).
+        self._last_window_rows = list((data or {}).get("windows") or []) if ok else []
         if not ok:
             return set()
         return {str(w.get("window_id")) for w in (data.get("windows") or [])
                 if w.get("window_id") is not None}
+
+    def _read_nothing(self, elements: list) -> bool:
+        """Whether a read that succeeded still saw no window: nothing in it at all, or the window it read is a ghost
+        (tiny or untitled, with no accessibility window behind it; _ghost). A DONE on such a look is judged like one
+        on no window (review of #42). A small real window is neither: it has a title or a tree, and its controls."""
+        if not elements:
+            return True
+        wid = self._window_id or self._pinned_window
+        row = next((w for w in getattr(self, "_last_window_rows", []) if str(w.get("window_id")) == str(wid)), None)
+        return row is not None and self._ghost(row)
 
 
     #: Buttons that only acknowledge. Nothing here discards work or deletes anything: a harness may clear an alert
@@ -1913,6 +1925,7 @@ class PeekabooDriver:
             dialog=bool(data.get("is_dialog")),
             notes=[n for n in (ax_truncation_note(data),) if n],
             accepts_keys=not self._vision_app(),
+            no_window=self._read_nothing(elements),
             # Peekaboo mints a new snapshot id per observation; reusing an old
             # one is exactly the staleness this field exists to detect.
             layout_version=self._obs_n,

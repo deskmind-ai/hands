@@ -44,6 +44,7 @@ class FakeMac:
         self.restored = [dict(w) for w in restored]   # what a launch brings back from the last session
         self.next_id = 30000
         self.events: list[tuple] = []
+        self.idle = 1e6          # seconds since the user last touched anything
 
     # -- what happens on the Mac
     def open_app(self, argv):
@@ -137,6 +138,8 @@ class FakeMac:
                     for w in self.windows] if self.running else []
         return types.SimpleNamespace(
             kCGWindowListOptionAll=0, kCGWindowListOptionIncludingWindow=8, CGWindowListCopyWindowInfo=windows,
+            CGEventSourceSecondsSinceLastEventType=lambda state, kind: self.idle,
+            kCGEventSourceStateHIDSystemState=1, kCGAnyInputEventType=~0,
             CGSessionCopyCurrentDictionary=lambda: {"kCGSSessionOnConsoleKey": True},
             kCGSessionOnConsoleKey="kCGSSessionOnConsoleKey")
 
@@ -354,7 +357,7 @@ class OwnWindow(unittest.TestCase):
         mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1200, 800)}])
         make = mac.osa
 
-        def two(script):
+        def two(script):  # noqa: E306
             ok, out = make(script)
             if "make new document" in script:
                 mac.new_window("恢复的标签页")
@@ -364,7 +367,94 @@ class OwnWindow(unittest.TestCase):
         d = self.mac(mac)
         self.assertIsNone(d._pinned_window)
         self.assertIn("could not be told apart", d.state()["own_browser_miss"])
+        obs = d.observe()                       # and neither new window is read or offered afterwards
+        self.assertTrue(obs.no_window)
         self.assertEqual(self.reads(mac), [])
+        self.assertEqual([w.id for w in obs.windows], [])
+
+    # -- second review: only the run's own windows, not "all but the user's at the start" ----------------------
+
+    def test_a_window_the_user_opens_during_the_run_is_not_the_runs(self):
+        mac = FakeMac()
+        d = self.mac(mac)
+        own = d._pinned_window
+        users = str(mac.new_window("用户自己新开的"))             # ⌘N by the user, between two steps
+        d._pinned_window = d._window_id = None                    # even with nothing pinned
+        obs = d.observe()
+        self.assertEqual(self.reads(mac), [own])
+        self.assertNotIn(users, [w.id for w in obs.windows])
+        res = d.execute(Action(kind=ActionKind.FOCUS_WINDOW, text=users))
+        self.assertFalse(res.ok)
+
+    def test_a_window_the_runs_own_step_opens_is_the_runs(self):
+        mac = FakeMac()
+        d = self.mac(mac)
+        d.observe()
+        opened = []
+        d._execute_outer = lambda action: opened.append(mac.new_window("链接打开的窗口")) or ExecResult(True, "clicked")
+        d.execute(Action(kind=ActionKind.WAIT, duration_s=0.1))
+        self.assertIn(str(opened[0]), [w.id for w in d._windows()])
+
+    def test_a_window_that_opens_during_a_step_while_the_user_works_is_not_the_runs(self):
+        mac = FakeMac()
+        d = self.mac(mac)
+        d.observe()
+        mac.idle = 0.0                                            # the user is typing during the step
+        opened = []
+        d._execute_outer = lambda action: opened.append(mac.new_window("谁开的？")) or ExecResult(True, "clicked")
+        d.execute(Action(kind=ActionKind.WAIT, duration_s=0.1))
+        self.assertNotIn(str(opened[0]), [w.id for w in d._windows()])
+
+    def test_a_browser_is_never_brought_forward_by_the_foreground_route(self):
+        mac = FakeMac([{"id": 19085, "title": "收藏夹", "on_screen": False, "frame": (0, 0, 1200, 800)}])
+        d = self.mac(mac)
+        d._background_input = lambda bundle: False
+        with mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": SAFARI}):
+            ok, detail = d._flash(SAFARI, lambda q: "clicked")
+        self.assertFalse(ok)
+        self.assertEqual([e for e in mac.events if e[0] in ("open", "sh")], [])
+        self.assertFalse(mac.find(19085)["on_screen"])
+
+    def test_focus_app_retries_the_start_browser_and_a_miss_is_no_success(self):
+        mac = FakeMac()
+        fail = {"on": True}
+        make = mac.osa
+        mac.osa = lambda script: (False, "execution error") if fail["on"] and "make new" in script else make(script)
+        d = self.mac(mac)
+        self.assertIsNone(d._pinned_window)
+        res = d.execute(Action(kind=ActionKind.FOCUS_APP, text=SAFARI))
+        self.assertFalse(res.ok)                                  # no window: not reported as switched
+        self.assertNotIn("already observing", res.detail)
+        fail["on"] = False
+        res = d.execute(Action(kind=ActionKind.FOCUS_APP, text=SAFARI))
+        self.assertTrue(res.ok, res.detail)
+        self.assertIsNotNone(d._pinned_window)
+
+    def test_one_browser_named_twice_gets_one_window(self):
+        mac = FakeMac()
+        self.mac(mac, stage_apps=["com.apple.safari"])
+        self.assertEqual(sum("make new" in e[1] for e in mac.events if e[0] == "osascript"), 1)
+        # Handled once, under one spelling: a second pass asked about "com.apple.safari" and could lose the window.
+        self.assertEqual([e for e in mac.events if e[0] == "peekaboo" and e[2] == "com.apple.safari"], [])
+
+    def test_chrome_by_its_app_name_is_a_browser(self):
+        mac = FakeMac()
+        d = self.mac(mac, app="com.apple.TextEdit", stage=())
+        d._stage_apps = ["Google Chrome"]
+        d._run = lambda key, _extra=None, **kw: (True, {"windows": [
+            {"window_id": 5, "window_title": "用户的 Chrome", "is_on_screen": True}]}, "") \
+            if kw.get("app") in ("com.google.Chrome", "Google Chrome") else mac.peekaboo(key, _extra, **kw)
+        d._mcp = object()
+        self.assertNotIn("5", [w.id for w in d._windows()])
+
+    def test_a_chromium_launch_gets_no_safari_flag(self):
+        mac = FakeMac(running=False)
+        d = self.mac(mac, app="com.apple.TextEdit", stage=())
+        d._app_is_running = lambda bundle: False
+        d._launch_in_background("com.google.Chrome")
+        argv = [e[1] for e in mac.events if e[0] == "open"][-1]
+        self.assertNotIn("-ApplePersistenceIgnoreState", argv)
+        self.assertNotIn("YES", argv)
 
 
 class Parsing(unittest.TestCase):
@@ -375,6 +465,10 @@ class Parsing(unittest.TestCase):
         self.assertEqual(pk._browser_stage('open -a "Google Chrome"', b), ("com.google.Chrome", ""))
         self.assertIsNone(pk._browser_stage('open -a TextEdit "$WS/a.txt"', b))
         self.assertIsNone(pk._browser_stage("open -b com.apple.Safari; rm -rf x", b))
+        self.assertIsNone(pk._browser_stage("open -b com.apple.Safari && echo", b))
+        # An & inside a quoted URL is no operator.
+        self.assertEqual(pk._browser_stage('open -a Safari "https://a.b/?x=1&y=2"', b),
+                         ("com.apple.Safari", '"https://a.b/?x=1&y=2"'))
 
     def test_scripts(self):
         self.assertIn("make new document", pk._new_window_script("com.apple.Safari"))

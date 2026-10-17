@@ -273,6 +273,7 @@ class Windows(unittest.TestCase):
         # The parts run switched to the user's own minimised Safari window and read its page (live 10-16).
         d = driver("com.apple.Safari")
         d._mcp, d._pinned_window, d._window_id, d._obs_n = None, "2", "2", 0
+        d._run_windows = {"1", "2", "3"}                # all the run's: only the minimised rule is tested here
         d._run = lambda op, **kw: (True, {"windows": [
             {"window_id": 1, "window_title": "新加坡 天气_百度搜索", "is_on_screen": False},
             {"window_id": 2, "window_title": "零件清单", "is_on_screen": True},
@@ -286,6 +287,7 @@ class Windows(unittest.TestCase):
         d = driver("com.apple.TextEdit")
         d._mcp, d._pinned_window, d._window_id, d._obs_n = object(), "9", "9", 0
         d._stage_apps, d._home_app, d._window_app = ["Safari"], "com.apple.TextEdit", {}
+        d._run_windows = {"1", "2"}
         d._run = lambda op, app=None, **kw: (True, {"windows": [] if app == "com.apple.TextEdit" else [
             {"window_id": 1, "window_title": "新加坡 天气_百度搜索", "is_on_screen": False},
             {"window_id": 2, "window_title": "零件清单", "is_on_screen": True}]}, "")
@@ -342,6 +344,7 @@ class ObservedWindowOnly(unittest.TestCase):
         fake_q = types.SimpleNamespace(CGWindowListCopyWindowInfo=lambda opt, wid: wins, kCGWindowListOptionAll=0)
         d = driver("com.apple.Safari")
         d._pinned_window, d._window_id = None, observed
+        d._run_windows = {"9"}                          # the run's own window; 7 is the user's
         with mock.patch.dict(sys.modules, {"Quartz": fake_q, "AppKit": types.SimpleNamespace(NSRunningApplication=None)}), \
                 mock.patch.object(skylight, "focus_without_raise", lambda pid, wid: ("token", wid)), \
                 mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)):

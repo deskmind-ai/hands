@@ -119,7 +119,9 @@ class PageServer:
     """One folder served over http on 127.0.0.1 only, on a free port, from a thread of this process: a staged local
     page reaches the run's Safari window as http://127.0.0.1:<port>/<file>, since Safari does not open file:// pages
     sent by script (live 10-17). Only files inside the folder are served (a path that leaves it, by .. or a link, is a
-    404), no folder is listed, and nothing is logged to stdout, which carries the run's protocol lines."""
+    404), no hidden file or folder (a segment starting with "."), no folder is listed, only a request whose Host is
+    127.0.0.1:<port> or localhost:<port> is answered (421 otherwise: DNS rebinding), and nothing is logged to stdout,
+    which carries the run's protocol lines."""
 
     def __init__(self, folder: Path) -> None:
         import http.server
@@ -131,9 +133,20 @@ class PageServer:
                 super().__init__(*a, directory=str(root), **kw)
 
             def send_head(self):
+                # Only a request addressed to this server by name: a page elsewhere that rebinds its own host name to
+                # 127.0.0.1 (DNS rebinding) sends its own Host, and is refused.
+                if (self.headers.get("Host") or "").strip().lower() not in server.hosts:
+                    self.send_error(421)
+                    return None
+                # No hidden file or folder (".hands/...", ".git/..."), by any segment of the path as asked.
+                from urllib.parse import unquote, urlsplit
+                if any(seg.startswith(".") for seg in unquote(urlsplit(self.path).path).split("/") if seg):
+                    self.send_error(404)
+                    return None
                 # Only a file inside the folder, after links are followed; a folder itself is not listed either.
                 p = Path(os.path.realpath(self.translate_path(self.path)))
-                if root not in p.parents or not p.is_file():
+                if root not in p.parents or not p.is_file() or any(
+                        part.startswith(".") for part in p.relative_to(root).parts):
                     self.send_error(404)
                     return None
                 return super().send_head()
@@ -145,10 +158,13 @@ class PageServer:
             def log_message(self, *args):
                 pass
 
+        server = self
         self.root = root
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.httpd.daemon_threads = True
         self.port = self.httpd.server_address[1]
+        #: The Host values a request may carry: this server by address or by localhost, with its port.
+        self.hosts = {f"127.0.0.1:{self.port}", f"localhost:{self.port}"}
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="hands-page-server", daemon=True)
         self.thread.start()
 

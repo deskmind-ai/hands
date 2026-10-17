@@ -331,24 +331,47 @@ class Ask(unittest.TestCase):
         self.assertEqual(user.asked[:1], [OWN_WINDOW_QUESTION["zh"]])
         self.assertIn("DeskMind opened for this run", planner.states[0]["note"])
 
-    def test_an_address_the_user_gives_is_typed_in_the_address_bar(self):
-        # Codex review of 82681e5: the user answered the question with the page's address, and the values to type
-        # were still the goal's and the screen's only (parts.txt).
-        url = "https://example.com/parts"
+    def answered(self, reply, done_verdict, turns):
+        """The empty-window ASK answered with `reply`, then the planner's `turns`. The judges answer as the app's Brain
+        did on these cases (probe, 10-17): typing parts.txt into the address bar 不做, the empty window `done_verdict`."""
         driver = OnMarker()
         a = SystemOneAdapter(url="http://127.0.0.1:9", timeout=2)
-        a._ask = planner = Script([("ASK", None, None), ("TYPE_TEXT", "在地址栏搜索", url), ("DONE", None, None)])
-        judged = []
-        a.judge_choice = lambda state, sy, options: judged.append(state) or {
-            "choice": judge.DO if judge.DO in options else judge.SHOWN}
-        user = User(reply=url)
+        a._ask = planner = Script([("ASK", None, None)] + turns)
+        a.judge_choice = lambda state, sy, options: {"choice": judge.DONT if "准备打的内容" in state else done_verdict}
+        user = User(reply=reply)
         res = run_marker(self.GOAL, driver, a, user)
+        return res, driver, planner, user
+
+    def test_an_answer_is_not_acted_on_and_the_run_never_completes(self):
+        # Option 1 (review of 61efec4): what the user answers is not turned into a value to type -- hands derives
+        # values with code rules and the model only chooses. The planner typed parts.txt into the address bar after
+        # an address was given (probe); the typing judge refuses that, and the empty window is not done.
+        turns = [("TYPE_TEXT", "在地址栏搜索", "parts.txt")] + [("DONE", None, None)] * 4
+        res, driver, planner, user = self.answered("https://example.com/parts", judge.NOT_SHOWN, turns)
+        self.assertEqual(user.asked[:1], [OWN_WINDOW_QUESTION["zh"]])
         values = [v["value"] for v in planner.requests[1]["type_text_value"]["criteria"].values()]
-        self.assertEqual(values[0], url)                       # offered, first
-        self.assertEqual(driver.typed, [url])                  # and typed, through the address bar search
-        self.assertIn(url, judged[0])                          # the typing judge read what the user said
-        self.assertIn("用户后来说的", judged[0])
-        self.assertEqual(res.state.value, "completed")
+        self.assertNotIn("https://example.com/parts", values)          # not acted on yet
+        self.assertEqual(driver.typed, [])                              # parts.txt never reached the address bar
+        self.assertTrue([s for s in res.steps if s.get("kind") == "judged" and s.get("verdict") == judge.DONT])
+        self.assertNotEqual(res.state.value, "completed")
+        self.assertEqual(res.failure.cls.name, "FALSE_COMPLETION")
+
+    def test_an_answer_of_dont_know_ends_unverified_not_completed(self):
+        # The Brain's done judge said 结果本来就不在网页上 of the empty window here (probe): with no step gone through,
+        # that is not taken.
+        turns = [("TYPE_TEXT", "在地址栏搜索", "parts.txt")] + [("DONE", None, None)] * 4
+        res, driver, _, _ = self.answered("不知道，你看着办", judge.NOT_ON_A_PAGE, turns)
+        self.assertEqual(driver.typed, [])
+        self.assertNotEqual(res.state.value, "completed")
+        self.assertIn("not verified", res.failure.detail)
+        judged = [s for s in res.steps if s.get("kind") == "judged" and s.get("about") == "result_on_page"]
+        self.assertTrue(judged and judged[0]["verdict"] == judge.NOT_ON_A_PAGE and judged[0].get("not_taken"))
+
+    def test_a_stop_after_the_answer_keeps_the_reason(self):
+        res, _, _, _ = self.answered("不知道", judge.NOT_SHOWN, [("BLOCKED", None, None)])
+        self.assertEqual(res.state.value, "gave_up")
+        stop = [s for s in res.steps if s.get("kind") == "give_up"]
+        self.assertTrue(stop and any("DeskMind opened for this run" in n for n in stop[0]["notes"]))
 
     def test_no_other_copy_of_a_look_drops_it(self):
         # The sweep after _filter: the hybrid adapter's look without pixels, and a look replayed from a trace.
@@ -360,14 +383,6 @@ class Ask(unittest.TestCase):
                                                       channels=frozenset({"ax"}))).observation
         self.assertTrue(blind.own_window_empty and blind.notes and blind.screenshot_png is None)
         self.assertTrue(observation({"id": "obs-0001", "own_window_empty": True}).own_window_empty)
-
-    def test_an_address_in_a_reply_is_offered_by_its_form(self):
-        from deskmind_hands.adapters.systemone import reply_values
-        self.assertEqual(reply_values([("这个网页在哪？", "网址是 example.com/parts，谢谢")]), ["example.com/parts"])
-        self.assertEqual(reply_values([("q", "a"), ("q", "https://a.example/x 或者 b.example")]),
-                         ["https://a.example/x", "b.example"])
-        self.assertEqual(reply_values([("哪一笔？", "The one from September 27.")]), [])     # no address: nothing
-        self.assertEqual(reply_values([]), [])
 
 
 class OnMarker(MockDriver):
@@ -381,7 +396,10 @@ class OnMarker(MockDriver):
 
     def observe(self):
         if not self.typed:
-            return marker_look()
+            # Each look a little different (the clock in the title bar, say): the loop's identical-looks stop is not
+            # what these tests are about.
+            self.looks = getattr(self, "looks", 0) + 1
+            return dataclasses.replace(marker_look(), focused_app=f"Safari浏览器 {self.looks}")
         return dataclasses.replace(marker_look(empty=False), window_title="零件表", id=f"obs-{len(self.typed) + 1}")
 
     def browser_field(self, eid):

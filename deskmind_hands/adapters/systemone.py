@@ -382,24 +382,6 @@ STEP_OP = re.compile(r"把|改名|重命名|移到|移动|放进|放到|新建|�
                      r"\b(?:rename|move|put|create|make|delete|remove|copy|open|close|save)\b", re.I)
 
 
-#: A web address in what the user said, by its form: with a scheme, or a host name with a dot and a known shape.
-WEB_ADDRESS = re.compile(r"https?://[^\s，。；、）)」”]+|(?<![\w@.])(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:/[^\s，。；、）)」”]*)?")
-
-
-def reply_values(users_words, limit: int = 6) -> list[str]:
-    """Values to type from what the user said after the goal (TurnContext.users_words), latest first: each web address
-    in a reply, by its form. A planner that asked for the page's address got it and could not type it: the values came
-    from the goal and the screen only (Codex review of 82681e5). Only addresses: a whole reply ("The one from September
-    27.") as a value is a change to every request after an answer, for its own measurement (the replay snapshots)."""
-    out: list[str] = []
-    for _, reply in reversed(list(users_words or ())):
-        for value in WEB_ADDRESS.findall(reply or ""):
-            value = value.strip()
-            if value and len(value) <= 200 and value not in out:
-                out.append(value)
-    return out[:limit]
-
-
 def value_candidates(goal: str, visible_text: str = "", limit: int = 14) -> list[str]:
     """Strings a typed value could be, drawn from the goal and from what is on screen.
 
@@ -1792,9 +1774,6 @@ class SystemOneAdapter:
             current = current + "\n" + lines
         earlier = self._seen_text.get(goal, "")
         candidates = value_candidates(goal, current + "\n" + earlier, limit=20)
-        # A web address the user gave since the goal comes first: given in reply to ASK, it is what to open next.
-        said = reply_values(ctx.users_words)
-        candidates = said + [c for c in candidates if c not in said]
         # Texts a field refused ("already ends with exactly this") while it still holds the same content.
         values_now = {e.id: e.value or "" for e in ctx.observation.elements}
         refused = {t.strip() for eid, (then, t) in self._written_out.items() if values_now.get(eid) == then and t}

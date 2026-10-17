@@ -88,6 +88,26 @@ def _new_window_script(bundle: str, url: str = "") -> str | None:
     return None
 
 
+#: Where a person allows one app to control another, said the way System Settings shows it.
+AUTOMATION_SETTING = "System Settings › Privacy & Security › Automation › DeskMind › {app}"
+
+
+def _automation_reason(bundle: str, out: str) -> str:
+    """Why the script that opens the run's window failed, in words the user can act on: macOS's Automation prompt went
+    unanswered (the script timed out while it waited), or the user said no (-1743); else the script's own words."""
+    app = next((n for n, b in STAGE_APP_BUNDLES.items() if b.lower() == bundle.lower()), None) or next(
+        (n.title() for n, b in BROWSER_BUNDLES.items() if b.lower() == bundle.lower() and n.isascii()), bundle)
+    setting = AUTOMATION_SETTING.format(app=app)
+    low = (out or "").lower()
+    if "-1743" in low or "not authorized" in low or "not allowed to send" in low:
+        return (f"macOS does not allow DeskMind to control {app}, so the run could not open a window of its own in "
+                f"it; turn it on in {setting}")
+    if "timed out" in low or "timeout" in low:
+        return (f"macOS asked whether DeskMind may control {app} and no answer came in time, so the run could not "
+                f"open a window of its own in it; answer Allow, or turn it on in {setting}")
+    return f"{app}: no window of the run's own could be opened ({(out or '').strip()[:200]})"
+
+
 def app_bundle(name: str) -> str:
     """The bundle id for an app name a staging command or the planner uses ("Safari", "Google Chrome"), else the name
     as given (already a bundle id, or an app this table does not know)."""
@@ -836,6 +856,8 @@ class PeekabooDriver:
         #: "every window but the user's at the start": a window the user opens during the run, one a launch restores
         #: late, or one the run could not tell apart from those, is none of the run's either.
         self._run_windows: set[str] = set()
+        self._own_browser_wanted: set[str] = set()
+        self._own_browser_retried = False
         #: Finder windows open before staging: a staged folder's window is one that was not there before. Title and
         #: position cannot tell it apart -- every new Finder window opens at the same place, and one task's 「桌面」
         #: window had a twin left from the run before, same title, same bounds.
@@ -1060,9 +1082,10 @@ class PeekabooDriver:
             self._own_browser_miss = f"{bundle}: its windows could not be listed, so a new one could not be told apart"
             return None
         pre |= before
+        self.__dict__.setdefault("_own_browser_wanted", set()).add(key)
         ok, out = self._osa(script)
         if not ok:
-            self._own_browser_miss = f"{bundle}: no new window ({out[:200]})"
+            self._own_browser_miss = _automation_reason(bundle, out)
             return None
         fresh: list[str] = []
         last: list[str] | None = None
@@ -1090,7 +1113,36 @@ class PeekabooDriver:
             return None
         own[key] = wid
         self.__dict__.setdefault("_run_windows", set()).add(wid)
+        self._apart_from_others(bundle, wid, hint)
         return wid
+
+    def _apart_from_others(self, bundle: str, wid: str, script_id: str) -> None:
+        """Move the run's new window a little in from its top-left corner when another window of the browser on
+        screen has exactly its place and size (a user's window zoomed to fill the screen): checks that find a window by
+        its frame cannot tell two such apart, and refused the search (axchrome._the_window). Shrunk, not moved, so it
+        stays on the screen."""
+        try:
+            import Quartz
+            all_wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionAll, 0) or []
+            pid = self._pid_of(bundle, all_wins)
+        except Exception:   # noqa: BLE001
+            return
+        frame = lambda w: tuple(round((w.get("kCGWindowBounds") or {}).get(k, 0)) for k in ("X", "Y", "Width", "Height"))
+        mine = next((w for w in all_wins if str(w.get("kCGWindowNumber")) == wid), None)
+        if mine is None or not pid:
+            return
+        f = frame(mine)
+        same = [w for w in all_wins if w is not mine and w.get("kCGWindowOwnerPID") == pid
+                and w.get("kCGWindowLayer") == 0 and w.get("kCGWindowIsOnscreen", False)
+                and all(abs(a - b) <= 2 for a, b in zip(frame(w), f))]
+        if not same:
+            return
+        x, y, w_, h = f
+        target = wid if bundle.lower() == "com.apple.safari" else script_id   # the id each app's script knows
+        if not str(target).isdigit():
+            return
+        self._osa(f'tell application id "{bundle}" to set bounds of window id {target} to '
+                  f'{{{x + 24}, {y + 24}, {x + w_}, {y + h}}}')
 
     def _may_use(self, bundle: str, wid: str) -> bool:
         """Whether the run may observe, offer, switch to or type into window `wid` of `bundle`: a browser's only if it
@@ -1109,7 +1161,8 @@ class PeekabooDriver:
         except Exception:   # noqa: BLE001
             return None
         return {str(w.get("kCGWindowNumber")) for w in all_wins
-                if pid and w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowNumber") is not None}
+                if pid and w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowNumber") is not None
+                and w.get("kCGWindowLayer") == 0}      # ordinary windows only: no menus, pop-ups or tooltips
 
     def _note_run_windows(self, bundle: str, before: set[str] | None, t0: float) -> None:
         """A browser window that came up during one of the run's steps (a link that opens a window, ⌘N) is the run's,
@@ -1305,7 +1358,7 @@ class PeekabooDriver:
         try:
             from deskmind_hands.drivers import axchrome
             pid = self._pid_of(self.app)
-            fields = axchrome.own_fields(pid, self._window_frame()) if pid else []
+            fields = axchrome.own_fields(pid, self._window_frame(), wid=self._observed_id()) if pid else []
         except Exception:   # noqa: BLE001 -- unread structure: nothing offered
             return []
         # Only the address bar known by its identifier: the search confirms the focus by that identifier, so a field
@@ -1365,7 +1418,7 @@ class PeekabooDriver:
         def on_bar() -> str | None:
             # The observed window's address bar, not merely an address bar: the identifier is the same in every
             # window. No window frame, no check, no paste.
-            return axchrome.focused_identifier(pid, frame) if pid and frame else None
+            return axchrome.focused_identifier(pid, frame, wid=self._observed_id()) if pid and frame else None
 
         try:
             self._post_click(q, x, y)
@@ -1417,9 +1470,14 @@ class PeekabooDriver:
         try:
             from deskmind_hands.drivers import axchrome
             pid = self._pid_of(self.app)
-            return axchrome.page_info(pid, self._window_frame()) if pid else None
+            return axchrome.page_info(pid, self._window_frame(), wid=self._observed_id()) if pid else None
         except Exception:   # noqa: BLE001 -- unread is no page
             return None
+
+    def _observed_id(self) -> str | None:
+        """The observed window's window-server id, for telling it from another window at the same frame (axchrome)."""
+        wid = getattr(self, "_pinned_window", None) or getattr(self, "_window_id", None)
+        return str(wid) if wid and str(wid).isdigit() else None
 
     def _window_frame(self) -> tuple | None:
         """Where the observed window is and how big, from the window server (cheap: no accessibility walk)."""
@@ -2116,6 +2174,13 @@ class PeekabooDriver:
                 self._pinned_window = self._window_to_observe(largest=True, rows=rows)
             none_allowed = rows == []
         chosen: str | None = None    # read by its id: the app-target read found no window (_window_to_observe)
+        key = self.app.lower()
+        if (self._pinned_window is None and key in self.BROWSERS and key in getattr(self, "_own_browser_wanted", set())
+                and key not in getattr(self, "_own_browser", {}) and not getattr(self, "_own_browser_retried", False)):
+            # The run's window could not be opened at the start -- macOS's Automation prompt was still up, say, and the
+            # user clicked Allow late. Tried once more on a look, since a one-app run is offered no FOCUS_APP to retry.
+            self._own_browser_retried = True
+            self._pinned_window = self._own_browser_window(self.app)
         if self._pinned_window is None and not none_allowed and self.app.lower() in self.BROWSERS:
             # A browser is never read by app: Peekaboo then picks the front window itself, and that can be the user's
             # own (deskmind#73). Only a window this task may use is read, by its id; none, or a list that cannot be
@@ -2189,11 +2254,15 @@ class PeekabooDriver:
                 self._labels_by_id = {e.id: e.label or "" for e in docs}
                 self._element_role = {e.id: e.role or "" for e in docs}
                 self._rects, self._element_value = {}, {e.id: "" for e in docs}
+                miss = getattr(self, "_own_browser_miss", "") if self.app.lower() in self.BROWSERS else ""
                 return Observation(
                     id=obs_id,
                     geometry=ScreenGeometry(fallback, fallback),
                     transform=ImageTransform.identity(fallback),
                     screenshot_png=None, elements=docs,
+                    # Why, when the driver knows: the planner and the done judge can stop with it, and the user can
+                    # act on it (an Automation permission), instead of a bare "(no window open)".
+                    notes=[f"No window of this run's own in {self.app}: {miss}"] if miss else [],
                     focused_app=f"{self.app} (no window open)",
                     # The windows it may switch to, other apps' among them: with none listed, nothing could be
                     # chosen but DONE or BLOCKED on an empty screen (deskmind#73, live 10-17). On screen only: never
@@ -3134,20 +3203,32 @@ class PeekabooDriver:
 
     def execute(self, action: Action) -> ExecResult:
         self._require_session()      # nothing is done on a locked screen, however the action was chosen
-        browser = self.app if self.app.lower() in self.BROWSERS and action.kind is not ActionKind.FOCUS_APP else None
+        # A window can become the run's only through a step that put input into the run's own window: a click, a key,
+        # typing, the search. Not a wait or a look: a session Safari restores window by window kept bringing windows up
+        # during the first steps, and a WAIT adopted one (review).
+        observed = getattr(self, "_pinned_window", None) or getattr(self, "_window_id", None)
+        browser = (self.app if self.app.lower() in self.BROWSERS and action.kind in self.INPUT_KINDS
+                   and observed and self._may_use(self.app, observed) else None)
         t0, before = time.time(), (self._quartz_window_ids(browser) if browser else None)
+        res = None
         try:
             if self.CONFIRM_BY_DIFF and action.kind in (ActionKind.CLICK, ActionKind.DOUBLE_CLICK,
                                                         ActionKind.RIGHT_CLICK):
                 res = self._execute_outer(action)
-                return self._confirm_by_diff(res) if res.indeterminate else res
-            return self._execute_outer(action)
+                res = self._confirm_by_diff(res) if res.indeterminate else res
+                return res
+            res = self._execute_outer(action)
+            return res
         finally:
             # A browser-field allowance is for this one step: an early return or an error must not leave it for the
             # next one.
             self._browser_field_allowed = None
-            if browser:
+            if browser and res is not None and res.ok:      # a refused or failed step delivered nothing
                 self._note_run_windows(browser, before, t0)
+
+    #: Steps that deliver input to the observed window: only after one of these can a new window be the run's.
+    INPUT_KINDS = frozenset({ActionKind.CLICK, ActionKind.DOUBLE_CLICK, ActionKind.RIGHT_CLICK, ActionKind.KEY,
+                             ActionKind.TYPE_TEXT})
 
     def _execute_outer(self, action: Action) -> ExecResult:
         if self._mcp is None:
@@ -3330,6 +3411,9 @@ class PeekabooDriver:
                 self._window_id = target
                 return self._settle(True, f"now observing window {target} ({known[target].title}); it was not "
                                           f"brought forward")
+            if self.app.lower() in self.BROWSERS:
+                return ExecResult(False, f"not switched: a {self.app} window is never brought to the front; this "
+                                         f"transport has no background switch")
             ok, _, detail = self._run("window_focus", window=target)
             if ok:
                 # Re-pin rather than unpin. The pin is what keeps a second
@@ -3347,9 +3431,11 @@ class PeekabooDriver:
             ok, _, detail = self._run("menu_click", app=self.app, path=path)
             if not ok:
                 # A half-traversed menu is left hanging open and blocks the next
-                # action, so close it before saying anything else.
-                self._run("press_fg", chord="escape", app=self.app)
-                self._foreground_actions += 1
+                # action, so close it before saying anything else -- but not into a browser window that is not the
+                # run's: an Escape there stops the user's page loading (review).
+                if self._foreground_refusal() is None:
+                    self._run("press_fg", chord="escape", app=self.app)
+                    self._foreground_actions += 1
                 detail = f"{detail} {self._menu_options(path)}".strip()
             return self._settle(ok, detail or f"menu {path}")
 
@@ -3597,6 +3683,8 @@ class PeekabooDriver:
             # and no folder appeared. Worse, they are not dropped but queued -- pressing in the background and then
             # escalating delivered both, and the run created two folders where the task wanted one. macOS routes a
             # command chord through the frontmost app, so when the foreground is permitted, that is the only route.
+            if self.allow_foreground and self.app.lower() in self.BROWSERS:
+                return ExecResult(False, f"{chord} not pressed: a {self.app} window is never brought to the front")
             if self.allow_foreground:
                 self._foreground_actions += 1
                 ok, data, detail = self._run("press_fg_window", chord=chord, app=self.app,
@@ -3636,6 +3724,34 @@ class PeekabooDriver:
                               unsupported=True)
         return ExecResult(True, f"{k.value} noted")
 
+    def _foreground_refusal(self) -> str | None:
+        """Why input sent to whatever holds the keyboard focus is refused: the run is in a browser (its windows never
+        take the foreground route: _flash), or the front window is a browser window that is not the run's -- the
+        user's, where a paste would land in their page or address bar. None otherwise. Front window unknown: refused
+        only for a browser run."""
+        if self.app.lower() in self.BROWSERS:
+            return f"not done: {self.app} is never typed into through the foreground, which could be the user's window"
+        front = self._front_window()
+        if front and front[0].lower() in self.BROWSERS and not self._may_use(front[0], front[1]):
+            return (f"not done: the keyboard focus is in a {front[0]} window that is not this run's (the user's), "
+                    f"and nothing is typed there")
+        return None
+
+    def _front_window(self) -> tuple[str, str] | None:
+        """(bundle, window id) of the frontmost ordinary window on screen, or None when it cannot be read."""
+        try:
+            import Quartz
+            from AppKit import NSRunningApplication
+            wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly
+                                                     | Quartz.kCGWindowListExcludeDesktopElements, 0) or []
+            w = next((w for w in wins if w.get("kCGWindowLayer") == 0), None)
+            if w is None:
+                return None
+            app = NSRunningApplication.runningApplicationWithProcessIdentifier_(w.get("kCGWindowOwnerPID"))
+            return str(app.bundleIdentifier() or ""), str(w.get("kCGWindowNumber"))
+        except Exception:   # noqa: BLE001
+            return None
+
     def _type_foreground(self, text: str, clear_first: bool = False, element_bound: bool = True) -> ExecResult:
         """Type into whatever holds keyboard focus, then prove it landed.
 
@@ -3651,6 +3767,9 @@ class PeekabooDriver:
         # edit mode after all, cmd+A selects the window's files instead of the field's text and the paste then
         # writes files into the folder -- one run left two "已粘贴 ....txt" behind that way. A wrong name is
         # recoverable; inventing files in the user's directory is not the kind of mistake this driver gets to make.
+        refused = self._foreground_refusal()
+        if refused:
+            return ExecResult(False, refused)
         self._foreground_actions += 1
         # Paste, not keystrokes. A Chinese input method turns synthesized typing into pinyin composition: the
         # folder name came out as "a'r'chi'v'e". `paste` sets the clipboard, sends cmd+V and restores the previous

@@ -775,6 +775,40 @@ class OwnWindow(unittest.TestCase):
         self.assertFalse(obs.no_window)
         self.assertTrue(any("example.com/page" in n and "could not be loaded" in n for n in obs.notes), obs.notes)
 
+    # -- Codex review of 1a00fb3: a closed window reopened; the staged page through a retry ----------------------
+
+    def test_a_closed_run_window_is_opened_again_by_focus_app(self):
+        mac = FakeMac()
+        d = self.mac(mac)
+        own = d._pinned_window
+        mac.windows = [w for w in mac.windows if str(w["id"]) != own]      # the run's window is closed
+        self.assertTrue(d.observe().no_window)
+        res = d.execute(Action(kind=ActionKind.FOCUS_APP, text=SAFARI))
+        self.assertTrue(res.ok, res.detail)
+        self.assertEqual(len(mac.windows), 1)
+        self.assertNotEqual(d._pinned_window, own)
+        self.assertFalse(d.observe().no_window)
+        # And with the new window there, the same switch is a no-op again.
+        self.assertIn("already observing", d.execute(Action(kind=ActionKind.FOCUS_APP, text=SAFARI)).detail)
+
+    def test_the_retry_after_a_late_allow_opens_the_staged_page(self):
+        mac, state = self.automation("execution error: timed out")
+        d = self.mac(mac, stage=('open -a Safari "https://example.com/page"',))
+        state["answer"] = None                              # the user clicks Allow
+        obs = d.observe()
+        self.assertFalse(obs.no_window)
+        self.assertEqual(mac.find(d._pinned_window)["url"], "https://example.com/page")
+        self.assertEqual(obs.notes, [])
+
+    def test_a_page_not_loaded_stays_said_when_the_window_is_made_again(self):
+        mac = FakeMac()
+        d = self.mac(mac, stage=('open -a Safari "$WS/page.html"',))
+        own = d._pinned_window
+        mac.windows = [w for w in mac.windows if str(w["id"]) != own]
+        self.assertTrue(d.execute(Action(kind=ActionKind.FOCUS_APP, text=SAFARI)).ok)
+        self.assertIn("does not open file:// pages", d.state()["own_browser_miss"])
+        self.assertTrue(any("http://127.0.0.1" in n for n in d.observe().notes))
+
 
 class Parsing(unittest.TestCase):
     def test_browser_staging_commands(self):

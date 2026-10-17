@@ -888,6 +888,8 @@ class PeekabooDriver:
         #: run's either: the planner stops or asks.
         self._run_windows: set[str] = set()
         self._own_browser_wanted: set[str] = set()
+        self._pending_url: dict[str, str] = {}
+        self._load_misses: dict[str, str] = {}
         self._own_browser_retried = False
         #: Finder windows open before staging: a staged folder's window is one that was not there before. Title and
         #: position cannot tell it apart -- every new Finder window opens at the same place, and one task's 「桌面」
@@ -1095,6 +1097,12 @@ class PeekabooDriver:
         key = bundle.lower()
         own = self.__dict__.setdefault("_own_browser", {})
         pre = self.__dict__.setdefault("_preexisting", set())
+        # The page staging asked for stays wanted until it is loaded or a clear reason is kept why not: a retry (the
+        # user allowing Automation late) opens the window on it too, not on the marker page alone (Codex review).
+        pending = self.__dict__.setdefault("_pending_url", {})
+        if url:
+            pending[key] = url
+        url = url or pending.get(key, "")
         if own.get(key):
             if self._still_open(bundle, own[key]):
                 return own[key]
@@ -1157,9 +1165,14 @@ class PeekabooDriver:
                                    f"{len(rows)} new window(s), so none is taken")
             return None
         own[key] = wid
-        self.__dict__.setdefault("_own_browser_misses", {}).pop(key, None)     # no longer missing: the old reason goes
+        # No longer missing a window: that reason goes. One why a staged page is not loaded stays until it loads.
+        misses = self.__dict__.setdefault("_own_browser_misses", {})
+        misses.pop(key, None)
+        if key in getattr(self, "_load_misses", {}):
+            misses[key] = self._load_misses[key]
         if url and key == "com.apple.safari":
             self._load_in_own_window(wid, url)          # bound first, by its marker title; the page after
+            pending.pop(key, None)                      # loaded, or a clear reason kept why not
         self.__dict__.setdefault("_run_windows", set()).add(wid)
         self._apart_from_others(bundle, wid, script_id or hint)
         return wid
@@ -1184,23 +1197,30 @@ class PeekabooDriver:
         whether or not anything loads (live 10-17). A file:// page is not tried (FILE_PAGE_MISS). A load that does not
         go is kept as Safari's miss, which every look of it carries in its notes; the window stays the run's."""
         if url.lower().startswith("file:"):
-            self._set_miss("com.apple.Safari", self.FILE_PAGE_MISS.format(url=url))
+            self._load_miss(self.FILE_PAGE_MISS.format(url=url))
             return False
         u = url.replace("\\", "\\\\").replace('"', '\\"')
         target = f'current tab of window id {int(wid)}'
         ok, out = self._osa(f'tell application id "com.apple.Safari" to set URL of {target} to "{u}"')
         if not ok:
-            self._set_miss("com.apple.Safari", f"Safari: the run's window opened, but {url} could not be loaded in it "
-                                               f"({(out or '').strip()[:200]})")
+            self._load_miss(f"Safari: the run's window opened, but {url} could not be loaded in it "
+                            f"({(out or '').strip()[:200]})")
             return False
         for _ in range(10):
             ok_u, now = self._osa(f'tell application id "com.apple.Safari" to get URL of {target}')
             if ok_u and now.strip() and not now.strip().lower().startswith("data:"):
+                self.__dict__.setdefault("_load_misses", {}).pop("com.apple.safari", None)
                 return True
             time.sleep(0.3)
-        self._set_miss("com.apple.Safari", f"Safari: the run's window opened, but {url} could not be loaded in it "
-                                           f"(it stayed on its first page)")
+        self._load_miss(f"Safari: the run's window opened, but {url} could not be loaded in it "
+                        f"(it stayed on its first page)")
         return False
+
+    def _load_miss(self, why: str) -> None:
+        """Why the staged page is not in the run's Safari window: Safari's miss, kept apart so that a window made later
+        does not clear it while the page is still not there."""
+        self.__dict__.setdefault("_load_misses", {})["com.apple.safari"] = why
+        self._set_miss("com.apple.Safari", why)
 
     def _miss_note(self) -> str:
         """The observed browser's miss, as an observation note, or "" (a non-browser, or nothing missing)."""
@@ -3377,6 +3397,11 @@ class PeekabooDriver:
                 # the user's window) nor by activating it: the same as staging one (_start). In either transport.
                 # Before the check below: the start browser with no window of its own yet may try again.
                 own = getattr(self, "_own_browser", {}).get(browser.lower())
+                if browser.lower() == self.app.lower() and own and self._pinned_window == own \
+                        and not self._still_open(browser, own):
+                    # The run's window was closed (or put away) since: not "already observing" -- the pin is stale,
+                    # and the switch opens a new window of the run's (Codex review).
+                    self._pinned_window = self._window_id = None
                 if browser.lower() == self.app.lower() and own and self._pinned_window == own:
                     return ExecResult(False, f"already observing {target}; that action cannot change anything -- "
                                              f"choose a different target or a different operation")

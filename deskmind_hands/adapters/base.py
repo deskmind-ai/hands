@@ -49,6 +49,10 @@ class TurnContext:
     #: How many questions the planner itself has asked this run: what takes ASK away and counts against the budget.
     #: A harness approval is not one, and is not in `dialogue` either (G16).
     asked: int = 0
+    #: What the user said after the goal, as (question, reply): their answers to the planner's questions and their own
+    #: changes, never a harness approval. Values to type are drawn from it -- an address the user gave in reply to
+    #: ASK could not be typed, offered only the goal's and the screen's words (Codex review of 82681e5).
+    users_words: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass

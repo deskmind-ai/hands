@@ -71,13 +71,24 @@ BROWSER_BUNDLES = {"safari": "com.apple.Safari", "safari浏览器": "com.apple.S
 _STAGE_OPEN = re.compile(r'^\s*open\s+(?:-g\s+)?(?:-a\s+(?:"([^"]+)"|(\S+))|-b\s+(\S+))(.*)$')
 
 
+#: The one line the run's new window shows until its page is loaded: what the window is, to the user, and a page
+#: body, so a read of it is never taken for a page still loading (_page_not_read).
+MARKER_TEXT = "DeskMind 的窗口"
+
+
+def marker_page(marker: str) -> str:
+    """The data: page a new Safari window of the run's is made on: titled exactly `marker`, with one line of text."""
+    from urllib.parse import quote
+    return f"data:text/html;charset=utf-8,<title>{marker}</title><p>{quote(MARKER_TEXT)}</p>"
+
+
 def _new_window_script(bundle: str, url: str = "", marker: str = "") -> str | None:
     """AppleScript that opens a new window of the browser `bundle` without activating it or touching any window it
     already has, and returns the window's id; None for a browser with no such command. On a running app `open` is a
     reopen, which un-minimises the user's window (deskmind#73, live 10-17), so no `open` is sent instead.
 
     Safari: the document is made on a page titled `marker` (a run's random `dm-...`, which no window of the user's
-    carries) and the window is found by that title -- not the front window (one the user opens in between is in
+    carries) and the window is found by that title, waited for up to 5 s (a Safari just launched is slow) -- not the front window (one the user opens in between is in
     front), and not by its document (`whose document is d` fails with -1700, and two start pages compare equal; live
     10-17). The id returned is the window server's. The page `url` is loaded only after that, by
     _load_in_own_window, so its title cannot get in the way. Chromium: `make new window` returns the window made; its
@@ -88,8 +99,8 @@ def _new_window_script(bundle: str, url: str = "", marker: str = "") -> str | No
         if not re.fullmatch(r"dm-[0-9a-f]{8,32}", marker or ""):
             raise ValueError(f"not a window marker: {marker!r}")   # plain ASCII by construction: nothing to escape
         return (f'tell application id "com.apple.Safari"\n'
-                f'  make new document with properties {{URL:"data:text/html,<title>{marker}</title>"}}\n'
-                f'  repeat 20 times\n'
+                f'  make new document with properties {{URL:"{marker_page(marker)}"}}\n'
+                f'  repeat 50 times\n'
                 f'    try\n'
                 f'      return id of (first window whose name is "{marker}")\n'
                 f'    end try\n'
@@ -1091,7 +1102,9 @@ class PeekabooDriver:
             # opened itself meanwhile (a pop-up): the safe side.
             del own[key]
         import secrets
-        script = _new_window_script(bundle, url, f"dm-{secrets.token_hex(6)}")
+        marker = f"dm-{secrets.token_hex(6)}"
+        self.__dict__.setdefault("_markers", set()).add(marker)
+        script = _new_window_script(bundle, url, marker)
         if script is None:
             pre |= self._app_window_ids(bundle) or set()
             self._set_miss(bundle, f"{bundle}: no way to open a window of the run's own in the background")
@@ -1144,9 +1157,9 @@ class PeekabooDriver:
                                    f"{len(rows)} new window(s), so none is taken")
             return None
         own[key] = wid
+        self.__dict__.setdefault("_own_browser_misses", {}).pop(key, None)     # no longer missing: the old reason goes
         if url and key == "com.apple.safari":
             self._load_in_own_window(wid, url)          # bound first, by its marker title; the page after
-        self.__dict__.setdefault("_own_browser_misses", {}).pop(key, None)     # no longer missing: the old reason goes
         self.__dict__.setdefault("_run_windows", set()).add(wid)
         self._apart_from_others(bundle, wid, script_id or hint)
         return wid
@@ -1160,9 +1173,20 @@ class PeekabooDriver:
         return row is not None and bool(row.get("is_on_screen", True)) and not self._ghost(row)
 
     def _load_in_own_window(self, wid: str, url: str) -> None:
-        """Load `url` in the run's own Safari window, found by its id (the window server's, which Safari's is)."""
+        """Load `url` in the run's own Safari window, found by its id (the window server's, which Safari's is); a load
+        that fails is kept as the browser's miss, which the observations' notes carry."""
         u = url.replace("\\", "\\\\").replace('"', '\\"')
-        self._osa(f'tell application id "com.apple.Safari" to set URL of current tab of window id {int(wid)} to "{u}"')
+        ok, out = self._osa(f'tell application id "com.apple.Safari" to set URL of current tab of window id {int(wid)} '
+                            f'to "{u}"')
+        if not ok:
+            # The window is the run's and stays so; the page the task staged is not in it, and the run is told why.
+            self._set_miss("com.apple.Safari", f"Safari: the run's window opened, but {url} could not be loaded in it "
+                                               f"({(out or '').strip()[:200]})")
+
+    def _miss_note(self) -> str:
+        """The observed browser's miss, as an observation note, or "" (a non-browser, or nothing missing)."""
+        miss = getattr(self, "_own_browser_misses", {}).get(self.app.lower(), "")
+        return f"No window of this run's own in {self.app}, or not as staged: {miss}" if miss else ""
 
     def _set_miss(self, bundle: str, why: str) -> None:
         self.__dict__.setdefault("_own_browser_misses", {})[bundle.lower()] = why
@@ -2145,6 +2169,8 @@ class PeekabooDriver:
         """Whether a successful read of a browser window holds its controls only, not the page."""
         if self.app.lower() not in self.BROWSERS or not data:
             return False
+        if (data.get("window_title") or "").strip() in getattr(self, "_markers", set()):
+            return False        # the run's new window on its marker page: nothing is still to load
         roles = [(e.get("role") or "").replace("AX", "").lower() for e in (data.get("ui_elements") or [])]
         return bool(roles) and all(r in self.BROWSER_CHROME_ROLES for r in roles)
 
@@ -2273,7 +2299,7 @@ class PeekabooDriver:
                 self._labels_by_id = {e.id: e.label or "" for e in docs}
                 self._element_role = {e.id: e.role or "" for e in docs}
                 self._rects, self._element_value = {}, {e.id: "" for e in docs}
-                miss = getattr(self, "_own_browser_misses", {}).get(self.app.lower(), "")
+                miss = self._miss_note()
                 return Observation(
                     id=obs_id,
                     geometry=ScreenGeometry(fallback, fallback),
@@ -2281,7 +2307,7 @@ class PeekabooDriver:
                     screenshot_png=None, elements=docs,
                     # Why, when the driver knows: the planner and the done judge can stop with it, and the user can
                     # act on it (an Automation permission), instead of a bare "(no window open)".
-                    notes=[f"No window of this run's own in {self.app}: {miss}"] if miss else [],
+                    notes=[miss] if miss else [],
                     focused_app=f"{self.app} (no window open)",
                     # The windows it may switch to, other apps' among them: with none listed, nothing could be
                     # chosen but DONE or BLOCKED on an empty screen (deskmind#73, live 10-17). On screen only: never
@@ -2318,7 +2344,7 @@ class PeekabooDriver:
             window_title=data.get("window_title") or "",
             windows=self._windows(on_screen_only=no_window),
             dialog=bool(data.get("is_dialog")),
-            notes=[n for n in (ax_truncation_note(data),) if n],
+            notes=[n for n in (ax_truncation_note(data), self._miss_note()) if n],
             accepts_keys=not self._vision_app(),
             no_window=no_window,
             # Peekaboo mints a new snapshot id per observation; reusing an old

@@ -195,13 +195,14 @@ class Observed(unittest.TestCase):
         self.assertFalse(observe(d).no_window)
         self.assertEqual(d._pinned_window, "78")
 
-    def vision_look(self, rows):
+    def vision_look(self, rows, windows=(TEST,), app="com.apple.Safari", readable=("19116",), d=None):
         # Safari read from its pixels (an empty tree sends it here on its own): OCR and the grounder stood in for.
         import os
         from deskmind_hands import vision
-        d = safari([TEST])
+        d = d or safari(list(windows), readable=readable)
+        d.app = d._home_app = app
         d.read = {**PAGE, "ui_elements": []}
-        with mock.patch.dict(os.environ, {"HANDS_VISION_APPS": "com.apple.safari"}), \
+        with mock.patch.dict(os.environ, {"HANDS_VISION_APPS": app.lower()}), \
                 mock.patch.object(vision, "ocr", lambda shot: [dict(r) for r in rows]), \
                 mock.patch.object(vision, "_icons", lambda *a, **k: {}), \
                 mock.patch.object(vision, "ground_one", lambda *a, **k: None):
@@ -214,6 +215,32 @@ class Observed(unittest.TestCase):
         self.assertTrue(obs.elements)
         self.assertFalse([e for e in obs.elements if e.id.startswith(("ocr:", "icon:")) and "scroll" not in e.id])
         self.assertTrue(obs.no_window)
+
+    def test_read_from_its_pixels_the_users_minimised_window_is_never_pinned(self):
+        # By size alone the user's minimised Safari window (the larger one) was pinned and read (review of #42).
+        d = safari([OWNER, TEST], readable=("19085", "19116"))
+        self.vision_look([], d=d)
+        self.assertEqual(d._pinned_window, "19116")
+        self.assertNotIn(("see_window", "19085"), d.calls)
+
+    def test_read_from_its_pixels_with_no_window_allowed_is_no_window(self):
+        d = safari([OWNER], readable=("19085",))
+        obs = self.vision_look([], d=d)
+        self.assertTrue(obs.no_window)
+        self.assertIsNone(d._pinned_window)
+        self.assertEqual([k for k, _ in d.calls if k in ("see", "see_window")], [])
+
+    def test_read_from_its_pixels_another_app_keeps_its_largest_window(self):
+        # The music app's 500x500 side window in front: its main window, the largest, is still the one read.
+        side = {"window_id": 31, "window_title": "迷你播放器", "window_index": 0, "is_on_screen": True,
+                "bounds": {"x": 0, "y": 0, "width": 500, "height": 500}}
+        main = {"window_id": 32, "window_title": "音乐", "window_index": 1, "is_on_screen": True,
+                "bounds": {"x": 0, "y": 0, "width": 1200, "height": 800}}
+        put_away = {"window_id": 33, "window_title": "大窗口", "window_index": 2, "is_on_screen": False,
+                    "bounds": {"x": 0, "y": 0, "width": 1600, "height": 1000}}
+        d = safari([side, main, put_away], readable=("31", "32", "33"))
+        self.vision_look([], d=d, app="com.example.music")
+        self.assertEqual(d._pinned_window, "32")
 
     def test_a_picture_with_words_in_it_is_a_window(self):
         obs = self.vision_look([{"text": "新加坡 天气 28°C", "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.03, "conf": 0.9}])

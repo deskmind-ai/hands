@@ -1172,16 +1172,35 @@ class PeekabooDriver:
         row = next((w for w in ((data or {}).get("windows") or []) if ok and str(w.get("window_id")) == str(wid)), None)
         return row is not None and bool(row.get("is_on_screen", True)) and not self._ghost(row)
 
-    def _load_in_own_window(self, wid: str, url: str) -> None:
-        """Load `url` in the run's own Safari window, found by its id (the window server's, which Safari's is); a load
-        that fails is kept as the browser's miss, which the observations' notes carry."""
+    #: Why a staged file:// page is not opened (live 10-17): Safari takes `set URL` to a file:// page, answers success,
+    #: and stays where it was; `make new document` on one gives an empty 「未命名」 window. `open -a Safari <file>` is not
+    #: a way round it: it opens the file in a tab of the front window, which can be the user's.
+    FILE_PAGE_MISS = ("Safari does not open file:// pages sent by script, so {url} was not loaded; serve the page over "
+                      "http://127.0.0.1 instead")
+
+    def _load_in_own_window(self, wid: str, url: str) -> bool:
+        """Load `url` in the run's own Safari window, found by its id (the window server's, which Safari's is), and
+        check that it went: the tab's URL has left the marker page within a few seconds. osascript says success
+        whether or not anything loads (live 10-17). A file:// page is not tried (FILE_PAGE_MISS). A load that does not
+        go is kept as Safari's miss, which every look of it carries in its notes; the window stays the run's."""
+        if url.lower().startswith("file:"):
+            self._set_miss("com.apple.Safari", self.FILE_PAGE_MISS.format(url=url))
+            return False
         u = url.replace("\\", "\\\\").replace('"', '\\"')
-        ok, out = self._osa(f'tell application id "com.apple.Safari" to set URL of current tab of window id {int(wid)} '
-                            f'to "{u}"')
+        target = f'current tab of window id {int(wid)}'
+        ok, out = self._osa(f'tell application id "com.apple.Safari" to set URL of {target} to "{u}"')
         if not ok:
-            # The window is the run's and stays so; the page the task staged is not in it, and the run is told why.
             self._set_miss("com.apple.Safari", f"Safari: the run's window opened, but {url} could not be loaded in it "
                                                f"({(out or '').strip()[:200]})")
+            return False
+        for _ in range(10):
+            ok_u, now = self._osa(f'tell application id "com.apple.Safari" to get URL of {target}')
+            if ok_u and now.strip() and not now.strip().lower().startswith("data:"):
+                return True
+            time.sleep(0.3)
+        self._set_miss("com.apple.Safari", f"Safari: the run's window opened, but {url} could not be loaded in it "
+                                           f"(it stayed on its first page)")
+        return False
 
     def _miss_note(self) -> str:
         """The observed browser's miss, as an observation note, or "" (a non-browser, or nothing missing)."""

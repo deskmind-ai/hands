@@ -45,7 +45,8 @@ class FakeMac:
         self.next_id = 30000
         self.events: list[tuple] = []
         self.user_opens_during_make = False
-        self.load_fails = False     # the user opens a window between the make and the script's answer
+        self.load_fails = False
+        self.load_silently_fails = False     # the user opens a window between the make and the script's answer
         self.idle = 1e6          # seconds since the user last touched anything
 
     # -- what happens on the Mac
@@ -132,9 +133,14 @@ class FakeMac:
             w = self.find(wid)
             if w is None:
                 return False, "no such window"
-            w["url"] = script.split(' to "', 1)[1].rsplit('"', 1)[0]
-            w["title"] = "已载入"
+            url = script.split(' to "', 1)[1].rsplit('"', 1)[0]
+            if url.startswith("file:") or self.load_silently_fails:
+                return True, ""           # as Safari does (live 10-17): success said, the tab stays where it was
+            w["url"], w["title"] = url, "已载入"
             return True, ""
+        if "get URL of current tab of window id" in script:
+            w = self.find(script.split("window id ", 1)[1].split()[0])
+            return (True, w["url"]) if w else (False, "no such window")
         if "set bounds of window id" in script:
             wid = script.split("window id ", 1)[1].split()[0]
             a, b, c, e = (int(v) for v in script.split("{", 1)[1].split("}", 1)[0].split(","))
@@ -292,13 +298,30 @@ class OwnWindow(unittest.TestCase):
 
     # -- other ways in -------------------------------------------------------------------------------------------
 
-    def test_a_staged_page_opens_in_the_runs_own_window(self):
+    def test_a_staged_file_page_is_a_clear_miss_never_an_open(self):
+        # Safari does not load a file:// page sent by script (live 10-17), and `open -a Safari <file>` would put it in
+        # a tab of the front window, maybe the user's: the run keeps its window and says why the page is not there.
         mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1200, 800)}])
         d = self.mac(mac, stage=('open -a Safari "$WS/page.html"',))
-        own = mac.find(d._pinned_window)
-        self.assertTrue(own["url"].startswith("file://") and own["url"].endswith("/ws/page.html"), own)
+        self.assertIsNotNone(d._pinned_window)
         self.assertNotEqual(d._pinned_window, "19116")
         self.assertEqual([e for e in mac.events if e[0] in ("open", "sh")], [])
+        self.assertFalse(any("set URL" in e[1] for e in mac.events if e[0] == "osascript"))
+        miss = d.state()["own_browser_miss"]
+        self.assertIn("does not open file:// pages", miss)
+        self.assertIn("http://127.0.0.1", miss)
+        self.assertTrue(any("http://127.0.0.1" in n for n in d.observe().notes))
+
+    def test_a_load_said_to_work_that_did_not_is_a_miss(self):
+        # osascript answers success whether or not anything loads: the tab's URL is what says.
+        mac = FakeMac()
+        mac.load_silently_fails = True
+        d = self.mac(mac, stage=('open -a Safari "https://example.com/page"',))
+        self.assertIn("stayed on its first page", d.state()["own_browser_miss"])
+        mac2 = FakeMac()
+        d2 = self.mac(mac2, stage=('open -a Safari "https://example.com/page"',))
+        self.assertEqual(d2.state()["own_browser_miss"], "")
+        self.assertEqual(mac2.find(d2._pinned_window)["url"], "https://example.com/page")
 
     def test_safari_as_another_app_of_the_task_offers_only_its_own_window(self):
         # TextEdit first, Safari named too (the app's --apps): Safari's windows offered to switch to are the run's.

@@ -263,6 +263,9 @@ NOTHING_DONE = ("no window of {app} can be seen and no step of this run has gone
 #: insisted on, the run ends unverified, as a DONE with no window seen and no judgement does.
 PAGE_UNREAD = ("the page in {app}'s window this run works in could not be read, so nothing confirms the goal is done: "
                "check whether it was done, or stop if it cannot be done.")
+NOTHING_ON_THE_PAGE = ("{app}: the window this run works in has no page in it yet, and no step of this run has gone "
+                       "through, so nothing shows the goal is done: check whether it was done, or stop if it cannot be "
+                       "done.")
 PAGE_UNJUDGED = ("whether the page in {app}'s window this run works in shows what the goal asks for could not be "
                  "judged (no answer), so nothing confirms the goal is done: check whether it was done, or stop if it "
                  "cannot be done.")
@@ -331,6 +334,14 @@ def _page_objection(task: Task, driver, adapter, said=(), obs=None, steps=(),
         return {**page, "no_window": True, "silent": True}, None, UNVERIFIED.format(app=app)
     if verdict is None and page.get("browser") and can_judge:
         return {**page, "app": app, "unjudged": "the judge gave no answer"}, None, PAGE_UNJUDGED.format(app=app)
+    if verdict == judge.NOT_ON_A_PAGE and page.get("marker") and not _acted(steps):
+        # The run's own window with no page in it, and no step of the run has gone through: a result that is not on a
+        # page is still one the run produced, and nothing did. Taken, the parts task whose ASK was answered
+        # 「不知道，你看着办」 would complete with nothing written: the Brain's judge said 结果本来就不在网页上 (probe,
+        # 10-17). As a no-window 结果本来就不需要窗口 is taken only from a run that did something (review of #42).
+        return ({**page, "app": app, "unbacked": judge.NOT_ON_A_PAGE,
+                 "unjudged": "the judge said the result is not on a page, and no step of the run has gone through"},
+                None, NOTHING_ON_THE_PAGE.format(app=app))
     if verdict != judge.NOT_SHOWN:
         return page, verdict, None
     where = ("this run's own window, with no page opened in it yet" if page.get("marker")
@@ -629,7 +640,6 @@ def run_task(
             ctx = TurnContext(task=task, observation=_filter(obs, cfg.channels),
                               history=history[-10:], channels=cfg.channels,
                               dialogue=[(d["question"], d["reply"]) for d in dialogue],
-                              users_words=tuple(_users_words(dialogue)),
                               notice=notice, ineffective=tuple(ineffective))
             notice = None
 

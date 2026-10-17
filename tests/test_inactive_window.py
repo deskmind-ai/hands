@@ -44,6 +44,8 @@ def safari(windows, readable=("19116",)):
     d._sparse_tree = lambda data: False
     d._pid_of = lambda bundle, all_wins=None: None
     d.calls, d.read = [], dict(PAGE)        # `read`: what a read by id returns (the real conversion runs on it)
+    # The browser windows the run may use: the test windows, the run's own (as staging opens one); never the owner's.
+    d._run_windows = {str(w["window_id"]) for w in windows if w is not OWNER and w.get("window_id") != 19085}
 
     def fake_run(key, _extra=None, **kw):
         d.calls.append((key, kw.get("window")))

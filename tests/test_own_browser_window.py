@@ -849,12 +849,36 @@ class PageServing(unittest.TestCase):
         self.server = pk.PageServer(self.folder)
         self.addCleanup(self.server.close)
 
-    def get(self, path):
+    def get(self, path, host=None):
         import http.client
         c = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=5)
-        c.request("GET", path)
+        if host is None:
+            c.request("GET", path)
+        else:
+            c.putrequest("GET", path, skip_host=True)
+            c.putheader("Host", host)
+            c.endheaders()
         r = c.getresponse()
         return r.status, r.read().decode(errors="replace")
+
+    def test_only_a_request_addressed_to_this_server(self):
+        # DNS rebinding: a page on evil.example whose name now resolves to 127.0.0.1 sends Host: evil.example.
+        port = self.server.port
+        for host in ("evil.example", f"evil.example:{port}", "127.0.0.1", f"127.0.0.1:{port + 1}", ""):
+            status, body = self.get("/page.html", host=host)
+            self.assertIn(status, (403, 421), host)
+            self.assertNotEqual(body, "ok", host)
+        for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"LOCALHOST:{port}"):
+            self.assertEqual(self.get("/page.html", host=host), (200, "ok"), host)
+
+    def test_no_hidden_file_or_folder(self):
+        (self.folder / ".hands").mkdir()
+        (self.folder / ".hands" / "scratch.txt").write_text("SCRATCH", encoding="utf-8")
+        (self.folder / ".env").write_text("SCRATCH", encoding="utf-8")
+        for path in ("/.hands/scratch.txt", "/.env", "/sub/../.env", "/%2ehands/scratch.txt", "/./.env"):
+            status, body = self.get(path)
+            self.assertEqual(status, 404, path)
+            self.assertNotIn("SCRATCH", body, path)
 
     def test_only_127_0_0_1(self):
         self.assertEqual(self.server.httpd.server_address[0], "127.0.0.1")

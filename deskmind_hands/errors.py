@@ -36,6 +36,8 @@ RULES: list[tuple[str, Kind]] = [
     (r"^the user is active", Kind.USER_BUSY),
     # The machine.
     (r"session is locked|screen capture is unavailable while the macos gui session is locked", Kind.ENVIRONMENT),
+    # Another user's session is in front (drivers/session.py): this one's screen is not shown.
+    (r"session is not on the console", Kind.ENVIRONMENT),
     (r"multiple apps match", Kind.ENVIRONMENT),
     (r"not (?:been )?granted|permission (?:is )?(?:denied|missing)|not authori[sz]ed|accessibility (?:access|permission)",
      Kind.ENVIRONMENT),

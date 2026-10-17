@@ -42,7 +42,7 @@ from ..geometry import (ImageTransform, Point, Rect, ScreenGeometry, Size,
                         clamp_to_screen, to_logical)
 from ..apps import APPS
 from ..grounding import VOCAB, name_unnamed
-from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, recognised, vision_elements
+from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, vision_elements
 from . import keys
 from .session import MESSAGES as SESSION_BLOCKED, gui_session, require_usable
 from .base import (USER_BUSY, Driver, DriverUnavailable, Element, ExecResult, Observation, effect_notes,
@@ -1969,9 +1969,10 @@ class PeekabooDriver:
         if self._vision_app() and getattr(self, "_shot", None) is not None and self._last_geometry:
             # No accessibility tree to read: the screenshot's words (on-device OCR) and grounded icons instead.
             geo = self._last_geometry
+            found: dict = {}
             els = vision_elements(self.app, self._shot, geo.logical.w, geo.logical.h, self._app_name,
                                   self._window_id or "", absent=self.__dict__.setdefault("_gen_absent", set()),
-                                  fields=self.__dict__.setdefault("_placed", {}))
+                                  fields=self.__dict__.setdefault("_placed", {}), found=found)
             # Kept for placing a generic control the planner chooses later (the observation's own file is removed).
             keep = self.scratch / "_vision_last.png"
             try:
@@ -1984,7 +1985,8 @@ class PeekabooDriver:
             self._element_value = {e.id: e.value or "" for e in els}
             self._labels_by_id = {e.id: e.label or "" for e in els}
             self._element_role = {e.id: e.role or "" for e in els}
-            self._real_read = recognised(els)      # the words and icons found in the pixels: what this read held
+            # What the pixels gave, counted by vision_elements before any of it became an element.
+            self._real_read = found.get("words", 0) + found.get("icons", 0)
             return els
         els = self._elements(data, origin)
         #: What the read itself held, before any control of the harness's own is added below (_read_nothing): a

@@ -195,7 +195,7 @@ class Observed(unittest.TestCase):
         self.assertFalse(observe(d).no_window)
         self.assertEqual(d._pinned_window, "78")
 
-    def vision_look(self, rows, windows=(TEST,), app="com.apple.Safari", readable=("19116",), d=None):
+    def vision_look(self, rows, windows=(TEST,), app="com.apple.Safari", readable=("19116",), d=None, box=None):
         # Safari read from its pixels (an empty tree sends it here on its own): OCR and the grounder stood in for.
         import os
         from deskmind_hands import vision
@@ -205,7 +205,7 @@ class Observed(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HANDS_VISION_APPS": app.lower()}), \
                 mock.patch.object(vision, "ocr", lambda shot: [dict(r) for r in rows]), \
                 mock.patch.object(vision, "_icons", lambda *a, **k: {}), \
-                mock.patch.object(vision, "ground_one", lambda *a, **k: None):
+                mock.patch.object(vision, "ground_one", lambda *a, **k: box):
             return observe(d)
 
     def test_a_picture_with_nothing_found_in_it_is_no_window(self):
@@ -241,6 +241,16 @@ class Observed(unittest.TestCase):
         d = safari([side, main, put_away], readable=("31", "32", "33"))
         self.vision_look([], d=d, app="com.example.music")
         self.assertEqual(d._pinned_window, "32")
+
+    def test_words_only_in_its_search_box_is_a_window(self):
+        # The only words on screen are the query in the search box: they become the box's value, not an ocr:
+        # element, and counted by element the window read as nothing (review of #42).
+        query = {"text": "新加坡 天气", "x": 0.3, "y": 0.05, "w": 0.2, "h": 0.03, "conf": 0.9}
+        obs = self.vision_look([query], box=(400.0, 45.0))      # the grounder puts the box on those words
+        box = next(e for e in obs.elements if e.id == "gen:搜索框")
+        self.assertEqual(box.value, "新加坡 天气")
+        self.assertFalse([e for e in obs.elements if e.id.startswith("ocr:")])
+        self.assertFalse(obs.no_window)
 
     def test_a_picture_with_words_in_it_is_a_window(self):
         obs = self.vision_look([{"text": "新加坡 天气 28°C", "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.03, "conf": 0.9}])

@@ -488,7 +488,7 @@ class OwnWindow(unittest.TestCase):
         mac, state = self.automation("Command '['/usr/bin/osascript', '-e', '...']' timed out after 15 seconds")
         d = self.mac(mac)
         miss = d.state()["own_browser_miss"]
-        self.assertIn("Privacy & Security › Automation › DeskMind › Safari", miss)
+        self.assertIn("Privacy & Security › Automation › DeskMind Hands › Safari", miss)
         self.assertNotIn("osascript", miss)
         obs = d.observe()                       # retried once on the look: still unanswered
         self.assertTrue(obs.no_window)
@@ -506,18 +506,38 @@ class OwnWindow(unittest.TestCase):
         self.assertEqual(self.reads(mac), [d.state()["own_browser_windows"][SAFARI.lower()]])
         self.assertNotIn("19116", self.reads(mac))
 
+    def test_an_old_reason_is_not_repeated_once_the_window_opened(self):
+        # Staging timed out, the look's retry opened the window; the run's window closed later, and the next look with
+        # no window still said "no answer came in time" (re-review). Kept per browser, too.
+        mac, state = self.automation("execution error: timed out")
+        d = self.mac(mac)
+        d._own_browser_window("org.mozilla.firefox")             # another browser's reason
+        state["answer"] = None
+        self.assertFalse(d.observe().no_window)                  # the retry opened it
+        self.assertNotIn("no answer came", d.state()["own_browser_miss"])
+        mac.windows = [w for w in mac.windows if str(w["id"]) != d._pinned_window]   # the run's window is closed
+        obs = d.observe()
+        self.assertTrue(obs.no_window)
+        self.assertFalse(any("no answer came" in n or "firefox" in n for n in obs.notes), obs.notes)
+
+    def test_the_setting_is_named_as_macos_shows_the_helper(self):
+        mac, _ = self.automation("execution error: timed out")
+        d = self.mac(mac)
+        self.assertIn("DeskMind Hands may control Safari", d.state()["own_browser_miss"])
+        self.assertIn("› Automation › DeskMind Hands › Safari", d.state()["own_browser_miss"])
+
     def test_a_denied_automation_names_the_setting(self):
         mac, _ = self.automation("execution error: Not authorized to send Apple events to Safari. (-1743)")
         d = self.mac(mac)
-        self.assertIn("does not allow DeskMind to control Safari", d.state()["own_browser_miss"])
+        self.assertIn("does not allow DeskMind Hands to control Safari", d.state()["own_browser_miss"])
         self.assertIn("System Settings › Privacy & Security › Automation", d.state()["own_browser_miss"])
 
     def test_the_done_judge_is_told_why_there_is_no_window(self):
         from deskmind_hands.runtime import judge
         prompts = []
         judge.done_unseen(lambda p, s, o: prompts.append(p) or {"choice": judge.NOT_SHOWN}, "搜索天气", SAFARI,
-                          done=["no window"], why="macOS does not allow DeskMind to control Safari")
-        self.assertIn("does not allow DeskMind to control Safari", str(prompts))
+                          done=["no window"], why="macOS does not allow DeskMind Hands to control Safari")
+        self.assertIn("does not allow DeskMind Hands to control Safari", str(prompts))
 
     def test_a_users_window_with_the_same_frame_does_not_stop_the_search(self):
         # The user's window zoomed to the very place and size the run's new window gets: checks by frame alone could

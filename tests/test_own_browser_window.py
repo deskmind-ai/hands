@@ -110,6 +110,10 @@ class FakeMac:
                 self.running = True           # AppleScript launches the app it names
             url = script.split('URL:"', 1)[1].split('"', 1)[0] if 'URL:"' in script else ""
             return True, str(self.new_window("新窗口", url))
+        if "set bounds of window id" in script:
+            wid = script.split("window id ", 1)[1].split()[0]
+            a, b, c, e = (int(v) for v in script.split("{", 1)[1].split("}", 1)[0].split(","))
+            self.find(wid)["frame"] = (a, b, c - a, e - b)
         return True, ""
 
     # -- subprocesses
@@ -134,6 +138,7 @@ class FakeMac:
                 w = self.find(wid)
                 return [{"kCGWindowBounds": dict(zip(("X", "Y", "Width", "Height"), w["frame"]))}] if w else []
             return [{"kCGWindowNumber": w["id"], "kCGWindowOwnerPID": PID, "kCGWindowLayer": 0,
+                     "kCGWindowIsOnscreen": w["on_screen"],
                      "kCGWindowBounds": dict(zip(("X", "Y", "Width", "Height"), w["frame"]))}
                     for w in self.windows] if self.running else []
         return types.SimpleNamespace(
@@ -225,7 +230,7 @@ class OwnWindow(unittest.TestCase):
                 mock.patch.object(skylight, "give_focus_back", lambda token: None), \
                 mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)), \
                 mock.patch.object(axchrome, "focused_identifier",
-                                  lambda pid, frame: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"
+                                  lambda pid, frame, wid=None: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"
                                   if frame == own_frame else "another window"):
             d.allow_browser_field(WEB_SEARCH)
             res = d._execute_projected(Action(kind=ActionKind.TYPE_TEXT, text="新加坡 天气",
@@ -392,7 +397,7 @@ class OwnWindow(unittest.TestCase):
         d.observe()
         opened = []
         d._execute_outer = lambda action: opened.append(mac.new_window("链接打开的窗口")) or ExecResult(True, "clicked")
-        d.execute(Action(kind=ActionKind.WAIT, duration_s=0.1))
+        d.execute(Action(kind=ActionKind.KEY, keys=("cmd", "n")))
         self.assertIn(str(opened[0]), [w.id for w in d._windows()])
 
     def test_a_window_that_opens_during_a_step_while_the_user_works_is_not_the_runs(self):
@@ -402,7 +407,7 @@ class OwnWindow(unittest.TestCase):
         mac.idle = 0.0                                            # the user is typing during the step
         opened = []
         d._execute_outer = lambda action: opened.append(mac.new_window("谁开的？")) or ExecResult(True, "clicked")
-        d.execute(Action(kind=ActionKind.WAIT, duration_s=0.1))
+        d.execute(Action(kind=ActionKind.KEY, keys=("cmd", "n")))
         self.assertNotIn(str(opened[0]), [w.id for w in d._windows()])
 
     def test_a_browser_is_never_brought_forward_by_the_foreground_route(self):
@@ -455,6 +460,144 @@ class OwnWindow(unittest.TestCase):
         argv = [e[1] for e in mac.events if e[0] == "open"][-1]
         self.assertNotIn("-ApplePersistenceIgnoreState", argv)
         self.assertNotIn("YES", argv)
+
+    # -- third review -------------------------------------------------------------------------------------------
+
+    def test_a_wait_or_a_refused_step_adopts_no_window(self):
+        # Safari restores a session window by window during the first steps: a WAIT is no input from the run, and a
+        # refused step delivered none, so what comes up meanwhile is not the run's.
+        mac = FakeMac()
+        d = self.mac(mac)
+        d.observe()
+        opened = []
+        d._execute_outer = lambda action: opened.append(mac.new_window("恢复的窗口")) or ExecResult(True, "waited")
+        d.execute(Action(kind=ActionKind.WAIT, duration_s=0.1))
+        d._execute_outer = lambda action: opened.append(mac.new_window("恢复的窗口")) or ExecResult(False, "refused")
+        d.execute(Action(kind=ActionKind.KEY, keys=("cmd", "n")))
+        offered = [w.id for w in d.observe().windows]
+        self.assertFalse(set(map(str, opened)) & set(offered), offered)
+
+    def automation(self, answer):
+        mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1200, 800)}])
+        make = mac.osa
+        state = {"answer": answer}
+        mac.osa = lambda script: (False, state["answer"]) if "make new" in script and state["answer"] else make(script)
+        return mac, state
+
+    def test_an_unanswered_automation_prompt_is_said_plainly_and_tried_again(self):
+        mac, state = self.automation("Command '['/usr/bin/osascript', '-e', '...']' timed out after 15 seconds")
+        d = self.mac(mac)
+        miss = d.state()["own_browser_miss"]
+        self.assertIn("Privacy & Security › Automation › DeskMind › Safari", miss)
+        self.assertNotIn("osascript", miss)
+        obs = d.observe()                       # retried once on the look: still unanswered
+        self.assertTrue(obs.no_window)
+        self.assertTrue(any("Automation" in n for n in obs.notes), obs.notes)   # the planner and the judge see why
+        self.assertEqual(self.reads(mac), [])
+        state["answer"] = None                  # the user clicks Allow late: not retried again on every look
+        self.assertTrue(d.observe().no_window)
+
+    def test_the_user_allowing_late_gets_the_run_its_window_on_the_next_look(self):
+        mac, state = self.automation("execution error: timed out")
+        d = self.mac(mac)
+        state["answer"] = None
+        obs = d.observe()
+        self.assertFalse(obs.no_window)
+        self.assertEqual(self.reads(mac), [d.state()["own_browser_windows"][SAFARI.lower()]])
+        self.assertNotIn("19116", self.reads(mac))
+
+    def test_a_denied_automation_names_the_setting(self):
+        mac, _ = self.automation("execution error: Not authorized to send Apple events to Safari. (-1743)")
+        d = self.mac(mac)
+        self.assertIn("does not allow DeskMind to control Safari", d.state()["own_browser_miss"])
+        self.assertIn("System Settings › Privacy & Security › Automation", d.state()["own_browser_miss"])
+
+    def test_the_done_judge_is_told_why_there_is_no_window(self):
+        from deskmind_hands.runtime import judge
+        prompts = []
+        judge.done_unseen(lambda p, s, o: prompts.append(p) or {"choice": judge.NOT_SHOWN}, "搜索天气", SAFARI,
+                          done=["no window"], why="macOS does not allow DeskMind to control Safari")
+        self.assertIn("does not allow DeskMind to control Safari", str(prompts))
+
+    def test_a_users_window_with_the_same_frame_does_not_stop_the_search(self):
+        # The user's window zoomed to the very place and size the run's new window gets: checks by frame alone could
+        # not tell them apart, and the search was refused. The run's window is moved in a little.
+        mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (220, 100, 1000, 700)}])
+        d = self.mac(mac)
+        own = d._pinned_window
+        self.assertNotEqual(mac.find(own)["frame"], mac.find(19116)["frame"])
+        d.observe()
+        own_frame, focused = mac.find(own)["frame"], []
+        d._address_bar, d._address_bar_rect = "e48", Rect(275, 18, 237, 31)
+        d._background_input = lambda bundle: True
+        d._wait_until_still = lambda bundle, what="": None
+        d._settle = lambda ok, detail: ExecResult(ok, detail)
+        d._post_click = lambda q, x, y: None
+        d._paste_and_submit = lambda q, text, before_return=None: True
+        users_frame = mac.find(19116)["frame"]
+        with mock.patch.object(skylight, "focus_without_raise", lambda pid, wid: focused.append(wid) or "token"), \
+                mock.patch.object(skylight, "give_focus_back", lambda token: None), \
+                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)), \
+                mock.patch.object(axchrome, "focused_identifier",
+                                  lambda pid, frame, wid=None: "another window" if frame == users_frame
+                                  else "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" if frame == own_frame else None):
+            d.allow_browser_field(WEB_SEARCH)
+            res = d._execute_projected(Action(kind=ActionKind.TYPE_TEXT, text="新加坡 天气",
+                                              binding=pk.Binding(observation_id="o", app="Safari",
+                                                                 element_id=WEB_SEARCH)))
+        self.assertTrue(res.ok, res.detail)
+        self.assertEqual(focused, [int(own)])
+
+    def test_the_ax_window_is_told_apart_by_its_id_at_one_frame(self):
+        frame = (0, 0, 1000, 700)
+        users, runs = object(), object()
+        with mock.patch.object(axchrome, "_windows_at", lambda pid, fr: [users, runs]), \
+                mock.patch.object(axchrome, "_window_id", lambda w: {id(users): 19116, id(runs): 30001}[id(w)]):
+            self.assertIs(axchrome._the_window(7, frame, "30001"), runs)
+            self.assertIsNone(axchrome._the_window(7, frame, "44444"))
+            self.assertIsNone(axchrome._the_window(7, frame))                 # no id: two at a frame name none
+        with mock.patch.object(axchrome, "_windows_at", lambda pid, fr: [users, runs]), \
+                mock.patch.object(axchrome, "_window_id", lambda w: None):
+            self.assertIsNone(axchrome._the_window(7, frame, "30001"))        # ids unreadable: still none
+
+    def test_no_foreground_typing_into_a_browser(self):
+        mac = FakeMac()
+        d = self.mac(mac)
+        d._run = mock.Mock(side_effect=AssertionError("nothing is sent"))
+        self.assertFalse(d._type_foreground("新加坡 天气").ok)
+
+    def test_no_foreground_typing_while_the_users_browser_window_has_the_focus(self):
+        mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1200, 800)}])
+        d = self.mac(mac, app="com.apple.TextEdit", stage=())
+        d._front_window = lambda: (SAFARI, "19116")
+        d._run = mock.Mock(side_effect=AssertionError("nothing is pasted"))
+        res = d._type_foreground("新加坡 天气")
+        self.assertFalse(res.ok)
+        self.assertIn("not this run's", res.detail)
+
+    def test_a_failed_menu_sends_no_escape_into_a_browser(self):
+        mac = FakeMac()
+        d = self.mac(mac)
+        d.observe()
+        sent = []
+        d._run = lambda key, _extra=None, **kw: sent.append(key) or (False, {}, "menu not found")
+        d._menu_options = lambda path: ""
+        d.execute(Action(kind=ActionKind.MENU, text="文件 > 不存在"))
+        self.assertNotIn("press_fg", sent)
+
+    def test_the_cli_transport_brings_no_browser_window_forward(self):
+        mac = FakeMac()
+        d = self.mac(mac)
+        d.observe()
+        d.allow_foreground, sent = True, []
+        base = d._run
+        d._run = lambda key, _extra=None, **kw: sent.append(key) or base(key, _extra, **kw)
+        self.assertFalse(d.execute(Action(kind=ActionKind.KEY, keys=("cmd", "l"))).ok)
+        other = str(mac.new_window("另一个"))
+        d._run_windows.add(other)
+        self.assertFalse(d.execute(Action(kind=ActionKind.FOCUS_WINDOW, text=other)).ok)
+        self.assertNotIn("press_fg_window", sent)
+        self.assertNotIn("window_focus", sent)
 
 
 class Parsing(unittest.TestCase):

@@ -44,7 +44,7 @@ def driver(app):
 
 class Offered(unittest.TestCase):
     def setUp(self):
-        self.p = mock.patch.object(axchrome, "own_fields", lambda pid, frame=None: [(BAR, False)])   # outside the page
+        self.p = mock.patch.object(axchrome, "own_fields", lambda pid, frame=None, wid=None: [(BAR, False)])   # outside the page
         self.p.start()
 
     def tearDown(self):
@@ -59,7 +59,7 @@ class Offered(unittest.TestCase):
 
     def test_offered_in_a_browser_window(self):
         d = driver("com.apple.Safari")
-        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None: [(BAR, True)]):
+        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None, wid=None: [(BAR, True)]):
             out = d._project_browser(SAFARI)
         self.assertEqual([(e.id, e.label, e.settable, e.synthetic) for e in out], [(WEB_SEARCH, "在地址栏搜索（智能搜索栏）", True, True)])
         self.assertEqual(d._address_bar, "e48")
@@ -71,7 +71,7 @@ class Offered(unittest.TestCase):
     def test_a_known_address_bar_without_a_page(self):
         # A start page or a blank tab has no web area; its address bar, known by its identifier, is still one (the live
         # run typed into the user's start page unjudged).
-        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None: [(BAR, True)]):
+        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None, wid=None: [(BAR, True)]):
             d = driver("com.apple.Safari")
             d.page_info = lambda: None
             out = d._project_browser([e for e in SAFARI if e.ax_role != "AXWebArea"])
@@ -80,14 +80,14 @@ class Offered(unittest.TestCase):
     def test_the_known_address_bar_before_a_find_bar(self):
         # A find bar is a browser-own field too; the address bar known by its identifier is the one offered.
         find = el("e70", "textField", "AXTextField", "在页面上查找", (100, 60, 300, 24))
-        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None: [((100, 60, 300, 24), False), (BAR, True)]):
+        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None, wid=None: [((100, 60, 300, 24), False), (BAR, True)]):
             d = driver("com.apple.Safari")
             d._project_browser([SAFARI[0], find, SAFARI[2]])
         self.assertEqual(d._address_bar, "e48")
 
     def test_only_the_observed_windows_fields(self):
         seen = []
-        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None: seen.append(frame) or [(BAR, True)]):
+        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None, wid=None: seen.append(frame) or [(BAR, True)]):
             driver("com.apple.Safari")._project_browser(SAFARI)
         self.assertEqual(seen, [(0, 0, 800, 600)])
 
@@ -105,7 +105,7 @@ class Offered(unittest.TestCase):
         self.assertEqual(d._project_browser(SAFARI), [])
 
     def test_not_when_no_address_bar_is_found(self):
-        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None: []):
+        with mock.patch.object(axchrome, "own_fields", lambda pid, frame=None, wid=None: []):
             self.assertEqual(driver("com.apple.Safari")._project_browser(SAFARI), [])
 
 
@@ -143,7 +143,7 @@ class Carried(unittest.TestCase):
         d._window_frame = lambda: frame
         seq = iter(focused if isinstance(focused, list) else [focused] * 3)
         self.patches = [mock.patch.object(axchrome, "focused_identifier",
-                                          lambda pid, fr: next(seq) if fr == WIN else "another window"),
+                                          lambda pid, fr, wid=None: next(seq) if fr == WIN else "another window"),
                         mock.patch.object(skylight, "give_focus_back", lambda token: d.events.append(("focus back",)))]
         for p in self.patches:
             p.start()

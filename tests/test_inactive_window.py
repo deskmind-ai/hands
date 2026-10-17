@@ -49,7 +49,10 @@ def safari(windows, readable=("19116",)):
         if key == "see":
             return False, {}, NOT_FOUND
         if key == "see_window":
-            return (True, PAGE, "") if kw.get("window") in readable else (False, {}, NOT_FOUND)
+            if kw.get("window") not in readable:
+                return False, {}, NOT_FOUND
+            cc = {**PAGE["coordinate_context"], "window": {"window_id": int(kw["window"])}}
+            return True, {**PAGE, "coordinate_context": cc}, ""
         if key == "window_list":
             return True, {"windows": [dict(w) for w in windows]}, ""
         raise AssertionError(key)
@@ -142,6 +145,28 @@ class Observed(unittest.TestCase):
         d._workspace_folder_names = lambda: {"ws"}
         self.assertIsNone(d._window_to_observe())
 
+    def test_a_read_with_nothing_in_it_is_no_window(self):
+        # A read that succeeds and holds nothing is judged like no window (review of #42).
+        d = safari([OWNER, TEST])
+        d._element_cache = lambda data, origin: []
+        self.assertTrue(observe(d).no_window)
+
+    def test_a_ghost_window_is_no_window(self):
+        # Safari's 64x64 untitled window with no accessibility window behind it, read because it was pinned.
+        ghost = {"window_id": 77, "window_title": "", "is_on_screen": True, "observation_capability": "pixels_only",
+                 "bounds": {"x": 0, "y": 900, "width": 64, "height": 64}}
+        d = safari([OWNER, TEST, ghost], readable=("77",))
+        d._pinned_window = "77"
+        self.assertTrue(observe(d).no_window)
+
+    def test_a_small_real_window_is_a_window(self):
+        # A small window with a title and a tree (a 140x90 panel) is a real one: not caught (review of #42).
+        small = {"window_id": 78, "window_title": "下载", "is_on_screen": True,
+                 "bounds": {"x": 0, "y": 0, "width": 140, "height": 90}}
+        d = safari([small], readable=("78",))
+        self.assertFalse(observe(d).no_window)
+        self.assertEqual(d._pinned_window, "78")
+
     def test_the_trace_keeps_it(self):
         import json
         import tempfile
@@ -179,6 +204,21 @@ class NoWindowBrowser(Browser):
 def run_unseen(goal, adapter, actions, done_check=True):
     with mock.patch("test_judge.Browser", NoWindowBrowser):
         return run(goal, actions, adapter, page=None, done_check=done_check)
+
+
+class Sequenced(Judged):
+    """Answers the done judgements in turn; None is no answer (the judge down)."""
+
+    def __init__(self, actions, answers):
+        super().__init__(actions)
+        self.answers = list(answers)
+
+    def judge_choice(self, state, instructions, criteria):
+        self.asked.append(state)
+        choice = self.answers.pop(0)
+        if choice is None:
+            raise RuntimeError("no answer")
+        return {"choice": choice, "probabilities": {choice: 0.9}}
 
 
 class DoneOnNothingSeen(unittest.TestCase):
@@ -224,9 +264,38 @@ class DoneOnNothingSeen(unittest.TestCase):
                           done=_what_was_done(steps))
         self.assertIn("saved and closed 'notes.txt'", prompt[0])
 
-    def test_no_judgement_holds_nothing_back(self):
-        # The judge down: no verdict, and the run completes as it did (only 没出来 holds a run back).
-        res, _, _ = run_unseen("打开 Safari，搜索新加坡的天气", Judged([DONE], down=True), [DONE])
+    def test_no_judgement_is_held_back_once_then_unverified(self):
+        # The judge down, or an answer off its options: never completed. Held back once with the reason, and
+        # insisted on, the run ends unverified (review of #42).
+        for adapter in (Judged([DONE] * 4, down=True), Judged([DONE] * 4, done="随便")):
+            res, _, _ = run_unseen("打开 Safari，搜索新加坡的天气", adapter, [DONE] * 4)
+            self.assertEqual(res.state.value, "gave_up")
+            self.assertTrue(res.failure.detail.startswith("not verified"))
+            blocked = [s for s in res.steps if s.get("kind") == "done_blocked"]
+            self.assertTrue(blocked)
+            self.assertIn("could not be confirmed", blocked[0]["text"])
+            self.assertTrue([s for s in res.steps if s.get("kind") == "done_unverified"])
+
+    def test_after_other_checks_no_judgement_is_still_held_back_once(self):
+        # done_check's objections took both blocks; the final DONE has no judgement: held back once, then unverified.
+        adapter = Judged([DONE] * 5, down=True)
+        adapter.done_objection = lambda ctx: "the file is not saved"
+        res, _, _ = run_unseen("打开 Safari，搜索新加坡的天气", adapter, [DONE] * 5)
+        self.assertNotEqual(res.state.value, "completed")     # here the unchanged screen ends it first (no progress)
+        unverified = [s for s in res.steps if s.get("kind") == "done_blocked" and "confirmed" in s["text"]]
+        self.assertEqual(len(unverified), 1)
+
+    def test_no_answer_after_not_shown_keeps_not_shown(self):
+        adapter = Sequenced([DONE] * 4, [judge.NOT_SHOWN, None, None, None])
+        res, _, _ = run_unseen("打开 Safari，搜索新加坡的天气", adapter, [DONE] * 4)
+        self.assertEqual(res.failure.cls.name, "FALSE_COMPLETION")
+        kept = [s for s in res.steps if s.get("kind") == "judged" and s.get("kept")]
+        self.assertTrue(kept)
+        self.assertEqual({s["verdict"] for s in kept}, {judge.NOT_SHOWN})
+
+    def test_a_later_answer_replaces_an_earlier_not_shown(self):
+        adapter = Sequenced([DONE] * 2, [judge.NOT_SHOWN, judge.NO_WINDOW_NEEDED])
+        res, _, _ = run_unseen("把草稿另存为 notes.txt，然后关掉文稿", adapter, [DONE] * 2)
         self.assertEqual(res.state.value, "completed")
 
     def test_blocks_spent_by_another_check_then_no_window_needed_completes(self):

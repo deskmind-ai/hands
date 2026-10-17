@@ -13,6 +13,7 @@ refused instead of clicking wherever those coordinates now point.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 
 import re
@@ -628,6 +629,7 @@ def run_task(
             ctx = TurnContext(task=task, observation=_filter(obs, cfg.channels),
                               history=history[-10:], channels=cfg.channels,
                               dialogue=[(d["question"], d["reply"]) for d in dialogue],
+                              users_words=tuple(_users_words(dialogue)),
                               notice=notice, ineffective=tuple(ineffective))
             notice = None
 
@@ -1052,14 +1054,12 @@ def _filter(obs: Observation, channels: frozenset[str]) -> Observation:
     """
     if "ax" in channels and "screenshot" in channels:
         return obs
-    return Observation(
-        id=obs.id,
-        geometry=obs.geometry,
-        transform=obs.transform,
+    # Only the withheld channels change; every other field is carried as it is. Rebuilt field by field, this dropped
+    # the window title, the windows, the notes, no_window and own_window_empty from every single-channel look, and the
+    # empty-window ASK never fired with --channels ax (Codex review of 82681e5).
+    return dataclasses.replace(
+        obs,
         screenshot_png=obs.screenshot_png if "screenshot" in channels else None,
         screenshot_path=obs.screenshot_path if "screenshot" in channels else None,
         elements=obs.elements if "ax" in channels else [],
-        focused_app=obs.focused_app,
-        layout_version=obs.layout_version,
-        ts=obs.ts,
     )

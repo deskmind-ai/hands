@@ -15,6 +15,7 @@ And `preexisting_windows` said 9 to 15 while Safari had 2 to 6 windows.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import sys
 import tempfile
@@ -95,12 +96,12 @@ class Judging(ReplayAdapter):
 
 
 class User:
-    def __init__(self):
-        self.asked = []
+    def __init__(self, reply="ok"):
+        self.asked, self.reply = [], reply
 
     def respond(self, question, approval, options=()):
         self.asked.append(question)
-        return "ok", True, 0.0
+        return self.reply, True, 0.0
 
 
 def run(goal, actions, driver, adapter, user=None):
@@ -307,26 +308,136 @@ class Ask(unittest.TestCase):
         self.assertNotIn("ASK", planner.offered[0])
 
     def test_the_question_reaches_the_user_in_a_run(self):
-        class Marker(MockDriver):
-            app = SAFARI
-
-            def observe(self):
-                return marker_look()
-
-            def execute(self, action):
-                return ExecResult(True, "ok")
-        from deskmind_bench.task import load_task
-        from deskmind_hands.env.workspace import Workspace
-        from deskmind_hands.runtime.loop import RunConfig, run_task
-        repo = Path(__file__).resolve().parent.parent
-        task = dataclasses.replace(load_task(repo / "tasks" / "smoke" / "S01-rename.yaml"), goal=self.GOAL)
-        ws = Workspace.create(Path(tempfile.mkdtemp()), repo / "fixtures")
         a = SystemOneAdapter(url="http://127.0.0.1:9", timeout=2)
         a._ask = Picks("ASK")
         user = User()
-        run_task(task, Marker(render=False), a, ws, config=RunConfig(user=user, approve_risky=True))
+        run_marker(self.GOAL, OnMarker(), a, user)
         self.assertEqual(user.asked[:1], [OWN_WINDOW_QUESTION["zh"]])
 
+    def test_with_the_ax_channel_alone_the_empty_window_still_asks(self):
+        # Codex review of 82681e5: _filter rebuilt the look for one channel and dropped own_window_empty and the notes.
+        from deskmind_hands.runtime.loop import _filter
+        for channels in ({"ax"}, {"screenshot"}):
+            seen = _filter(marker_look(), frozenset(channels))
+            self.assertTrue(seen.own_window_empty, channels)
+            self.assertEqual(seen.notes, marker_look().notes)
+            self.assertEqual(seen.window_title, "dm-c087a9a2d0a2")
+        self.assertEqual(_filter(marker_look(), frozenset({"screenshot"})).elements, [])     # the channel withheld
+        a = SystemOneAdapter(url="http://127.0.0.1:9", timeout=2)
+        a._ask = planner = Picks("ASK")
+        user = User()
+        run_marker(self.GOAL, OnMarker(), a, user, channels=frozenset({"ax"}))
+        self.assertIn("ASK", planner.offered[0])
+        self.assertEqual(user.asked[:1], [OWN_WINDOW_QUESTION["zh"]])
+        self.assertIn("DeskMind opened for this run", planner.states[0]["note"])
+
+    def test_an_address_the_user_gives_is_typed_in_the_address_bar(self):
+        # Codex review of 82681e5: the user answered the question with the page's address, and the values to type
+        # were still the goal's and the screen's only (parts.txt).
+        url = "https://example.com/parts"
+        driver = OnMarker()
+        a = SystemOneAdapter(url="http://127.0.0.1:9", timeout=2)
+        a._ask = planner = Script([("ASK", None, None), ("TYPE_TEXT", "在地址栏搜索", url), ("DONE", None, None)])
+        judged = []
+        a.judge_choice = lambda state, sy, options: judged.append(state) or {
+            "choice": judge.DO if judge.DO in options else judge.SHOWN}
+        user = User(reply=url)
+        res = run_marker(self.GOAL, driver, a, user)
+        values = [v["value"] for v in planner.requests[1]["type_text_value"]["criteria"].values()]
+        self.assertEqual(values[0], url)                       # offered, first
+        self.assertEqual(driver.typed, [url])                  # and typed, through the address bar search
+        self.assertIn(url, judged[0])                          # the typing judge read what the user said
+        self.assertIn("用户后来说的", judged[0])
+        self.assertEqual(res.state.value, "completed")
+
+    def test_no_other_copy_of_a_look_drops_it(self):
+        # The sweep after _filter: the hybrid adapter's look without pixels, and a look replayed from a trace.
+        from deskmind_hands.adapters.base import TurnContext as Ctx
+        from deskmind_hands.adapters.hybrid import HybridAdapter
+        from deskmind_hands.replay import observation
+        task = live_task(self.GOAL, Path(tempfile.mkdtemp()), app=SAFARI, max_actions=20, wall_clock_s=60)
+        blind = HybridAdapter._without_screenshot(Ctx(task=task, observation=marker_look(), history=[],
+                                                      channels=frozenset({"ax"}))).observation
+        self.assertTrue(blind.own_window_empty and blind.notes and blind.screenshot_png is None)
+        self.assertTrue(observation({"id": "obs-0001", "own_window_empty": True}).own_window_empty)
+
+    def test_an_address_in_a_reply_is_offered_by_its_form(self):
+        from deskmind_hands.adapters.systemone import reply_values
+        self.assertEqual(reply_values([("这个网页在哪？", "网址是 example.com/parts，谢谢")]), ["example.com/parts"])
+        self.assertEqual(reply_values([("q", "a"), ("q", "https://a.example/x 或者 b.example")]),
+                         ["https://a.example/x", "b.example"])
+        self.assertEqual(reply_values([("哪一笔？", "The one from September 27.")]), [])     # no address: nothing
+        self.assertEqual(reply_values([]), [])
+
+
+class OnMarker(MockDriver):
+    """The run's own Safari window on its marker page until something is searched from its address bar."""
+
+    app = SAFARI
+
+    def __init__(self):
+        super().__init__(render=False)
+        self.typed, self.allowed = [], []
+
+    def observe(self):
+        if not self.typed:
+            return marker_look()
+        return dataclasses.replace(marker_look(empty=False), window_title="零件表", id=f"obs-{len(self.typed) + 1}")
+
+    def browser_field(self, eid):
+        return "智能搜索栏" if eid == "syn:websearch" else None
+
+    def allow_browser_field(self, eid):
+        self.allowed.append(eid)
+
+    def page_info(self):
+        if not self.typed:
+            return MARKER
+        return {"url": self.typed[-1], "title": "零件表", "text": "P-102 螺丝 200", "browser": True}
+
+    def execute(self, action):
+        if action.kind is ActionKind.TYPE_TEXT and action.binding.element_id == "syn:websearch":
+            self.typed.append(action.text)
+            return ExecResult(True, f"searched {action.text!r} from the address bar (in the background)")
+        return ExecResult(True, "ok")
+
+
+def run_marker(goal, driver, adapter, user, channels=None):
+    from deskmind_bench.task import load_task
+    from deskmind_hands.env.workspace import Workspace
+    from deskmind_hands.runtime.loop import RunConfig, run_task
+    repo = Path(__file__).resolve().parent.parent
+    task = dataclasses.replace(load_task(repo / "tasks" / "smoke" / "S01-rename.yaml"), goal=goal)
+    ws = Workspace.create(Path(tempfile.mkdtemp()), repo / "fixtures")
+    cfg = RunConfig(user=user, approve_risky=True, **({"channels": channels} if channels else {}))
+    with mock.patch.dict(os.environ, {"HANDS_DONE_CHECK": "1"}):
+        return run_task(task, driver, adapter, ws, config=cfg)
+
+
+class Script:
+    """A planner answering from a script, one (operation, target's label, value) a turn; heads it was not given a
+    pick for take their first option."""
+
+    def __init__(self, turns):
+        self.turns, self.requests = list(turns), []
+
+    def __call__(self, state, questions):
+        self.requests.append(questions)
+        ops = list(questions["operation"]["criteria"])
+        op, label, value = self.turns.pop(0) if self.turns else ("BLOCKED", None, None)
+        assert op in ops, (op, ops)
+        one = lambda pick, keys: {"type": "choice", "choice": pick,
+                                  "probabilities": {k: (1.0 if k == pick else 0.0) for k in keys}}
+        out = {"operation": one(op, ops)}
+        for qid, q in questions.items():
+            if qid == "operation":
+                continue
+            keys = list(q["criteria"])
+            want = value if qid.endswith("_value") else label if qid.endswith("_target") else None
+            pick = next((k for k, v in q["criteria"].items() if want and want in json.dumps(v, ensure_ascii=False)
+                         and (not qid.endswith("_value") or v.get("value") == want)), keys[0])
+            out[qid] = one(pick, keys)
+        return out
 
 if __name__ == "__main__":
     unittest.main()

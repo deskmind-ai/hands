@@ -44,6 +44,7 @@ class FakeMac:
         self.restored = [dict(w) for w in restored]   # what a launch brings back from the last session
         self.next_id = 30000
         self.events: list[tuple] = []
+        self.user_opens_during_make = False     # the user opens a window between the make and the script's answer
         self.idle = 1e6          # seconds since the user last touched anything
 
     # -- what happens on the Mac
@@ -109,7 +110,14 @@ class FakeMac:
             if not self.running:
                 self.running = True           # AppleScript launches the app it names
             url = script.split('URL:"', 1)[1].split('"', 1)[0] if 'URL:"' in script else ""
-            return True, str(self.new_window("新窗口", url))
+            made = self.new_window("新窗口", url)
+            if self.user_opens_during_make:
+                self.new_window("用户刚开的窗口")            # in front now, and new as well
+            if "front window" in script:
+                return True, str(self.windows[0]["id"])
+            if "whose document is d" in script:
+                return True, str(made)
+            return False, "unknown script"
         if "set bounds of window id" in script:
             wid = script.split("window id ", 1)[1].split()[0]
             a, b, c, e = (int(v) for v in script.split("{", 1)[1].split("}", 1)[0].split(","))
@@ -371,7 +379,7 @@ class OwnWindow(unittest.TestCase):
         mac.osa = two
         d = self.mac(mac)
         self.assertIsNone(d._pinned_window)
-        self.assertIn("could not be told apart", d.state()["own_browser_miss"])
+        self.assertIn("so none is taken", d.state()["own_browser_miss"])
         obs = d.observe()                       # and neither new window is read or offered afterwards
         self.assertTrue(obs.no_window)
         self.assertEqual(self.reads(mac), [])
@@ -391,14 +399,18 @@ class OwnWindow(unittest.TestCase):
         res = d.execute(Action(kind=ActionKind.FOCUS_WINDOW, text=users))
         self.assertFalse(res.ok)
 
-    def test_a_window_the_runs_own_step_opens_is_the_runs(self):
+    def test_a_new_window_during_the_runs_own_step_is_not_the_runs(self):
+        # A session Safari restores late needs no input from anyone, and can come up during any step the run takes,
+        # with the user away: nothing ties it to the step, so it is not the run's (Codex review). Nor, by the same
+        # token, a pop-up the run's own click opens: the planner stops or asks.
         mac = FakeMac()
         d = self.mac(mac)
         d.observe()
         opened = []
-        d._execute_outer = lambda action: opened.append(mac.new_window("链接打开的窗口")) or ExecResult(True, "clicked")
-        d.execute(Action(kind=ActionKind.KEY, keys=("cmd", "n")))
-        self.assertIn(str(opened[0]), [w.id for w in d._windows()])
+        d._execute_outer = lambda action: opened.append(mac.new_window("恢复的窗口")) or ExecResult(True, "clicked")
+        d.execute(Action(kind=ActionKind.KEY, keys=("cmd", "l")))
+        self.assertNotIn(str(opened[0]), [w.id for w in d.observe().windows])
+        self.assertEqual(d._run_windows, {d._pinned_window})
 
     def test_a_window_that_opens_during_a_step_while_the_user_works_is_not_the_runs(self):
         mac = FakeMac()
@@ -619,6 +631,50 @@ class OwnWindow(unittest.TestCase):
         self.assertNotIn("press_fg_window", sent)
         self.assertNotIn("window_focus", sent)
 
+    # -- Codex review: the window the script made -------------------------------------------------------------
+
+    def test_a_window_the_user_opens_while_the_runs_is_made_is_not_taken(self):
+        mac = FakeMac([{"id": 19085, "title": "收藏夹", "on_screen": False, "frame": (0, 0, 1200, 800)}])
+        mac.user_opens_during_make = True
+        d = self.mac(mac)
+        users = str(mac.windows[0]["id"])                    # in front, and new too
+        self.assertNotEqual(d._pinned_window, users)
+        self.assertEqual(mac.find(d._pinned_window)["title"], "新窗口")
+        self.assertNotIn(users, [w.id for w in d.observe().windows])
+
+    def test_an_id_that_is_not_a_new_window_pins_nothing(self):
+        mac = FakeMac()
+        make = mac.osa
+        mac.osa = lambda script: (make(script)[0], "99999") if "make new" in script else make(script)
+        d = self.mac(mac)
+        self.assertIsNone(d._pinned_window)
+        self.assertTrue(d.observe().no_window)
+        self.assertEqual(self.reads(mac), [])
+
+    def test_a_chromium_window_is_found_by_the_place_the_script_returns(self):
+        mac = FakeMac(running=False)
+        d = self.mac(mac, app="com.apple.TextEdit", stage=())
+        chrome = "com.google.Chrome"
+        rows = {"before": [{"window_id": 5, "window_title": "用户的", "is_on_screen": True,
+                            "bounds": {"x": 0, "y": 0, "width": 1200, "height": 800}}]}
+        new = [{"window_id": 41, "window_title": "用户刚开的", "is_on_screen": True,
+                "bounds": {"x": 40, "y": 40, "width": 1200, "height": 800}},
+               {"window_id": 42, "window_title": "新标签页", "is_on_screen": True,
+                "bounds": {"x": 220, "y": 100, "width": 1000, "height": 700}}]
+        state = {"made": False}
+        d._app_is_running = lambda bundle: True
+        d._run = lambda key, _extra=None, **kw: (True, {"windows": rows["before"] + (new if state["made"] else [])}, "")
+        d._osa = lambda script: (state.update(made=True) or (True, "1234|220,100,1220,800")) \
+            if "make new window" in script else (True, "")
+        with mock.patch.dict(sys.modules, {"Quartz": None}):
+            self.assertEqual(d._own_browser_window(chrome), "42")
+        state["made"] = False
+        d._own_browser.clear()
+        d._osa = lambda script: (state.update(made=True) or (True, "1234|900,900,1000,1000")) \
+            if "make new window" in script else (True, "")
+        with mock.patch.dict(sys.modules, {"Quartz": None}):
+            self.assertIsNone(d._own_browser_window(chrome))     # no new window at that place: none
+
 
 class Parsing(unittest.TestCase):
     def test_browser_staging_commands(self):
@@ -635,6 +691,9 @@ class Parsing(unittest.TestCase):
 
     def test_scripts(self):
         self.assertIn("make new document", pk._new_window_script("com.apple.Safari"))
+        self.assertIn("whose document is d", pk._new_window_script("com.apple.Safari"))
+        self.assertNotIn("front window", pk._new_window_script("com.apple.Safari"))
+        self.assertIn("bounds of w", pk._new_window_script("com.google.Chrome"))
         self.assertIn('URL:"https://a.b/\\"x"', pk._new_window_script("com.apple.Safari", 'https://a.b/"x'))
         self.assertIn("make new window", pk._new_window_script("com.google.Chrome", "https://a.b"))
         self.assertIsNone(pk._new_window_script("org.mozilla.firefox"))

@@ -942,11 +942,9 @@ KEY_CHOICES = {
 #: ASK's question when the run's own browser window has no page in it (Observation.own_window_empty) and no text
 #: helper writes one: what the run can see and may use, and what would let it go on.
 OWN_WINDOW_QUESTION = {
-    "zh": "我只能在 DeskMind 自己打开的浏览器窗口里操作，这个窗口里还没有网页；你自己的浏览器窗口我不能读，也不能用。"
-          "你说的网页在哪里？可以把它的网址告诉我，我在自己的窗口里打开。",
-    "en": "I can only work in the browser window DeskMind opened for itself, and no page is open in it yet; I may not "
-          "read or use your own browser windows. Where is the page you mean? You can tell me its address, and I will "
-          "open it in my window.",
+    "zh": "这个窗口里还没有网页。要我打开哪个网址，或者搜索什么？你自己窗口里的网页我不能读。",
+    "en": "There is no page in this window yet. Which address should I open, or what should I search for? I can't read "
+          "the pages in your own windows.",
 }
 
 #: What each operation means, as the planner reads it; the harness maps them onto its own action vocabulary.

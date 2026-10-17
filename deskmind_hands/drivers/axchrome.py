@@ -151,13 +151,24 @@ OVERLAY_ROLES = {"AXSheet", "AXPopover"}
 OVERLAY_SUBROLES = {"AXDialog", "AXSystemDialog"}
 
 
+def _clip(a, b) -> tuple | None:
+    """The part of frame `a` inside frame `b`, or None when they do not overlap."""
+    x, y = max(a[0], b[0]), max(a[1], b[1])
+    r, btm = min(a[0] + a[2], b[0] + b[2]), min(a[1] + a[3], b[1] + b[3])
+    return (x, y, r - x, btm - y) if r > x and btm > y else None
+
+
 def regions(pid: int, frame: tuple | None, wid=None) -> dict | None:
     """Where the window at `frame` (the window the run observes; `wid`, its window-server id) shows the page, and what
-    else in it is not the browser's own: {"window": its frame, "page": the web areas' frames, "overlay": sheets',
-    dialogs' and popovers' frames, "address_bar": the address bars' frames}, all screen frames. Everything else inside
-    the window -- the toolbar, the tab bar, the sidebar with the user's tab groups, bookmarks and reading list -- is the
-    browser's own (chrome). None when no single window is at `frame` (_the_window). By structure only: roles and the
-    address bar's identifier, never a word on screen.
+    else in it is not the browser's own: {"window": its frame, "page": the visible part of each web area, "overlay":
+    sheets', dialogs' and popovers' frames, "address_bar": the address bars' frames, "menus": menus the browser's own
+    controls opened}, all screen frames. Everything else inside the window -- the toolbar, the tab bar, the sidebar with
+    the user's tab groups, bookmarks and reading list -- is the browser's own (chrome). None when no single window is
+    at `frame` (_the_window). By structure only: roles and the address bar's identifier, never a word on screen.
+
+    A web area's frame is the whole document, not what is shown: scrolled, it starts above the window and covers the
+    toolbar. The page is the web area clipped to the scroll area holding it (the viewport) and to the window (review of
+    de228eb).
 
     Live 10-17 (0.4.3-rc.3, run 4): in its own window, still on its marker page, a run asked to copy a table from a page
     open in the user's window clicked 「显示边栏」 and double-clicked the sidebar's 「默认，含1个标签页的标签页组」 -- the
@@ -165,22 +176,33 @@ def regions(pid: int, frame: tuple | None, wid=None) -> dict | None:
     win = _the_window(pid, frame, wid)
     if win is None:
         return None
-    out: dict = {"window": _frame(win) or tuple(frame), "page": [], "overlay": [], "address_bar": []}
-    stack, seen = list(reversed(_get(win, "AXChildren") or [])), 0
+    wf = _frame(win) or tuple(frame)
+    out: dict = {"window": wf, "page": [], "overlay": [], "address_bar": [], "menus": []}
+    # Each node with the viewport it is shown in: the nearest scroll area's frame, else the window's.
+    stack, seen = [(c, wf) for c in reversed(_get(win, "AXChildren") or [])], 0
     while stack and seen < MAX_NODES:
-        el = stack.pop()
+        el, view = stack.pop()
         seen += 1
         role = _get(el, "AXRole")
-        if role == "AXWebArea" or role in OVERLAY_ROLES or _get(el, "AXSubrole") in OVERLAY_SUBROLES:
-            f = _frame(el)
+        f = _frame(el)
+        if role == "AXWebArea":
+            shown = _clip(f, view) if f else None
+            shown = _clip(shown, wf) if shown else None
+            if shown:
+                out["page"].append(shown)
+            continue        # what is inside is the page's: not walked
+        if role in OVERLAY_ROLES or _get(el, "AXSubrole") in OVERLAY_SUBROLES:
             if f:
-                out["page" if role == "AXWebArea" else "overlay"].append(f)
-            continue        # what is inside is the page's or the overlay's: not walked
-        if role in TEXT_ROLES and _get(el, "AXIdentifier") in ADDRESS_BAR_IDS:
-            f = _frame(el)
+                out["overlay"].append(f)
+            continue        # likewise an overlay's
+        if role == "AXMenu":
             if f:
-                out["address_bar"].append(f)
-        stack.extend(reversed(_get(el, "AXChildren") or []))
+                out["menus"].append(f)     # opened from the browser's own controls (the tab group picker, say)
+            continue
+        if role in TEXT_ROLES and _get(el, "AXIdentifier") in ADDRESS_BAR_IDS and f:
+            out["address_bar"].append(f)
+        inner = (_clip(f, view) or f) if role == "AXScrollArea" and f else view
+        stack.extend((c, inner) for c in reversed(_get(el, "AXChildren") or []))
     return out
 
 
@@ -190,11 +212,26 @@ def _overlap(a, b) -> bool:
     return min(ax + aw, bx + bw) > max(ax, bx) and min(ay + ah, by + bh) > max(ay, by)
 
 
+#: How far an element's frame is shrunk before it is tested: a control whose edge only touches the page (a toolbar
+#: button flush with the page's top) is not on it.
+INSET = 3
+
+
+def _inset(rect) -> tuple:
+    x, y, w, h = rect
+    dx, dy = min(INSET, max(0, (w - 1) / 2)), min(INSET, max(0, (h - 1) / 2))
+    return (x + dx, y + dy, w - 2 * dx, h - 2 * dy)
+
+
 def chrome(r: dict, rect: tuple) -> bool:
     """Whether the screen rectangle `rect` (x, y, w, h: an element's) is one of the browser's own controls in the
-    window `r` describes (regions): inside the window, and touching none of its page, overlays or address bar. Any
-    part on the page keeps an element the page's: a row scrolled half under the toolbar is still the page's. A rect
-    wholly outside the window (a menu the page opened) is not the window's chrome."""
+    window `r` describes (regions): on a menu the browser's own controls opened, or inside the window and touching none
+    of its page, overlays or address bar. Any part on the page keeps an element the page's: a row scrolled half under
+    the toolbar is still the page's. A rect wholly outside the window (a menu the page opened) is not the window's
+    chrome. The rect is shrunk by INSET first."""
+    rect = _inset(rect)
+    if any(_overlap(rect, m) for m in r.get("menus", [])):
+        return True
     return (_overlap(rect, r["window"])
             and not any(_overlap(rect, f) for f in r["page"] + r["overlay"] + r["address_bar"]))
 
@@ -236,3 +273,32 @@ def page_info(pid: int, frame: tuple | None, wid=None) -> dict | None:
         stack.extend(reversed(_get(el, "AXChildren") or []))
     return {"url": url, "title": str(_get(win, "AXTitle") or _get(page, "AXTitle") or ""),
             "text": " ".join(parts)[:PAGE_TEXT_CHARS]}
+
+
+def main(argv=None) -> int:
+    """Print regions() for every window of an app on screen, as frames only (no title, no page text), for checking
+    against a real window: python -m deskmind_hands.drivers.axchrome [bundle id, default Safari]."""
+    import json
+    import sys
+    from AppKit import NSRunningApplication
+    from ApplicationServices import AXUIElementCreateApplication
+    bundle = (argv if argv is not None else sys.argv[1:] or ["com.apple.Safari"])[0]
+    apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle) or []
+    if not apps:
+        print(f"{bundle} is not running")
+        return 1
+    pid = apps[0].processIdentifier()
+    for w in _get(AXUIElementCreateApplication(pid), "AXWindows") or []:
+        f = _frame(w)
+        if not f or _get(w, "AXMinimized"):
+            continue
+        wid = _window_id(w)
+        r = regions(pid, f, wid)
+        rounded = None if r is None else {k: ([round(n) for n in v] if k == "window" else
+                                              [[round(n) for n in x] for x in v]) for k, v in r.items()}
+        print(json.dumps({"window_id": wid, "frame": [round(n) for n in f], "regions": rounded}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -41,8 +41,8 @@ def safari(windows, readable=("19116",)):
     d._pinned_window, d._window_id, d._pin_window = None, None, True
     d.scratch, d.offer_folder_files, d._origin = Path("/nonexistent"), False, Point(0, 0)
     d._sparse_tree = lambda data: False
-    d._element_cache = lambda data, origin: [Element(id="e1", role="webArea", ax_role="AXWebArea", label="控制台")]
-    d.calls = []
+    d._pid_of = lambda bundle, all_wins=None: None
+    d.calls, d.read = [], dict(PAGE)        # `read`: what a read by id returns (the real conversion runs on it)
 
     def fake_run(key, _extra=None, **kw):
         d.calls.append((key, kw.get("window")))
@@ -51,8 +51,8 @@ def safari(windows, readable=("19116",)):
         if key == "see_window":
             if kw.get("window") not in readable:
                 return False, {}, NOT_FOUND
-            cc = {**PAGE["coordinate_context"], "window": {"window_id": int(kw["window"])}}
-            return True, {**PAGE, "coordinate_context": cc}, ""
+            cc = {**d.read["coordinate_context"], "window": {"window_id": int(kw["window"])}}
+            return True, {**d.read, "coordinate_context": cc}, ""
         if key == "window_list":
             return True, {"windows": [dict(w) for w in windows]}, ""
         raise AssertionError(key)
@@ -148,8 +148,36 @@ class Observed(unittest.TestCase):
     def test_a_read_with_nothing_in_it_is_no_window(self):
         # A read that succeeds and holds nothing is judged like no window (review of #42).
         d = safari([OWNER, TEST])
-        d._element_cache = lambda data, origin: []
+        d.read = {**PAGE, "ui_elements": []}
         self.assertTrue(observe(d).no_window)
+
+    def textedit(self, ui_elements):
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "parts.txt").write_text("P-101\n")
+        (tmp / "notes.txt").write_text("")
+        doc = {"window_id": 6, "window_title": "parts.txt", "window_index": 0, "is_on_screen": True,
+               "bounds": {"x": 0, "y": 0, "width": 600, "height": 500}}
+        d = safari([doc], readable=("6",))
+        d.app = d._home_app = "com.apple.TextEdit"
+        d._mcp, d.ws, d.offer_folder_files, d._preexisting = object(), tmp, True, set()
+        d._workspace_file_names = lambda: {"parts.txt", "notes.txt"}
+        d.read = {**PAGE, "application_name": "文本编辑", "window_title": "parts.txt", "ui_elements": ui_elements}
+        return observe(d)
+
+    def test_a_read_of_nothing_with_the_harness_own_controls_is_no_window(self):
+        # TextEdit read of nothing, through the real conversion: 保存, 另存为 and the folder's documents are added,
+        # and they are not a window's content (review of #42: real 0, synthetic 5, the done judge never asked).
+        obs = self.textedit([])
+        self.assertTrue([e for e in obs.elements if e.synthetic])
+        self.assertIn("syn:save", [e.id for e in obs.elements])
+        self.assertTrue(obs.no_window)
+
+    def test_a_document_read_with_its_text_is_a_window(self):
+        obs = self.textedit([{"id": "t1", "role": "AXTextArea", "label": "", "value": "P-101\n",
+                              "is_value_settable": True}])
+        self.assertIn("t1", [e.id for e in obs.elements])
+        self.assertFalse(obs.no_window)
 
     def test_a_ghost_window_is_no_window(self):
         # Safari's 64x64 untitled window with no accessibility window behind it, read because it was pinned.
@@ -292,6 +320,46 @@ class DoneOnNothingSeen(unittest.TestCase):
         kept = [s for s in res.steps if s.get("kind") == "judged" and s.get("kept")]
         self.assertTrue(kept)
         self.assertEqual({s["verdict"] for s in kept}, {judge.NOT_SHOWN})
+
+    def test_not_shown_is_dropped_once_the_run_acted(self):
+        # 没出来, then a step that went through (the save-and-close), then the judge times out: the old 没出来 is
+        # about a screen that is gone; unverified, not a false completion (review of #42).
+        key = {"kind": "key", "keys": "cmd+s"}
+        adapter = Sequenced([DONE, key, DONE, DONE], [judge.NOT_SHOWN, None, None])
+        res, _, _ = run_unseen("把草稿另存为 notes.txt，然后关掉文稿", adapter, [DONE, key, DONE, DONE])
+        self.assertEqual(res.metrics.actions, 1)
+        self.assertNotEqual(res.state.value, "completed")
+        self.assertNotEqual(res.failure.cls.name, "FALSE_COMPLETION")
+        self.assertFalse([s for s in res.steps if s.get("kept")])
+        blocked = [s["text"] for s in res.steps if s.get("kind") == "done_blocked"]
+        self.assertIn("could not be confirmed", blocked[1])       # the second DONE: unverified, not 没出来 again
+
+    def test_a_silent_judge_is_not_asked_again(self):
+        adapter = Sequenced([DONE] * 3, [None, judge.NO_WINDOW_NEEDED, judge.NO_WINDOW_NEEDED])
+        res, _, _ = run_unseen("打开 Safari，搜索新加坡的天气", adapter, [DONE] * 3)
+        self.assertEqual(len(adapter.asked), 1)
+        self.assertEqual(res.state.value, "gave_up")
+
+    def test_an_adapter_that_cannot_judge_keeps_the_old_behaviour(self):
+        # No judge_choice (anthropic_cu, openai_cu, a hybrid over one): a save-and-close is not failed for a missing
+        # capability; the run says the check was off (review of #42).
+        from deskmind_hands.adapters.scripted import ReplayAdapter
+        res, _, _ = run_unseen("把草稿另存为 notes.txt，然后关掉文稿", ReplayAdapter([DONE]), [DONE])
+        self.assertEqual(res.state.value, "completed")
+        self.assertTrue(res.checks["no_window_judge"].startswith("off"))
+        self.assertIn("checks", res.to_json())
+        res, _, _ = run_unseen("把草稿另存为 notes.txt，然后关掉文稿", Judged([DONE], done=judge.NO_WINDOW_NEEDED), [DONE])
+        self.assertEqual(res.checks["no_window_judge"], "on")
+
+    def test_a_hybrid_passes_its_planners_judgement_through(self):
+        from deskmind_hands.adapters.hybrid import HybridAdapter
+
+        class Planner:
+            def judge_choice(self, state, instructions, criteria):
+                return {"choice": judge.NO_WINDOW_NEEDED}
+
+        self.assertTrue(callable(getattr(HybridAdapter(Planner(), object()), "judge_choice", None)))
+        self.assertIsNone(getattr(HybridAdapter(object(), object()), "judge_choice", None))
 
     def test_a_later_answer_replaces_an_earlier_not_shown(self):
         adapter = Sequenced([DONE] * 2, [judge.NOT_SHOWN, judge.NO_WINDOW_NEEDED])

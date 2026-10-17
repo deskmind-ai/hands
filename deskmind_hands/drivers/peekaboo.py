@@ -1556,43 +1556,6 @@ class PeekabooDriver:
                                 synthetic=True, app=self._app_name, window_id=self._window_id or "")]
         return []
 
-    #: Said when a step names one of the browser's own controls that was not offered (_browser_scope).
-    CHROME_REFUSAL = ("not done: that is one of the browser's own controls (its toolbar, tabs or sidebar -- the user's "
-                      "tab groups, bookmarks and reading list), not the page; only the page, the address bar search "
-                      "and the windows listed are offered")
-
-    def _browser_scope(self, els: list[Element], origin: Point) -> list[Element]:
-        """In a browser's window, the page and what sits over it (a sheet, a dialog, a popover), and the address bar,
-        which is offered as 「在地址栏搜索」 (_project_browser): never the browser's own controls -- its toolbar, tab bar and
-        sidebar. The sidebar lists the user's tab groups, bookmarks and reading list, and a tab group opened from it
-        loads the user's tabs into the window clicked, and can be rearranged: on its marker page, with the page it
-        needed in the user's window, a run clicked 「显示边栏」 and double-clicked the user's tab groups, twelve clicks in
-        68 s (0.4.3-rc.3, live 10-17, run 4). Told apart by structure (axchrome.regions), no word read. A window whose
-        structure cannot be read, or shows neither a page nor a known address bar, keeps its elements: there is nothing
-        to tell them apart by. A window with no page but Safari's address bar (a start page, which lists the user's
-        favourites) offers only the address bar. The ids left out are
-        remembered, and a step naming one is refused (CHROME_REFUSAL)."""
-        self._chrome_ids = set()
-        if self.app.lower() not in self.BROWSERS:
-            return els
-        try:
-            from deskmind_hands.drivers import axchrome
-            pid = self._pid_of(self.app)
-            r = axchrome.regions(pid, self._window_frame(), wid=self._observed_id()) if pid else None
-        except Exception:   # noqa: BLE001 -- unread structure: nothing to tell apart by
-            return els
-        if r is None or not (r["page"] or r["address_bar"]):
-            # Neither a page nor a known address bar: a structure not understood (Chrome shows no web area until a
-            # client turns its tree on), and nothing to tell the page from the chrome by.
-            return els
-        keep = []
-        for e in els:
-            if e.rect and axchrome.chrome(r, (origin.x + e.rect.x, origin.y + e.rect.y, e.rect.w, e.rect.h)):
-                self._chrome_ids.add(e.id)
-            else:
-                keep.append(e)
-        return keep
-
     #: The observation note for the run's own browser window with no page in it yet (_own_window_empty).
     OWN_WINDOW_EMPTY_NOTE = ("This is the browser window DeskMind opened for this run, and no web page is open in it "
                              "yet: it shows only DeskMind's own empty start page. {others} To get a page here, search "
@@ -2415,7 +2378,6 @@ class PeekabooDriver:
         # Every observation passes here, the loop's and the driver's own, so the planner never sees a locked screen.
         self._require_session()
         self._obs_n += 1
-        self._chrome_ids = set()        # the last look's: set again by _browser_scope for this one
         FAULTS.observed(self._obs_n)
         obs_id = f"obs-{self._obs_n:04d}"
         shot = self.scratch / f"{obs_id}.png"
@@ -2596,7 +2558,6 @@ class PeekabooDriver:
             els = vision_elements(self.app, self._shot, geo.logical.w, geo.logical.h, self._app_name,
                                   self._window_id or "", absent=self.__dict__.setdefault("_gen_absent", set()),
                                   fields=self.__dict__.setdefault("_placed", {}), found=found)
-            els = self._browser_scope(els, origin)      # a browser read from its pixels: its sidebar's words too
             # Kept for placing a generic control the planner chooses later (the observation's own file is removed).
             keep = self.scratch / "_vision_last.png"
             try:
@@ -2653,7 +2614,6 @@ class PeekabooDriver:
             els += self._project_textedit()
         elif self.app.lower() == CHAT_APP:
             els = self._chat_scope(els)
-        els = self._browser_scope(els, origin)
         if PROJECTION and self._mcp is not None:
             web = self._project_browser(els)
             if web:
@@ -3545,8 +3505,6 @@ class PeekabooDriver:
             return ExecResult(False, "no snapshot yet; observe before acting")
         k = action.kind
         vid = action.binding.element_id or ""
-        if vid and vid in getattr(self, "_chrome_ids", set()):
-            return ExecResult(False, self.CHROME_REFUSAL)       # never offered (_browser_scope)
         # Before every route that writes: the projected one (an append pasted into a search field and submitted with
         # Return) wrote a parts row into Safari's address bar while this check sat after it (app run, 10-01).
         if k is ActionKind.TYPE_TEXT and vid and not vid.startswith("syn:"):

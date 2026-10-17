@@ -6,7 +6,9 @@ a click Peekaboo refused, and DONE -- completed with no judgement of the page at
 
 Run 4, 「把网页上的零件表抄进 parts.txt」 with the parts page in the user's window: the run's window stayed on its marker
 page, and in 68 s the run clicked 「显示边栏」 and double-clicked the sidebar's 「默认，含1个标签页的标签页组」, 「边栏」 and
-「单元格」 -- the user's tab groups -- twelve clicks, until it ended as a loop. It never asked.
+「单元格」 -- the user's tab groups -- twelve clicks, until it ended as a loop. It never asked: the look did not say
+its window was empty, and ASK was not offered. (Which actions are in scope is for a model to judge, not a per-app list
+of controls: the computer-use design, step 5.)
 
 And `preexisting_windows` said 9 to 15 while Safari had 2 to 6 windows.
 """
@@ -16,7 +18,6 @@ import dataclasses
 import os
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,7 +25,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from deskmind_hands.actions import Action, ActionKind, Binding   # noqa: E402
+from deskmind_hands.actions import ActionKind   # noqa: E402
 from deskmind_hands.adapters.base import TurnContext   # noqa: E402
 from deskmind_hands.adapters.scripted import ReplayAdapter   # noqa: E402
 from deskmind_hands.adapters.systemone import OWN_WINDOW_QUESTION, SystemOneAdapter   # noqa: E402
@@ -207,161 +208,13 @@ class PageInfo(OnTheMac):
             self.assertIsNone(d.page_info())
 
 
-# -- the browser's own controls are never offered -----------------------------------------------------------------
+# -- the run's own window, still on its marker page ----------------------------------------------------------------
 
-def node(role, frame=None, children=(), **attrs):
-    return {"AXRole": role, "frame": frame, "AXChildren": list(children), **attrs}
-
-
-def safari_window(x, y, w, h, sheet=False, scrolled=0, menu=None):
-    """Safari's window as accessibility shows it, sidebar open: toolbar, sidebar (the user's tab groups), the page in
-    its scroll area. `scrolled`: how far the page is scrolled down -- WebKit's web area frame is the whole document, so
-    it then starts above the window. `menu`: a menu the toolbar's tab group picker opened, at that frame."""
-    toolbar = node("AXToolbar", (x, y, w, 50), [
-        node("AXButton", (x + 10, y + 10, 30, 24), AXDescription="显示边栏"),
-        node("AXButton", (x + 50, y + 10, 30, 24), AXDescription="后退"),
-        node("AXTextField", (x + 300, y + 10, 300, 24), AXIdentifier="WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD")])
-    sidebar = node("AXGroup", (x, y + 50, 250, h - 50), [node("AXScrollArea", (x, y + 50, 250, h - 50), [
-        node("AXOutline", (x, y + 50, 250, h - 50), [node("AXRow", (x + 5, y + 60, 240, 24), [
-            node("AXCell", (x + 5, y + 60, 240, 24))])], AXDescription="边栏")])])
-    doc = node("AXWebArea", (x + 250, y + 50 - scrolled, w - 250, h - 50 + 3 * scrolled),
-               [node("AXStaticText", AXValue=pk.MARKER_TEXT)])
-    page = node("AXTabGroup", (x + 250, y + 50, w - 250, h - 50), [node("AXGroup", (x + 250, y + 50, w - 250, h - 50), [
-        node("AXScrollArea", (x + 250, y + 50, w - 250, h - 50), [doc])])])
-    if menu:
-        toolbar["AXChildren"].append(node("AXMenuButton", (x + 90, y + 10, 30, 24), [node("AXMenu", menu)]))
-    kids = [node("AXSplitGroup", (x, y + 50, w, h - 50), [sidebar, node("AXSplitter"), page]), toolbar]
-    if sheet:
-        kids.append(node("AXSheet", (x + 100, y + 50, 400, 200), [node("AXButton", (x + 120, y + 200, 60, 24))]))
-    return node("AXWindow", (x, y, w, h), kids, AXTitle="dm-c087a9a2d0a2")
-
-
-def fake_ax(windows):
-    app = {"AXWindows": windows}
-    return [mock.patch.object(axchrome, "_get", lambda el, attr: el.get(attr)),
-            mock.patch.object(axchrome, "_frame", lambda el: el.get("frame")),
-            mock.patch.object(axchrome, "_window_id", lambda w: None),
-            mock.patch.dict(sys.modules, {"ApplicationServices": types.SimpleNamespace(
-                AXUIElementCreateApplication=lambda pid: app)})]
-
-
-class Regions(unittest.TestCase):
-    def setUp(self):
-        for p in fake_ax([safari_window(0, 0, 1200, 800, sheet=True)]):
-            p.start()
-            self.addCleanup(p.stop)
-
-    def test_what_is_the_browsers_own(self):
-        r = axchrome.regions(PID, (0, 0, 1200, 800))
-        self.assertEqual(r["page"], [(250, 50, 950, 750)])
-        chrome = lambda *rect: axchrome.chrome(r, rect)
-        self.assertTrue(chrome(10, 10, 30, 24))         # 「显示边栏」
-        self.assertTrue(chrome(50, 10, 30, 24))         # back: the toolbar is the browser's; the address bar search goes on
-        self.assertTrue(chrome(5, 400, 240, 24))        # a row of the sidebar: the user's tab groups
-        self.assertTrue(chrome(0, 300, 250, 500))       # the sidebar, below the sheet, up to the page's edge
-        self.assertFalse(chrome(300, 10, 300, 24))      # the address bar (offered as 「在地址栏搜索」)
-        self.assertFalse(chrome(400, 300, 200, 20))     # the page
-        self.assertFalse(chrome(400, 30, 200, 40))      # a page row scrolled half under the toolbar: still the page's
-        self.assertFalse(chrome(120, 200, 60, 24))      # a sheet over the sidebar: its buttons are the next step
-        self.assertFalse(chrome(1500, 400, 50, 20))     # outside the window (a menu the page opened)
-
-    def test_a_structure_not_understood_is_left_alone(self):
-        # Chrome with its tree off: no web area, no address bar known by its identifier -- nothing is told apart.
-        r = {"window": (0, 0, 1200, 800), "page": [], "overlay": [], "address_bar": []}
-        d = pk.PeekabooDriver.__new__(pk.PeekabooDriver)
-        d.app, d._pid_of, d._window_frame, d._observed_id = "com.google.Chrome", (lambda b, w=None: PID), \
-            (lambda: (0, 0, 1200, 800)), (lambda: None)
-        els = [Element(id="e1", role="link", label="零件表", rect=Rect(400, 300, 100, 20))]
-        with mock.patch.object(axchrome, "regions", lambda pid, frame, wid=None: r):
-            self.assertEqual(d._browser_scope(els, pk.Point(0, 0)), els)
-        start_page = {**r, "address_bar": [(300, 10, 300, 24)]}
-        with mock.patch.object(axchrome, "regions", lambda pid, frame, wid=None: start_page):
-            self.assertEqual(d._browser_scope(els, pk.Point(0, 0)), [])     # a start page: only the address bar
-
-    def test_a_scrolled_page_does_not_bring_the_toolbar_back(self):
-        # Review of de228eb: scrolled, the web area's frame starts above the window and covers the toolbar.
-        for p in fake_ax([safari_window(0, 0, 1200, 800, scrolled=2000)]):
-            p.start()
-            self.addCleanup(p.stop)
-        r = axchrome.regions(PID, (0, 0, 1200, 800))
-        self.assertEqual(r["page"], [(250, 50, 950, 750)])            # the viewport, not the document
-        self.assertTrue(axchrome.chrome(r, (1100, 10, 30, 24)))         # a toolbar button above the page's column
-        self.assertFalse(axchrome.chrome(r, (400, 300, 200, 20)))       # the page
-
-    def test_a_web_area_with_no_scroll_area_is_clipped_to_the_window(self):
-        win = node("AXWindow", (0, 0, 1200, 800), [node("AXWebArea", (0, -3000, 1200, 9000))])
-        for p in fake_ax([win]):
-            p.start()
-            self.addCleanup(p.stop)
-        self.assertEqual(axchrome.regions(PID, (0, 0, 1200, 800))["page"], [(0, 0, 1200, 800)])
-
-    def test_a_menu_the_toolbar_opened_over_the_page_is_chrome(self):
-        for p in fake_ax([safari_window(0, 0, 1200, 800, menu=(90, 34, 300, 400))]):
-            p.start()
-            self.addCleanup(p.stop)
-        r = axchrome.regions(PID, (0, 0, 1200, 800))
-        self.assertTrue(axchrome.chrome(r, (95, 300, 280, 22)))        # a tab group listed in the picker's menu
-        self.assertFalse(axchrome.chrome(r, (600, 300, 200, 20)))       # the page beside it
-
-    def test_an_edge_that_only_touches_the_page_is_not_on_it(self):
-        r = axchrome.regions(PID, (0, 0, 1200, 800))
-        self.assertTrue(axchrome.chrome(r, (700, 30, 30, 22)))          # a toolbar button 2 px over the page's top
-
-    def test_no_single_window_no_regions(self):
-        self.assertIsNone(axchrome.regions(PID, (5, 5, 10, 10)))
-        self.assertIsNone(axchrome.regions(PID, None))
-
-
-class SafariWithSidebar(FakeMac):
-    """Run 4's window: the run's own, on its marker page, the sidebar open with the user's tab groups."""
-
-    def peekaboo(self, key, _extra=None, **kw):
-        ok, data, detail = super().peekaboo(key, _extra, **kw)
-        if ok and key in ("see", "see_window"):
-            x, y = data["coordinate_context"]["logical_bounds"][0]
-            el = lambda i, role, label, bx, by, bw, bh: {"id": i, "role": role, "ax_role": role, "label": label,
-                                                         "bounds": {"x": x + bx, "y": y + by, "width": bw, "height": bh}}
-            data = {**data, "ui_elements": [
-                el("e1", "AXButton", "显示边栏", 10, 10, 30, 24),
-                el("e2", "AXTextField", "智能搜索栏", 300, 10, 300, 24),
-                el("e3", "AXOutline", "边栏", 0, 50, 250, 650),
-                el("e4", "AXRow", "默认，含1个标签页的标签页组", 5, 60, 240, 24),
-                el("e5", "AXCell", "单元格", 5, 60, 240, 24),
-                el("e6", "AXStaticText", pk.MARKER_TEXT, 400, 300, 200, 20)]}
-        return ok, data, detail
-
-
-class Scope(OnTheMac):
-    def run4(self):
-        mac = SafariWithSidebar([{"id": 19116, "title": "零件表", "on_screen": True, "frame": (0, 0, 1200, 800)}])
-        d = self.mac(mac)
-        del d._element_cache                       # the real one: what the planner is offered
-        d._attach_popup_options = lambda els, origin: None
-        x, y, w, h = mac.find(d._pinned_window)["frame"]
-        for p in fake_ax([safari_window(x, y, w, h)]):
-            p.start()
-            self.addCleanup(p.stop)
-        return mac, d
-
-    def test_run4_the_sidebar_and_tab_groups_are_not_offered(self):
-        _, d = self.run4()
-        obs = d.observe()
-        labels = [e.label for e in obs.elements]
-        for chrome in ("显示边栏", "边栏", "默认，含1个标签页的标签页组", "单元格"):
-            self.assertNotIn(chrome, labels)
-        self.assertIn(pk.MARKER_TEXT, labels)           # the page
-        self.assertIn("智能搜索栏", labels)                # the address bar (projected as the search with Peekaboo's MCP)
-
-    def test_a_step_on_one_of_them_is_refused(self):
-        _, d = self.run4()
-        d.observe()
-        for kind in (ActionKind.CLICK, ActionKind.DOUBLE_CLICK):
-            res = d._execute_inner(Action(kind=kind, binding=Binding(observation_id="o", app="Safari", element_id="e4")))
-            self.assertFalse(res.ok)
-            self.assertIn("browser's own controls", res.detail)
-
+class MarkerPage(OnTheMac):
     def test_the_marker_page_is_said_plainly(self):
-        mac, d = self.run4()
+        # Run 4's setting: the page it needed is in the user's window; the run's window is on its marker page.
+        mac = FakeMac([{"id": 19116, "title": "零件表", "on_screen": True, "frame": (0, 0, 1200, 800)}])
+        d = self.mac(mac)
         obs = d.observe()
         self.assertTrue(obs.own_window_empty)
         note = next((n for n in obs.notes if "DeskMind opened for this run" in n), "")
@@ -376,7 +229,7 @@ class Scope(OnTheMac):
         self.assertFalse([n for n in obs.notes if "DeskMind opened for this run" in n])
 
     def test_preexisting_windows_counts_the_users_real_windows(self):
-        class Busy(SafariWithSidebar):
+        class Busy(FakeMac):
             def quartz(self):
                 q = super().quartz()
                 inner = q.CGWindowListCopyWindowInfo

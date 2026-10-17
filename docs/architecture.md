@@ -39,6 +39,11 @@ performed in the foreground:
   again. It never happens while you are in that app or have touched the keyboard or mouse in the last 3 s;
 - every foreground action is counted in the run record (`driver_state`), because "runs without disturbing you" is a
   claim that has to be measured.
+- a browser run works in a window it opens itself, in the background (Safari's `make new document`, Chromium's
+  `make new window`). Every browser window that was there before the run, minimised or on screen, is yours: never
+  observed, offered or typed into, and no `open` is sent to a running browser, because that is a reopen and
+  un-minimises your window. A browser with no scripted new window (Firefox, Arc) gets no window at all rather than
+  yours. `driver_state.own_browser_windows` / `own_browser_miss` record what happened.
 
 ## The projection layer
 

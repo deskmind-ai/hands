@@ -320,6 +320,18 @@ class Observed(unittest.TestCase):
         d.transport = "mcp"
         observe(d)
         self.assertEqual(d.state()["observed_by_id"], 1)
+        # A browser is never read by app (Peekaboo would pick its front window, maybe the user's): no miss to report.
+        self.assertNotIn(("see", None), d.calls)
+        self.assertEqual(d.state()["app_read_miss"], "")
+        # Another app's read that found no window says why.
+        d = safari([{"window_id": 6, "window_title": "parts.txt", "window_index": 0, "is_on_screen": True}],
+                   readable=("6",))
+        d.app = d._home_app = "com.apple.textedit"
+        d._workspace_file_names, d._preexisting = (lambda: {"parts.txt"}), set()
+        d._foreground_actions = d._scripted_actions = d._projected_actions = 0
+        d.transport = "mcp"
+        observe(d)
+        self.assertEqual(d.state()["observed_by_id"], 1)
         self.assertIn("WINDOW_NOT_FOUND", d.state()["app_read_miss"])
 
 

@@ -1,0 +1,335 @@
+"""A run does its browser work in a window it opened itself, never in a window of the user's (deskmind#73).
+
+Found live on 0.4.3-rc.2 (hands 07a9a75): with Safari's only window minimised and Finder in front, staging ran
+`open -b com.apple.Safari` (rewritten to `open -g -b`). On a running app both are a reopen, which un-minimised the
+user's window; the run then read Safari by app, Peekaboo picked that window, and the search navigated the user's tab.
+With a user's window on screen, the read picked it the same way.
+
+Nothing here touches the Mac. A stand-in Mac holds Safari's windows and plays the parts that matter: an `open` of a
+running Safari un-minimises its windows (the reopen), an `open` of a stopped one launches it and brings back the last
+session's windows, AppleScript's `make new document` adds a window, and a read of the app picks the front window on
+screen. Peekaboo, AppleScript, `open`, Quartz, AppKit, SkyLight and the clipboard are all stood in for.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from deskmind_hands.actions import Action, ActionKind   # noqa: E402
+from deskmind_hands.drivers import axchrome, skylight   # noqa: E402
+from deskmind_hands.drivers import peekaboo as pk   # noqa: E402
+from deskmind_hands.drivers.base import ExecResult   # noqa: E402
+from deskmind_hands.drivers.peekaboo import WEB_SEARCH, PeekabooDriver   # noqa: E402
+from deskmind_hands.geometry import Rect   # noqa: E402
+
+SAFARI = "com.apple.Safari"
+PID = 500
+REAL_RUN = subprocess.run
+
+
+class FakeMac:
+    """Safari's windows, front first. Each window: id, title, on_screen, frame (x, y, w, h)."""
+
+    def __init__(self, windows=(), running=True, restored=()):
+        self.windows = [dict(w) for w in windows]
+        self.running = running
+        self.restored = [dict(w) for w in restored]   # what a launch brings back from the last session
+        self.next_id = 30000
+        self.events: list[tuple] = []
+
+    # -- what happens on the Mac
+    def open_app(self, argv):
+        self.events.append(("open", tuple(argv)))
+        if SAFARI.lower() not in " ".join(argv).lower() and "safari" not in " ".join(argv).lower():
+            return
+        if self.running:
+            # The reopen: every minimised window comes back, and a Safari with none opens one.
+            for w in self.windows:
+                w["on_screen"] = True
+            if not self.windows:
+                self.new_window("起始页")
+        else:
+            self.running = True
+            self.windows = self.restored + self.windows
+            if not self.windows:
+                self.new_window("起始页")
+
+    def new_window(self, title, url=""):
+        self.next_id += 1
+        frame = (200 + 20 * len(self.windows), 100, 1000, 700)
+        self.windows.insert(0, {"id": self.next_id, "title": title, "on_screen": True, "frame": frame, "url": url})
+        return self.next_id
+
+    def find(self, wid):
+        return next((w for w in self.windows if str(w["id"]) == str(wid)), None)
+
+    # -- Peekaboo
+    def peekaboo(self, key, _extra=None, **kw):
+        self.events.append(("peekaboo", key, kw.get("app"), kw.get("window")))
+        safari = (kw.get("app") or "").lower() == SAFARI.lower()
+        if key in ("window_list", "window_list_of"):
+            if not safari:
+                return True, {"windows": []}, ""
+            if not self.running:
+                return False, {}, "APP_NOT_FOUND: Safari is not running"
+            return True, {"windows": [{"window_id": w["id"], "window_title": w["title"], "window_index": i,
+                                       "is_on_screen": w["on_screen"],
+                                       "bounds": dict(zip(("x", "y", "width", "height"), w["frame"]))}
+                                      for i, w in enumerate(self.windows)]}, ""
+        if key == "see":
+            # Asked for the app, Peekaboo picks the front window on screen itself.
+            w = next((w for w in self.windows if w["on_screen"]), None) if self.running and safari else None
+        elif key == "see_window":
+            w = self.find(kw.get("window"))
+            w = w if w and w["on_screen"] else None
+        else:
+            return False, {}, f"not stood in for: {key}"
+        if w is None:
+            return False, {}, "WINDOW_NOT_FOUND: No window found for application com.apple.Safari"
+        self.events.append(("read", str(w["id"])))
+        x, y, ww, hh = w["frame"]
+        return True, {"coordinate_context": {"window": {"window_id": w["id"]},
+                                             "logical_bounds": [[x, y], [x + ww, y + hh]]},
+                      "application_name": "Safari浏览器", "window_title": w["title"], "ui_elements": [],
+                      "snapshot_id": f"snap-{w['id']}"}, ""
+
+    # -- AppleScript
+    def osa(self, script):
+        self.events.append(("osascript", script))
+        if "make new document" in script:
+            if not self.running:
+                self.running = True           # AppleScript launches the app it names
+            url = script.split('URL:"', 1)[1].split('"', 1)[0] if 'URL:"' in script else ""
+            return True, str(self.new_window("新窗口", url))
+        return True, ""
+
+    # -- subprocesses
+    def subprocess_run(self, argv, *a, **kw):
+        if argv[0] == "/usr/bin/open":
+            self.open_app(argv)
+        elif argv[0] == "/bin/sh":
+            cmd = argv[2]
+            if cmd.startswith("printf"):
+                return REAL_RUN(argv, *a, **kw)
+            self.events.append(("sh", cmd))
+            if cmd.lstrip().startswith("open"):
+                self.open_app(cmd.split())
+        else:
+            self.events.append(("run", tuple(argv)))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    # -- Quartz / AppKit
+    def quartz(self):
+        def windows(option, wid):
+            if option == 8:     # kCGWindowListOptionIncludingWindow
+                w = self.find(wid)
+                return [{"kCGWindowBounds": dict(zip(("X", "Y", "Width", "Height"), w["frame"]))}] if w else []
+            return [{"kCGWindowNumber": w["id"], "kCGWindowOwnerPID": PID, "kCGWindowLayer": 0,
+                     "kCGWindowBounds": dict(zip(("X", "Y", "Width", "Height"), w["frame"]))}
+                    for w in self.windows] if self.running else []
+        return types.SimpleNamespace(
+            kCGWindowListOptionAll=0, kCGWindowListOptionIncludingWindow=8, CGWindowListCopyWindowInfo=windows,
+            CGSessionCopyCurrentDictionary=lambda: {"kCGSSessionOnConsoleKey": True},
+            kCGSessionOnConsoleKey="kCGSSessionOnConsoleKey")
+
+    def appkit(self):
+        running = types.SimpleNamespace(
+            runningApplicationsWithBundleIdentifier_=lambda b: ["Safari"] if self.running else [])
+        return types.SimpleNamespace(NSRunningApplication=running)
+
+    def pid_of(self, bundle, all_wins=None):
+        return PID if bundle.lower() == SAFARI.lower() and self.running and self.windows else None
+
+
+class OwnWindow(unittest.TestCase):
+    def mac(self, mac: FakeMac, *, app=SAFARI, stage=("open -b com.apple.Safari",), stage_apps=None):
+        """The driver as `hands do --app com.apple.Safari` builds it, started on `mac`."""
+        self.scratch = Path(tempfile.mkdtemp())
+        (self.scratch / "ws").mkdir()
+        patches = [mock.patch.dict(sys.modules, {"Quartz": mac.quartz(), "AppKit": mac.appkit()}),
+                   mock.patch.dict(os.environ, {"HANDS_PERMISSIONS_VERIFIED": "1"}),
+                   mock.patch.object(pk.subprocess, "run", mac.subprocess_run),
+                   mock.patch.object(pk.time, "sleep", lambda s: None)]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in reversed(patches)])
+        d = PeekabooDriver(app=app, binary=sys.executable, scratch=self.scratch, stage_commands=list(stage))
+        if stage_apps is not None:
+            d._stage_apps = list(stage_apps)
+        d._run, d._osa, d._pid_of = mac.peekaboo, mac.osa, mac.pid_of
+        d.clipboard = lambda: ""
+        d._set_clipboard = lambda value: None
+        d._frontmost = lambda: "Finder"
+        d._sparse_tree = lambda data: False
+        d._element_cache = lambda data, origin: setattr(d, "_real_read", 1) or []
+        d.start(self.scratch / "ws")
+        return d
+
+    def reads(self, mac):
+        return [e[1] for e in mac.events if e[0] == "read"]
+
+    # -- a minimised window of the user's ------------------------------------------------------------------------
+
+    def test_a_minimised_window_is_never_unminimised_or_used(self):
+        mac = FakeMac([{"id": 19085, "title": "收藏夹", "on_screen": False, "frame": (0, 0, 1200, 800)}])
+        d = self.mac(mac)
+        obs = d.observe()
+        self.assertFalse(mac.find(19085)["on_screen"], "the user's minimised window was un-minimised")
+        self.assertEqual([e for e in mac.events if e[0] in ("open", "sh")], [])      # no reopen sent at all
+        self.assertNotIn("19085", self.reads(mac))
+        own = d.state()["own_browser_windows"][SAFARI.lower()]
+        self.assertNotEqual(own, "19085")
+        self.assertEqual(d._pinned_window, own)
+        self.assertEqual(self.reads(mac), [own])
+        self.assertNotIn("19085", [w.id for w in obs.windows])
+
+    # -- a window of the user's on screen ------------------------------------------------------------------------
+
+    def test_an_on_screen_window_of_the_users_is_never_read_or_navigated(self):
+        mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1200, 800)}])
+        d = self.mac(mac)
+        obs = d.observe()
+        self.assertNotIn("19116", self.reads(mac))
+        self.assertNotIn("19116", [w.id for w in obs.windows])
+        # Switching to it is refused: it is not one of the windows offered.
+        res = d.execute(Action(kind=ActionKind.FOCUS_WINDOW, text="19116"))
+        self.assertFalse(res.ok)
+        self.assertNotEqual(d._pinned_window, "19116")
+
+    def test_the_web_search_goes_to_the_runs_own_window(self):
+        mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1200, 800)},
+                       {"id": 19085, "title": "收藏夹", "on_screen": False, "frame": (0, 0, 1200, 800)}])
+        d = self.mac(mac)
+        d.observe()
+        own = d.state()["own_browser_windows"][SAFARI.lower()]
+        own_frame = mac.find(own)["frame"]
+        focused, posted = [], []
+        d._address_bar, d._address_bar_rect = "e48", Rect(275, 18, 237, 31)
+        d._background_input = lambda bundle: True
+        d._wait_until_still = lambda bundle, what="": None
+        d._settle = lambda ok, detail: ExecResult(ok, detail)
+        d._post_click = lambda q, x, y: posted.append(("click", x, y))
+        d._paste_and_submit = lambda q, text, before_return=None: posted.append(("paste", text)) or True
+        with mock.patch.object(skylight, "focus_without_raise", lambda pid, wid: focused.append(wid) or "token"), \
+                mock.patch.object(skylight, "give_focus_back", lambda token: None), \
+                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)), \
+                mock.patch.object(axchrome, "focused_identifier",
+                                  lambda pid, frame: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"
+                                  if frame == own_frame else "another window"):
+            d.allow_browser_field(WEB_SEARCH)
+            res = d._execute_projected(Action(kind=ActionKind.TYPE_TEXT, text="新加坡 天气",
+                                              binding=pk.Binding(observation_id="o", app="Safari",
+                                                                 element_id=WEB_SEARCH)))
+        self.assertTrue(res.ok, res.detail)
+        self.assertEqual(focused, [int(own)])                  # the keyboard went to the run's window only
+        self.assertEqual(posted[-1], ("paste", "新加坡 天气"))
+        self.assertTrue(mac.find(19116)["on_screen"] and not mac.find(19085)["on_screen"])
+
+    # -- a Safari that is not running ----------------------------------------------------------------------------
+
+    def test_a_fresh_launch_works_and_the_restored_windows_stay_the_users(self):
+        mac = FakeMac(running=False,
+                      restored=[{"id": 18000, "title": "上次的标签页", "on_screen": True, "frame": (0, 0, 1200, 800)}])
+        d = self.mac(mac)
+        obs = d.observe()
+        launches = [e for e in mac.events if e[0] == "open"]
+        self.assertEqual(len(launches), 1)
+        self.assertIn("-g", launches[0][1])                     # in the background
+        self.assertIn("-ApplePersistenceIgnoreState", launches[0][1])
+        own = d.state()["own_browser_windows"][SAFARI.lower()]
+        self.assertNotEqual(own, "18000")
+        self.assertEqual(self.reads(mac), [own])
+        self.assertFalse(obs.no_window)
+        self.assertNotIn("18000", [w.id for w in obs.windows])
+
+    def test_a_running_safari_gets_no_open_at_all(self):
+        # Any `open` of a running app is a reopen: it is never sent, with -g or without.
+        mac = FakeMac([{"id": 19085, "title": "收藏夹", "on_screen": False, "frame": (0, 0, 1200, 800)}])
+        self.mac(mac)
+        self.assertEqual([e for e in mac.events if e[0] in ("open", "sh")], [])
+        self.assertEqual(sum("make new document" in e[1] for e in mac.events if e[0] == "osascript"), 1)
+
+    # -- other ways in -------------------------------------------------------------------------------------------
+
+    def test_a_staged_page_opens_in_the_runs_own_window(self):
+        mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1200, 800)}])
+        d = self.mac(mac, stage=('open -a Safari "$WS/page.html"',))
+        own = mac.find(d._pinned_window)
+        self.assertTrue(own["url"].startswith("file://") and own["url"].endswith("/ws/page.html"), own)
+        self.assertNotEqual(d._pinned_window, "19116")
+        self.assertEqual([e for e in mac.events if e[0] in ("open", "sh")], [])
+
+    def test_safari_as_another_app_of_the_task_offers_only_its_own_window(self):
+        # TextEdit first, Safari named too (the app's --apps): Safari's windows offered to switch to are the run's.
+        mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1200, 800)}])
+        d = self.mac(mac, app="com.apple.TextEdit", stage=(), stage_apps=[SAFARI])
+        d._mcp = object()
+        own = d.state()["own_browser_windows"][SAFARI.lower()]
+        offered = [w.id for w in d._windows()]
+        self.assertIn(own, offered)
+        self.assertNotIn("19116", offered)
+
+    def test_focus_app_to_safari_opens_the_runs_own_window_without_open(self):
+        mac = FakeMac([{"id": 19085, "title": "收藏夹", "on_screen": False, "frame": (0, 0, 1200, 800)}])
+        d = self.mac(mac, app="com.apple.TextEdit", stage=())
+        res = d.execute(Action(kind=ActionKind.FOCUS_APP, text=SAFARI))
+        self.assertTrue(res.ok, res.detail)
+        self.assertFalse(mac.find(19085)["on_screen"])
+        self.assertEqual([e for e in mac.events if e[0] in ("open", "sh")], [])
+        self.assertEqual(d._pinned_window, d.state()["own_browser_windows"][SAFARI.lower()])
+        d.observe()
+        self.assertNotIn("19085", self.reads(mac))
+
+    def test_unpinned_a_browser_is_read_only_by_the_id_of_a_window_it_may_use(self):
+        # No window of its own (Safari not staged): the user's window on screen is still not read.
+        mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1200, 800)}])
+        d = self.mac(mac, stage=())
+        obs = d.observe()
+        self.assertTrue(obs.no_window)
+        self.assertEqual(self.reads(mac), [])
+
+    def test_a_browser_with_no_scripted_window_gets_none_and_no_open(self):
+        mac = FakeMac()
+        d = self.mac(mac, app="com.apple.TextEdit", stage=())
+        d._own_browser_window("org.mozilla.firefox")
+        self.assertIn("no way to open", d.state()["own_browser_miss"])
+        self.assertEqual([e for e in mac.events if e[0] in ("open", "sh")], [])
+
+    def test_a_window_that_cannot_be_told_from_the_users_is_not_taken(self):
+        # The script answered, but no new window shows in the list: nothing is pinned, the user's is not used.
+        mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1200, 800)}])
+        mac.osa = lambda script: (True, "19116")
+        d = self.mac(mac)
+        self.assertIsNone(d._pinned_window)
+        self.assertIn("did not show up", d.state()["own_browser_miss"])
+
+
+class Parsing(unittest.TestCase):
+    def test_browser_staging_commands(self):
+        b = PeekabooDriver.BROWSERS
+        self.assertEqual(pk._browser_stage("open -b com.apple.Safari", b), ("com.apple.Safari", ""))
+        self.assertEqual(pk._browser_stage("open -g -a Safari \"$WS/p.html\"", b), ("com.apple.Safari", '"$WS/p.html"'))
+        self.assertEqual(pk._browser_stage('open -a "Google Chrome"', b), ("com.google.Chrome", ""))
+        self.assertIsNone(pk._browser_stage('open -a TextEdit "$WS/a.txt"', b))
+        self.assertIsNone(pk._browser_stage("open -b com.apple.Safari; rm -rf x", b))
+
+    def test_scripts(self):
+        self.assertIn("make new document", pk._new_window_script("com.apple.Safari"))
+        self.assertIn('URL:"https://a.b/\\"x"', pk._new_window_script("com.apple.Safari", 'https://a.b/"x'))
+        self.assertIn("make new window", pk._new_window_script("com.google.Chrome", "https://a.b"))
+        self.assertIsNone(pk._new_window_script("org.mozilla.firefox"))
+        for s in (pk._new_window_script("com.apple.Safari"), pk._new_window_script("com.google.Chrome")):
+            self.assertNotIn("activate", s)
+            self.assertNotIn("reopen", s)
+
+
+if __name__ == "__main__":
+    unittest.main()

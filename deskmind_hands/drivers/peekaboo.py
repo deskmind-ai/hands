@@ -534,6 +534,11 @@ _GHOST = {"window_id": 999999, "window_title": "", "bounds": {"x": 0, "y": 600, 
           "observation_capability_reason": "no_matching_accessibility_window"}
 
 
+def _no_window_read(detail: str) -> bool:
+    """A failed read that found no window to read (WINDOW_NOT_FOUND and its kin), as opposed to one that failed."""
+    return "WINDOW_NOT_FOUND" in (detail or "") or "not found" in (detail or "").lower()
+
+
 def _transient_read(detail: str) -> bool:
     """A failed read worth making again (deskmind_hands/errors.py decides): an incomplete accessibility tree, or a
     window that changed while it was being captured."""
@@ -1352,32 +1357,7 @@ class PeekabooDriver:
         if FAULTS.since("ghost_window", self._obs_n):
             data = {**data, "windows": list(data.get("windows") or []) + [dict(_GHOST)]}
         out: list[WindowRef] = []
-        for w in (data.get("windows") or []):
-            wid = w.get("window_id")
-            if wid is None or self._ghost(w):
-                continue
-            wid = str(wid)
-            if wid in getattr(self, "_unreadable", set()):
-                continue
-            title = (w.get("window_title") or "").strip()
-            # A browser window that is not on screen (minimised, another Space) is not offered unless it is the one
-            # observed: a run copying a table switched to the user's own minimised Safari window and read its page
-            # (deskmind#73, live 10-16). What the user put away is not a place this task may go.
-            if (self.app.lower() in self.BROWSERS and not w.get("is_on_screen", True)
-                    and wid not in (self._pinned_window, self._window_id)):
-                continue
-            # A Finder window is offered only if it shows a folder of this workspace. Anything else -- another
-            # run's folder, the user's Downloads -- is not a place this task may go, and is not shown.
-            if (self.app.lower() == "com.apple.finder" and title and wid != self._pinned_window
-                    and title not in self._workspace_folder_names()):
-                continue
-            # Likewise a TextEdit window is offered only if it shows a document of this workspace. C013 switched to
-            # an "(untitled, index 2)" window that was not the task's -- the user's own, or left from before --
-            # and the run ended on its unreadable accessibility tree.
-            if (self.app.lower() == "com.apple.textedit" and wid != self._pinned_window
-                    and (title not in self._workspace_file_names()
-                         or wid in getattr(self, "_preexisting", set()))):
-                continue
+        for w, wid, title in self._own_windows(data):
             out.append(WindowRef(
                 id=wid,
                 title=title or f"(untitled, index {w.get('window_index', '?')})",
@@ -1422,6 +1402,55 @@ class PeekabooDriver:
                     out.append(WindowRef(id=wid, title=f"{t} ({name})",
                                          active=False, on_screen=bool(w.get("is_on_screen", True))))
         return out
+
+    def _own_windows(self, data: dict) -> list[tuple[dict, str, str]]:
+        """This app's windows from a `window list` read that this task may observe or go to, as (row, id, title):
+        no ghost, none found unreadable, and none put away by the user or not the task's (below)."""
+        out = []
+        for w in (data.get("windows") or []):
+            wid = w.get("window_id")
+            if wid is None or self._ghost(w):
+                continue
+            wid = str(wid)
+            if wid in getattr(self, "_unreadable", set()):
+                continue
+            title = (w.get("window_title") or "").strip()
+            # A browser window that is not on screen (minimised, another Space) is not offered unless it is the one
+            # observed: a run copying a table switched to the user's own minimised Safari window and read its page
+            # (deskmind#73, live 10-16). What the user put away is not a place this task may go.
+            if (self.app.lower() in self.BROWSERS and not w.get("is_on_screen", True)
+                    and wid not in (self._pinned_window, self._window_id)):
+                continue
+            # A Finder window is offered only if it shows a folder of this workspace. Anything else -- another
+            # run's folder, the user's Downloads -- is not a place this task may go, and is not shown.
+            if (self.app.lower() == "com.apple.finder" and title and wid != self._pinned_window
+                    and title not in self._workspace_folder_names()):
+                continue
+            # Likewise a TextEdit window is offered only if it shows a document of this workspace. C013 switched to
+            # an "(untitled, index 2)" window that was not the task's -- the user's own, or left from before --
+            # and the run ended on its unreadable accessibility tree.
+            if (self.app.lower() == "com.apple.textedit" and wid != self._pinned_window
+                    and (title not in self._workspace_file_names()
+                         or wid in getattr(self, "_preexisting", set()))):
+                continue
+            out.append((w, wid, title))
+        return out
+
+    def _window_to_observe(self) -> str | None:
+        """The window to read by its id when Peekaboo, asked for the app, finds none: the front one (the window list's
+        own order) of this app's windows that are on screen and that this task may use, or None.
+
+        Asked for an app, Peekaboo picks the window itself, from those it takes to be capturable, and with Safari not
+        the active app it found none: one test window open, the user's own window minimised, the run saw "no window
+        open", and 「打开 Safari，搜索新加坡的天气」 ended "completed" in 4 s with nothing searched (deskmind#73, live
+        10-17). The window list still showed the test window on screen, and read by its id it came back whole. A window
+        off screen (minimised, another Space) is never chosen: what the user put away is not where a run starts."""
+        ok, data, _ = self._run("window_list", app=self.app)
+        if not ok:
+            return None
+        rows = [(w.get("window_index", i), wid) for i, (w, wid, _) in enumerate(self._own_windows(data))
+                if w.get("is_on_screen", True)]
+        return min(rows)[1] if rows else None
 
     def _stage_finder_window(self) -> None:
         """Put the workspace on screen in a state whose contents can be read and typed into.
@@ -1778,15 +1807,23 @@ class PeekabooDriver:
             if wins:
                 big = max(wins, key=lambda w: (w.get("bounds") or {}).get("width", 0) * (w.get("bounds") or {}).get("height", 0))
                 self._pinned_window = str(big["window_id"])
+        chosen: str | None = None    # read by its id: the app-target read found no window (_window_to_observe)
         for attempt in range(1, attempts + 1):
             if FAULTS.once("capture_error", self._obs_n):
                 ok, data, detail = False, {}, ("Failed to capture UI state: Desktop observation target changed during "
                                                "capture (injected fault)")
-            elif self._pinned_window:
+            elif self._pinned_window or chosen:
                 ok, data, detail = self._run("see_window", app=self.app,
-                                             window=self._pinned_window, path=str(shot))
+                                             window=self._pinned_window or chosen, path=str(shot))
             else:
                 ok, data, detail = self._run("see", app=self.app, path=str(shot))
+                if not ok and _no_window_read(detail) and attempt < attempts:
+                    # An app not in front: its window is read by id, not reported missing (deskmind#73, live 10-17).
+                    # Peekaboo's words are kept for the run's summary: they name why it found no window.
+                    self._app_read_miss = detail[:400]
+                    chosen = self._window_to_observe()
+                    if chosen:
+                        continue
             if ok and attempt < attempts and self._page_not_read(data):
                 # A browser whose page is not in the tree yet: WebKit builds it for the first client that asks, and the
                 # first read got the toolbar and tabs only. Taken as the screen, the planner saw no table, went to the
@@ -1812,10 +1849,14 @@ class PeekabooDriver:
                 self._followed_windows = getattr(self, "_followed_windows", 0) + 1   # reported in usage()
                 self._pinned_window = fresh[-1]
                 ok, data, detail = self._run("see_window", app=self.app, window=self._pinned_window, path=str(shot))
+        if ok and chosen:
+            self._observed_by_id = getattr(self, "_observed_by_id", 0) + 1     # reported in state()
+            if self._pin_window and self._pinned_window is None:
+                self._pinned_window = chosen      # the window this run observes from now on, as a first look pins
         if ok:
             self._seen_windows = self._window_ids()
         if not ok:
-            if "WINDOW_NOT_FOUND" in detail or "not found" in detail.lower():
+            if _no_window_read(detail):
                 # An app with nothing open has no window. That is a state the
                 # agent created and can undo, not an environment failure, so it
                 # comes back as an observation saying so rather than as an
@@ -1834,7 +1875,10 @@ class PeekabooDriver:
                     transform=ImageTransform.identity(fallback),
                     screenshot_png=None, elements=docs,
                     focused_app=f"{self.app} (no window open)",
-                    accepts_keys=False,
+                    # The windows it may switch to, other apps' among them: with none listed, nothing could be
+                    # chosen but DONE or BLOCKED on an empty screen (deskmind#73, live 10-17).
+                    windows=self._windows(),
+                    accepts_keys=False, no_window=True,
                     layout_version=self._obs_n)
             raise DriverUnavailable(f"see failed: {detail}")
 
@@ -3955,7 +3999,10 @@ class PeekabooDriver:
                 "focus_escalations": self._escalations,
                 "incomplete_reads": self._incomplete_reads,
                 "followed_new_windows": getattr(self, "_followed_windows", 0),
-                "session_unread": getattr(self, "_session_unread", 0)}
+                "session_unread": getattr(self, "_session_unread", 0),
+                # Reads of the app that found no window, and the window then read by its id (_window_to_observe).
+                "observed_by_id": getattr(self, "_observed_by_id", 0),
+                "app_read_miss": getattr(self, "_app_read_miss", "")}
 
     def clipboard(self) -> str | None:
         try:

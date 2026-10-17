@@ -65,7 +65,7 @@ def observation(rec: dict) -> Observation:
         windows=[WindowRef(id=w["id"], title=w.get("title", ""), active=bool(w.get("active")),
                            on_screen=w.get("on_screen", True)) for w in rec.get("windows") or []],
         dialog=bool(rec.get("dialog")), notes=list(rec.get("notes") or []),
-        accepts_keys=bool(rec.get("accepts_keys", True)),
+        accepts_keys=bool(rec.get("accepts_keys", True)), no_window=bool(rec.get("no_window")),
         layout_version=rec.get("layout_version", 0), ts=rec.get("ts", 0.0))
 
 

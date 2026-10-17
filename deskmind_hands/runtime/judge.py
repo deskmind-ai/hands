@@ -2,9 +2,10 @@
 a browser task's result is on the page.
 
 The code decides *when* to ask, from structure alone: the field is outside the page's web area (axchrome), or the run
-is finishing on a web page. The model decides *what is right*, and the loop enforces its answer. A keyword list over
-the goal used to make the first judgement: 「打开 Safari，搜索新加坡的天气」 named none of its words, so the address bar
-was refused, and the planner typed into the page's own search box and said it was done (deskmind#73).
+is finishing on a web page, or with no window of its app to be seen. The model decides *what is right*, and the loop
+enforces its answer. A keyword list over the goal used to make the first judgement: 「打开 Safari，搜索新加坡的天气」
+named none of its words, so the address bar was refused, and the planner typed into the page's own search box and said
+it was done (deskmind#73).
 
 The wording lives here, in one place, so it can be changed once it has been evaluated on cases it was not written for.
 """
@@ -35,6 +36,17 @@ DONE = {
     SHOWN: "页面上能看到用户要的东西。",
     NOT_SHOWN: "页面不是用户要的结果：还停在别的页面、打不开、搜的词不对，或者在某个网站里搜了而用户没要求在这个网站里搜。",
     NOT_ON_A_PAGE: "用户要的结果不是一个网页，例如写进了文件、发出了消息、改了设置；这个页面不用回答它。",
+}
+
+#: A run that says DONE while no window of its app could be seen: there is no page to judge, and nothing on screen
+#: shows the result either. The run used to complete there by default: Safari, not in front, read as "no window open",
+#: and 「打开 Safari，搜索新加坡的天气」 ended completed in 4 s with no search made (deskmind#73, live 10-17). Two options:
+#: whether the result needed a window at all is for the model to say, from the request.
+DONE_UNSEEN_QUESTION = ("任务执行完了，但助手最后看不到这个应用的任何窗口（见「看到的」），没法在屏幕上核对结果。"
+                        "根据用户原话，用户要的结果本该在这个应用的窗口里看到吗？")
+DONE_UNSEEN = {
+    NOT_SHOWN: "用户要的结果本该在窗口里看到，例如打开的网页、搜索结果、打开的文稿；现在一个窗口也没有，所以没做成。",
+    NOT_ON_A_PAGE: "用户要的结果本来就不需要窗口，例如写进了文件、发出了消息、改了设置、关掉了窗口或文稿。",
 }
 
 #: The most page text a judgement is shown: enough to see a result, not the whole page.
@@ -88,3 +100,10 @@ def done(ask: AskChoice | None, goal: str, page: dict, said=()) -> str | None:
     context = {"用户原话": goal, "当前网址": page.get("url") or "", "页面标题": page.get("title") or "",
                "页面文字": (page.get("text") or "")[:PAGE_TEXT_CHARS]}
     return _choice(ask, DONE_QUESTION, _said(context, said), DONE)
+
+
+def done_unseen(ask: AskChoice | None, goal: str, app: str, said=()) -> str | None:
+    """没出来 / 结果本来就不在网页上 for a run finishing with no window of `app` seen, or None when there is no answer.
+    Only 没出来 holds a run back, as for a page."""
+    context = {"用户原话": goal, "看到的": f"{app}：没有打开的窗口，什么也看不到"}
+    return _choice(ask, DONE_UNSEEN_QUESTION, _said(context, said), DONE_UNSEEN)

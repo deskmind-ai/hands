@@ -89,7 +89,8 @@ def _new_window_script(bundle: str, url: str = "") -> str | None:
 
 
 #: Where a person allows one app to control another, said the way System Settings shows it.
-AUTOMATION_SETTING = "System Settings › Privacy & Security › Automation › DeskMind › {app}"
+#: The helper is listed there, and in macOS's prompt, as "DeskMind Hands" (not the app, "DeskMind").
+AUTOMATION_SETTING = "System Settings › Privacy & Security › Automation › DeskMind Hands › {app}"
 
 
 def _automation_reason(bundle: str, out: str) -> str:
@@ -100,10 +101,10 @@ def _automation_reason(bundle: str, out: str) -> str:
     setting = AUTOMATION_SETTING.format(app=app)
     low = (out or "").lower()
     if "-1743" in low or "not authorized" in low or "not allowed to send" in low:
-        return (f"macOS does not allow DeskMind to control {app}, so the run could not open a window of its own in "
+        return (f"macOS does not allow DeskMind Hands to control {app}, so the run could not open a window of its own in "
                 f"it; turn it on in {setting}")
     if "timed out" in low or "timeout" in low:
-        return (f"macOS asked whether DeskMind may control {app} and no answer came in time, so the run could not "
+        return (f"macOS asked whether DeskMind Hands may control {app} and no answer came in time, so the run could not "
                 f"open a window of its own in it; answer Allow, or turn it on in {setting}")
     return f"{app}: no window of the run's own could be opened ({(out or '').strip()[:200]})"
 
@@ -850,7 +851,9 @@ class PeekabooDriver:
         #: The window this run opened in each browser (bundle, lower case -> window id): the only browser windows it
         #: starts in (_own_browser_window). Why one could not be opened, for the run's summary.
         self._own_browser: dict[str, str] = {}
-        self._own_browser_miss = ""
+        #: Why the run has no window of its own, per browser (lower-case bundle): cleared when one is opened, so a later
+        #: look never repeats an old reason (a timed-out prompt answered since).
+        self._own_browser_misses: dict[str, str] = {}
         #: The browser windows this run may use, and only these: the ones it opened (_own_browser_window) and those
         #: that came up during one of its own steps while the user did not touch anything (_note_run_windows). Not
         #: "every window but the user's at the start": a window the user opens during the run, one a launch restores
@@ -1073,19 +1076,19 @@ class PeekabooDriver:
         script = _new_window_script(bundle, url)
         if script is None:
             pre |= self._app_window_ids(bundle) or set()
-            self._own_browser_miss = f"{bundle}: no way to open a window of the run's own in the background"
+            self._set_miss(bundle, f"{bundle}: no way to open a window of the run's own in the background")
             return None
         if not self._app_is_running(bundle):
             self._launch_in_background(bundle)
         before = self._app_window_ids(bundle)
         if before is None:
-            self._own_browser_miss = f"{bundle}: its windows could not be listed, so a new one could not be told apart"
+            self._set_miss(bundle, f"{bundle}: its windows could not be listed, so a new one could not be told apart")
             return None
         pre |= before
         self.__dict__.setdefault("_own_browser_wanted", set()).add(key)
         ok, out = self._osa(script)
         if not ok:
-            self._own_browser_miss = _automation_reason(bundle, out)
+            self._set_miss(bundle, _automation_reason(bundle, out))
             return None
         fresh: list[str] = []
         last: list[str] | None = None
@@ -1101,7 +1104,7 @@ class PeekabooDriver:
             last = fresh
             time.sleep(0.3)
         if not fresh:
-            self._own_browser_miss = f"{bundle}: the new window did not show up in its window list"
+            self._set_miss(bundle, f"{bundle}: the new window did not show up in its window list")
             return None
         # The id the script returned, when it is one of the new windows (Safari's is the window server's); else the
         # only new window. Several new windows and no id among them (a launch still restoring windows, a Chromium id,
@@ -1109,12 +1112,16 @@ class PeekabooDriver:
         hint = (out or "").strip()
         wid = hint if hint in fresh else fresh[0] if len(fresh) == 1 else None
         if wid is None:
-            self._own_browser_miss = f"{bundle}: {len(fresh)} new windows, and the run's own could not be told apart"
+            self._set_miss(bundle, f"{bundle}: {len(fresh)} new windows, and the run's own could not be told apart")
             return None
         own[key] = wid
+        self.__dict__.setdefault("_own_browser_misses", {}).pop(key, None)     # no longer missing: the old reason goes
         self.__dict__.setdefault("_run_windows", set()).add(wid)
         self._apart_from_others(bundle, wid, hint)
         return wid
+
+    def _set_miss(self, bundle: str, why: str) -> None:
+        self.__dict__.setdefault("_own_browser_misses", {})[bundle.lower()] = why
 
     def _apart_from_others(self, bundle: str, wid: str, script_id: str) -> None:
         """Move the run's new window a little in from its top-left corner when another window of the browser on
@@ -2254,7 +2261,7 @@ class PeekabooDriver:
                 self._labels_by_id = {e.id: e.label or "" for e in docs}
                 self._element_role = {e.id: e.role or "" for e in docs}
                 self._rects, self._element_value = {}, {e.id: "" for e in docs}
-                miss = getattr(self, "_own_browser_miss", "") if self.app.lower() in self.BROWSERS else ""
+                miss = getattr(self, "_own_browser_misses", {}).get(self.app.lower(), "")
                 return Observation(
                     id=obs_id,
                     geometry=ScreenGeometry(fallback, fallback),
@@ -3334,7 +3341,7 @@ class PeekabooDriver:
                                              f"choose a different target or a different operation")
                 wid = self._own_browser_window(browser)
                 if wid is None:
-                    why = getattr(self, "_own_browser_miss", "")
+                    why = getattr(self, "_own_browser_misses", {}).get(browser.lower(), "")
                     return ExecResult(False, f"not switched to {target}: no window of this run's own could be opened "
                                              f"({why}), and the user's windows are not used")
                 self.app = browser
@@ -4488,7 +4495,7 @@ class PeekabooDriver:
                 "app_read_miss": getattr(self, "_app_read_miss", ""),
                 # The browser windows this run opened to work in, and why one could not be (_own_browser_window).
                 "own_browser_windows": dict(getattr(self, "_own_browser", {})),
-                "own_browser_miss": getattr(self, "_own_browser_miss", ""),
+                "own_browser_miss": "; ".join(getattr(self, "_own_browser_misses", {}).values()),
                 "preexisting_windows": len(getattr(self, "_preexisting", set()))}
 
     def clipboard(self) -> str | None:

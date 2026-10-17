@@ -939,6 +939,7 @@ class PeekabooDriver:
         # "未命名-1" from an earlier run shares its title with this run's scratch document, and a planner switched to
         # it and ended on its unreadable accessibility tree. A browser's likewise (below), every one of them.
         self._preexisting: set[str] = set()
+        self._ghost_ids: set[str] = set()       # ghosts among them, not counted as the user's (_app_window_ids)
         #: The window this run opened in each browser (bundle, lower case -> window id): the only browser windows it
         #: starts in (_own_browser_window). Why one could not be opened, for the run's summary.
         self._own_browser: dict[str, str] = {}
@@ -1100,7 +1101,10 @@ class PeekabooDriver:
 
     def _app_window_ids(self, bundle: str) -> set[str] | None:
         """Every window `bundle` has, minimised ones and those on other Spaces included, as the window server and
-        Peekaboo each list them; None when neither list could be read."""
+        Peekaboo each list them; None when neither list could be read. Only ordinary windows (layer 0) from the window
+        server: the others are the app's own surfaces (Safari keeps several, off screen), never a window anyone reads.
+        The ghosts among them (_ghost) stay in the set and are counted apart (_ghost_ids): `preexisting_windows`
+        said 9 to 15 while Safari had 2 to 6 windows (0.4.3-rc.3, live 10-17)."""
         ids: set[str] = set()
         read = False
         try:
@@ -1109,13 +1113,16 @@ class PeekabooDriver:
             pid = self._pid_of(bundle, all_wins)
             read = True
             ids |= {str(w.get("kCGWindowNumber")) for w in all_wins
-                    if pid and w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowNumber") is not None}
+                    if pid and w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowNumber") is not None
+                    and w.get("kCGWindowLayer", 0) == 0}
         except Exception:   # noqa: BLE001 -- no window server answer: Peekaboo's list alone
             pass
         ok, data, _ = self._run("window_list", app=bundle)
         if ok:
             read = True
-            ids |= {str(w["window_id"]) for w in (data.get("windows") or []) if w.get("window_id") is not None}
+            rows = [w for w in (data.get("windows") or []) if w.get("window_id") is not None]
+            ids |= {str(w["window_id"]) for w in rows}
+            self.__dict__.setdefault("_ghost_ids", set()).update(str(w["window_id"]) for w in rows if self._ghost(w))
         return ids if read else None
 
     def _app_is_running(self, bundle: str) -> bool:
@@ -1549,6 +1556,29 @@ class PeekabooDriver:
                                 synthetic=True, app=self._app_name, window_id=self._window_id or "")]
         return []
 
+    #: The observation note for the run's own browser window with no page in it yet (_own_window_empty).
+    OWN_WINDOW_EMPTY_NOTE = ("This is the browser window DeskMind opened for this run, and no web page is open in it "
+                             "yet: it shows only DeskMind's own empty start page. {others} To get a page here, search "
+                             "or enter its address with the address bar search. If the request is about a page the "
+                             "user has open in their own window, it cannot be read from here: ask the user (for its "
+                             "address, say), or stop and say why.")
+
+    def _own_window_empty(self, data: dict) -> bool:
+        """Whether this read is of the run's own browser window still on its marker page: no page opened in it yet."""
+        return (self.app.lower() in self.BROWSERS
+                and str(self._window_id or "") in getattr(self, "_run_windows", set())
+                and (data.get("window_title") or "").strip() in getattr(self, "_markers", set()))
+
+    def _own_window_note(self) -> str:
+        """OWN_WINDOW_EMPTY_NOTE, with how many of the browser's windows are the user's (real ones, as listed)."""
+        ok, data, _ = self._run("window_list", app=self.app)
+        rows = ((data or {}).get("windows") or []) if ok else []
+        users = [w for w in rows if w.get("window_id") is not None and not self._ghost(w)
+                 and str(w["window_id"]) not in getattr(self, "_run_windows", set())]
+        others = (f"The browser's other {len(users)} window(s) are the user's, and this run may not read or use them."
+                  if users else "No other window of the browser is open.")
+        return self.OWN_WINDOW_EMPTY_NOTE.format(others=others)
+
     def _web_search(self, action: Action) -> ExecResult:
         """「在地址栏搜索」: the value typed into the address bar, replacing what is there, and submitted with Return.
         Only in the background, into the window the run observes -- never the app's largest window, never by bringing
@@ -1638,15 +1668,36 @@ class PeekabooDriver:
             if items:
                 pb.writeObjects_(items)
 
-    def page_info(self) -> dict | None:
+    #: Why a browser window's page reads as nothing, for the done judgement (runtime/loop.py).
+    PAGE_UNREAD = "the page in the browser window this run works in could not be read"
+
+    def page_info(self, tries: int = 3) -> dict | None:
         """The web page the observed window shows ({"url", "title", "text"}), or None: no browser page, or the
-        structure cannot be read. For the judgement whether a browser task's result is on the page."""
-        try:
-            from deskmind_hands.drivers import axchrome
-            pid = self._pid_of(self.app)
-            return axchrome.page_info(pid, self._window_frame(), wid=self._observed_id()) if pid else None
-        except Exception:   # noqa: BLE001 -- unread is no page
-            return None
+        structure cannot be read. For the judgement whether a browser task's result is on the page.
+
+        In a browser, never None: a page read is `browser`; the run's own window still on its marker page is `marker`
+        (no page opened in it yet); and a page that cannot be read after `tries` reads is `unread`, with the reason. A
+        None there was taken for "no web page" and a DONE completed with no judgement of the page at all (0.4.3-rc.3,
+        live 10-17, run 5)."""
+        browser = self.app.lower() in self.BROWSERS
+        page = None
+        for i in range(max(1, tries) if browser else 1):
+            try:
+                from deskmind_hands.drivers import axchrome
+                pid = self._pid_of(self.app)
+                page = axchrome.page_info(pid, self._window_frame(), wid=self._observed_id()) if pid else None
+            except Exception:   # noqa: BLE001 -- unread is no page
+                page = None
+            if page is not None or not browser:
+                break
+            if i + 1 < tries:
+                time.sleep(0.4)
+        if not browser:
+            return page
+        if page is None:
+            return {"url": "", "title": "", "text": "", "browser": True, "unread": self.PAGE_UNREAD}
+        marker = (page.get("title") or "").strip() in getattr(self, "_markers", set())
+        return {**page, "browser": True, **({"marker": True} if marker else {})}
 
     def _observed_id(self) -> str | None:
         """The observed window's window-server id, for telling it from another window at the same frame (axchrome)."""
@@ -2468,6 +2519,7 @@ class PeekabooDriver:
         self._last_sig = self._signature(elements, data.get("window_title") or "")
         # Decided first: a look that read nothing lists only windows on screen, as one with no window does (review).
         no_window = self._read_nothing()
+        own_empty = not no_window and self._own_window_empty(data)
 
         return Observation(
             id=obs_id, geometry=geometry, transform=transform,
@@ -2477,9 +2529,10 @@ class PeekabooDriver:
             window_title=data.get("window_title") or "",
             windows=self._windows(on_screen_only=no_window),
             dialog=bool(data.get("is_dialog")),
-            notes=[n for n in (ax_truncation_note(data), self._miss_note()) if n],
+            notes=[n for n in (ax_truncation_note(data), self._miss_note(),
+                               self._own_window_note() if own_empty else "") if n],
             accepts_keys=not self._vision_app(),
-            no_window=no_window,
+            no_window=no_window, own_window_empty=own_empty,
             # Peekaboo mints a new snapshot id per observation; reusing an old
             # one is exactly the staleness this field exists to detect.
             layout_version=self._obs_n,
@@ -4656,7 +4709,10 @@ class PeekabooDriver:
                 # The browser windows this run opened to work in, and why one could not be (_own_browser_window).
                 "own_browser_windows": dict(getattr(self, "_own_browser", {})),
                 "own_browser_miss": "; ".join(getattr(self, "_own_browser_misses", {}).values()),
-                "preexisting_windows": len(getattr(self, "_preexisting", set()))}
+                # The user's windows the run found open and never uses: real ones only, not a ghost (_ghost) and not
+                # one of the run's own (a run window closed and made again is added to the set, on the safe side).
+                "preexisting_windows": len(getattr(self, "_preexisting", set()) - getattr(self, "_ghost_ids", set())
+                                           - getattr(self, "_run_windows", set()))}
 
     def clipboard(self) -> str | None:
         try:

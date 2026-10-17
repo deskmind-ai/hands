@@ -243,13 +243,8 @@ class HybridAdapter:
     def _without_screenshot(ctx: TurnContext) -> TurnContext:
         """Hand the planner an observation with the pixels removed."""
         from dataclasses import replace
-        from ..drivers.base import Observation
-        obs = ctx.observation
-        blind_obs = Observation(
-            id=obs.id, geometry=obs.geometry, transform=obs.transform,
-            screenshot_png=None, screenshot_path=None, elements=obs.elements,
-            focused_app=obs.focused_app, layout_version=obs.layout_version, ts=obs.ts)
-        return replace(ctx, observation=blind_obs)
+        # Only the pixels go; every other field of the look stays (a field-by-field copy dropped the notes and flags).
+        return replace(ctx, observation=replace(ctx.observation, screenshot_png=None, screenshot_path=None))
 
     @staticmethod
     def _with_notice(ctx: TurnContext, notice: str) -> TurnContext:

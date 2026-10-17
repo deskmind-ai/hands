@@ -97,7 +97,7 @@ class Refusal(unittest.TestCase):
         d = driver("打开 Safari，搜索新加坡的天气")
         d._window_frame = lambda: (900, 0, 800, 600)
         with mock.patch.object(axchrome, "page_info", lambda pid, frame, wid=None: {"frame": frame}):
-            self.assertEqual(d.page_info(), {"frame": (900, 0, 800, 600)})
+            self.assertEqual(d.page_info(), {"frame": (900, 0, 800, 600), "browser": True})
 
     def test_the_page_is_typed_into(self):
         self.assertIsNone(driver("Fill in the expense report and submit.")._browser_field_refusal("field"))

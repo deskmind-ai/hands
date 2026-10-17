@@ -72,6 +72,10 @@ DONE_UNSEEN_IDLE = {
     NOT_SHOWN: "要做的事还没做：用户要的结果需要助手动手（例如写进文件、打开网页、搜索、打开文稿），而助手什么也没做。",
 }
 
+#: How the run's own browser window, with no page opened in it yet (its marker page), is shown to the done judgement.
+MARKER_URL = "（没有打开任何网页）"
+MARKER_TITLE = "DeskMind 自己开的浏览器窗口，里面还没有网页"
+
 #: The most page text a judgement is shown: enough to see a result, not the whole page.
 PAGE_TEXT_CHARS = 1500
 
@@ -112,6 +116,8 @@ def typing(ask: AskChoice | None, goal: str, field: str, text: str, page: dict |
     """照做 / 不做 / 先问用户 for typing `text` into a browser's own field. Without an answer: 先问用户, never 照做.
     `said`: the user's later words, (question, reply) pairs. `address_bar`: the field is the address bar."""
     where = page or {}
+    if where.get("marker"):         # the run's own window with no page in it: not its data: address and random title
+        where = {"title": MARKER_TITLE, "url": MARKER_URL}
     context = {"用户原话": goal, "输入框": f"{field}：{FIELD_ADDRESS_BAR if address_bar else FIELD_OTHER}",
                "准备打的内容": text, "当前页面": " · ".join(x for x in (where.get("title"), where.get("url")) if x) or "不知道"}
     return _choice(ask, TYPING_QUESTION, _said(context, said), TYPING) or ASK
@@ -119,7 +125,12 @@ def typing(ask: AskChoice | None, goal: str, field: str, text: str, page: dict |
 
 def done(ask: AskChoice | None, goal: str, page: dict, said=()) -> str | None:
     """出来了 / 没出来 / 结果本来就不在网页上 for a run finishing on `page`, or None when there is no answer. Only 没出来
-    holds a run back. `said`: the user's later words, as for typing."""
+    holds a run back. `said`: the user's later words, as for typing. A `marker` page is the run's own window with no
+    page opened in it yet, said as such: its address is a data: line and its title a random name."""
+    if page.get("marker"):
+        context = {"用户原话": goal, "当前网址": MARKER_URL, "页面标题": MARKER_TITLE,
+                   "页面文字": (page.get("text") or "")[:PAGE_TEXT_CHARS]}
+        return _choice(ask, DONE_QUESTION, _said(context, said), DONE)
     context = {"用户原话": goal, "当前网址": page.get("url") or "", "页面标题": page.get("title") or "",
                "页面文字": (page.get("text") or "")[:PAGE_TEXT_CHARS]}
     return _choice(ask, DONE_QUESTION, _said(context, said), DONE)

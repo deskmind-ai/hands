@@ -58,6 +58,20 @@ DONE_UNSEEN = {
                "（例如打开的网页、搜索结果、打开的文稿）。",
 }
 
+#: The same judgement for a run in which no step that changes anything went through. "Done, and it needs no window"
+#: cannot be true of nothing done -- the 4B said it of 「加一行，保存后关闭」 with no step (review of #42) -- so it is not
+#: offered; what can be is that the state the user wants was already there when the run started (「确保 Safari 窗口已关
+#: 闭；已经关闭就不用操作」 with no window at all), and that is asked instead. Zero-step cases against the app's local
+#: Brain: dev 5/5 already-there passed and 5/5 needing work held back with 一开始就已经是这样 first (4/5 with 没出来 first,
+#: and 5/5 with one three-option question for every run); held-out 5/5 and 8/8.
+ALREADY = "一开始就已经是这样"
+DONE_UNSEEN_IDLE_QUESTION = ("助手什么也没做，最后也看不到这个应用的任何窗口（见「看到的」）。对照用户原话：用户要的状态是不是一开始"
+                             "就已经是这样，不需要做任何事？")
+DONE_UNSEEN_IDLE = {
+    ALREADY: "用户要的状态一开始就已经是这样，不需要做任何事（例如要关掉的窗口本来就没开、要退出的应用本来就没在运行）。",
+    NOT_SHOWN: "要做的事还没做：用户要的结果需要助手动手（例如写进文件、打开网页、搜索、打开文稿），而助手什么也没做。",
+}
+
 #: The most page text a judgement is shown: enough to see a result, not the whole page.
 PAGE_TEXT_CHARS = 1500
 
@@ -111,9 +125,13 @@ def done(ask: AskChoice | None, goal: str, page: dict, said=()) -> str | None:
     return _choice(ask, DONE_QUESTION, _said(context, said), DONE)
 
 
-def done_unseen(ask: AskChoice | None, goal: str, app: str, said=(), done=()) -> str | None:
-    """没出来 / 结果本来就不需要窗口 for a run finishing with no window of `app` seen, or None when there is no answer.
-    Only 没出来 holds a run back, as for a page. `done`: what the run's last actions did, in the driver's words."""
+def done_unseen(ask: AskChoice | None, goal: str, app: str, said=(), done=(), acted: bool = True) -> str | None:
+    """结果本来就不需要窗口 / 没出来 for a run finishing with no window of `app` seen, or None when there is no answer.
+    Only 没出来 holds a run back, as for a page. `done`: what the run's last actions did, in the driver's words.
+    `acted`: whether a step that changes something went through; if not, the question is whether the state was
+    already there (一开始就已经是这样 / 没出来)."""
     context = {"用户原话": goal, "看到的": f"{app}：没有能看到内容的窗口（没有打开的窗口，或者窗口里什么也读不到）",
                "助手做过的事": "\n".join(done) or "什么也没做"}
+    if not acted:
+        return _choice(ask, DONE_UNSEEN_IDLE_QUESTION, _said(context, said), DONE_UNSEEN_IDLE)
     return _choice(ask, DONE_UNSEEN_QUESTION, _said(context, said), DONE_UNSEEN)

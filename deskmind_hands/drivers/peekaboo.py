@@ -1945,6 +1945,8 @@ class PeekabooDriver:
         elements = self._element_cache(data, origin)
         shot.unlink(missing_ok=True)
         self._last_sig = self._signature(elements, data.get("window_title") or "")
+        # Decided first: a look that read nothing lists only windows on screen, as one with no window does (review).
+        no_window = self._read_nothing()
 
         return Observation(
             id=obs_id, geometry=geometry, transform=transform,
@@ -1952,11 +1954,11 @@ class PeekabooDriver:
             elements=elements,
             focused_app=self._app_name,
             window_title=data.get("window_title") or "",
-            windows=self._windows(),
+            windows=self._windows(on_screen_only=no_window),
             dialog=bool(data.get("is_dialog")),
             notes=[n for n in (ax_truncation_note(data),) if n],
             accepts_keys=not self._vision_app(),
-            no_window=self._read_nothing(),
+            no_window=no_window,
             # Peekaboo mints a new snapshot id per observation; reusing an old
             # one is exactly the staleness this field exists to detect.
             layout_version=self._obs_n,

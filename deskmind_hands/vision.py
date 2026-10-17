@@ -196,6 +196,19 @@ def ground_one(shot: Path, width: float, height: float, description: str) -> tup
     return (pt[0] * width, pt[1] * height) if pt else None
 
 
+#: What vision_elements adds whatever the picture holds: the two scroll buttons. (gen:* generic controls and desc:*
+#: described targets are added without being found too; they are told apart by their ids below.)
+ALWAYS_ADDED = frozenset({"icon:scroll_down", "icon:scroll_up"})
+
+
+def recognised(els: list[Element]) -> int:
+    """How many of vision_elements' elements were found in the picture: the words OCR read (ocr:*) and the icons the
+    grounder placed (icon:*, the scroll buttons aside). The scroll buttons, the generic controls (gen:*) and the
+    described targets (desc:*, made from words already counted) are there whatever the picture holds: counted, a
+    window whose pixels gave nothing read as 15 elements and passed for a window (review of #42)."""
+    return sum(1 for e in els if e.id.startswith("ocr:") or (e.id.startswith("icon:") and e.id not in ALWAYS_ADDED))
+
+
 def vision_elements(app: str, shot: Path, width: float, height: float, app_name: str,
                     window_id: str, absent: set[str] | None = None,
                     fields: dict[str, Rect] | None = None) -> list[Element]:

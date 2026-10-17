@@ -86,6 +86,10 @@ class HybridAdapter:
         # The planner must not be able to see an image even by accident.
         # mode is already set above: _extend_tools depends on it.
         self._blind_planner()
+        # The harness's judgements (runtime/judge.py) go to the planner when it can make them: they are text only, so
+        # nothing visual crosses. Without this, a hybrid over a planner that judges was taken for one that cannot.
+        if callable(getattr(planner, "judge_choice", None)):
+            self.judge_choice = planner.judge_choice
 
     def _blind_planner(self) -> None:
         """Replace the planner's image encoder with one that refuses.

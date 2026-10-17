@@ -1204,11 +1204,12 @@ class PeekabooDriver:
         return {str(w.get("window_id")) for w in (data.get("windows") or [])
                 if w.get("window_id") is not None}
 
-    def _read_nothing(self, elements: list) -> bool:
-        """Whether a read that succeeded still saw no window: nothing in it at all, or the window it read is a ghost
-        (tiny or untitled, with no accessibility window behind it; _ghost). A DONE on such a look is judged like one
-        on no window (review of #42). A small real window is neither: it has a title or a tree, and its controls."""
-        if not elements:
+    def _read_nothing(self) -> bool:
+        """Whether a read that succeeded still saw no window: nothing in it at all (counted before the harness adds
+        controls of its own: _element_cache), or the window it read is a ghost (tiny or untitled, with no
+        accessibility window behind it; _ghost). A DONE on such a look is judged like one on no window (review of
+        #42). A small real window is neither: it has a title or a tree, and its controls."""
+        if not getattr(self, "_real_read", 0):
             return True
         wid = self._window_id or self._pinned_window
         row = next((w for w in getattr(self, "_last_window_rows", []) if str(w.get("window_id")) == str(wid)), None)
@@ -1925,7 +1926,7 @@ class PeekabooDriver:
             dialog=bool(data.get("is_dialog")),
             notes=[n for n in (ax_truncation_note(data),) if n],
             accepts_keys=not self._vision_app(),
-            no_window=self._read_nothing(elements),
+            no_window=self._read_nothing(),
             # Peekaboo mints a new snapshot id per observation; reusing an old
             # one is exactly the staleness this field exists to detect.
             layout_version=self._obs_n,
@@ -1962,8 +1963,12 @@ class PeekabooDriver:
             self._element_value = {e.id: e.value or "" for e in els}
             self._labels_by_id = {e.id: e.label or "" for e in els}
             self._element_role = {e.id: e.role or "" for e in els}
+            self._real_read = len(els)      # the words and icons found in the pixels: what this read held
             return els
         els = self._elements(data, origin)
+        #: What the read itself held, before any control of the harness's own is added below (_read_nothing): a
+        #: TextEdit read of nothing still came back with 保存 and 另存为, and passed for a window (review of #42).
+        self._real_read = len(els)
         # A scroll bar's value is settable in the accessibility tree (it is a position), and a planner looking for
         # somewhere to put a document's text wrote it into two of them. Not a text target.
         for e in els:

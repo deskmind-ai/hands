@@ -52,8 +52,11 @@ class HandsExecutor:
     HIDDEN = {"com.apple.dock", "com.apple.controlcenter", "com.apple.notificationcenterui", "com.apple.WindowManager",
               "com.apple.Spotlight", "ai.deskmind.app", "com.boltai.peekaboo", "boo.peekaboo.mac"}
 
-    def __init__(self, scratch: Path | None = None) -> None:
+    def __init__(self, scratch: Path | None = None, workspace: Path | None = None) -> None:
         self.scratch = Path(scratch or tempfile.mkdtemp(prefix="hands-exec-"))
+        #: The task's folder: where the projections' save-as puts files ("工作目录顶层"), so a document saved from the
+        #: GUI lands where the task's own file tools and the verdict look.
+        self.workspace = Path(workspace) if workspace else self.scratch
         self.epoch = 1
         self.drivers: dict[str, object] = {}
         self.last_obs: dict[str, Observation] = {}       # window id -> last observation (for bindings)
@@ -133,7 +136,7 @@ class HandsExecutor:
             os.environ["HANDS_PERMISSIONS_VERIFIED"] = "1" if self.drivers else os.environ.get("HANDS_PERMISSIONS_VERIFIED", "")
             d = PeekabooDriver(app=bundle, allow_foreground=True, open_workspace=False, scratch=self.scratch,
                                transport=os.environ.get("HANDS_PEEKABOO_TRANSPORT", "mcp"))
-            d.start(self.scratch)
+            d.start(self.workspace)
             self.drivers[bundle] = d
         return d
 
@@ -218,11 +221,19 @@ class HandsExecutor:
                 return {"status": "unsupported", "why": f"unknown action {kind}"}
         except Exception as e:  # noqa: BLE001 -- an action the model wrote wrong is its mistake to read
             return {"status": "error", "why": str(e)}
+        before = {w["id"] for w in self._windows()}
         res: ExecResult = d.execute(a)
         status = "ok" if res.ok else "unsupported" if res.unsupported else "error"
         if res.ok and res.indeterminate:
             status = "unverified"
-        return {"status": status, "why": res.detail, "window": window}
+        out = {"status": status, "why": res.detail, "window": window}
+        # any action can open a window (a "new document" button, a sheet that becomes a window): reported so the
+        # ledger upstream can credit it to the task, as it does for open_window
+        fresh = [w for w in self._windows() if w["id"] not in before]
+        if fresh:
+            w = fresh[-1]
+            out["new_window"] = {"id": w["id"], "app": w["app"], "title": w["title"]}
+        return out
 
     def _open_window(self, app: str, url: str | None) -> dict:
         before = {w["id"] for w in self._windows()}
@@ -269,7 +280,7 @@ def main() -> None:
         rid, op = req.get("id"), req.get("op")
         try:
             if op == "begin":
-                ex = HandsExecutor(Path(req["scratch"]) if req.get("scratch") else None)
+                ex = HandsExecutor(Path(req["scratch"]) if req.get("scratch") else None, Path(req["workspace"]) if req.get("workspace") else None)
                 res = ex.snapshot()
             elif ex is None:
                 raise RuntimeError("begin first")

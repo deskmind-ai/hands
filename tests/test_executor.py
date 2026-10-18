@@ -89,3 +89,11 @@ def test_installed_apps_reads_localized_names():
     assert "com.apple.TextEdit" in bundles
     names = {n for n, b in apps if b == "com.apple.TextEdit"}
     assert "TextEdit" in names and "文本编辑" in names        # the English name and a localization, from the bundle itself
+
+
+def test_allow_flash_adds_once(monkeypatch):
+    from deskmind_hands.executor import allow_flash
+    monkeypatch.setenv("HANDS_FLASH_APPS", "com.apple.Safari")
+    allow_flash("com.apple.TextEdit"); allow_flash("com.apple.textedit")
+    import os
+    assert os.environ["HANDS_FLASH_APPS"] == "com.apple.Safari,com.apple.TextEdit"

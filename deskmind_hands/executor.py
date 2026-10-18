@@ -43,6 +43,14 @@ def _bundle_of_pid(pid: int) -> str:
     return (app.bundleIdentifier() if app else None) or ""
 
 
+def allow_flash(bundle: str) -> None:
+    """Let the driver bring `bundle` forward for a step (HANDS_FLASH_APPS, read at each step): the apps the request
+    names come from the app; an app whose window this task opened itself is added here."""
+    have = [b for b in os.environ.get("HANDS_FLASH_APPS", "").split(",") if b.strip()]
+    if bundle and bundle.lower() not in {b.lower() for b in have}:
+        os.environ["HANDS_FLASH_APPS"] = ",".join(have + [bundle])
+
+
 def resolve_app(name: str, running: list[tuple[str, str]], installed: list[tuple[str, str]]) -> str:
     """`name` → a bundle id. A bundle id is itself; else a running app's localized name (what the snapshot shows,
     in whatever language the Mac runs in); else an installed app's display name in any of its localizations, or its
@@ -313,19 +321,22 @@ class HandsExecutor:
             return {"status": "error", "why": "observe the window before acting in it"}
         binding = Binding(observation_id=obs.id, app=bundle, window_id=wid, element_id=action.get("target"))
         try:
+            # foreground=True: the driver delivers in the background whenever the app takes that, and may bring the
+            # app forward (briefly, only while the user is still, only for apps in HANDS_FLASH_APPS) when it does
+            # not. The executor above has already refused the step if the user is active in a window of theirs.
             if kind == "click":
-                a = Action(kind=ActionKind.CLICK, binding=binding)
+                a = Action(kind=ActionKind.CLICK, binding=binding, foreground=True)
             elif kind == "set_value":
-                a = Action(kind=ActionKind.TYPE_TEXT, text=action.get("value") or "", clear_first=True, binding=binding)
+                a = Action(kind=ActionKind.TYPE_TEXT, text=action.get("value") or "", clear_first=True, binding=binding, foreground=True)
             elif kind == "type":
-                a = Action(kind=ActionKind.TYPE_TEXT, text=action.get("text") or "", binding=binding)
+                a = Action(kind=ActionKind.TYPE_TEXT, text=action.get("text") or "", binding=binding, foreground=True)
             elif kind == "select":
-                a = Action(kind=ActionKind.TYPE_TEXT, text=action.get("option") or "", clear_first=True, binding=binding)
+                a = Action(kind=ActionKind.TYPE_TEXT, text=action.get("option") or "", clear_first=True, binding=binding, foreground=True)
             elif kind == "key":
                 a = Action(kind=ActionKind.KEY, keys=tuple(k.strip() for k in str(action.get("chord") or "").split("+") if k.strip()),
-                           binding=Binding(observation_id=obs.id, app=bundle, window_id=wid))
+                           binding=Binding(observation_id=obs.id, app=bundle, window_id=wid), foreground=True)
             elif kind == "scroll":
-                a = Action(kind=ActionKind.SCROLL, scroll_dy=int(action.get("dy") or 0), binding=binding)
+                a = Action(kind=ActionKind.SCROLL, scroll_dy=int(action.get("dy") or 0), binding=binding, foreground=True)
             else:
                 return {"status": "unsupported", "why": f"unknown action {kind}"}
         except Exception as e:  # noqa: BLE001 -- an action the model wrote wrong is its mistake to read
@@ -364,6 +375,7 @@ class HandsExecutor:
                 fresh = self._fresh_windows(before, 3)
         if fresh:
             w = fresh[-1]
+            allow_flash(bundle)   # a window the task opened is the task's: the app may be brought forward for it
             return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "title": w["title"]}}
         return {"status": "unverified", "why": f"{app} ({bundle}) was asked to open a window; none appeared"}
 

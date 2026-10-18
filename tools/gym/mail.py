@@ -18,8 +18,10 @@ import random
 
 from tools.gym import split
 
-#: Bumped when the labels this oracle gives change (see tools/gym/run.py rows).
-ORACLE_VERSION = 3
+#: Bumped when the labels this oracle gives change (see tools/gym/run.py rows). 4: the page shows a reply arrow and the
+#: sent reply on a replied-to message (page v2), so rows recorded before it saw a different inbox after Send.
+ORACLE_VERSION = 4
+PAGE_VERSION = 2
 
 ZH_PEOPLE = ["林晓", "苏然", "沈一舟", "顾青", "程远", "许诺", "陆川", "温言", "叶知秋", "姜禾", "方舟", "白露"]
 EN_PEOPLE = ["Mira Lune", "Kai Solen", "Ivy Hart", "Theo Vale", "Rowan Reed", "Lena Marsh", "Ezra Quill",
@@ -33,10 +35,10 @@ EN_REPLIES = ["Got it, thanks", "Sounds good to me", "I will check and get back 
 TIMES = ["09:30", "10:00", "14:00", "15:30", "16:45", "11:15"]
 APPS = [("Mailora", "#246"), ("Mailwise", "#2a6"), ("Inkwell", "#555"), ("信鸽", "#a52"), ("邮筒", "#383")]
 TEXTS = {
-    "zh": {"inbox": "收件箱", "reply": "回复", "delete": "删除", "flag": "加旗标", "unflag": "取消旗标",
+    "zh": {"inbox": "收件箱", "replied": "已回复", "reply": "回复", "delete": "删除", "flag": "加旗标", "unflag": "取消旗标",
            "send": "发送", "cancel": "取消", "confirm": "确认删除", "confirmText": "确定删除这封邮件吗？",
            "body": "回复内容", "draft": "（草稿）", "meeting": "会议时间：%s", "empty": "选择一封邮件"},
-    "en": {"inbox": "Inbox", "reply": "Reply", "delete": "Delete", "flag": "Flag", "unflag": "Unflag",
+    "en": {"inbox": "Inbox", "replied": "Replied", "reply": "Reply", "delete": "Delete", "flag": "Flag", "unflag": "Unflag",
            "send": "Send", "cancel": "Cancel", "confirm": "Delete message", "confirmText": "Delete this message?",
            "body": "Reply text", "draft": " (draft)", "meeting": "Meeting time: %s", "empty": "Select a message"},
 }

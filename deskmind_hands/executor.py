@@ -122,10 +122,20 @@ class HandsExecutor:
         app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
         return (app.localizedName() if app else None) or ""
 
+    #: The user is "active" when the keyboard or mouse moved within this many seconds (hands' driver uses the same
+    #: idle window before a foreground step).
+    USER_ACTIVE_S = 3.0
+
+    def user_active(self) -> bool:
+        if Quartz is None:
+            return False
+        idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
+        return idle < self.USER_ACTIVE_S
+
     def snapshot(self) -> dict:
         wins = self._windows()
         front = self._front()
-        return {"epoch": self.epoch, "locked": self.locked(), "front_app": front,
+        return {"epoch": self.epoch, "locked": self.locked(), "front_app": front, "user_active": self.user_active(),
                 "windows": [{"id": w["id"], "app": w["app"], "title": w["title"], "focused": w["app"] == front} for w in wins]}
 
     # -- see and act ----------------------------------------------------------

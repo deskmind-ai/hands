@@ -43,6 +43,96 @@ def _bundle_of_pid(pid: int) -> str:
     return (app.bundleIdentifier() if app else None) or ""
 
 
+def resolve_app(name: str, running: list[tuple[str, str]], installed: list[tuple[str, str]]) -> str:
+    """`name` → a bundle id. A bundle id is itself; else a running app's localized name (what the snapshot shows,
+    in whatever language the Mac runs in); else an installed app's display name in any of its localizations, or its
+    folder name. Case-insensitive, exact. No application is special-cased."""
+    key = name.strip().lower()
+    if not key:
+        return ""
+    if "." in key and " " not in key:
+        return name.strip()
+    for shown, bundle in running:
+        if shown.lower() == key:
+            return bundle
+    for shown, bundle in installed:
+        if shown.lower() == key:
+            return bundle
+    return ""
+
+
+def running_apps() -> list[tuple[str, str]]:
+    """(localized name, bundle id) of every running app, as the snapshot names them."""
+    try:
+        from AppKit import NSWorkspace
+        out = []
+        for a in NSWorkspace.sharedWorkspace().runningApplications():
+            b = a.bundleIdentifier()
+            if b:
+                out.append((str(a.localizedName() or ""), str(b)))
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+_INSTALLED: list[tuple[str, str]] | None = None
+
+
+def installed_apps() -> list[tuple[str, str]]:
+    """(name, bundle id) for every app in the standard folders: the folder name, CFBundleName / CFBundleDisplayName,
+    and every localization's version of those two (InfoPlist.strings), so a user naming an app in their language
+    finds it even when it is not running. Read once per process."""
+    global _INSTALLED
+    if _INSTALLED is not None:
+        return _INSTALLED
+    import glob as _glob
+    import plistlib
+    import re as _re
+    out: list[tuple[str, str]] = []
+    homes = ["/Applications", "/System/Applications", "/System/Applications/Utilities", os.path.expanduser("~/Applications")]
+    for home in homes:
+        for app in sorted(_glob.glob(os.path.join(home, "*.app")) + _glob.glob(os.path.join(home, "*", "*.app"))):
+            try:
+                with open(os.path.join(app, "Contents", "Info.plist"), "rb") as fh:
+                    info = plistlib.load(fh)
+            except Exception:  # noqa: BLE001
+                continue
+            bundle = str(info.get("CFBundleIdentifier") or "")
+            if not bundle:
+                continue
+            names = {os.path.basename(app)[:-4], str(info.get("CFBundleName") or ""), str(info.get("CFBundleDisplayName") or "")}
+            # newer system apps keep every language in one InfoPlist.loctable ({lang: {CFBundleName: …}})
+            for table in _glob.glob(os.path.join(app, "Contents", "Resources", "InfoPlist.loctable")):
+                try:
+                    with open(table, "rb") as fh:
+                        for lang in plistlib.load(fh).values():
+                            if isinstance(lang, dict):
+                                for k in ("CFBundleName", "CFBundleDisplayName"):
+                                    if lang.get(k):
+                                        names.add(str(lang[k]))
+                except Exception:  # noqa: BLE001
+                    continue
+            for strings in _glob.glob(os.path.join(app, "Contents", "Resources", "*.lproj", "InfoPlist.strings")):
+                try:
+                    with open(strings, "rb") as fh:
+                        raw = fh.read()
+                    try:
+                        loc = plistlib.loads(raw)
+                    except Exception:  # noqa: BLE001
+                        text = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode("utf-8", "ignore")
+                        loc = dict(_re.findall(r'"?(CFBundle(?:Display)?Name)"?\s*=\s*"((?:[^"\\]|\\.)*)"', text))
+                    for k in ("CFBundleName", "CFBundleDisplayName"):
+                        if loc.get(k):
+                            names.add(str(loc[k]))
+                except Exception:  # noqa: BLE001
+                    continue
+            for n in names:
+                if n:
+                    out.append((n, bundle))
+    _INSTALLED = out
+    return out
+
+
 def _app_name_of_pid(pid: int) -> str:
     app = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid) if AppKit else None
     return (app.localizedName() if app else None) or ""
@@ -255,24 +345,35 @@ class HandsExecutor:
         return out
 
     def _open_window(self, app: str, url: str | None) -> dict:
+        """Open a window of `app` (a bundle id, or a name as the snapshot shows it) and wait for it. No app is named
+        in code: the name is resolved to a bundle id generically, and a new document is asked for the way any
+        document-based app answers (its own scripting, by bundle id), then by the keyboard."""
         before = {w["id"] for w in self._windows()}
-        bundle = app if "." in app else ""
-        name = app
-        low = app.lower()
-        if low in {"textedit", "文本编辑", "com.apple.textedit"}:
-            subprocess.run(["osascript", "-e", 'tell application "TextEdit"\nactivate\nmake new document\nend tell'], capture_output=True, timeout=20)
-        elif url:
-            cmd = ["open", "-n", "-a", name, url] if not bundle else ["open", "-n", "-b", bundle, url]
-            subprocess.run(cmd, capture_output=True, timeout=20)
-        else:
-            subprocess.run(["open", "-n", "-b", bundle] if bundle else ["open", "-n", "-a", name], capture_output=True, timeout=20)
-        for _ in range(30):
+        bundle = resolve_app(app, running_apps(), installed_apps())
+        if not bundle:
+            return {"status": "unsupported", "why": f"no application called {app!r} is running or installed"}
+        subprocess.run(["open", "-b", bundle] + ([url] if url else []), capture_output=True, timeout=20)
+        fresh = self._fresh_windows(before, 2.5)
+        if not fresh and not url:
+            # running already, or launched without a window: ask it for a new document (any scriptable document app
+            # answers `make new document`; one that does not just errors), then try the New shortcut
+            subprocess.run(["osascript", "-e", f'tell application id "{bundle}"\nactivate\nmake new document\nend tell'], capture_output=True, timeout=20)
+            fresh = self._fresh_windows(before, 3)
+            if not fresh:
+                subprocess.run(["osascript", "-e", 'tell application "System Events" to keystroke "n" using command down'], capture_output=True, timeout=20)
+                fresh = self._fresh_windows(before, 3)
+        if fresh:
+            w = fresh[-1]
+            return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "title": w["title"]}}
+        return {"status": "unverified", "why": f"{app} ({bundle}) was asked to open a window; none appeared"}
+
+    def _fresh_windows(self, before: set, seconds: float) -> list[dict]:
+        for _ in range(int(seconds / 0.3)):
             time.sleep(0.3)
             fresh = [w for w in self._windows() if w["id"] not in before]
             if fresh:
-                w = fresh[-1]
-                return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "title": w["title"]}}
-        return {"status": "unverified", "why": f"{app} was asked to open a window; none appeared within 9 s"}
+                return fresh
+        return []
 
     def end(self) -> dict:
         for d in self.drivers.values():

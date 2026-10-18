@@ -69,3 +69,23 @@ def test_perform_maps_actions_and_binds_them_to_the_last_observation():
     r = ex.perform({"kind": "select", "window": "com.apple.TextEdit#12", "target": "P3", "option": "文稿"})
     assert stub.actions[-1].text == "文稿"
     assert ex.perform({"kind": "dance", "window": "com.apple.TextEdit#12"})["status"] == "unsupported"
+
+
+def test_resolve_app_names_no_app_in_code():
+    from deskmind_hands.executor import resolve_app
+    running = [("文本编辑", "com.apple.TextEdit"), ("访达", "com.apple.finder")]
+    installed = [("TextEdit", "com.apple.TextEdit"), ("文本编辑", "com.apple.TextEdit"), ("Safari", "com.apple.Safari")]
+    assert resolve_app("com.apple.TextEdit", [], []) == "com.apple.TextEdit"          # a bundle id is itself
+    assert resolve_app("文本编辑", running, installed) == "com.apple.TextEdit"          # as the snapshot shows it
+    assert resolve_app("textedit", [], installed) == "com.apple.TextEdit"             # installed, any case
+    assert resolve_app("Safari", running, installed) == "com.apple.Safari"            # not running, installed
+    assert resolve_app("没有这个应用", running, installed) == ""
+
+
+def test_installed_apps_reads_localized_names():
+    from deskmind_hands.executor import installed_apps
+    apps = installed_apps()
+    bundles = {b for _, b in apps}
+    assert "com.apple.TextEdit" in bundles
+    names = {n for n, b in apps if b == "com.apple.TextEdit"}
+    assert "TextEdit" in names and "文本编辑" in names        # the English name and a localization, from the bundle itself

@@ -1,0 +1,29 @@
+{
+  "run_id": "do-20261007-015848",
+  "task_id": "do-20261007-015848",
+  "system": "do:deskmind-local",
+  "goal": "在邮筒里回复温言关于“季度复盘”的邮件：“已确认”",
+  "target": null,
+  "apps": {
+    "邮筒": "ai.deskmind.gymhost"
+  },
+  "adapter": "systemone",
+  "app": "ai.deskmind.gymhost",
+  "ask": "stdin",
+  "driver": "peekaboo",
+  "live": true,
+  "budget": {
+    "max_actions": 12,
+    "wall_clock_s": 360.0
+  },
+  "files_before": 0,
+  "environment": {
+    "captured_at": "2026-10-07T01:58:48+0800",
+    "harness_commit": "d62987d2959907c9e6b61c060b5b99b7699e225b",
+    "harness_dirty": true,
+    "python": "3.12.11",
+    "platform": "macOS-27.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "os_version": "27.2"
+  }
+}

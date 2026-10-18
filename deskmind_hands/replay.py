@@ -65,7 +65,8 @@ def observation(rec: dict) -> Observation:
         windows=[WindowRef(id=w["id"], title=w.get("title", ""), active=bool(w.get("active")),
                            on_screen=w.get("on_screen", True)) for w in rec.get("windows") or []],
         dialog=bool(rec.get("dialog")), notes=list(rec.get("notes") or []),
-        accepts_keys=bool(rec.get("accepts_keys", True)),
+        accepts_keys=bool(rec.get("accepts_keys", True)), no_window=bool(rec.get("no_window")),
+        own_window_empty=bool(rec.get("own_window_empty")),
         layout_version=rec.get("layout_version", 0), ts=rec.get("ts", 0.0))
 
 
@@ -161,6 +162,10 @@ class FollowAdapter(SystemOneAdapter):
             self.divergences.append(Divergence(self._n, "the replay asked past the recorded run"))
             answers["operation"] = _one("DONE") if "DONE" in (questions["operation"]["criteria"]) else answers["operation"]
             return answers
+        if "goal_complete" in questions:
+            # The completion check (HANDS_COMPLETION_CHECK) is answered as recorded: "yes" only on the step it ended.
+            # Its first option is "yes", and answered that way every replay ended at the second step.
+            answers["goal_complete"] = _one("yes" if self._recorded_stop(rec) == "check" else "no")
         want = self._recorded_operation(rec)
         ops = questions["operation"]["criteria"]
         if want not in ops:
@@ -169,6 +174,13 @@ class FollowAdapter(SystemOneAdapter):
         answers["operation"] = _one(want)
         self._target(rec, want, state, questions, answers)
         return answers
+
+    @staticmethod
+    def _recorded_stop(rec: dict) -> str | None:
+        try:
+            return json.loads(rec.get("decision") or "{}").get("stop_by")
+        except ValueError:
+            return None
 
     @staticmethod
     def _recorded_operation(rec: dict) -> str:
@@ -185,7 +197,8 @@ class FollowAdapter(SystemOneAdapter):
     def _target(self, rec: dict, op: str, state: dict, questions: dict, answers: dict) -> None:
         action = rec.get("action") or {}
         eid = (action.get("binding") or {}).get("element_id")
-        text = action.get("text")
+        # An answer ends the run: its step has no action, and the text ("answer: ...") is on the step itself.
+        text = action.get("text") if action else rec.get("text")
 
         def pick(key: str, value, what: str) -> None:
             crit = (questions.get(key) or {}).get("criteria") or {}
@@ -280,8 +293,9 @@ def replay(run_dir: Path) -> ReplayResult:
     from .runtime.loop import RunConfig, run_task
 
     manifest, records = load_trace(run_dir)
-    if not manifest.get("live"):
-        raise ValueError(f"{run_dir}: only `hands do` runs can be replayed so far")
+    task_file = Path(manifest.get("task_file") or "")
+    if not manifest.get("live") and not (manifest.get("task_file") and task_file.exists()):
+        raise ValueError(f"{run_dir}: only `hands do` runs, and task runs whose task file is here, can be replayed")
     obs_recs = [r for r in records if r.get("t") == "obs"]
     step_recs = [r for r in records if r.get("t") == "step"]
     summary = next((r for r in reversed(records) if r.get("t") == "summary"), {})
@@ -291,16 +305,33 @@ def replay(run_dir: Path) -> ReplayResult:
                 "unsupported": s.get("unsupported"), "indeterminate": s.get("indeterminate")}
                for s in step_recs if s.get("action")]
     replies = [(s.get("reply") or "", True) for s in step_recs if s.get("question")]
-    target = Path(manifest["target"]) if manifest.get("target") else None
-    app = manifest.get("app") or _first_app(obs_recs, manifest)
     budget = manifest.get("budget") or {}
-    task = live_task(manifest["goal"], target, app=app, apps=manifest.get("apps") or {},
-                     max_actions=budget.get("max_actions", 30), wall_clock_s=10 ** 9)
+    if manifest.get("live"):
+        target = Path(manifest["target"]) if manifest.get("target") else None
+        app = manifest.get("app") or _first_app(obs_recs, manifest)
+        task = live_task(manifest["goal"], target, app=app, apps=manifest.get("apps") or {},
+                         max_actions=budget.get("max_actions", 30), wall_clock_s=10 ** 9)
+    else:
+        # A task run (bench, gym): the task as its file says, with no clock. What the planner is shown depends on
+        # the goal, the observations and the results, all recorded; the workspace is only graded, here meaninglessly.
+        from deskmind_bench.task import load_task
+        task = load_task(task_file)
+        task.budget.max_actions = max(task.budget.max_actions, len(planned) + 1)
+        task.budget.wall_clock_s = 10 ** 9
+        task.changes = []
     driver = ReplayDriver([observation(r) for r in obs_recs], results)
     adapter = FollowAdapter(planned)
     scratch = Path(tempfile.mkdtemp(prefix="hands-replay-"))
-    ws = LiveWorkspace(root=scratch, ws=scratch / "ws", fixtures_dir=scratch)
-    (scratch / "ws").mkdir()
+    if manifest.get("live"):
+        ws = LiveWorkspace(root=scratch, ws=scratch / "ws", fixtures_dir=scratch)
+        (scratch / "ws").mkdir()
+    else:
+        # The task's own fixture where its repository has it (only the grade at the end reads the workspace).
+        from .env.workspace import Workspace
+        fixtures = task_file.resolve().parents[2] / "fixtures"
+        if not (task.fixture and (fixtures / task.fixture).exists()):
+            task.fixture = None
+        ws = Workspace.create(scratch, fixtures if fixtures.exists() else scratch)
     notes = []
     if obs_recs and not all(k in obs_recs[0] for k in FULL_TRACE_KEYS):
         notes.append("trace predates window titles and window lists: FOCUS_WINDOW options are empty")

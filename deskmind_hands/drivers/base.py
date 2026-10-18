@@ -122,6 +122,16 @@ class Observation:
     #: read from its pixels (hands/vision.py), whose input only goes through a click's or a field's foreground flash:
     #: offered anyway, KEY was refused every time -- G18b pressed cmd+f twice in the music app just launched (10-01).
     accepts_keys: bool = True
+    #: No window of the app could be observed: none is open, none this run may use, or the one read showed nothing
+    #: (no element at all, or a ghost window: peekaboo._read_nothing). The elements are then not a
+    #: window's, and a DONE on this observation is judged rather than taken (runtime/loop.py): read as an empty
+    #: screen, it ended a web search "completed" with nothing searched (deskmind#73, live 10-17).
+    no_window: bool = False
+    #: The window observed is the browser window the run opened for itself, and no web page is open in it yet (it
+    #: still shows the run's own empty start page). Whatever page the user has open is in a window of theirs, which
+    #: the run may not use. Said in `notes` too; ASK is offered on it (adapters/systemone.py) -- a run with nothing
+    #: to work on clicked the browser's sidebar twelve times instead (0.4.3-rc.3, live 10-17).
+    own_window_empty: bool = False
     layout_version: int = 0
     ts: float = field(default_factory=time.time)
 

@@ -224,7 +224,9 @@ def _works(goal: str) -> list[tuple[str, str]]:
     if m:
         # "白鹿乐队的安静的引擎": which 的 separates the artist from the title is not knowable from the words, so
         # every split is offered, the first 的 first (titles contain 的 more often than artists do).
-        phrase = m.group(1).strip()
+        # A place named before the verb goes, as in value_candidates: "在智能搜索栏里搜索新加坡的天气" matched the verb
+        # inside the field's name and composed 「栏里搜索新加坡 天气」 (deskmind#73).
+        phrase = re.sub(r"^.*[里上中]\s*(?:播放|放一下|听一下|搜索|搜一下|搜|查找)", "", m.group(1).strip())
         for k in [i for i, ch in enumerate(phrase) if ch == "的"]:
             if 0 < k < len(phrase) - 1:
                 put(phrase[:k], phrase[k + 1:])
@@ -454,19 +456,23 @@ def value_candidates(goal: str, visible_text: str = "", limit: int = 14) -> list
     # "归到一个新文件夹 reports 里" was never offered, and the folder was named "文件归到一个新文件夹".
     # What a goal says to search for, whole: "搜索 林夏的 纸船" is the query, not "林夏的" and "纸船" separately -- a
     # planner offered only the pieces searched for the title alone. The possessive is dropped as a search box wants
-    # it ("林夏 纸船").
+    # it ("林夏 纸船"). A place named before the verb ("在智能搜索栏里搜索新加坡的天气") can hold the verb itself: the
+    # match then starts inside the field's name and only 「栏里搜索新加坡的天气」 was offered (deskmind#73, live 10-16).
+    # What follows 里/上/中 and the verb is offered first; the whole stays after it.
     for m in re.finditer(r"(?:搜索|搜一下|(?:(?<=^)|(?<=[\s，,。：:里上]))搜|查找|search(?:\s+for)?|look\s+up|find)\s*[:：]?\s*"
                          r"([^，,。；;！!？?\n]{1,60})",
                          goal, re.I):
-        # The query ends where the goal moves on: "并/然后/and …", a dash ("… 夜空中最亮的星 — who sings …"), or the
-        # question itself ("who/what/which …", "谁/哪") -- typed whole, the dash and the question went into the box.
-        # "and" ends the query only when an action follows ("… and play it"): "Salt and Cedar" is a title.
-        q = re.sub(r"\s*(?:并|然后|\band\s+(?:then\s+)?(?:play|start|open|listen|tell|show|add|save)\b|and then|"
-                   r"[—–]|\s-\s|\b(?:who|what|which|where|when|how)\b|是谁|哪).*$", "",
-                   m.group(1), flags=re.I).strip(" 「」“”\"'《》")
-        if q:
-            add(re.sub(r"(\S)的\s+", r"\1 ", q))
-            add(q)
+        inner = re.search(r"[里上中]\s*(?:搜索|搜一下|搜|查找)\s*[:：]?\s*(.+)$", m.group(1))
+        for raw in ([inner.group(1)] if inner else []) + [m.group(1)]:
+            # The query ends where the goal moves on: "并/然后/and …", a dash ("… 夜空中最亮的星 — who sings …"), or the
+            # question itself ("who/what/which …", "谁/哪") -- typed whole, the dash and the question went into the box.
+            # "and" ends the query only when an action follows ("… and play it"): "Salt and Cedar" is a title.
+            q = re.sub(r"\s*(?:并|然后|\band\s+(?:then\s+)?(?:play|start|open|listen|tell|show|add|save)\b|and then|"
+                       r"[—–]|\s-\s|\b(?:who|what|which|where|when|how)\b|是谁|哪).*$", "",
+                       raw, flags=re.I).strip(" 「」“”\"'《》")
+            if q:
+                add(re.sub(r"(\S)的\s+", r"\1 ", q))
+                add(q)
     # A work the goal names and who made it, composed into what one types into a search box: "Play Paper Boats by
     # Sable Fox in Tunebox" offered only 'Play Paper Boats', 'Sable Fox' and 'Tunebox', and "在声海里播放苏晚的《安静的
     # 引擎》" only '在声海里播放苏晚的' -- no query that finds the song. "<artist> <title>" first, then the title alone.
@@ -933,6 +939,14 @@ KEY_CHOICES = {
     "delete": "Delete the selection",
 }
 
+#: ASK's question when the run's own browser window has no page in it (Observation.own_window_empty) and no text
+#: helper writes one: what the run can see and may use, and what would let it go on.
+OWN_WINDOW_QUESTION = {
+    "zh": "这个窗口里还没有网页。要我打开哪个网址，或者搜索什么？你自己窗口里的网页我不能读。",
+    "en": "There is no page in this window yet. Which address should I open, or what should I search for? I can't read "
+          "the pages in your own windows.",
+}
+
 #: What each operation means, as the planner reads it; the harness maps them onto its own action vocabulary.
 OPERATION_LABELS = {
     "CLICK": "Click one element: a button, menu item, tab, list entry or other control. Clicking a file row only "
@@ -1052,8 +1066,14 @@ class SystemOneAdapter:
         #: This turn's identity (run, step, observation) and the requests it sent, as {"id", "form"} (_ask).
         self._turn: dict = {}
         self.sent: list[dict] = []
+        #: Every reply of the current turn as the model gave it, before anything here acts on it: each head's choice
+        #: and full probabilities, and who answered (routing). The trace keeps them for calibration (deskmind#59,
+        #: "know when it doesn't know"); the decision record keeps only the top three operations.
+        self.replies: list[dict] = []
         self._value_cache: dict[tuple, str] = {}
         self._seen_text: dict[str, str] = {}
+        #: The judgements this run asked (judge_choice): what was chosen, with its probabilities.
+        self.judgements: list[dict] = []
         self._read_by_window: dict[str, dict[str, str]] = {}
         #: What an earlier phase of the same task read somewhere this adapter cannot see -- a web page read through
         #: the browser channel before the desktop phase writes it into a document (HANDS_PRIOR_READ, a JSON file
@@ -1080,6 +1100,8 @@ class SystemOneAdapter:
         from ..done_check import Ledger
         self._ledger = Ledger()
         self._pending_write: tuple[str, str] | None = None
+        #: (the name typed into a Save As sheet, the document whose sheet it is), until the save it leads to.
+        self._save_as: tuple[str, str] | None = None
 
     # -- wire -------------------------------------------------------------
 
@@ -1141,10 +1163,40 @@ class SystemOneAdapter:
             # by position is the last candidate): a reply like that is not one to guess from (protocol review 10-06).
             raise AdapterUnavailable(f"system one endpoint {self.url} answered outside what it was asked: {bad}")
         answers = {k: a for k, a in answers.items() if k in asked}
+        self.replies.append({"id": ident["request_id"], **({"routing": self._routing} if self._routing else {}),
+                             "answers": {k: {f: a[f] for f in ("choice", "probabilities", "scored") if f in a}
+                                         for k, a in answers.items() if isinstance(a, dict)},
+                             **({"filled_here": sorted(fixed)} if fixed else {})})
         for k, q in fixed.items():
             only = next(iter(q["criteria"]))
             answers[k] = {"type": "choice", "choice": only, "confidence": 1.0, "probabilities": {only: 1.0}}
         return answers
+
+    def judge_choice(self, state: str, instructions: str, criteria: dict) -> dict:
+        """One judgement as a choice (runtime/judge.py): the material and question as the state, each option with
+        what it means. Sent on its own, not with a step's heads, and kept out of last_request (what replays compare);
+        recorded in self.judgements for the trace. Raises AdapterUnavailable when there is no usable answer."""
+        questions = {"judgement": {"type": "choice", "instructions": {"goal": instructions, "question": "judgement"},
+                                   "criteria": dict(criteria)}}
+        form = "list" if "list" in self._criteria_forms() else "object"
+        wire = {"state": state, "model": self.model, "request_id": uuid.uuid4().hex, **self._turn,
+                "questions": list_form(questions) if form == "list" else questions}
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(f"{self.url}/v1/systemone", data=json.dumps(wire).encode(), headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                answers = json.load(r)["answers"]
+        except Exception as exc:
+            raise AdapterUnavailable(f"system one endpoint {self.url} failed: {exc}") from exc
+        bad = unoffered(questions, answers)
+        if bad:
+            raise AdapterUnavailable(f"system one endpoint {self.url} answered outside what it was asked: {bad}")
+        a = answers["judgement"]
+        self.judgements.append({"id": wire["request_id"], "choice": a.get("choice"),
+                                "probabilities": a.get("probabilities"), "options": list(criteria)})
+        return a
 
     # -- state ------------------------------------------------------------
 
@@ -1558,6 +1610,7 @@ class SystemOneAdapter:
     def propose(self, ctx: TurnContext) -> Proposal:
         """One request, all heads: the operation and a target head per operation, exactly as the /v1/systemone protocol asks."""
         self.sent = []
+        self.replies = []
         self._turn = {k: v for k, v in (("session_id", ctx.run_id), ("step", ctx.step),
                                         ("observation_id", ctx.observation.id)) if v}
         self._keep_ledger(ctx)
@@ -1623,8 +1676,12 @@ class SystemOneAdapter:
         # test exactly this: two orders match "Zhang Wei's order" and the goal names one.
         seen_text = ((state.get("page") or {}).get("text", "") + "\n" + self._seen_text.get(goal, ""))
         asked = ctx.asked > 0   # its own questions; a yes to the harness's approval is not one (G16)
+        # The run's own browser window with no page in it (Observation.own_window_empty) is a fact of the look, not a
+        # reading of the goal: asking for the page is one way on from there, and with no text helper it had none --
+        # 12 clicks on the browser's sidebar instead (0.4.3-rc.3, live 10-17, run 4).
+        own_empty = bool(getattr(ctx.observation, "own_window_empty", False))
         if ctx.task.budget.max_dialogue_turns > 0 and not asked and (
-                self.text_helper or ambiguity_question(goal, seen_text)):
+                self.text_helper or ambiguity_question(goal, seen_text) or own_empty):
             operations["ASK"] = OPERATION_LABELS["ASK"]
         # Two documents of the same app are two windows, and only the focused one is observable: the task that
         # reads sixty lines in one file and writes the answer into another had no way to reach the second.
@@ -1894,6 +1951,8 @@ class SystemOneAdapter:
         elif op == "ASK":
             found = ambiguity(goal, (state.get("page") or {}).get("text", "") + "\n" + self._seen_text.get(goal, ""))
             question, options = found if found else (self._ask_text(goal, state), [])
+            if question is None and getattr(ctx.observation, "own_window_empty", False):
+                question = OWN_WINDOW_QUESTION["zh" if re.search(f"[{HAN}]", goal) else "en"]
             if question is None:
                 return self._refuse(f"ASK without a question: {self._helper_error or 'no text helper'}", answers, t0)
             action = Action(kind=ActionKind.ASK_USER, text=question, options=tuple(options), binding=b, raw=answers)
@@ -2152,9 +2211,34 @@ class SystemOneAdapter:
         if last is not None and last.result_ok and self._pending_write:
             self._ledger.wrote(*self._pending_write)
         self._pending_write = None
+        if last is not None and not last.result_ok:
+            self._save_as = None      # a step of the sheet that failed: the sheet is not to be trusted to have saved
         if last is not None and last.result_ok:
-            for m in re.finditer(r"saved '(.+?)'", last.result_detail or ""):
-                self._ledger.was_saved(m.group(1))
+            detail = last.result_detail or ""
+            # A name typed into a Save As sheet: the document whose sheet it is will be saved under it.
+            m = re.match(r"save-as name set to '(.+?)'", detail)
+            if m:
+                self._save_as = (m.group(1), (ctx.observation.window_title or "").split(" (")[0].strip())
+            elif not re.match(r"save-as \w+ set to |saved '", detail):
+                # The sheet's steps run straight into its save. Anything else in between -- the sheet cancelled, a
+                # click elsewhere -- and a later save is a plain one: renaming then would credit a file never written.
+                self._save_as = None
+            for m in re.finditer(r"saved '(.+?)'", detail):
+                pending = self._save_as
+                if pending:
+                    # Saved through the sheet: whichever name the driver reports (the new file's, or the untitled
+                    # document's), what was written into the document is now the named file.
+                    typed, document = pending
+                    old = m.group(1) if m.group(1) in self._ledger.written else document
+                    title = (ctx.observation.window_title or "").split(" (")[0].strip()
+                    # The name the file got: the driver's, unless it is the old one; else the window's, when it is
+                    # the typed name with the extension the app added ("draft" -> "draft.txt"); else as typed.
+                    new = (m.group(1) if m.group(1) != old else
+                           title if title.startswith(typed) and title != old else typed)
+                    self._ledger.saved_as(old, new)
+                    self._save_as = None
+                else:
+                    self._ledger.was_saved(m.group(1))
             for m in re.finditer(r"closed '(.+?)'", last.result_detail or ""):
                 self._ledger.was_closed(m.group(1))
 

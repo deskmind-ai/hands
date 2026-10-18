@@ -583,6 +583,8 @@ def cmd_do(args) -> int:
         # for 17 s of a recording, 10-01). It is started by opening the folder's document, the run's first step.
         stage = []
     else:
+        # A browser's is never run as an `open` (a reopen, which un-minimises the user's window): the driver opens a
+        # window of the run's own instead, and leaves every window the user has alone (PeekabooDriver._start).
         stage = [f'open -b {shlex.quote(args.app)}']
     driver = _make_driver("peekaboo", not args.no_screenshots, scratch=rd,
                           app=args.app, stage=stage, reset_apps=[])

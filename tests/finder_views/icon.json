@@ -1,0 +1,324 @@
+{
+ "ui_elements": [
+  {
+   "id": "elem_125",
+   "role": "button",
+   "ax_role": "AXButton",
+   "label": "返回",
+   "bounds": {
+    "width": 36,
+    "x": 480,
+    "y": 164,
+    "height": 36
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_126",
+   "role": "button",
+   "ax_role": "AXButton",
+   "label": "前进",
+   "bounds": {
+    "width": 37,
+    "x": 516,
+    "y": 164,
+    "height": 36
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_134",
+   "role": "button",
+   "ax_role": "AXButton",
+   "label": "共享",
+   "bounds": {
+    "x": 1089,
+    "y": 155,
+    "height": 52,
+    "width": 36
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_95",
+   "role": "image",
+   "ax_role": "AXImage",
+   "label": "报销单.csv",
+   "title": "报销单.csv",
+   "bounds": {
+    "x": 505,
+    "y": 221,
+    "height": 64,
+    "width": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_97",
+   "role": "image",
+   "ax_role": "AXImage",
+   "label": "发票.pdf",
+   "title": "发票.pdf",
+   "bounds": {
+    "x": 617,
+    "y": 221,
+    "height": 64,
+    "width": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_99",
+   "role": "image",
+   "ax_role": "AXImage",
+   "label": "项目",
+   "title": "项目",
+   "bounds": {
+    "x": 729,
+    "y": 221,
+    "height": 64,
+    "width": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_101",
+   "role": "image",
+   "ax_role": "AXImage",
+   "label": "budget.xlsx",
+   "title": "budget.xlsx",
+   "bounds": {
+    "x": 841,
+    "y": 221,
+    "height": 64,
+    "width": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_103",
+   "role": "image",
+   "ax_role": "AXImage",
+   "label": "notes.txt",
+   "title": "notes.txt",
+   "bounds": {
+    "x": 953,
+    "y": 221,
+    "height": 64,
+    "width": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_105",
+   "role": "image",
+   "ax_role": "AXImage",
+   "label": "readme.txt",
+   "title": "readme.txt",
+   "bounds": {
+    "x": 1065,
+    "y": 221,
+    "height": 64,
+    "width": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_107",
+   "role": "image",
+   "ax_role": "AXImage",
+   "label": "todo.md",
+   "title": "todo.md",
+   "bounds": {
+    "x": 505,
+    "y": 333,
+    "height": 64,
+    "width": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_93",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 672,
+    "x": 481,
+    "y": 217,
+    "height": 224
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_94",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 64,
+    "x": 505,
+    "y": 221,
+    "height": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_96",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 64,
+    "x": 617,
+    "y": 221,
+    "height": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_98",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 64,
+    "x": 729,
+    "y": 221,
+    "height": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_100",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 64,
+    "x": 841,
+    "y": 221,
+    "height": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_102",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 64,
+    "x": 953,
+    "y": 221,
+    "height": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_104",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 64,
+    "x": 1065,
+    "y": 221,
+    "height": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_106",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 64,
+    "x": 505,
+    "y": 333,
+    "height": 64
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_108",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 672,
+    "x": 481,
+    "y": 217,
+    "height": 224
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_123",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 81,
+    "x": 475,
+    "y": 155,
+    "height": 52
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_127",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 164,
+    "x": 862,
+    "y": 155,
+    "height": 52
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_137",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 40,
+    "x": 1208,
+    "y": 155,
+    "height": 52
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_141",
+   "role": "group",
+   "ax_role": "AXGroup",
+   "label": "组",
+   "bounds": {
+    "width": 14,
+    "x": 397,
+    "y": 174,
+    "height": 14
+   },
+   "is_actionable": false
+  },
+  {
+   "id": "elem_10",
+   "role": "other",
+   "ax_role": "AXStaticText",
+   "label": "共享",
+   "value": "共享",
+   "bounds": {
+    "width": 77,
+    "x": 377,
+    "y": 246,
+    "height": 18
+   },
+   "is_actionable": false
+  }
+ ]
+}

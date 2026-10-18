@@ -57,6 +57,8 @@ class Recorder:
             "windows": [w.to_json() for w in obs.windows],
             "dialog": obs.dialog,
             **({"accepts_keys": False} if not getattr(obs, "accepts_keys", True) else {}),
+            **({"no_window": True} if getattr(obs, "no_window", False) else {}),
+            **({"own_window_empty": True} if getattr(obs, "own_window_empty", False) else {}),
         }
         if getattr(obs, "notes", None):
             rec["notes"] = list(obs.notes)

@@ -9,6 +9,16 @@ planner, since it is a change to what the model sees.
     python tools/harness_replay.py add runs/do-20260930-172539 --name d4-real-ask
     python tools/harness_replay.py check              # exit 1 on any difference
     python tools/harness_replay.py check --update     # accept the current output
+    python tools/harness_replay.py coverage           # what the cases reach, and what none does
+
+Every run recorded on this machine is a check too (`hands do`, bench and gym runs alike; they stay here, never in the
+repository): dump them before a change that should leave what the planner sees alone, and compare after it.
+
+    python tools/harness_replay.py corpus runs/ --out runs/corpus-before.json
+    python tools/harness_replay.py corpus runs/ --against runs/corpus-before.json   # exit 1 on any difference
+
+A dump holds the screen text of every run in it: keep it under runs/ (ignored by git), never in /tmp or anywhere
+shared, and delete it when the comparison is done.
 """
 from __future__ import annotations
 
@@ -43,12 +53,16 @@ def _sanitize(text: str) -> str:
 #: recorded with (env.json) and every other one off, whatever the caller's environment: a run recorded through the
 #: app, with the DONE check on, replayed without it built two requests fewer.
 SWITCHES = ("HANDS_EFFECT_NOTES", "HANDS_ENV_SECTIONS", "HANDS_MARK_NEW", "HANDS_PROGRESS", "HANDS_LESSONS",
-            "HANDS_DONE_CHECK")
+            "HANDS_DONE_CHECK", "HANDS_COMPLETION_CHECK")
 
 
 def expected_of(case: Path) -> dict:
     env = json.loads((case / "env.json").read_text(encoding="utf-8")) if (case / "env.json").exists() else {}
-    with mock.patch.dict(os.environ, {k: "0" for k in SWITCHES} | env):
+    # No HANDS_* setting of the caller's reaches the replay, listed or not: HANDS_COMPLETION_CHECK, set in a shell,
+    # added a question to every request after the first, and a snapshot passed or failed by whose machine it ran on.
+    # (A switch read when a module is imported is out of reach here; none of those changes a request today.)
+    outside = {k: v for k, v in os.environ.items() if not k.startswith("HANDS_")}
+    with mock.patch.dict(os.environ, outside | {k: "0" for k in SWITCHES} | env, clear=True):
         r = replay(case)
     return {"result": r.to_json() | {"run": case.name},
             "requests": [normalize(q) for q in r.requests]}
@@ -106,6 +120,68 @@ def check(update: bool = False, only: list[str] | None = None) -> list[tuple[str
     return failures
 
 
+def coverage(only: list[str] | None = None) -> dict[str, dict[str, int]]:
+    """What the cases put to the planner, from their snapshots: how many requests asked each question, and offered
+    each operation. A path no case reaches is one a refactor can change unseen (deskmind#58, step 0)."""
+    heads: dict[str, int] = {}
+    ops: dict[str, int] = {}
+    for case in sorted(p for p in CASES.iterdir() if (p / "expected.json").exists()):
+        if only and case.name not in only:
+            continue
+        for req in json.loads((case / "expected.json").read_text(encoding="utf-8"))["requests"]:
+            for key, q in req["questions"].items():
+                heads[key] = heads.get(key, 0) + 1
+                if key == "operation":
+                    crit = q.get("criteria") or {}
+                    for op in (crit if isinstance(crit, dict) else [c.get("key") for c in crit]):
+                        ops[op] = ops.get(op, 0) + 1
+    return {"questions": heads, "operations": ops}
+
+
+def every_path() -> dict[str, set[str]]:
+    """Every question and operation the adapter can put to the planner."""
+    from deskmind_hands.adapters import systemone
+    heads = {"operation", "goal_complete", *(h for hs in systemone.HEADS.values() for h in hs)}
+    return {"questions": heads, "operations": set(systemone.OPERATION_LABELS) | set(systemone.HEADS)}
+
+
+def gaps(only: list[str] | None = None) -> dict[str, list[str]]:
+    seen, every = coverage(only), every_path()
+    return {k: sorted(every[k] - set(seen[k])) for k in every}
+
+
+def manifest_task(run: Path) -> Path | None:
+    f = json.loads((run / "manifest.json").read_text(encoding="utf-8")).get("task_file")
+    return Path(f) if f and Path(f).exists() else None
+
+
+def _sha(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+
+
+def corpus(runs: list[Path], env: dict[str, str] | None = None) -> dict[str, dict]:
+    """Every run under `runs` that can be replayed, replayed: its requests, normalized, and its outcome. Not a
+    snapshot -- recorded runs from the desktop stay on the machine that made them -- but the same comparison over many
+    more runs: dumped before a change and after it, two dumps that differ name a run whose requests the change moved
+    (deskmind#58: a step that only moves code must leave every one of them as it was)."""
+    out = {}
+    for run in sorted({p.parent for r in runs for p in Path(r).rglob("trace.jsonl")}):
+        try:
+            outside = {k: v for k, v in os.environ.items() if not k.startswith("HANDS_")}
+            with mock.patch.dict(os.environ, outside | {k: "0" for k in SWITCHES} | (env or {}), clear=True):
+                r = replay(run)
+        except Exception as exc:  # noqa: BLE001 - a run that cannot be replayed is listed, not fatal
+            out[str(run)] = {"skipped": f"{type(exc).__name__}: {exc}"[:200]}
+            continue
+        # The replay's scratch folder is new every time, and the grade's words name it.
+        result = json.loads(re.sub(r"[^\"' ]*hands-replay-[^/\"' ]+", "<scratch>", json.dumps(r.to_json())))
+        out[str(run)] = {"result": result, "requests": [normalize(q) for q in r.requests],
+                         # A task file edited between two dumps moves the requests too; this tells it from a code change.
+                         **({"task_sha": _sha(manifest_task(run))} if manifest_task(run) else {})}
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -117,7 +193,35 @@ def main() -> int:
     c = sub.add_parser("check")
     c.add_argument("--update", action="store_true")
     c.add_argument("cases", nargs="*")
+    sub.add_parser("coverage", help="which questions and operations the cases reach, and which none does")
+    k = sub.add_parser("corpus", help="replay every recorded run under the given folders; dump, or compare to a dump")
+    k.add_argument("runs", nargs="+", type=Path)
+    k.add_argument("--out", type=Path, help="write the dump here")
+    k.add_argument("--against", type=Path, help="compare with an earlier dump; exit 1 on any difference")
     args = ap.parse_args()
+    if args.cmd == "corpus":
+        got = json.loads(json.dumps(corpus(args.runs), ensure_ascii=False))
+        if args.out:
+            args.out.write_text(json.dumps(got, ensure_ascii=False) + "\n", encoding="utf-8")
+        replayed = [k for k, v in got.items() if "requests" in v]
+        print(f"{len(replayed)} run(s) replayed, {sum(len(got[k]['requests']) for k in replayed)} requests; "
+              f"{len(got) - len(replayed)} skipped")
+        if args.against:
+            want = json.loads(args.against.read_text(encoding="utf-8"))
+            diffs = [(k, first_difference(want.get(k), got.get(k))) for k in sorted(set(want) | set(got))]
+            diffs = [(k, d) for k, d in diffs if d]
+            for k, d in diffs[:20]:
+                print(f"CHANGED  {k}: {d}")
+            print(f"{len(diffs)} run(s) changed" if diffs else "every run replays to the same requests")
+            return 1 if diffs else 0
+        return 0
+    if args.cmd == "coverage":
+        seen = coverage()
+        for kind, counts in seen.items():
+            print(f"{kind}: " + ", ".join(f"{k} {n}" for k, n in sorted(counts.items(), key=lambda kv: -kv[1])))
+        for kind, missing in gaps().items():
+            print(f"no case reaches these {kind}: {', '.join(missing) or 'none'}")
+        return 0
     os.environ.setdefault("HANDS_EFFECT_NOTES", "0")
     if args.cmd == "add":
         env = dict(e.split("=", 1) for e in args.env)

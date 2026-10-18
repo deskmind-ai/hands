@@ -9,6 +9,7 @@ One JSON request per line on stdin, one JSON reply per line on stdout (`{"id", "
     observe   {window, screenshot?}      one window close up: elements, dialog, text
     perform   {action}                   one generic action (click, set_value, type, select, key, scroll,
                                          open_window, close_window, focus_window, wait)
+    stop      {}                         the app's stop switch: every later perform is refused
     end       {}
 
 Ownership, consequence classes, consent and the guard live in harness (`src/executor/`); nothing here judges. The
@@ -192,7 +193,15 @@ class HandsExecutor:
             out["screenshot_png"] = base64.b64encode(obs.screenshot_png).decode()
         return out
 
+    def stop(self) -> dict:
+        """The app's stop switch, straight to the execution layer: every later action is refused here, whatever the
+        runtime above still wants."""
+        self.stopped = True
+        return {"stopped": True}
+
     def perform(self, action: dict) -> dict:
+        if getattr(self, "stopped", False):
+            return {"status": "error", "why": "stopped by the app"}
         kind = action.get("kind")
         self.epoch += 1
         if kind == "wait":
@@ -300,6 +309,8 @@ def main() -> None:
                 res = ex.observe(req["window"], bool(req.get("screenshot")))
             elif op == "perform":
                 res = ex.perform(req["action"])
+            elif op == "stop":
+                res = ex.stop()
             elif op == "end":
                 res = ex.end()
             else:

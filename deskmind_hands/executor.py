@@ -43,6 +43,16 @@ def _bundle_of_pid(pid: int) -> str:
     return (app.bundleIdentifier() if app else None) or ""
 
 
+def takeover_until() -> float:
+    """Epoch seconds until which the user has handed the screen over (the file HANDS_TAKEOVER_FILE names, written by
+    the app), 0 when they have not."""
+    path = os.environ.get("HANDS_TAKEOVER_FILE")
+    try:
+        return float(Path(path).read_text().strip() or 0) if path else 0.0
+    except (OSError, ValueError):
+        return 0.0
+
+
 def allow_flash(bundle: str) -> None:
     """Let the driver bring `bundle` forward for a step (HANDS_FLASH_APPS, read at each step): the apps the request
     names come from the app; an app whose window this task opened itself is added here."""
@@ -226,6 +236,11 @@ class HandsExecutor:
     USER_ACTIVE_S = 3.0
 
     def user_active(self) -> bool:
+        # The user handed the screen over for a while ("let DeskMind use it", the app writes the end time to
+        # HANDS_TAKEOVER_FILE): their keyboard and mouse no longer count as being in the way, as the driver's own
+        # foreground waits already treat it (PeekabooDriver._takeover).
+        if takeover_until() > time.time():
+            return False
         if Quartz is None:
             return False
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)

@@ -97,3 +97,17 @@ def test_allow_flash_adds_once(monkeypatch):
     allow_flash("com.apple.TextEdit"); allow_flash("com.apple.textedit")
     import os
     assert os.environ["HANDS_FLASH_APPS"] == "com.apple.Safari,com.apple.TextEdit"
+
+
+def test_user_active_yields_to_takeover(monkeypatch, tmp_path):
+    import time
+    from deskmind_hands.executor import HandsExecutor, takeover_until
+    f = tmp_path / "takeover-until"
+    monkeypatch.setenv("HANDS_TAKEOVER_FILE", str(f))
+    assert takeover_until() == 0.0                                  # no file: no takeover
+    f.write_text(str(time.time() + 60))
+    assert takeover_until() > time.time()
+    ex = HandsExecutor.__new__(HandsExecutor)                        # no desktop needed for this check
+    assert ex.user_active() is False                                 # handed over: the user is not "in the way"
+    f.write_text(str(time.time() - 1))
+    assert takeover_until() < time.time()                            # expired: back to the keyboard/mouse rule

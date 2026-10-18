@@ -326,6 +326,8 @@ class HandsExecutor:
             # not. The executor above has already refused the step if the user is active in a window of theirs.
             if kind == "click":
                 a = Action(kind=ActionKind.CLICK, binding=binding, foreground=True)
+            elif kind == "double_click":
+                a = Action(kind=ActionKind.DOUBLE_CLICK, binding=binding, foreground=True)
             elif kind == "set_value":
                 a = Action(kind=ActionKind.TYPE_TEXT, text=action.get("value") or "", clear_first=True, binding=binding, foreground=True)
             elif kind == "type":

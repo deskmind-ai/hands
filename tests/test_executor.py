@@ -111,3 +111,75 @@ def test_user_active_yields_to_takeover(monkeypatch, tmp_path):
     assert ex.user_active() is False                                 # handed over: the user is not "in the way"
     f.write_text(str(time.time() - 1))
     assert takeover_until() < time.time()                            # expired: back to the keyboard/mouse rule
+
+
+def test_perform_carries_the_drivers_files_receipt(tmp_path):
+    ex, stub = _executor()
+    ex.workspace = tmp_path
+    ex._document = lambda window, wins: None   # noqa: SLF001 -- no desktop: the app says no document
+    target = tmp_path / "hello.txt"
+    target.write_text("hi", encoding="utf-8")
+    stub.execute = lambda action: ExecResult(True, "saved 'hello.txt'", files=(str(target),))
+    ex.observe("com.apple.TextEdit#12")
+    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
+    assert r["status"] == "ok" and r["files"] == [str(target)] and "document" not in r
+    # a click that wrote nothing the driver knows of, in a window whose document is unknown: no receipt at all
+    stub.execute = lambda action: ExecResult(True, "done")
+    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
+    assert "files" not in r
+    # an action that cannot write a file: the receipt says so (files: [])
+    r = ex.perform({"kind": "type", "window": "com.apple.TextEdit#12", "target": "T1", "text": "x"})
+    assert r["files"] == []
+    assert ex.perform({"kind": "wait", "ms": 1})["files"] == []
+
+
+def test_perform_credits_the_windows_document_only_when_the_action_changed_it(tmp_path):
+    ex, stub = _executor()
+    ex.workspace = tmp_path
+    doc = tmp_path / "notes.txt"
+    doc.write_text("v1", encoding="utf-8")
+    ex._document = lambda window, wins: str(doc)   # noqa: SLF001 -- what AXDocument would say
+    ex.observe("com.apple.TextEdit#12")
+    # a click that does not touch the file: the document is reported, no file is credited
+    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "T1"})
+    assert r["document"] == str(doc) and "files" not in r
+
+    # cmd+S through the app: the file at the window's document changed during the action -> credited
+    def save(action):
+        doc.write_text("v2 longer", encoding="utf-8")
+        return ExecResult(True, "pressed; could not be confirmed", indeterminate=True)
+    stub.execute = save
+    r = ex.perform({"kind": "key", "window": "com.apple.TextEdit#12", "chord": "cmd+s"})
+    assert r["status"] == "unverified" and r["files"] == [str(doc)]
+
+    # a save-as moved the window to another file: the new file is credited
+    moved = tmp_path / "renamed.txt"
+
+    def save_as(action):
+        moved.write_text("v2 longer", encoding="utf-8")
+        ex._document = lambda window, wins: str(moved)   # noqa: SLF001
+        return ExecResult(True, "done")
+    stub.execute = save_as
+    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
+    assert r["files"] == [str(moved)] and r["document"] == str(moved)
+
+
+def test_a_drivers_scratch_document_is_never_a_file_of_the_task(tmp_path):
+    ex, stub = _executor()
+    ex.workspace = tmp_path
+    scratch = tmp_path / ".hands" / "未命名-1"
+    scratch.parent.mkdir()
+    scratch.write_text("", encoding="utf-8")
+    ex._document = lambda window, wins: str(scratch)   # noqa: SLF001 -- a new document's path until it is saved as
+    ex.observe("com.apple.TextEdit#12")
+
+    def pressed(action):
+        scratch.write_text("typed text", encoding="utf-8")   # cmd+S on a never-saved document went to the scratch
+        return ExecResult(True, "done")
+    stub.execute = pressed
+    r = ex.perform({"kind": "key", "window": "com.apple.TextEdit#12", "chord": "cmd+s"})
+    assert "files" not in r and r["document"] == str(scratch)
+    # typing never saves: the document is not even asked for
+    ex._document = lambda window, wins: (_ for _ in ()).throw(AssertionError("asked"))   # noqa: SLF001
+    r = ex.perform({"kind": "type", "window": "com.apple.TextEdit#12", "target": "T1", "text": "more"})
+    assert r["files"] == [] and "document" not in r

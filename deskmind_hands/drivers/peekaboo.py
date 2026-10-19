@@ -4268,8 +4268,26 @@ class PeekabooDriver:
             ok, out = self._osa(f'tell application "TextEdit" to get modified of (first document whose name is "{doc}")')
             if ok and out.strip() == "false":
                 self._scripted_actions += 1
-                return ExecResult(True, f"saved {name!r} (scripted, in the background)")
+                # The receipt: where the document was written, asked of TextEdit by the same query
+                # _open_workspace_documents uses. The driver's own scratch file is not a file the task wrote.
+                ok, where = self._osa(f'tell application "TextEdit" to get path of (first document whose name is "{doc}")')
+                written = self._receipt(where.strip()) if ok else ()
+                return ExecResult(True, f"saved {name!r} (scripted, in the background)", files=written)
         return ExecResult(False, f"could not confirm that {name!r} was saved")
+
+    def _receipt(self, *paths: str) -> tuple[str, ...]:
+        """`paths` as a files receipt: absolute, existing, and not the driver's own scratch under .hands/."""
+        out = []
+        scratch = (Path(os.path.realpath(str(self.ws))) / ".hands") if getattr(self, "ws", None) is not None else None
+        for p in paths:
+            if not p or not p.startswith("/"):
+                continue
+            full = Path(os.path.realpath(p))
+            if scratch is not None and (full == scratch or scratch in full.parents):
+                continue
+            if full.exists():
+                out.append(str(full))
+        return tuple(out)
 
     def _textedit_projected(self, eid: str, action: Action) -> ExecResult | None:
         pending = self.__dict__.setdefault("_pending_saveas", {})
@@ -4363,7 +4381,8 @@ class PeekabooDriver:
             self._window_title = name
             # "saved '<name>'" first, the form a save is recorded in: "saved the document as ..." was never read as
             # a save, and the oracle labelled one more 保存 after every save-as (audit 09-26).
-            return self._settle(True, f"saved {name!r} in {place!r}, as a new document (projected)")
+            return self._settle(True, f"saved {name!r} in {place!r}, as a new document (projected)",
+                                files=self._receipt(str(target)))
         return None
 
     #: Finder's view modes, by the names its View menu uses.
@@ -4659,7 +4678,7 @@ class PeekabooDriver:
             return ok, meta, detail or text[:200]
         raise KeyError(key)
 
-    def _settle(self, ok: bool, detail: str) -> ExecResult:
+    def _settle(self, ok: bool, detail: str, files: tuple[str, ...] = ()) -> ExecResult:
         # Any action can move a window, so the snapshot is retired immediately.
         # The loop observes again before the next action, which is what makes a
         # stale binding impossible rather than merely unlikely.
@@ -4674,7 +4693,7 @@ class PeekabooDriver:
                               detail=("dispatched but the outcome could not be confirmed; "
                                       "upstream says not to retry -- observe and check "
                                       f"before acting again. {detail[:250]}"))
-        return ExecResult(ok, detail[:400])
+        return ExecResult(ok, detail[:400], files=files if ok else ())
 
     def _evidence(self, ok: bool, data: dict, detail: str, what: str) -> ExecResult:
         """Carry what actually landed into the trace, not just a boolean."""

@@ -8,7 +8,10 @@ One JSON request per line on stdin, one JSON reply per line on stdout (`{"id", "
     snapshot  {}                         the whole computer: locked, front app, every on-screen window of every app
     observe   {window, screenshot?}      one window close up: elements, dialog, text
     perform   {action}                   one generic action (click, set_value, type, select, key, scroll,
-                                         open_window, close_window, focus_window, wait)
+                                         open_window, close_window, focus_window, wait); its reply carries
+                                         `files` (absolute paths this action wrote: the driver's receipt, or the
+                                         window's own document when it changed) and `document` (the file the
+                                         window shows afterwards, when the app says)
     stop      {}                         the app's stop switch: every later perform is refused
     end       {}
 
@@ -29,6 +32,7 @@ import time
 from pathlib import Path
 
 from .actions import Action, ActionKind, Binding
+from .axdocument import window_document
 from .drivers.base import ExecResult, Observation
 
 try:
@@ -234,6 +238,9 @@ class HandsExecutor:
     #: The user is "active" when the keyboard or mouse moved within this many seconds (hands' driver uses the same
     #: idle window before a foreground step).
     USER_ACTIVE_S = 3.0
+    #: Actions that can make an app write a file (a save button, cmd+S, a choice in a save panel): the window's
+    #: document is checked around these.
+    SAVING_KINDS = {"click", "double_click", "key", "select"}
 
     def user_active(self) -> bool:
         # The user handed the screen over for a while ("let DeskMind use it", the app writes the end time to
@@ -319,17 +326,17 @@ class HandsExecutor:
         self.epoch += 1
         if kind == "wait":
             time.sleep(min(float(action.get("ms") or 0) / 1000, 30))
-            return {"status": "ok"}
+            return {"status": "ok", "files": []}
         if kind == "open_window":
             return self._open_window(action.get("app") or "", action.get("url"))
         window = action.get("window") or ""
         bundle, wid = self._split(window)
         if kind == "close_window":
             data = self._pk(["window", "close", "--window-id", wid, "--json"])
-            return {"status": "ok" if data is not None else "error"}
+            return {"status": "ok" if data is not None else "error", "files": []}
         if kind == "focus_window":
             self._pk(["window", "focus", "--window-id", wid, "--json"])
-            return {"status": "ok", "window": window}
+            return {"status": "ok", "window": window, "files": []}
         d = self._driver(bundle)
         obs = self.last_obs.get(window)
         if obs is None:
@@ -358,7 +365,13 @@ class HandsExecutor:
                 return {"status": "unsupported", "why": f"unknown action {kind}"}
         except Exception as e:  # noqa: BLE001 -- an action the model wrote wrong is its mistake to read
             return {"status": "error", "why": str(e)}
-        before = {w["id"] for w in self._windows()}
+        wins = self._windows()
+        before = {w["id"] for w in wins}
+        # the window's document is read only around an action that can save (a click, a key chord, a choice):
+        # typing and scrolling never write a file, and each read asks the app (up to two osascript runs)
+        may_save = kind in self.SAVING_KINDS
+        doc0 = self._document(window, wins) if may_save else None
+        stamp0 = self._stamp(doc0)
         res: ExecResult = d.execute(a)
         status = "ok" if res.ok else "unsupported" if res.unsupported else "error"
         if res.ok and res.indeterminate:
@@ -366,11 +379,55 @@ class HandsExecutor:
         out = {"status": status, "why": res.detail, "window": window}
         # any action can open a window (a "new document" button, a sheet that becomes a window): reported so the
         # ledger upstream can credit it to the task, as it does for open_window
-        fresh = [w for w in self._windows() if w["id"] not in before]
+        wins = self._windows()
+        fresh = [w for w in wins if w["id"] not in before]
         if fresh:
             w = fresh[-1]
             out["new_window"] = {"id": w["id"], "app": w["app"], "title": w["title"]}
+        # the files receipt: what the driver knows it wrote, plus the window's own document when the action moved
+        # it (a save-as) or changed it (a save) -- read from the window, so no app is named here. The layer above
+        # credits a screen action's files by this alone and checks each path's version itself.
+        doc1 = self._document(window, wins) if may_save else None
+        files = list(res.files)
+        if doc1 and (doc1 != doc0 or self._stamp(doc1) != stamp0) and self._reportable(doc1):
+            files.append(doc1)
+        # `files: []` is a receipt too: this action could not have written a file (typing, scrolling). Around an
+        # action that could, the field is there only when a write is known; left out, the driver does not know
+        # (an app's own save panel in an app that says nothing of its document), and the layer above credits nothing.
+        if files:
+            out["files"] = sorted(set(files))
+        elif not may_save:
+            out["files"] = []
+        if doc1:
+            out["document"] = doc1
         return out
+
+    def _document(self, window: str, wins: list[dict]) -> str | None:
+        """The file the window shows, by its AXDocument; None when the app does not say or the window is gone."""
+        info = next((w for w in wins if w["id"] == window), None)
+        if info is None or not info.get("pid"):
+            return None
+        return window_document(int(info["pid"]), info.get("bundle") or "", info.get("title") or "", info.get("bounds"))
+
+    @staticmethod
+    def _stamp(path: str | None) -> tuple[float, int] | None:
+        """(mtime, size) of a file, None when it is not there: whether an action wrote the window's document."""
+        if not path:
+            return None
+        try:
+            st = os.stat(path)
+            return (st.st_mtime, st.st_size)
+        except OSError:
+            return None
+
+    def _reportable(self, path: str) -> bool:
+        """A path that can be a task's file: it exists, and it is not a driver's scratch under the task folder's
+        .hands/ (the staged 未命名-N a new document is opened from is the document's path until it is saved as)."""
+        full = Path(os.path.realpath(path))
+        scratch = Path(os.path.realpath(str(self.workspace))) / ".hands"
+        if full == scratch or scratch in full.parents:
+            return False
+        return full.exists()
 
     def _open_window(self, app: str, url: str | None) -> dict:
         """Open a window of `app` (a bundle id, or a name as the snapshot shows it) and wait for it. No app is named

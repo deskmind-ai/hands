@@ -1,25 +1,48 @@
-"""The harness-facing executor: the JSON mapping on both sides of a driver, with the driver stubbed (no desktop)."""
+"""The harness-facing executor: the JSON mapping on both sides of a driver, with the driver stubbed (no desktop).
+
+unittest, as CI collects it (python -m unittest discover -s tests); pytest runs these too."""
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
 
 from deskmind_hands.actions import ActionKind
 from deskmind_hands.drivers.base import Element, ExecResult, Observation
-from deskmind_hands.executor import HandsExecutor
+from deskmind_hands.executor import HandsExecutor, allow_flash, installed_apps, resolve_app, sends, takeover_until
 from deskmind_hands.geometry import ImageTransform, ScreenGeometry, Size
+
+TE = "com.apple.TextEdit"
+W12 = f"{TE}#12"
+W13 = f"{TE}#13"
+
+
+def _win(wid: str, bundle: str = TE, title: str = "未命名", app: str = "文本编辑") -> dict:
+    return {"id": f"{bundle}#{wid}", "app": app, "bundle": bundle, "title": title, "pid": 1, "bounds": None}
 
 
 class StubDriver:
     def __init__(self):
         self.actions = []
+        self.allowed = []
+        self.follow = None          # a window id the observe lands on instead of the one asked for
         self._pinned_window = None
         self._window_id = None
 
     def observe(self):
+        if self.follow:
+            self._pinned_window = self.follow
         els = [Element(id="T1", role="textField", label="正文", value="", settable=True, focused=True),
                Element(id="B2", role="button", label="保存"),
                Element(id="P3", role="popUpButton", label="位置", options=["桌面", "文稿"]),
-               Element(id="S4", role="staticText", label="", value="已保存")]
+               Element(id="S4", role="staticText", label="", value="已保存"),
+               Element(id="B5", role="button", label="发送"),
+               Element(id="B6", role="button", label="回复")]
         size = Size(400, 300)
         return Observation(id="obs-1", geometry=ScreenGeometry(logical=size, pixels=size), transform=ImageTransform.identity(size), elements=els,
                            window_title="未命名", dialog=False)
@@ -30,6 +53,9 @@ class StubDriver:
             return ExecResult(True, "pressed; could not be confirmed", indeterminate=True)
         return ExecResult(True, "done")
 
+    def allow_browser_field(self, eid):
+        self.allowed.append(eid)
+
     def close(self):
         pass
 
@@ -37,243 +63,349 @@ class StubDriver:
 def _executor():
     ex = HandsExecutor()
     stub = StubDriver()
-    ex._driver = lambda bundle: stub   # noqa: SLF001 -- the point of the test is the layer above the driver
+    ex._driver = lambda bundle: stub            # noqa: SLF001 -- the point of the tests is the layer above the driver
+    ex._document = lambda window, wins: None   # noqa: SLF001 -- no desktop: the app says no document
+    ex._last_input_at = lambda: 0.0            # noqa: SLF001 -- the user has not touched the Mac
     return ex, stub
 
 
-def test_observe_maps_elements_to_the_generic_shape():
-    ex, _ = _executor()
-    o = ex.observe("com.apple.TextEdit#12")
-    by_id = {e["id"]: e for e in o["elements"]}
-    assert by_id["T1"]["actions"] == ["click", "set_value", "type"] and by_id["T1"]["focused"] is True
-    assert by_id["B2"]["actions"] == ["click"]
-    assert by_id["P3"]["actions"] == ["click", "select"] and by_id["P3"]["options"] == ["桌面", "文稿"]
-    assert o["text"] == "已保存"
-    assert o["window"] == {"id": "com.apple.TextEdit#12", "app": "com.apple.TextEdit", "title": "未命名"}
-    assert o["modal"] is None
-    assert json.dumps(o, ensure_ascii=False)   # serialisable as it stands
+class Mapping(unittest.TestCase):
+    def test_observe_maps_elements_to_the_generic_shape(self):
+        ex, _ = _executor()
+        o = ex.observe(W12)
+        by_id = {e["id"]: e for e in o["elements"]}
+        self.assertEqual(by_id["T1"]["actions"], ["click", "set_value", "type"])
+        self.assertTrue(by_id["T1"]["focused"])
+        self.assertEqual(by_id["B2"]["actions"], ["click"])
+        self.assertEqual(by_id["P3"]["actions"], ["click", "select"])
+        self.assertEqual(by_id["P3"]["options"], ["桌面", "文稿"])
+        self.assertEqual(o["text"], "已保存")
+        self.assertEqual(o["window"], {"id": W12, "app": TE, "title": "未命名"})
+        self.assertIsNone(o["modal"])
+        self.assertTrue(json.dumps(o, ensure_ascii=False))   # serialisable as it stands
+
+    def test_perform_maps_actions_and_binds_them_to_the_last_observation(self):
+        ex, stub = _executor()
+        self.assertEqual(ex.perform({"kind": "click", "window": W12, "target": "B2"})["status"], "error")   # not observed yet
+        ex.observe(W12)
+        e0 = ex.epoch
+        r = ex.perform({"kind": "set_value", "window": W12, "target": "T1", "value": "你好"})
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(ex.epoch, e0 + 1)
+        a = stub.actions[-1]
+        self.assertIs(a.kind, ActionKind.TYPE_TEXT)
+        self.assertEqual((a.text, a.clear_first), ("你好", True))
+        self.assertEqual((a.binding.observation_id, a.binding.element_id, a.binding.window_id), ("obs-1", "T1", "12"))
+        r = ex.perform({"kind": "key", "window": W12, "chord": "cmd+s"})
+        self.assertEqual(r["status"], "unverified")
+        self.assertEqual(stub.actions[-1].keys, ("cmd", "s"))
+        ex.perform({"kind": "select", "window": W12, "target": "P3", "option": "文稿"})
+        self.assertEqual(stub.actions[-1].text, "文稿")
+        self.assertEqual(ex.perform({"kind": "dance", "window": W12})["status"], "unsupported")
 
 
-def test_perform_maps_actions_and_binds_them_to_the_last_observation():
-    ex, stub = _executor()
-    assert ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})["status"] == "error"   # not observed yet
-    ex.observe("com.apple.TextEdit#12")
-    e0 = ex.epoch
-    r = ex.perform({"kind": "set_value", "window": "com.apple.TextEdit#12", "target": "T1", "value": "你好"})
-    assert r["status"] == "ok" and ex.epoch == e0 + 1
-    a = stub.actions[-1]
-    assert a.kind is ActionKind.TYPE_TEXT and a.text == "你好" and a.clear_first is True
-    assert a.binding.observation_id == "obs-1" and a.binding.element_id == "T1" and a.binding.window_id == "12"
-    r = ex.perform({"kind": "key", "window": "com.apple.TextEdit#12", "chord": "cmd+s"})
-    assert r["status"] == "unverified" and stub.actions[-1].keys == ("cmd", "s")
-    r = ex.perform({"kind": "select", "window": "com.apple.TextEdit#12", "target": "P3", "option": "文稿"})
-    assert stub.actions[-1].text == "文稿"
-    assert ex.perform({"kind": "dance", "window": "com.apple.TextEdit#12"})["status"] == "unsupported"
+class Apps(unittest.TestCase):
+    def test_resolve_app_names_no_app_in_code(self):
+        running = [("文本编辑", TE), ("访达", "com.apple.finder")]
+        installed = [("TextEdit", TE), ("文本编辑", TE), ("Safari", "com.apple.Safari")]
+        self.assertEqual(resolve_app(TE, [], []), TE)                       # a bundle id is itself
+        self.assertEqual(resolve_app("文本编辑", running, installed), TE)   # as the snapshot shows it
+        self.assertEqual(resolve_app("textedit", [], installed), TE)       # installed, any case
+        self.assertEqual(resolve_app("Safari", running, installed), "com.apple.Safari")   # not running, installed
+        self.assertEqual(resolve_app("没有这个应用", running, installed), "")
+
+    def test_installed_apps_reads_localized_names(self):
+        if not os.path.isdir("/System/Applications/TextEdit.app"):
+            self.skipTest("not a Mac with TextEdit")
+        apps = installed_apps()
+        names = {n for n, b in apps if b == TE}
+        self.assertIn("TextEdit", names)
+        self.assertIn("文本编辑", names)        # the English name and a localization, from the bundle itself
+
+    def test_allow_flash_adds_once(self):
+        with mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": "com.apple.Safari"}):
+            allow_flash(TE)
+            allow_flash("com.apple.textedit")
+            self.assertEqual(os.environ["HANDS_FLASH_APPS"], f"com.apple.Safari,{TE}")
+
+    def test_user_active_yields_to_takeover(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"HANDS_TAKEOVER_FILE": str(Path(d) / "takeover-until")}):
+            f = Path(d) / "takeover-until"
+            self.assertEqual(takeover_until(), 0.0)                       # no file: no takeover
+            f.write_text(str(time.time() + 60))
+            self.assertGreater(takeover_until(), time.time())
+            ex = HandsExecutor.__new__(HandsExecutor)                      # no desktop needed for this check
+            self.assertFalse(ex.user_active())                             # handed over: the user is not "in the way"
+            f.write_text(str(time.time() - 1))
+            self.assertLess(takeover_until(), time.time())                 # expired: back to the keyboard/mouse rule
 
 
-def test_resolve_app_names_no_app_in_code():
-    from deskmind_hands.executor import resolve_app
-    running = [("文本编辑", "com.apple.TextEdit"), ("访达", "com.apple.finder")]
-    installed = [("TextEdit", "com.apple.TextEdit"), ("文本编辑", "com.apple.TextEdit"), ("Safari", "com.apple.Safari")]
-    assert resolve_app("com.apple.TextEdit", [], []) == "com.apple.TextEdit"          # a bundle id is itself
-    assert resolve_app("文本编辑", running, installed) == "com.apple.TextEdit"          # as the snapshot shows it
-    assert resolve_app("textedit", [], installed) == "com.apple.TextEdit"             # installed, any case
-    assert resolve_app("Safari", running, installed) == "com.apple.Safari"            # not running, installed
-    assert resolve_app("没有这个应用", running, installed) == ""
+class Receipts(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_perform_carries_the_drivers_files_receipt(self):
+        ex, stub = _executor()
+        ex.workspace = self.ws
+        target = self.ws / "hello.txt"
+        target.write_text("hi", encoding="utf-8")
+        digest = hashlib.sha256(b"hi").hexdigest()
+        stub.execute = lambda action: ExecResult(True, "saved 'hello.txt'", files=((str(target), digest),))
+        ex.observe(W12)
+        r = ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["files"], [{"path": str(target), "sha256": digest}])
+        self.assertNotIn("document", r)
+        # a click that wrote nothing the driver knows of, in a window whose document is unknown: no receipt at all
+        stub.execute = lambda action: ExecResult(True, "done")
+        self.assertNotIn("files", ex.perform({"kind": "click", "window": W12, "target": "B2"}))
+        # an action that cannot write a file: the receipt says so (files: [])
+        self.assertEqual(ex.perform({"kind": "type", "window": W12, "target": "T1", "text": "x"})["files"], [])
+        self.assertEqual(ex.perform({"kind": "wait", "ms": 1})["files"], [])
+
+    def test_the_windows_document_is_credited_only_on_the_apps_own_word_with_the_digest_of_its_text(self):
+        ex, stub = _executor()
+        ex.workspace = self.ws
+        doc = self.ws / "notes.txt"
+        doc.write_text("v1", encoding="utf-8")
+        state = {"now": (str(doc), True), "text": "v1"}   # what the app's scripting says: the document, unsaved, its text
+        ex._document = lambda window, wins: state["now"]   # noqa: SLF001
+        ex._content_digest = lambda window, wins: hashlib.sha256(state["text"].encode()).hexdigest() if state["text"] is not None else None   # noqa: SLF001
+        ex.observe(W12)
+        # a click that saves nothing: still unsaved after -> the document is reported, no file is credited
+        r = ex.perform({"kind": "click", "window": W12, "target": "T1"})
+        self.assertEqual(r["document"], str(doc))
+        self.assertNotIn("files", r)
+
+        # the file changed on disk during the action but the app does not say it saved (a sync program wrote it)
+        def disk_only(action):
+            doc.write_text("someone else's v2", encoding="utf-8")
+            return ExecResult(True, "done")
+        stub.execute = disk_only
+        r = ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertNotIn("files", r)
+
+        # cmd+S through the app: unsaved before, saved after -> the app's own word, credited with the digest of
+        # what the app holds; a sync program writing over it at once makes upstream's match fail
+        def save(action):
+            doc.write_text("someone else's v4", encoding="utf-8")
+            state["now"], state["text"] = (str(doc), False), "v3"
+            return ExecResult(True, "pressed; could not be confirmed", indeterminate=True)
+        stub.execute = save
+        r = ex.perform({"kind": "key", "window": W12, "chord": "cmd+s"})
+        self.assertEqual(r["status"], "unverified")
+        self.assertEqual(r["files"], [{"path": str(doc), "sha256": hashlib.sha256(b"v3").hexdigest()}])
+        self.assertNotEqual(r["files"][0]["sha256"], hashlib.sha256(doc.read_bytes()).hexdigest())
+        # saved again with nothing to save: no flip, nothing credited
+        stub.execute = lambda action: ExecResult(True, "done")
+        self.assertNotIn("files", ex.perform({"kind": "key", "window": W12, "chord": "cmd+s"}))
+
+        # a never-saved document (no path, unsaved) saved through the app's own panel under a new name, the app
+        # giving no text: the path alone, told but not credited
+        moved = self.ws / "renamed.txt"
+        state["now"] = (None, True)
+
+        def save_as(action):
+            moved.write_text("v3", encoding="utf-8")
+            state["now"], state["text"] = (str(moved), False), None
+            return ExecResult(True, "done")
+        stub.execute = save_as
+        r = ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertEqual(r["files"], [{"path": str(moved)}])
+        self.assertEqual(r["document"], str(moved))
+
+        # only the path is known (accessibility, no scripting): never credited, only told
+        state["now"] = (str(moved), None)
+        stub.execute = disk_only
+        r = ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertNotIn("files", r)
+        self.assertEqual(r["document"], str(moved))
+
+    def test_a_drivers_scratch_document_is_never_a_file_of_the_task(self):
+        ex, stub = _executor()
+        ex.workspace = self.ws
+        scratch = self.ws / ".hands" / "未命名-1"
+        scratch.parent.mkdir()
+        scratch.write_text("", encoding="utf-8")
+        state = {"now": (str(scratch), True)}
+        ex._document = lambda window, wins: state["now"]   # noqa: SLF001 -- a new document's path until it is saved as
+        ex._content_digest = lambda window, wins: "x"      # noqa: SLF001
+        ex.observe(W12)
+
+        def pressed(action):
+            scratch.write_text("typed text", encoding="utf-8")   # cmd+S on a never-saved document went to the scratch
+            state["now"] = (str(scratch), False)
+            return ExecResult(True, "done")
+        stub.execute = pressed
+        r = ex.perform({"kind": "key", "window": W12, "chord": "cmd+s"})
+        self.assertNotIn("files", r)
+        self.assertEqual(r["document"], str(scratch))
+        # typing never saves: the document is not even asked for
+        ex._document = lambda window, wins: (_ for _ in ()).throw(AssertionError("asked"))   # noqa: SLF001
+        r = ex.perform({"kind": "type", "window": W12, "target": "T1", "text": "more"})
+        self.assertEqual(r["files"], [])
+        self.assertNotIn("document", r)
 
 
-def test_installed_apps_reads_localized_names():
-    from deskmind_hands.executor import installed_apps
-    apps = installed_apps()
-    bundles = {b for _, b in apps}
-    assert "com.apple.TextEdit" in bundles
-    names = {n for n, b in apps if b == "com.apple.TextEdit"}
-    assert "TextEdit" in names and "文本编辑" in names        # the English name and a localization, from the bundle itself
+class Windows(unittest.TestCase):
+    def test_an_action_in_a_window_the_driver_is_not_on_is_refused_until_it_is_observed_again(self):
+        """observe A, observe B, act in A: the shared driver holds B's snapshot and element ids (PR #48 review)."""
+        ex, stub = _executor()
+        ex.observe(W12)
+        ex.observe(W13)
+        r = ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertEqual(r["status"], "error")
+        self.assertIn("observe it again", r["why"])
+        self.assertEqual(stub.actions, [])
+        ex.observe(W12)
+        self.assertEqual(ex.perform({"kind": "click", "window": W12, "target": "B2"})["status"], "ok")
+        self.assertEqual((stub._pinned_window, stub._window_id), ("12", "12"))
+        self.assertEqual(ex.perform({"kind": "click", "window": W13, "target": "B2"})["status"], "error")
+
+    def test_an_observation_that_landed_on_another_window_is_refused(self):
+        """The driver followed another window (its read of the one asked for stayed incomplete): not an observation
+        of the window asked for, and never filed as one (PR #48 review: observe(#100) answered with #200's content)."""
+        ex, stub = _executor()
+        stub.follow = "200"
+        with self.assertRaises(RuntimeError) as cm:
+            ex.observe(W12)
+        self.assertIn("#200", str(cm.exception))
+        self.assertNotIn(W12, ex.last_obs)
+        self.assertEqual(ex.perform({"kind": "click", "window": W12, "target": "B2"})["status"], "error")
+        self.assertEqual(stub.actions, [])
+        stub.follow = None
+        ex.observe(W12)
+        self.assertEqual(ex.perform({"kind": "click", "window": W12, "target": "B2"})["status"], "ok")
+
+    def test_only_the_acted_apps_windows_that_did_not_exist_before_are_new(self):
+        """A window of another app appearing during the action is not this action's, and neither is a minimised
+        window of the acted app that a launch or an `open` brought back (PR #48 review, both rounds)."""
+        ex, stub = _executor()
+        state = {"on": [_win("12")], "off": [_win("100", title="用户的笔记")]}   # #100: the user's, minimised
+        ex._windows = lambda every=False: state["on"] + (state["off"] if every else [])   # noqa: SLF001
+        ex.observe(W12)
+
+        def restores(action):   # the action brought the minimised window back and another app opened one
+            state["on"] = state["on"] + state["off"] + [_win("77", bundle="com.apple.Safari", title="News", app="Safari")]
+            state["off"] = []
+            return ExecResult(True, "done")
+        stub.execute = restores
+        r = ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertNotIn("new_window", r)
+
+        def makes(action):      # a window that did not exist in any form before
+            state["on"] = state["on"] + [_win("14", title="未命名 2")]
+            return ExecResult(True, "done")
+        stub.execute = makes
+        r = ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertEqual(r["new_window"]["id"], f"{TE}#14")
+
+        # open_window: the same rule -- the reopen restores the user's minimised window, which is not the task's
+        state = {"on": [_win("12")], "off": [_win("101", title="用户的另一篇")]}
+        ex._windows = lambda every=False: state["on"] + (state["off"] if every else [])   # noqa: SLF001
+
+        def opens(*a, **k):
+            state["on"] = state["on"] + state["off"]
+            state["off"] = []
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=opens), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value=TE), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            r = ex.perform({"kind": "open_window", "app": "TextEdit"})
+        self.assertEqual(r["status"], "unverified")      # nothing the action made appeared
+        self.assertNotIn("new_window", r)
+
+    def test_a_failed_window_command_is_not_reported_as_done(self):
+        """peekaboo's failure (window not found, timeout, no JSON) is an error upstream, not a closed or focused
+        window (PR #48 review)."""
+        ex, _ = _executor()
+        ex._pk = lambda args: None   # noqa: SLF001 -- the command failed
+        self.assertEqual(ex.perform({"kind": "close_window", "window": W12})["status"], "error")
+        self.assertEqual(ex.perform({"kind": "focus_window", "window": W12})["status"], "error")
+        ex._pk = lambda args: {}   # noqa: SLF001 -- succeeded with nothing to say
+        self.assertEqual(ex.perform({"kind": "close_window", "window": W12})["status"], "ok")
+        self.assertEqual(ex.perform({"kind": "focus_window", "window": W12})["status"], "ok")
+
+    def test_pk_tells_failure_from_an_empty_answer(self):
+        from types import SimpleNamespace
+        ex, _ = _executor()
+        with mock.patch("deskmind_hands.executor.subprocess.run", return_value=SimpleNamespace(stdout='{"success": false, "error": "Window not found"}')):
+            self.assertIsNone(ex._pk(["window", "close"]))   # noqa: SLF001
+        with mock.patch("deskmind_hands.executor.subprocess.run", return_value=SimpleNamespace(stdout='{"success": true}')):
+            self.assertEqual(ex._pk(["window", "close"]), {})   # noqa: SLF001
+        with mock.patch("deskmind_hands.executor.subprocess.run", return_value=SimpleNamespace(stdout="not json")):
+            self.assertIsNone(ex._pk(["window", "close"]))   # noqa: SLF001
 
 
-def test_allow_flash_adds_once(monkeypatch):
-    from deskmind_hands.executor import allow_flash
-    monkeypatch.setenv("HANDS_FLASH_APPS", "com.apple.Safari")
-    allow_flash("com.apple.TextEdit"); allow_flash("com.apple.textedit")
-    import os
-    assert os.environ["HANDS_FLASH_APPS"] == "com.apple.Safari,com.apple.TextEdit"
+class Epoch(unittest.TestCase):
+    def test_the_epoch_moves_when_the_user_or_the_windows_changed(self):
+        """A snapshot after the user's input, or after a window appeared, vanished or was renamed, is a new epoch:
+        an observation and a consent decided before it are stale upstream (PR #48 review: a delete approved for A
+        ran on B the user had selected meanwhile)."""
+        ex, stub = _executor()
+        state = {"wins": [_win("12")], "input": 0.0}
+        ex._windows = lambda every=False: state["wins"]   # noqa: SLF001
+        ex._front = lambda: "文本编辑"                      # noqa: SLF001
+        ex._last_input_at = lambda: state["input"]        # noqa: SLF001
+        e0 = ex.snapshot()["epoch"]
+        self.assertEqual(ex.snapshot()["epoch"], e0)                  # nothing happened
+        state["input"] = time.time()                                  # the user touched the Mac after the epoch was set
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)              # once per change
+        state["wins"] = [_win("12", title="hello.txt")]              # a window renamed (a save-as)
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 2)
+        state["wins"] = [_win("12", title="hello.txt"), _win("15")]   # one appeared
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 3)
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 3)
+        # the action's own input is not the user's: a perform moves the epoch once, and the input it sent during
+        # the action does not move it again at the next snapshot
+        ex.observe(W12)
+
+        def acts(action):
+            state["input"] = time.time()
+            return ExecResult(True, "done")
+        stub.execute = acts
+        ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertEqual(ex.epoch, e0 + 4)
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 4)
 
 
-def test_user_active_yields_to_takeover(monkeypatch, tmp_path):
-    import time
-    from deskmind_hands.executor import HandsExecutor, takeover_until
-    f = tmp_path / "takeover-until"
-    monkeypatch.setenv("HANDS_TAKEOVER_FILE", str(f))
-    assert takeover_until() == 0.0                                  # no file: no takeover
-    f.write_text(str(time.time() + 60))
-    assert takeover_until() > time.time()
-    ex = HandsExecutor.__new__(HandsExecutor)                        # no desktop needed for this check
-    assert ex.user_active() is False                                 # handed over: the user is not "in the way"
-    f.write_text(str(time.time() - 1))
-    assert takeover_until() < time.time()                            # expired: back to the keyboard/mouse rule
+class Sends(unittest.TestCase):
+    def test_send_controls_are_known_by_their_verb(self):
+        for role, label in [("button", "发送"), ("button", "Send"), ("button", "Send message"), ("button", "发送消息"),
+                            ("button", "提交"), ("button", "Submit"), ("button", "发布"), ("button", "Post"),
+                            ("button", "支付"), ("button", "Pay"), ("button", "下单"), ("button", "Place order"),
+                            ("menuItem", "发送…"), ("button", "Tweet")]:
+            self.assertTrue(sends(role, label), label)
+        for role, label in [("button", "回复"), ("button", "Reply"), ("button", "新邮件"), ("button", "New Message"),
+                            ("button", "保存"), ("button", "Sender"), ("textField", "发送"), ("staticText", "Send"),
+                            ("button", ""), ("button", "Sent items")]:
+            self.assertFalse(sends(role, label), label)
+
+    def test_observe_exports_sends_on_a_send_control(self):
+        ex, _ = _executor()
+        by_id = {e["id"]: e for e in ex.observe(W12)["elements"]}
+        self.assertTrue(by_id["B5"].get("sends"))       # 发送
+        self.assertNotIn("sends", by_id["B6"])          # 回复 opens a form, sends nothing
+        self.assertNotIn("sends", by_id["B2"])          # 保存
 
 
-def test_perform_carries_the_drivers_files_receipt(tmp_path):
-    ex, stub = _executor()
-    ex.workspace = tmp_path
-    ex._document = lambda window, wins: None   # noqa: SLF001 -- no desktop: the app says no document
-    target = tmp_path / "hello.txt"
-    target.write_text("hi", encoding="utf-8")
-    digest = "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"   # sha256("hi")
-    stub.execute = lambda action: ExecResult(True, "saved 'hello.txt'", files=((str(target), digest),))
-    ex.observe("com.apple.TextEdit#12")
-    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
-    assert r["status"] == "ok" and r["files"] == [{"path": str(target), "sha256": digest}] and "document" not in r
-    # a click that wrote nothing the driver knows of, in a window whose document is unknown: no receipt at all
-    stub.execute = lambda action: ExecResult(True, "done")
-    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
-    assert "files" not in r
-    # an action that cannot write a file: the receipt says so (files: [])
-    r = ex.perform({"kind": "type", "window": "com.apple.TextEdit#12", "target": "T1", "text": "x"})
-    assert r["files"] == []
-    assert ex.perform({"kind": "wait", "ms": 1})["files"] == []
+class BrowserFields(unittest.TestCase):
+    def test_an_approved_write_into_a_field_is_the_drivers_one_step_allowance(self):
+        """The layer above judged the step; the driver's guard against writing into a browser's own field takes
+        that as the allowance it asks for (PR #48 review: an approved address-bar search was always refused)."""
+        ex, stub = _executor()
+        ex.observe(W12)
+        ex.perform({"kind": "set_value", "window": W12, "target": "T1", "value": "weather"})
+        ex.perform({"kind": "type", "window": W12, "target": "T1", "text": " singapore"})
+        ex.perform({"kind": "select", "window": W12, "target": "P3", "option": "文稿"})
+        self.assertEqual(stub.allowed, ["T1", "T1", "P3"])
+        ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertEqual(stub.allowed, ["T1", "T1", "P3"])   # a click allows nothing
 
 
-def test_perform_credits_the_windows_document_only_on_the_apps_own_word_that_it_saved(tmp_path):
-    ex, stub = _executor()
-    ex.workspace = tmp_path
-    doc = tmp_path / "notes.txt"
-    doc.write_text("v1", encoding="utf-8")
-    state = {"now": (str(doc), True), "text": "v1"}   # what the app's scripting says: the document, unsaved, its text
-    ex._document = lambda window, wins: state["now"]   # noqa: SLF001
-    import hashlib
-    ex._content_digest = lambda window, wins: hashlib.sha256(state["text"].encode()).hexdigest() if state["text"] is not None else None   # noqa: SLF001
-    ex.observe("com.apple.TextEdit#12")
-    # a click that saves nothing: still unsaved after -> the document is reported, no file is credited
-    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "T1"})
-    assert r["document"] == str(doc) and "files" not in r
-
-    # the file changed on disk during the action but the app does not say it saved (a sync program wrote it):
-    # not credited
-    def disk_only(action):
-        doc.write_text("someone else's v2", encoding="utf-8")
-        return ExecResult(True, "done")
-    stub.execute = disk_only
-    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
-    assert "files" not in r and r["document"] == str(doc)
-
-    # cmd+S through the app: unsaved before, saved after -> the app's own word, credited
-    def save(action):
-        doc.write_text("someone else's v4", encoding="utf-8")   # the app wrote v3; a sync program wrote over it at once
-        state["now"], state["text"] = (str(doc), False), "v3"
-        return ExecResult(True, "pressed; could not be confirmed", indeterminate=True)
-    stub.execute = save
-    r = ex.perform({"kind": "key", "window": "com.apple.TextEdit#12", "chord": "cmd+s"})
-    # the digest is of what the app holds, so upstream's match against the disk fails and nothing is credited
-    assert r["status"] == "unverified" and r["files"] == [{"path": str(doc), "sha256": hashlib.sha256(b"v3").hexdigest()}]
-    assert r["files"][0]["sha256"] != hashlib.sha256(doc.read_bytes()).hexdigest()
-    # saved again with nothing to save: no flip, nothing credited
-    stub.execute = lambda action: ExecResult(True, "done")
-    r = ex.perform({"kind": "key", "window": "com.apple.TextEdit#12", "chord": "cmd+s"})
-    assert "files" not in r
-
-    # a never-saved document (no path, unsaved) saved through the app's own panel under a new name: credited
-    moved = tmp_path / "renamed.txt"
-    state["now"] = (None, True)
-
-    def save_as(action):
-        moved.write_text("v3", encoding="utf-8")
-        state["now"], state["text"] = (str(moved), False), None   # the app does not give its text
-        return ExecResult(True, "done")
-    stub.execute = save_as
-    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
-    assert r["files"] == [{"path": str(moved)}] and r["document"] == str(moved)   # the path alone: told, not credited
-
-    # only the path is known (accessibility, no scripting): never credited, only told
-    state["now"] = (str(moved), None)
-    stub.execute = disk_only
-    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
-    assert "files" not in r and r["document"] == str(moved)
-
-
-def test_a_drivers_scratch_document_is_never_a_file_of_the_task(tmp_path):
-    ex, stub = _executor()
-    ex.workspace = tmp_path
-    scratch = tmp_path / ".hands" / "未命名-1"
-    scratch.parent.mkdir()
-    scratch.write_text("", encoding="utf-8")
-    state = {"now": (str(scratch), True)}
-    ex._document = lambda window, wins: state["now"]   # noqa: SLF001 -- a new document's path until it is saved as
-    ex.observe("com.apple.TextEdit#12")
-
-    def pressed(action):
-        scratch.write_text("typed text", encoding="utf-8")   # cmd+S on a never-saved document went to the scratch
-        state["now"] = (str(scratch), False)
-        return ExecResult(True, "done")
-    stub.execute = pressed
-    r = ex.perform({"kind": "key", "window": "com.apple.TextEdit#12", "chord": "cmd+s"})
-    assert "files" not in r and r["document"] == str(scratch)
-    # typing never saves: the document is not even asked for
-    ex._document = lambda window, wins: (_ for _ in ()).throw(AssertionError("asked"))   # noqa: SLF001
-    r = ex.perform({"kind": "type", "window": "com.apple.TextEdit#12", "target": "T1", "text": "more"})
-    assert r["files"] == [] and "document" not in r
-
-
-def test_an_action_in_a_window_the_driver_is_not_on_is_refused_until_it_is_observed_again():
-    """observe A, observe B, act in A: the shared driver holds B's snapshot and element ids (PR #48 review)."""
-    ex, stub = _executor()
-    ex.observe("com.apple.TextEdit#12")
-    ex.observe("com.apple.TextEdit#13")
-    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
-    assert r["status"] == "error" and "observe it again" in r["why"] and stub.actions == []
-    ex.observe("com.apple.TextEdit#12")
-    assert ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})["status"] == "ok"
-    assert stub._pinned_window == "12" and stub._window_id == "12"
-    # another app's driver is its own: untouched by this one's bookkeeping
-    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#13", "target": "B2"})
-    assert r["status"] == "error"
-
-
-def test_only_the_acted_apps_windows_are_reported_as_new(monkeypatch):
-    """A window of another app appearing during the action (the user's, a notification) is not this action's
-    (PR #48 review: a TextEdit click credited a Safari window)."""
-    ex, stub = _executor()
-    calls = {"n": 0}
-    base = [{"id": "com.apple.TextEdit#12", "app": "文本编辑", "bundle": "com.apple.TextEdit", "title": "未命名", "pid": 1, "bounds": None}]
-
-    def windows():
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return list(base)
-        return base + [{"id": "com.apple.Safari#77", "app": "Safari", "bundle": "com.apple.Safari", "title": "News", "pid": 2, "bounds": None},
-                       {"id": "com.apple.TextEdit#14", "app": "文本编辑", "bundle": "com.apple.TextEdit", "title": "未命名 2", "pid": 1, "bounds": None}]
-    ex._windows = windows   # noqa: SLF001
-    ex._document = lambda window, wins: None   # noqa: SLF001
-    ex.observe("com.apple.TextEdit#12")
-    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
-    assert r["new_window"]["id"] == "com.apple.TextEdit#14"
-    # open_window: the same rule
-    monkeypatch.setattr("deskmind_hands.executor.subprocess.run", lambda *a, **k: None)
-    monkeypatch.setattr("deskmind_hands.executor.resolve_app", lambda *a: "com.apple.TextEdit")
-    monkeypatch.setattr("deskmind_hands.executor.time.sleep", lambda s: None)
-    calls["n"] = 0
-    r = ex.perform({"kind": "open_window", "app": "TextEdit"})
-    assert r["status"] == "ok" and r["new_window"]["id"] == "com.apple.TextEdit#14"
-
-
-def test_a_failed_window_command_is_not_reported_as_done():
-    """peekaboo's failure (window not found, timeout, no JSON) is an error upstream, not a closed or focused window
-    (PR #48 review)."""
-    ex, _ = _executor()
-    ex._pk = lambda args: None   # noqa: SLF001 -- the command failed
-    assert ex.perform({"kind": "close_window", "window": "com.apple.TextEdit#12"})["status"] == "error"
-    assert ex.perform({"kind": "focus_window", "window": "com.apple.TextEdit#12"})["status"] == "error"
-    ex._pk = lambda args: {}   # noqa: SLF001 -- succeeded with nothing to say
-    assert ex.perform({"kind": "close_window", "window": "com.apple.TextEdit#12"})["status"] == "ok"
-    assert ex.perform({"kind": "focus_window", "window": "com.apple.TextEdit#12"})["status"] == "ok"
-
-
-def test_pk_tells_failure_from_an_empty_answer(monkeypatch):
-    from types import SimpleNamespace
-    ex, _ = _executor()
-    monkeypatch.setattr("deskmind_hands.executor.subprocess.run", lambda *a, **k: SimpleNamespace(stdout='{"success": false, "error": "Window not found"}'))
-    assert ex._pk(["window", "close"]) is None   # noqa: SLF001
-    monkeypatch.setattr("deskmind_hands.executor.subprocess.run", lambda *a, **k: SimpleNamespace(stdout='{"success": true}'))
-    assert ex._pk(["window", "close"]) == {}   # noqa: SLF001
-    monkeypatch.setattr("deskmind_hands.executor.subprocess.run", lambda *a, **k: SimpleNamespace(stdout="not json"))
-    assert ex._pk(["window", "close"]) is None   # noqa: SLF001
+if __name__ == "__main__":
+    unittest.main()

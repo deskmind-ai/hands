@@ -90,14 +90,15 @@ def _pick(lines: str, title: str, bounds: list | None) -> DocState | None:
         rows.append((name, doc, xy, modified))
     same = [r for r in rows if r[0] == (title or "")]
     # position tells same-titled windows apart on the accessibility rows; an app's scripted `bounds` is not the
-    # screen rectangle (TextEdit, 10-19), so on those rows nothing is near and the first same-titled window is taken
+    # screen rectangle (TextEdit, 10-19), so on those rows nothing is near. Two windows with the same title that
+    # cannot be told apart are unknown, never "the first one" (PR #48 review: the user's notes.txt for the task's).
     if len(same) > 1 and bounds and None not in bounds[:2]:
         x, y = float(bounds[0]), float(bounds[1])
         near = [r for r in same if r[2] is not None and abs(r[2][0] - x) < 2 and abs(r[2][1] - y) < 2]
-        same = near or same
+        same = near
     if not same and len(rows) == 1 and not title:
         same = rows
-    return (same[0][1], same[0][3]) if same else None
+    return (same[0][1], same[0][3]) if len(same) == 1 else None
 
 
 def window_document(pid: int, bundle: str, title: str, bounds: list | None) -> DocState | None:
@@ -128,6 +129,8 @@ def window_document(pid: int, bundle: str, title: str, bounds: list | None) -> D
         else:
             from_sc = _pick(sc, title, bounds)
             if from_sc is not None:
+                if from_ax and from_ax[0] and from_sc[0] and from_sc[0] != from_ax[0]:
+                    return (from_ax[0], None)      # the scripting matched another window of that title: its flag is not this one's
                 return (from_sc[0] or (from_ax[0] if from_ax else None), from_sc[1])
     return from_ax
 
@@ -144,9 +147,11 @@ def document_text(bundle: str, title: str, bounds: list | None) -> str | None:
     # by title only: an app's scripted `bounds of window` is not the screen rectangle Quartz reports (TextEdit gave
     # 152,73 for a window Quartz placed at 212,114 on 10-19), so `bounds` cannot tell same-titled windows apart here
     del bounds
-    out = _osa(f'tell application id "{_q(bundle)}"\nrepeat with w in windows\ntry\n'
-               f'if (name of w) is "{_q(title or "")}" then return "ok" & linefeed & (text of document of w)\n'
-               'end try\nend repeat\nreturn ""\nend tell')
+    # one window of that title, or unknown: two cannot be told apart here, and the first one's text was another
+    # document's (PR #48 review)
+    out = _osa(f'tell application id "{_q(bundle)}"\nset n to 0\nset t to ""\nrepeat with w in windows\ntry\n'
+               f'if (name of w) is "{_q(title or "")}" then\nset n to n + 1\nset t to (text of document of w)\nend if\n'
+               'end try\nend repeat\nif n is 1 then return "ok" & linefeed & t\nreturn "n=" & n\nend tell')
     if out is None:
         _NO_SCRIPTING.add(bundle)
         return None

@@ -156,6 +156,28 @@ def installed_apps() -> list[tuple[str, str]]:
     return out
 
 
+#: Verbs whose control sends something out of the machine (a message, a post, a payment, an order): the floor
+#: upstream for activating one is `external`, consent needed. A vocabulary of the verbs themselves, in the languages
+#: this runs in, matched on the control's own label -- structure, not a model's reading -- and never a verb that only
+#: opens a form (reply, compose, new message).
+SENDS = {"send", "post", "submit", "publish", "tweet", "share", "pay", "purchase", "buy", "place order", "checkout",
+         "send message", "send mail", "send email", "send now", "confirm payment",
+         "发送", "发布", "提交", "发表", "分享", "支付", "付款", "购买", "下单", "结算", "确认支付", "确认付款", "发出"}
+
+
+def sends(role: str, label: str) -> bool:
+    """Whether activating a control with this role and label sends something out, by SENDS: the label is the verb,
+    or starts with it (「发送消息」, "Send message"), in a control that can be pressed."""
+    if (role or "").lower() not in ("button", "menuitem", "menubutton", "link", "radiobutton", "toolbarbutton", ""):
+        return False
+    text = (label or "").strip().rstrip("…").rstrip(".").strip().lower()
+    if not text:
+        return False
+    if text in SENDS:
+        return True
+    return any(text.startswith(v + " ") or (not v.isascii() and text.startswith(v)) for v in SENDS)
+
+
 def _app_name_of_pid(pid: int) -> str:
     app = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid) if AppKit else None
     return (app.localizedName() if app else None) or ""
@@ -172,6 +194,12 @@ class HandsExecutor:
         #: GUI lands where the task's own file tools and the verdict look.
         self.workspace = Path(workspace) if workspace else self.scratch
         self.epoch = 1
+        #: When the epoch was last set, and the inventory it was set on: a user's input after that moment, or a
+        #: window appearing, vanishing or renamed, moves the epoch at the next snapshot, so an observation and a
+        #: consent decided before it are stale upstream (PR #48 review: a delete approved for A ran on B the user
+        #: had selected meanwhile).
+        self._epoch_at = time.time()
+        self._inventory: tuple | None = None
         self.drivers: dict[str, object] = {}
         self.last_obs: dict[str, Observation] = {}       # window id -> last observation (for bindings)
         #: bundle -> the window its driver observed last: the one whose snapshot and element ids the driver holds.
@@ -188,17 +216,19 @@ class HandsExecutor:
         d = Quartz.CGSessionCopyCurrentDictionary() or {}
         return bool(d.get("CGSSessionScreenIsLocked", 0))
 
-    def _windows(self) -> list[dict]:
+    def _windows(self, every: bool = False) -> list[dict]:
+        """The windows on screen; with `every`, the minimised and hidden ones too (what a launch or `open` brings
+        back is not a window the action made -- PR #48 review: the user's minimised Safari window passed for new)."""
         if Quartz is None:
-            return self._windows_via_peekaboo()
-        wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly
-                                                 | Quartz.kCGWindowListExcludeDesktopElements, 0) or []
+            return self._windows_via_peekaboo(every)
+        option = Quartz.kCGWindowListOptionAll if every else Quartz.kCGWindowListOptionOnScreenOnly
+        wins = Quartz.CGWindowListCopyWindowInfo(option | Quartz.kCGWindowListExcludeDesktopElements, 0) or []
         out = []
         for w in wins:
             if w.get("kCGWindowLayer", 0) != 0:
                 continue
             b = w.get("kCGWindowBounds") or {}
-            if (b.get("Width") or 0) < 40 or (b.get("Height") or 0) < 40:
+            if not every and ((b.get("Width") or 0) < 40 or (b.get("Height") or 0) < 40):
                 continue
             pid = int(w.get("kCGWindowOwnerPID") or 0)
             bundle = _bundle_of_pid(pid)
@@ -209,7 +239,7 @@ class HandsExecutor:
                         "bounds": [b.get("X"), b.get("Y"), b.get("Width"), b.get("Height")]})
         return out
 
-    def _windows_via_peekaboo(self) -> list[dict]:
+    def _windows_via_peekaboo(self, every: bool = False) -> list[dict]:
         out = []
         apps = (self._pk(["app", "list", "--json"]) or {}).get("apps") or []
         for a in apps:
@@ -220,11 +250,15 @@ class HandsExecutor:
                 continue
             data = self._pk(["window", "list", "--app", bundle, "--json"]) or {}
             for w in data.get("windows") or []:
-                if w.get("window_id") is None or not w.get("is_on_screen", True):
+                if w.get("window_id") is None or (not every and not w.get("is_on_screen", True)):
                     continue
                 out.append({"id": f"{bundle}#{w['window_id']}", "app": a.get("name") or bundle, "bundle": bundle,
                             "title": w.get("window_title") or "", "pid": a.get("pid"), "bounds": None})
         return out
+
+    def _known_windows(self) -> set[str]:
+        """Every window that exists now, on screen or not: a window not among these afterwards was made meanwhile."""
+        return {w["id"] for w in self._windows(every=True)}
 
     def _pk(self, args: list[str]) -> dict | None:
         """Peekaboo's data for a command; None when the command failed, timed out or answered no JSON -- a caller
@@ -260,9 +294,25 @@ class HandsExecutor:
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
         return idle < self.USER_ACTIVE_S
 
+    def _last_input_at(self) -> float:
+        """When the keyboard or mouse was last touched (epoch seconds); 0 when it cannot be known."""
+        if Quartz is None:
+            return 0.0
+        idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
+        return time.time() - idle
+
+    def _advance(self) -> None:
+        self.epoch += 1
+        self._epoch_at = time.time()
+
     def snapshot(self) -> dict:
         wins = self._windows()
         front = self._front()
+        # anything that changed the computer since the epoch was set moves it: the user's input, or the windows
+        inventory = (front, tuple(sorted((w["id"], w["title"]) for w in wins)))
+        if self._last_input_at() > self._epoch_at or (self._inventory is not None and inventory != self._inventory):
+            self._advance()
+        self._inventory = inventory
         return {"epoch": self.epoch, "locked": self.locked(), "front_app": front, "user_active": self.user_active(),
                 "windows": [{"id": w["id"], "app": w["app"], "title": w["title"], "focused": w["app"] == front} for w in wins]}
 
@@ -289,6 +339,15 @@ class HandsExecutor:
         d._pinned_window = wid or None
         d._window_id = wid or None
         obs: Observation = d.observe()
+        landed = getattr(d, "_pinned_window", None)
+        if wid and landed not in (None, wid):
+            # the driver followed another window (its own read of the one asked for stayed incomplete): that is not
+            # an observation of this window, and filed as one it bound later actions to the other's snapshot and
+            # element ids (PR #48 review)
+            self.last_obs.pop(window, None)
+            self.current.pop(bundle, None)
+            raise RuntimeError(f"window {window} could not be read; the driver read {bundle}#{landed} instead -- "
+                               f"observe that window, or this one again")
         self.last_obs[window] = obs
         self.current[bundle] = window
         els = []
@@ -303,6 +362,8 @@ class HandsExecutor:
             if role.lower() in {"statictext", "text"} and (e.value or e.label):
                 texts.append(e.value or e.label)
             el = {"id": e.id, "role": role, "label": e.label, "actions": actions}
+            if sends(role, e.label):
+                el["sends"] = True
             if e.value is not None:
                 el["value"] = e.value
             if e.options:
@@ -331,7 +392,7 @@ class HandsExecutor:
         if getattr(self, "stopped", False):
             return {"status": "error", "why": "stopped by the app"}
         kind = action.get("kind")
-        self.epoch += 1
+        self._advance()
         if kind == "wait":
             time.sleep(min(float(action.get("ms") or 0) / 1000, 30))
             return {"status": "ok", "files": []}
@@ -383,7 +444,11 @@ class HandsExecutor:
         except Exception as e:  # noqa: BLE001 -- an action the model wrote wrong is its mistake to read
             return {"status": "error", "why": str(e)}
         wins = self._windows()
-        before = {w["id"] for w in wins}
+        if kind in ("set_value", "type", "select") and action.get("target") and hasattr(d, "allow_browser_field"):
+            # the layer above judged this step (its judge, or the person); the driver's own guard against writing
+            # into a browser's address bar or search field takes that as the one-step allowance it asks for
+            d.allow_browser_field(action.get("target"))
+        before = self._known_windows()
         # the window's document is read only around an action that can save (a click, a key chord, a choice):
         # typing and scrolling never write a file, and each read asks the app (up to two osascript runs)
         may_save = kind in self.SAVING_KINDS
@@ -396,8 +461,9 @@ class HandsExecutor:
         # any action can open a window (a "new document" button, a sheet that becomes a window): reported so the
         # ledger upstream can credit it to the task, as it does for open_window
         wins = self._windows()
-        # ... a window of the acted app only: another app's window appearing meanwhile (the user's, or a
-        # notification) is not this action's (PR #48 review: a TextEdit click credited a Safari window)
+        # ... a window of the acted app only, and one that did not exist before (a minimised window brought back is
+        # not new): another app's window appearing meanwhile (the user's, a notification) is not this action's
+        # (PR #48 review: a TextEdit click credited a Safari window; a restored window passed for made)
         fresh = [w for w in wins if w["id"] not in before and w["bundle"] == bundle]
         if fresh:
             w = fresh[-1]
@@ -427,6 +493,7 @@ class HandsExecutor:
             out["files"] = []
         if doc1:
             out["document"] = doc1
+        self._epoch_at = time.time()     # the input this action itself sent is not the user's
         return out
 
     def _document(self, window: str, wins: list[dict]) -> tuple[str | None, bool | None] | None:
@@ -460,7 +527,7 @@ class HandsExecutor:
         """Open a window of `app` (a bundle id, or a name as the snapshot shows it) and wait for it. No app is named
         in code: the name is resolved to a bundle id generically, and a new document is asked for the way any
         document-based app answers (its own scripting, by bundle id), then by the keyboard."""
-        before = {w["id"] for w in self._windows()}
+        before = self._known_windows()
         bundle = resolve_app(app, running_apps(), installed_apps())
         if not bundle:
             return {"status": "unsupported", "why": f"no application called {app!r} is running or installed"}

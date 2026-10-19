@@ -12,13 +12,17 @@ def test_document_values_become_posix_paths():
 
 
 def test_the_window_is_picked_by_title_then_position():
-    rows = ("notes.txt\tfile:///ws/one/notes.txt\t10\t20\n"
-            "notes.txt\tfile:///ws/two/notes.txt\t400\t20\n"
-            "未命名\t\t0\t0\n")
-    assert ad._pick(rows, "notes.txt", [400, 20, 500, 300]) == "/ws/two/notes.txt"
-    assert ad._pick(rows, "notes.txt", None) == "/ws/one/notes.txt"
-    assert ad._pick(rows, "未命名", None) is None            # no document yet
+    rows = ("notes.txt\tfile:///ws/one/notes.txt\t10\t20\ttrue\n"
+            "notes.txt\tfile:///ws/two/notes.txt\t400\t20\tfalse\n"
+            "未命名\t\t0\t0\ttrue\n"
+            "ghost\t\t0\t0\t\n")
+    assert ad._pick(rows, "notes.txt", [400, 20, 500, 300]) == ("/ws/two/notes.txt", False)
+    assert ad._pick(rows, "notes.txt", None) == ("/ws/one/notes.txt", True)
+    assert ad._pick(rows, "未命名", None) == (None, True)     # never saved: no path, unsaved changes
+    assert ad._pick(rows, "ghost", None) is None              # neither known: not a document window
     assert ad._pick(rows, "other", None) is None
+    # accessibility rows carry no modified column: the path alone
+    assert ad._pick("a.txt\tfile:///ws/a.txt\t1\t2\n", "a.txt", None) == ("/ws/a.txt", None)
 
 
 def test_an_app_whose_scripting_hangs_is_asked_once(monkeypatch):

@@ -4260,6 +4260,10 @@ class PeekabooDriver:
         turns false) and never answers the Apple Event: every save timed out, and was reported as a failure the
         planner retried. The save is sent ignoring the reply; success is the document no longer being modified."""
         doc = self._q(name)
+        # The receipt needs a save to have happened: unsaved changes before, none after. A save of a document with
+        # nothing to save writes nothing the task can be credited with (PR #16 review, eighth round).
+        ok, before = self._osa(f'tell application "TextEdit" to get modified of (first document whose name is "{doc}")')
+        was_modified = ok and before.strip() == "true"
         self._osa('ignoring application responses\n'
                   f'  tell application "TextEdit" to save (first document whose name is "{doc}")\n'
                   'end ignoring')
@@ -4270,9 +4274,12 @@ class PeekabooDriver:
                 self._scripted_actions += 1
                 # The receipt: where the document was written, asked of TextEdit by the same query
                 # _open_workspace_documents uses. The driver's own scratch file is not a file the task wrote.
-                ok, where = self._osa(f'tell application "TextEdit" to get path of (first document whose name is "{doc}")')
-                written = self._receipt(where.strip()) if ok else ()
-                return ExecResult(True, f"saved {name!r} (scripted, in the background)", files=written)
+                written: tuple[str, ...] = ()
+                if was_modified:
+                    ok, where = self._osa(f'tell application "TextEdit" to get path of (first document whose name is "{doc}")')
+                    written = self._receipt(where.strip()) if ok else ()
+                return ExecResult(True, f"saved {name!r} (scripted, in the background)" if was_modified
+                                  else f"{name!r} had no unsaved changes; nothing to save", files=written)
         return ExecResult(False, f"could not confirm that {name!r} was saved")
 
     def _receipt(self, *paths: str) -> tuple[str, ...]:

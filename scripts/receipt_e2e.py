@@ -5,11 +5,12 @@ JSON protocol (begin / observe / perform / end), as harness drives it.
 
 Needs an unlocked Mac with the peekaboo CLI and the accessibility permissions hands already uses. It opens its own
 draft document in TextEdit in the background, saves it as hello.txt in a temporary task folder through the driver's
-projected save-as, presses cmd+S on the result, prints the two replies, and closes only the documents it opened
-(TextEdit is quit again if this script launched it). Nothing of the user's is touched.
+projected save-as, presses cmd+S on the unchanged result, edits the document (by TextEdit's scripting, standing in
+for the user's typing) and presses cmd+S again, prints the replies, and closes only the documents it opened (TextEdit
+is quit again if this script launched it). Nothing of the user's is touched.
 
-Pass: the save-as reply carries files == [<task folder>/hello.txt]; the cmd+S reply carries that file too (the
-scripted save rewrote it) and document == the same path; no files: [] is claimed for either.
+Pass: the save-as reply carries files == [<task folder>/hello.txt]; the first cmd+S (nothing to save) carries no
+files and document == that path; the second cmd+S (unsaved changes before, none after) carries the file again.
 """
 from __future__ import annotations
 
@@ -81,11 +82,21 @@ def main() -> int:
         else:
             call("observe", window=win2["id"])
             r = call("perform", action={"kind": "key", "window": win2["id"], "chord": "cmd+s"})
-            show("CMD+S", r)
-            if str(target) not in (r.get("files") or []):
-                failures.append(f"cmd+S receipt: expected {target} in files, got {r.get('files')!r}")
-            if r.get("document") not in (None, str(target)):
+            show("CMD+S (nothing to save)", r)
+            if "files" in r and r["files"]:
+                failures.append(f"cmd+S with nothing to save claimed files: {r['files']!r}")
+            if r.get("document") != str(target):
                 failures.append(f"cmd+S document: expected {target}, got {r.get('document')!r}")
+            # the user types into the document (stood in for by TextEdit's scripting), then saves
+            subprocess.run(["osascript", "-e", 'tell application "TextEdit" to set text of (first document whose name is "hello.txt") to "hello, edited"'],
+                           capture_output=True, timeout=20)
+            call("observe", window=win2["id"])
+            r = call("perform", action={"kind": "key", "window": win2["id"], "chord": "cmd+s"})
+            show("CMD+S (after an edit)", r)
+            if r.get("files") != [str(target)]:
+                failures.append(f"cmd+S after an edit: expected files == [{target}], got {r.get('files')!r}")
+            if target.exists() and "edited" not in target.read_text(encoding="utf-8"):
+                failures.append("the edit was not saved to hello.txt")
         call("end")
     except Exception as e:  # noqa: BLE001 -- reported below, after the cleanup
         failures.append(str(e))

@@ -10,8 +10,10 @@ Two generic sources, no app named in code:
    even when the app exposes no accessibility windows yet -- a TextEdit launched in the background (`open -g`)
    had no AX windows at all ten seconds after launch (10-19), while its scripting answered at once.
 
-It is how the execution layer tells which file a save through the app's own panel or cmd+S went to: the window's
-document before and after the action, and whether that file changed meanwhile.
+It is how the execution layer tells which file a save through the app's own panel or cmd+S went to, and whether a
+save happened at all: the window's document before and after the action, with the document's `modified` flag from
+the Standard Suite. A file that merely changed on disk proves nothing (a sync program may have written it at that
+moment); a document that was unsaved before the action and saved after it is the app's own word that it saved.
 
 Not PyObjC: on this macOS (27.2) ApplicationServices.AXUIElementCopyAttributeValue returned the application element
 in place of every window, for every app (10-19), so the bridge cannot enumerate windows.
@@ -62,24 +64,30 @@ def _osa(script: str) -> str | None:
     return p.stdout if p.returncode == 0 else ""
 
 
-def _pick(lines: str, title: str, bounds: list | None) -> str | None:
-    """Among "name<TAB>document<TAB>x<TAB>y" lines, the document of the window titled `title`; among several, the one
-    at `bounds`' position; a single untitled match when the title is empty."""
+#: What is known of a window's document: its path (None for a document never saved, or an app that does not say) and
+#: whether it has unsaved changes (None when the app's scripting did not answer that).
+DocState = tuple[str | None, bool | None]
+
+
+def _pick(lines: str, title: str, bounds: list | None) -> DocState | None:
+    """Among "name<TAB>document<TAB>x<TAB>y<TAB>modified" lines, the state of the window titled `title`; among
+    several, the one at `bounds`' position; a single untitled match when the title is empty. None: no such window."""
     rows = []
     for line in lines.splitlines():
         parts = line.split("\t")
         if len(parts) < 2:
             continue
         name, doc = parts[0], _posix(parts[1])
-        if not doc:
-            continue
         xy = None
         if len(parts) >= 4:
             try:
                 xy = (float(parts[2]), float(parts[3]))
             except ValueError:
                 xy = None
-        rows.append((name, doc, xy))
+        modified = {"true": True, "false": False}.get(parts[4].strip().lower()) if len(parts) >= 5 else None
+        if doc is None and modified is None:
+            continue
+        rows.append((name, doc, xy, modified))
     same = [r for r in rows if r[0] == (title or "")]
     if len(same) > 1 and bounds and None not in bounds[:2]:
         x, y = float(bounds[0]), float(bounds[1])
@@ -87,31 +95,36 @@ def _pick(lines: str, title: str, bounds: list | None) -> str | None:
         same = near or same
     if not same and len(rows) == 1 and not title:
         same = rows
-    return same[0][1] if same else None
+    return (same[0][1], same[0][3]) if same else None
 
 
-def window_document(pid: int, bundle: str, title: str, bounds: list | None) -> str | None:
-    """The POSIX path of the document shown by the window titled `title` of the app `bundle` (pid `pid`), at
-    `bounds` ([x, y, w, h] in screen points, or None), or None when the app does not say."""
+def window_document(pid: int, bundle: str, title: str, bounds: list | None) -> DocState | None:
+    """(path, modified) of the document shown by the window titled `title` of the app `bundle` (pid `pid`), at
+    `bounds` ([x, y, w, h] in screen points, or None); None when the app does not say. `modified` is known only
+    through the app's scripting (accessibility has no such attribute), so a state from AXDocument alone is
+    (path, None)."""
     # 1. accessibility, through System Events (any app that exposes its windows and sets AXDocument)
     ax = _osa(f'tell application "System Events" to tell (first process whose unix id is {int(pid)})\n'
               'set r to ""\nrepeat with w in windows\ntry\n'
               'set p to position of w\n'
               'set r to r & (name of w) & tab & (value of attribute "AXDocument" of w) & tab & (item 1 of p) & tab & (item 2 of p) & linefeed\n'
               'end try\nend repeat\nreturn r\nend tell')
-    doc = _pick(ax or "", title, bounds)
-    if doc:
-        return doc
-    # 2. the app's own scripting (the Standard Suite: a document window's document has a path)
-    if not bundle or bundle in _NO_SCRIPTING:
-        return None
-    sc = _osa(f'tell application id "{_q(bundle)}"\nset r to ""\nrepeat with w in windows\ntry\n'
-              'set b to bounds of w\n'
-              'set r to r & (name of w) & tab & (POSIX path of (path of document of w as text)) & tab & (item 1 of b) & tab & (item 2 of b) & linefeed\n'
-              'on error\ntry\n'
-              'set r to r & (name of w) & tab & (path of document of w) & tab & "" & tab & "" & linefeed\n'
-              'end try\nend try\nend repeat\nreturn r\nend tell')
-    if sc is None:
-        _NO_SCRIPTING.add(bundle)
-        return None
-    return _pick(sc, title, bounds)
+    from_ax = _pick(ax or "", title, bounds)
+    # 2. the app's own scripting (the Standard Suite: a document window's document has a path and a modified flag;
+    #    a document never saved has the flag and no path). Asked even when accessibility gave the path: only the
+    #    scripting says whether the document is saved.
+    if bundle and bundle not in _NO_SCRIPTING:
+        sc = _osa(f'tell application id "{_q(bundle)}"\nset r to ""\nrepeat with w in windows\ntry\n'
+                  'set d to document of w\nset p to ""\nset m to ""\nset x to ""\nset y to ""\n'
+                  'try\nset p to POSIX path of (path of d as text)\non error\ntry\nset p to (path of d as text)\nend try\nend try\n'
+                  'try\nset m to (modified of d) as text\nend try\n'
+                  'try\nset b to bounds of w\nset x to item 1 of b\nset y to item 2 of b\nend try\n'
+                  'set r to r & (name of w) & tab & p & tab & x & tab & y & tab & m & linefeed\n'
+                  'end try\nend repeat\nreturn r\nend tell')
+        if sc is None:
+            _NO_SCRIPTING.add(bundle)
+        else:
+            from_sc = _pick(sc, title, bounds)
+            if from_sc is not None:
+                return (from_sc[0] or (from_ax[0] if from_ax else None), from_sc[1])
+    return from_ax

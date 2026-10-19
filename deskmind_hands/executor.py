@@ -9,9 +9,9 @@ One JSON request per line on stdin, one JSON reply per line on stdout (`{"id", "
     observe   {window, screenshot?}      one window close up: elements, dialog, text
     perform   {action}                   one generic action (click, set_value, type, select, key, scroll,
                                          open_window, close_window, focus_window, wait); its reply carries
-                                         `files` (absolute paths this action wrote: the driver's receipt, or the
-                                         window's own document when it changed) and `document` (the file the
-                                         window shows afterwards, when the app says)
+                                         `files` (absolute paths this action wrote: the driver's own writes, or
+                                         the window's document when the app says it saved it during the action)
+                                         and `document` (the file the window shows afterwards, when the app says)
     stop      {}                         the app's stop switch: every later perform is refused
     end       {}
 
@@ -370,8 +370,7 @@ class HandsExecutor:
         # the window's document is read only around an action that can save (a click, a key chord, a choice):
         # typing and scrolling never write a file, and each read asks the app (up to two osascript runs)
         may_save = kind in self.SAVING_KINDS
-        doc0 = self._document(window, wins) if may_save else None
-        stamp0 = self._stamp(doc0)
+        state0 = self._document(window, wins) if may_save else None
         res: ExecResult = d.execute(a)
         status = "ok" if res.ok else "unsupported" if res.unsupported else "error"
         if res.ok and res.indeterminate:
@@ -384,12 +383,15 @@ class HandsExecutor:
         if fresh:
             w = fresh[-1]
             out["new_window"] = {"id": w["id"], "app": w["app"], "title": w["title"]}
-        # the files receipt: what the driver knows it wrote, plus the window's own document when the action moved
-        # it (a save-as) or changed it (a save) -- read from the window, so no app is named here. The layer above
-        # credits a screen action's files by this alone and checks each path's version itself.
-        doc1 = self._document(window, wins) if may_save else None
+        # the files receipt: what the driver knows it wrote, plus the window's own document when the app itself says
+        # it saved it during this action -- unsaved changes before (modified true), none after (false). A document
+        # that merely changed on disk is not credited: a sync program may have written it at that moment (PR #16
+        # review, eighth round). Read from the window, so no app is named here; the layer above credits a screen
+        # action's files by this alone and checks each path's version itself.
+        state1 = self._document(window, wins) if may_save else None
+        doc1 = state1[0] if state1 else None
         files = list(res.files)
-        if doc1 and (doc1 != doc0 or self._stamp(doc1) != stamp0) and self._reportable(doc1):
+        if doc1 and state0 and state0[1] is True and state1[1] is False and self._reportable(doc1):
             files.append(doc1)
         # `files: []` is a receipt too: this action could not have written a file (typing, scrolling). Around an
         # action that could, the field is there only when a write is known; left out, the driver does not know
@@ -402,23 +404,13 @@ class HandsExecutor:
             out["document"] = doc1
         return out
 
-    def _document(self, window: str, wins: list[dict]) -> str | None:
-        """The file the window shows, by its AXDocument; None when the app does not say or the window is gone."""
+    def _document(self, window: str, wins: list[dict]) -> tuple[str | None, bool | None] | None:
+        """(path, modified) of the document the window shows, asked of the app; None when the app does not say or the
+        window is gone. `modified` is None when only the path is known (accessibility, not the app's scripting)."""
         info = next((w for w in wins if w["id"] == window), None)
         if info is None or not info.get("pid"):
             return None
         return window_document(int(info["pid"]), info.get("bundle") or "", info.get("title") or "", info.get("bounds"))
-
-    @staticmethod
-    def _stamp(path: str | None) -> tuple[float, int] | None:
-        """(mtime, size) of a file, None when it is not there: whether an action wrote the window's document."""
-        if not path:
-            return None
-        try:
-            st = os.stat(path)
-            return (st.st_mtime, st.st_size)
-        except OSError:
-            return None
 
     def _reportable(self, path: str) -> bool:
         """A path that can be a task's file: it exists, and it is not a driver's scratch under the task folder's

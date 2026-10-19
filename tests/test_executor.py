@@ -313,6 +313,7 @@ class Windows(unittest.TestCase):
             state["off"] = []
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=opens), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=TE), \
+             mock.patch("deskmind_hands.executor.running_apps", return_value=[("文本编辑", TE)]), \
              mock.patch("deskmind_hands.executor.time.sleep"):
             r = ex.perform({"kind": "open_window", "app": "TextEdit"})
         self.assertEqual(r["status"], "unverified")      # nothing the action made appeared
@@ -354,7 +355,9 @@ class Epoch(unittest.TestCase):
         self.assertEqual(ex.snapshot()["epoch"], e0)                  # nothing happened
         state["input"] = time.time()                                  # the user touched the Mac after the epoch was set
         self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
-        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)              # once per change
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)              # once per input
+        ex._front = lambda: "DeskMind"                                 # noqa: SLF001 -- which app is in front is no change
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
         state["wins"] = [_win("12", title="hello.txt")]              # a window renamed (a save-as)
         self.assertEqual(ex.snapshot()["epoch"], e0 + 2)
         state["wins"] = [_win("12", title="hello.txt"), _win("15")]   # one appeared
@@ -405,6 +408,75 @@ class BrowserFields(unittest.TestCase):
         self.assertEqual(stub.allowed, ["T1", "T1", "P3"])
         ex.perform({"kind": "click", "window": W12, "target": "B2"})
         self.assertEqual(stub.allowed, ["T1", "T1", "P3"])   # a click allows nothing
+
+
+class OpenWindow(unittest.TestCase):
+    """A Mac with one app: launched, it brings its last session's windows back; asked, it makes a document."""
+
+    def _mac(self, ex, running: bool, restored: list[dict]):
+        state = {"running": running, "on": [], "off": [], "n": 30000, "events": []}
+        ex._windows = lambda every=False: state["on"] + (state["off"] if every else [])   # noqa: SLF001
+
+        def run(argv, **k):
+            state["events"].append(argv[:3] if argv[0] == "open" else argv[0])
+            if argv[:2] == ["open", "-b"] and not state["running"]:
+                state["running"] = True
+                state["on"] = state["on"] + restored            # the session comes back: the user's windows
+            elif argv[0] == "osascript" and "make new document" in argv[-1]:
+                state["n"] += 1
+                state["on"] = state["on"] + [_win(str(state["n"]), title="未命名")]
+        running_apps = lambda: [("文本编辑", TE)] if state["running"] else []   # noqa: E731
+        return state, run, running_apps
+
+    def test_windows_an_app_restores_at_launch_are_the_users_not_the_tasks(self):
+        """PR #48 review, third round: the restored window #18000 was taken for the task's; only the window that
+        appears after the explicit ask is."""
+        ex, stub = _executor()
+        state, run, running = self._mac(ex, running=False, restored=[_win("18000", title="上次的文稿")])
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
+             mock.patch("deskmind_hands.executor.running_apps", side_effect=running), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value=TE), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            r = ex.perform({"kind": "open_window", "app": "文本编辑"})
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["new_window"]["id"], f"{TE}#30001")          # the document asked for, not #18000
+        self.assertEqual(state["events"][0], ["open", "-b", TE])         # launched on its own first
+        self.assertIn("osascript", state["events"])                       # then asked explicitly
+        # the task's window is the driver's own; the restored one is not
+        self.assertIn("30001", stub.__dict__.get("_run_windows", set()))
+        self.assertNotIn("18000", stub.__dict__.get("_run_windows", set()))
+
+    def test_a_launch_that_restores_windows_and_makes_none_is_unverified(self):
+        ex, _ = _executor()
+        state, run, running = self._mac(ex, running=False, restored=[_win("18000", title="上次的文稿")])
+
+        def no_document(argv, **k):
+            run(argv, **k) if argv[0] == "open" else None               # the app answers no `make new document`
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=no_document), \
+             mock.patch("deskmind_hands.executor.running_apps", side_effect=running), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value=TE), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            r = ex.perform({"kind": "open_window", "app": "文本编辑"})
+        self.assertEqual(r["status"], "unverified")
+        self.assertNotIn("new_window", r)
+
+    def test_a_window_an_action_opened_is_registered_with_the_driver(self):
+        """The driver started after the window was made had it among the user's windows and refused to use it
+        (PR #48 review, third round)."""
+        ex, stub = _executor()
+        stub._preexisting = {"14"}        # what the driver, started late, took for the user's
+        state = {"on": [_win("12")]}
+        ex._windows = lambda every=False: state["on"]   # noqa: SLF001
+        ex.observe(W12)
+
+        def makes(action):
+            state["on"] = state["on"] + [_win("14", title="未命名 2")]
+            return ExecResult(True, "done")
+        stub.execute = makes
+        r = ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertEqual(r["new_window"]["id"], f"{TE}#14")
+        self.assertIn("14", stub.__dict__["_run_windows"])
+        self.assertNotIn("14", stub._preexisting)
 
 
 if __name__ == "__main__":

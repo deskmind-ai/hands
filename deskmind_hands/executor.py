@@ -256,6 +256,19 @@ class HandsExecutor:
                             "title": w.get("window_title") or "", "pid": a.get("pid"), "bounds": None})
         return out
 
+    @staticmethod
+    def _own(driver, wid: str) -> None:
+        """Tell the driver this window is the run's own (made by the task): its own guards (a browser window not the
+        run's is never used; a window there before the run is the user's) must not refuse it (PR #48 review: a window
+        open_window made before the driver started went into its `preexisting` set)."""
+        wid = str(wid or "")
+        if not wid:
+            return
+        getattr(driver, "__dict__", {}).setdefault("_run_windows", set()).add(wid)
+        pre = getattr(driver, "_preexisting", None)
+        if isinstance(pre, set):
+            pre.discard(wid)
+
     def _known_windows(self) -> set[str]:
         """Every window that exists now, on screen or not: a window not among these afterwards was made meanwhile."""
         return {w["id"] for w in self._windows(every=True)}
@@ -308,8 +321,12 @@ class HandsExecutor:
     def snapshot(self) -> dict:
         wins = self._windows()
         front = self._front()
-        # anything that changed the computer since the epoch was set moves it: the user's input, or the windows
-        inventory = (front, tuple(sorted((w["id"], w["title"]) for w in wins)))
+        # anything that may have changed the computer since the epoch was set moves it: the user's input, or a
+        # window that appeared, vanished or was renamed. The epoch is the signal, not the verdict: the layer above
+        # observes the target again and goes on when it reads exactly as it did when the action was decided (the
+        # user's click on its own consent card is input too, and must not stale the action it approved -- PR #48
+        # review, third round). Which app is in front is no change of anything the task looks at.
+        inventory = tuple(sorted((w["id"], w["title"]) for w in wins))
         if self._last_input_at() > self._epoch_at or (self._inventory is not None and inventory != self._inventory):
             self._advance()
         self._inventory = inventory
@@ -468,6 +485,7 @@ class HandsExecutor:
         if fresh:
             w = fresh[-1]
             out["new_window"] = {"id": w["id"], "app": w["app"], "title": w["title"]}
+            self._own(d, self._split(w["id"])[1])
         # the files receipt: what the driver knows it wrote, plus the window's own document when the app itself says
         # it saved it during this action -- unsaved changes before (modified true), none after (false). A document
         # that merely changed on disk is not credited: a sync program may have written it at that moment (PR #16
@@ -527,15 +545,23 @@ class HandsExecutor:
         """Open a window of `app` (a bundle id, or a name as the snapshot shows it) and wait for it. No app is named
         in code: the name is resolved to a bundle id generically, and a new document is asked for the way any
         document-based app answers (its own scripting, by bundle id), then by the keyboard."""
-        before = self._known_windows()
         bundle = resolve_app(app, running_apps(), installed_apps())
         if not bundle:
             return {"status": "unsupported", "why": f"no application called {app!r} is running or installed"}
-        subprocess.run(["open", "-b", bundle] + ([url] if url else []), capture_output=True, timeout=20)
-        fresh = self._fresh_windows(before, 2.5, bundle)
-        if not fresh and not url:
-            # running already, or launched without a window: ask it for a new document (any scriptable document app
-            # answers `make new document`; one that does not just errors), then try the New shortcut
+        if bundle not in {b for _, b in running_apps()}:
+            # Not running: launched first, on its own. What it brings back then -- the last session's windows, as
+            # Safari and TextEdit do -- is the user's, not a window this action made (PR #48 review, third round).
+            # Only a window that appears after the explicit ask below is the task's.
+            subprocess.run(["open", "-b", bundle], capture_output=True, timeout=20)
+            self._settled(bundle)
+        d = self._driver(bundle)      # started now, so the windows it finds are the ones there before the task's
+        before = self._known_windows()
+        if url:
+            subprocess.run(["open", "-b", bundle, url], capture_output=True, timeout=20)
+            fresh = self._fresh_windows(before, 2.5, bundle)
+        else:
+            # ask it for a new document (any scriptable document app answers `make new document`; one that does not
+            # just errors), then try the New shortcut
             subprocess.run(["osascript", "-e", f'tell application id "{bundle}"\nactivate\nmake new document\nend tell'], capture_output=True, timeout=20)
             fresh = self._fresh_windows(before, 3, bundle)
             if not fresh:
@@ -544,8 +570,22 @@ class HandsExecutor:
         if fresh:
             w = fresh[-1]
             allow_flash(bundle)   # a window the task opened is the task's: the app may be brought forward for it
+            self._own(d, self._split(w["id"])[1])
             return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "title": w["title"]}}
         return {"status": "unverified", "why": f"{app} ({bundle}) was asked to open a window; none appeared"}
+
+    def _settled(self, bundle: str, timeout: float = 10.0) -> None:
+        """Wait for a just-launched app to be running and its windows to stop changing (two readings alike)."""
+        last = None
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            time.sleep(0.5)
+            if bundle not in {b for _, b in running_apps()}:
+                continue
+            now = self._known_windows()
+            if now == last:
+                return
+            last = now
 
     def _fresh_windows(self, before: set, seconds: float, bundle: str) -> list[dict]:
         """New windows of `bundle` within `seconds`: only that app's, as the window asked for is its (PR #48 review)."""

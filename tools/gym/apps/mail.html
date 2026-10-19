@@ -38,14 +38,16 @@ function render() {
   const t = document.getElementById('list'); t.innerHTML = '';
   T.inbox.filter(m => !S.deleted.includes(m.id)).forEach(m => {
     const tr = document.createElement('tr'); if (m.id === S.selected) tr.className = 'sel';
-    tr.innerHTML = `<td>${m.from}</td><td>${m.subject}</td><td>${S.flagged.includes(m.id) ? '⚑' : ''}</td><td>${m.date}</td>`;
+    // a replied-to message carries the reply arrow every mail app shows (page v2: what a verifier can see after Send)
+    tr.innerHTML = `<td>${m.from}</td><td>${m.subject}</td><td>${S.flagged.includes(m.id) ? '⚑' : ''}${S.replies.some(r => r.to === m.id) ? '↩' : ''}</td><td>${m.date}</td>`;
     tr.onclick = () => select(m.id); t.appendChild(tr); });
   const r = document.getElementById('read');
   const m = S.selected && msg(S.selected);
   document.getElementById('flag').textContent = m && S.flagged.includes(m.id) ? T.texts.unflag : T.texts.flag;
   if (!m) { r.innerHTML = `<p>${T.texts.empty}</p>`; }
   else {
-    r.innerHTML = `<h3>${m.subject}</h3><p>${m.from}</p>` + m.body.map(l => `<p>${l}</p>`).join('');
+    r.innerHTML = `<h3>${m.subject}</h3><p>${m.from}</p>` + m.body.map(l => `<p>${l}</p>`).join('')
+      + S.replies.filter(r => r.to === m.id).map(r => `<p class="replied">↩ ${T.texts.replied || (T.texts.reply === 'Reply' ? 'Replied' : '已回复')}：${r.body}</p>`).join('');
     if (S.composing) {
       const c = document.createElement('div'); c.id = 'compose';
       c.innerHTML = `<textarea id="body" aria-label="${T.texts.body}" placeholder="${T.texts.body}"></textarea><br>

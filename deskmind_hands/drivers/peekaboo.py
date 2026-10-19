@@ -1246,6 +1246,9 @@ class PeekabooDriver:
             self._load_in_own_window(wid, url)          # bound first, by its marker title; the page after
             pending.pop(key, None)                      # loaded, or a clear reason kept why not
         self.__dict__.setdefault("_run_windows", set()).add(wid)
+        # the id the app's own script knows this window by: Safari's is the window server's, Chromium's is the
+        # browser's own; kept so a later load into this window (executor._navigate) addresses the same window
+        self.__dict__.setdefault("_own_browser_script", {})[key] = script_id or wid
         self._apart_from_others(bundle, wid, script_id or hint)
         return wid
 
@@ -1459,7 +1462,8 @@ class PeekabooDriver:
             frames = axchrome.fields_outside_page(pid) if pid else []
         except Exception:   # noqa: BLE001 -- a structure that cannot be read is no browser field
             return None
-        if axchrome.at(frames, self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2):
+        origin = getattr(self, "_origin", None)
+        if origin is not None and axchrome.at(frames, origin.x + r.x + r.w / 2, origin.y + r.y + r.h / 2):
             return self._labels_by_id.get(eid, eid)
         return None
 
@@ -1502,7 +1506,8 @@ class PeekabooDriver:
             bars = axchrome.address_bars(pid) if pid and r is not None else []
         except Exception:   # noqa: BLE001 -- unread: it may be the address bar, so it is refused as one (review)
             return refusal
-        if r is not None and axchrome.at(bars, self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2):
+        origin = getattr(self, "_origin", None)
+        if r is not None and origin is not None and axchrome.at(bars, origin.x + r.x + r.w / 2, origin.y + r.y + r.h / 2):
             return refusal
         return None
 
@@ -3863,7 +3868,7 @@ class PeekabooDriver:
             self._chord_repeat = {chord: self._chord_repeat.get(chord, 0) + 1}
             scripted = self._scripted_command(chord)
             if scripted is not None:
-                return self._settle(scripted.ok, scripted.detail)
+                return self._settle(scripted.ok, scripted.detail, files=scripted.files)
 
         if k is ActionKind.KEY and self._mcp is not None:
             # No menu route. A background click on the menu item that owns a chord is accepted and not executed
@@ -4260,6 +4265,10 @@ class PeekabooDriver:
         turns false) and never answers the Apple Event: every save timed out, and was reported as a failure the
         planner retried. The save is sent ignoring the reply; success is the document no longer being modified."""
         doc = self._q(name)
+        # The receipt needs a save to have happened: unsaved changes before, none after. A save of a document with
+        # nothing to save writes nothing the task can be credited with (PR #16 review, eighth round).
+        ok, before = self._osa(f'tell application "TextEdit" to get modified of (first document whose name is "{doc}")')
+        was_modified = ok and before.strip() == "true"
         self._osa('ignoring application responses\n'
                   f'  tell application "TextEdit" to save (first document whose name is "{doc}")\n'
                   'end ignoring')
@@ -4268,8 +4277,34 @@ class PeekabooDriver:
             ok, out = self._osa(f'tell application "TextEdit" to get modified of (first document whose name is "{doc}")')
             if ok and out.strip() == "false":
                 self._scripted_actions += 1
-                return ExecResult(True, f"saved {name!r} (scripted, in the background)")
+                # The receipt: where the document was written, asked of TextEdit by the same query
+                # _open_workspace_documents uses. The driver's own scratch file is not a file the task wrote.
+                written: tuple[tuple[str, str | None], ...] = ()
+                if was_modified:
+                    ok, where = self._osa(f'tell application "TextEdit" to get path of (first document whose name is "{doc}")')
+                    # the digest of what TextEdit holds (plain text as UTF-8, its line breaks and trailing newline as
+                    # they are -- _osa strips its output, so the generic reader is used), not of the file on disk
+                    from ..axdocument import document_text
+                    text = document_text("com.apple.TextEdit", name, None)
+                    content = text.encode("utf-8") if text is not None else None
+                    written = self._receipt(where.strip(), content) if ok else ()
+                return ExecResult(True, f"saved {name!r} (scripted, in the background)" if was_modified
+                                  else f"{name!r} had no unsaved changes; nothing to save", files=written)
         return ExecResult(False, f"could not confirm that {name!r} was saved")
+
+    def _receipt(self, path: str, data: bytes | None) -> tuple[tuple[str, str | None], ...]:
+        """`path` as a files receipt, (absolute path, SHA-256 of `data`): the content written -- the bytes this driver
+        wrote, or the app's own document text as bytes -- never the file read back from disk, which another program
+        may have rewritten since (PR #16 review, eleventh round). No `data`: the path alone, which upstream tells but
+        never credits. Empty for a relative path and for the driver's own scratch under .hands/."""
+        import hashlib
+        if not path or not path.startswith("/"):
+            return ()
+        full = Path(os.path.realpath(path))
+        scratch = (Path(os.path.realpath(str(self.ws))) / ".hands") if getattr(self, "ws", None) is not None else None
+        if scratch is not None and (full == scratch or scratch in full.parents):
+            return ()
+        return ((str(full), hashlib.sha256(data).hexdigest() if data is not None else None),)
 
     def _textedit_projected(self, eid: str, action: Action) -> ExecResult | None:
         pending = self.__dict__.setdefault("_pending_saveas", {})
@@ -4339,7 +4374,8 @@ class PeekabooDriver:
             ok, text = self._osa(f'tell application "TextEdit" to get text of (first document whose name is "{doc}")')
             if not ok:
                 return self._settle(False, f"could not read the document to save it as {name!r}: {text[:160]}")
-            target.write_text(text.replace("\r", "\n"), encoding="utf-8")
+            written = text.replace("\r", "\n").encode("utf-8")
+            target.write_bytes(written)
             self._osa(f'tell application "TextEdit" to close (first document whose name is "{doc}") saving no')
             old = Path(os.path.realpath(str(self.ws))) / ".hands" / self._window_title
             if old.exists():
@@ -4363,7 +4399,8 @@ class PeekabooDriver:
             self._window_title = name
             # "saved '<name>'" first, the form a save is recorded in: "saved the document as ..." was never read as
             # a save, and the oracle labelled one more 保存 after every save-as (audit 09-26).
-            return self._settle(True, f"saved {name!r} in {place!r}, as a new document (projected)")
+            return self._settle(True, f"saved {name!r} in {place!r}, as a new document (projected)",
+                                files=self._receipt(str(target), written))
         return None
 
     #: Finder's view modes, by the names its View menu uses.
@@ -4659,7 +4696,7 @@ class PeekabooDriver:
             return ok, meta, detail or text[:200]
         raise KeyError(key)
 
-    def _settle(self, ok: bool, detail: str) -> ExecResult:
+    def _settle(self, ok: bool, detail: str, files: tuple[tuple[str, str | None], ...] = ()) -> ExecResult:
         # Any action can move a window, so the snapshot is retired immediately.
         # The loop observes again before the next action, which is what makes a
         # stale binding impossible rather than merely unlikely.
@@ -4674,7 +4711,7 @@ class PeekabooDriver:
                               detail=("dispatched but the outcome could not be confirmed; "
                                       "upstream says not to retry -- observe and check "
                                       f"before acting again. {detail[:250]}"))
-        return ExecResult(ok, detail[:400])
+        return ExecResult(ok, detail[:400], files=files if ok else ())
 
     def _evidence(self, ok: bool, data: dict, detail: str, what: str) -> ExecResult:
         """Carry what actually landed into the trace, not just a boolean."""

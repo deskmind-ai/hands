@@ -298,7 +298,8 @@ def main() -> int:
         calls.clear()
         # A task with several apps has a page for each (task["pages"]: app page name -> page), each its own window of
         # the host and its own run id; one app's task has one page, named after it.
-        pages = task.get("pages") or {a.app: task["page"]}
+        # a family may add page-only labels to its page (mail.page_for): no part of the task, so not of its hash
+        pages = task.get("pages") or {a.app: getattr(gym_app, "page_for", lambda t: t["page"])(task)}
         urls = []
         for name, pg in pages.items():
             rid = run if "pages" not in task else f"{run}-{name}"

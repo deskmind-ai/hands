@@ -18,8 +18,10 @@ import random
 
 from tools.gym import split
 
-#: Bumped when the labels this oracle gives change (see tools/gym/run.py rows).
-ORACLE_VERSION = 3
+#: Bumped when the labels this oracle gives change (see tools/gym/run.py rows). 4: the page shows a reply arrow and the
+#: sent reply on a replied-to message (page v2), so rows recorded before it saw a different inbox after Send.
+ORACLE_VERSION = 4
+PAGE_VERSION = 2
 
 ZH_PEOPLE = ["林晓", "苏然", "沈一舟", "顾青", "程远", "许诺", "陆川", "温言", "叶知秋", "姜禾", "方舟", "白露"]
 EN_PEOPLE = ["Mira Lune", "Kai Solen", "Ivy Hart", "Theo Vale", "Rowan Reed", "Lena Marsh", "Ezra Quill",
@@ -40,6 +42,17 @@ TEXTS = {
            "send": "Send", "cancel": "Cancel", "confirm": "Delete message", "confirmText": "Delete this message?",
            "body": "Reply text", "draft": " (draft)", "meeting": "Meeting time: %s", "empty": "Select a message"},
 }
+#: Labels the page shows that are no part of a task (its hash is a contract, GymSplit.test_split_1_seeds_unchanged):
+#: merged into the page's texts by page_for(), never into make_task's output.
+PAGE_TEXTS = {"zh": {"replied": "已回复"}, "en": {"replied": "Replied"}}
+
+
+def page_for(task: dict) -> dict:
+    """What the page renders for `task`: its page, with the page-only labels of the task's language."""
+    page = task["page"]
+    return {**page, "texts": {**page["texts"], **PAGE_TEXTS.get(task.get("lang", "zh"), {})}}
+
+
 GOALS = {
     "reply": {"zh": ["在{app}里回复{sender}关于“{subject}”的邮件：“{body}”", "用{app}给{sender}的“{subject}”那封邮件回复“{body}”"],
               "en": ["In {app}, reply to {sender}'s email about \"{subject}\" with \"{body}\"",

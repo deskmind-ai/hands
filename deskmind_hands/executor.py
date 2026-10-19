@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 
 from .actions import Action, ActionKind, Binding
-from .axdocument import document_text, window_document
+from .axdocument import _q, document_text, window_document
 from .drivers.base import ExecResult, Observation
 from .inputwatch import InputWatch
 
@@ -566,31 +566,57 @@ class HandsExecutor:
         bundle = resolve_app(app, running_apps(), installed_apps())
         if not bundle:
             return {"status": "unsupported", "why": f"no application called {app!r} is running or installed"}
-        if bundle not in {b for _, b in running_apps()}:
+        was_running = bundle in {b for _, b in running_apps()}
+        if not was_running:
             # Not running: launched first, on its own. What it brings back then -- the last session's windows, as
             # Safari and TextEdit do -- is the user's, not a window this action made (PR #48 review, third round).
-            # Only a window that appears after the explicit ask below is the task's.
             subprocess.run(["open", "-b", bundle], capture_output=True, timeout=20)
             self._settled(bundle)
         d = self._driver(bundle)      # started now, so the windows it finds are the ones there before the task's
         before = self._known_windows()
-        if url:
+        # Whose the window is: the task's on proof that this action made it -- the window id the app's scripting
+        # returned for the document it made, or a browser window the driver opened and told apart by its marker.
+        # A window that merely appeared after the ask is the task's only when the app was running already (a
+        # running app brings no session back); after a launch it may be the last session's, the user's: returned
+        # to observe, not claimed (PR #48 review, fourth round: the restored #18000 was claimed when the ask failed).
+        proof: str | None = None
+        fresh: list[dict] = []
+        if url and bundle.lower() in getattr(d, "BROWSERS", set()) and hasattr(d, "_own_browser_window"):
+            proof = d._own_browser_window(bundle, url)
+        elif url:
             subprocess.run(["open", "-b", bundle, url], capture_output=True, timeout=20)
             fresh = self._fresh_windows(before, 2.5, bundle)
         else:
-            # ask it for a new document (any scriptable document app answers `make new document`; one that does not
-            # just errors), then try the New shortcut
-            subprocess.run(["osascript", "-e", f'tell application id "{bundle}"\nactivate\nmake new document\nend tell'], capture_output=True, timeout=20)
-            fresh = self._fresh_windows(before, 3, bundle)
-            if not fresh:
+            proof = self._new_document(bundle)
+            if not proof:
                 subprocess.run(["osascript", "-e", 'tell application "System Events" to keystroke "n" using command down'], capture_output=True, timeout=20)
                 fresh = self._fresh_windows(before, 3, bundle)
-        if fresh:
-            w = fresh[-1]
-            allow_flash(bundle)   # a window the task opened is the task's: the app may be brought forward for it
-            self._own(d, self._split(w["id"])[1])
-            return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "title": w["title"]}}
-        return {"status": "unverified", "why": f"{app} ({bundle}) was asked to open a window; none appeared"}
+        if proof:
+            fresh = [w for w in self._fresh_windows(set(), 3, bundle) if self._split(w["id"])[1] == str(proof)]
+        if not fresh:
+            return {"status": "unverified", "why": f"{app} ({bundle}) was asked to open a window; none appeared"}
+        w = fresh[-1]
+        owned = bool(proof) or (was_running and self._split(w["id"])[1] not in {self._split(b)[1] for b in before})
+        if not owned:
+            return {"status": "ok", "window": w["id"],
+                    "why": f"a window of {app} is there, but it may be one the app brought back when it launched, not one this action made"}
+        allow_flash(bundle)   # a window the task opened is the task's: the app may be brought forward for it
+        self._own(d, self._split(w["id"])[1])
+        return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "title": w["title"]}}
+
+    def _new_document(self, bundle: str) -> str | None:
+        """Ask the app for a new document the way any scriptable document app answers (`make new document`), and
+        return the window id it got -- the app's own word that this window was made now (NSWindow's number, which is
+        its CGWindowID). None when the app does not answer, or does not say which window."""
+        script = (f'tell application id "{_q(bundle)}"\nactivate\nset d to make new document\n'
+                  'repeat with w in windows\ntry\nif document of w is d then return id of w\nend try\nend repeat\n'
+                  'try\nreturn id of window 1\nend try\nreturn ""\nend tell')
+        try:
+            p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        out = (p.stdout or "").strip() if p.returncode == 0 else ""
+        return out if out.isdigit() else None
 
     def _settled(self, bundle: str, timeout: float = 10.0) -> None:
         """Wait for a just-launched app to be running and its windows to stop changing (two readings alike)."""

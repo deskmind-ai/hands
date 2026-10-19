@@ -1,15 +1,20 @@
-"""Which application the user's input goes to, so input to DeskMind itself is not "the user changed something".
+"""Which application the user's input went to, so input to DeskMind itself is not "the user changed something".
 
 The executor's epoch moves when the user touched the keyboard or mouse since it was set (an observation and a
 consent decided before are stale upstream). The user's click on DeskMind's own consent card is input too, and
 counted it made the action it approved stale, re-observed and re-asked without end (PR #48 review, third round).
 Whether the window was changed cannot be read off the window (a table's selection is not in the observation), so
-the input is told by where it went: a listen-only event tap records each mouse and key event's target process --
-the owner of the frontmost window under the pointer, or the frontmost application for a key -- and input to
-DeskMind (the app and its helper) is left out. Where no tap can be made (the permission is not there), the caller
-falls back to the HID idle time, where every input counts.
+the input is told by where it went -- as the window server routed it, not by a guess from window rectangles: a
+card that lets clicks through (ignoresMouseEvents) is under the pointer but not the receiver (fourth round).
 
-Listen-only: nothing is changed or delayed; the tap reads what the window server already delivered.
+A listen-only tap at the annotated session point (kCGAnnotatedSessionEventTap) sees each event after the window
+server has decided its target process (kCGEventTargetUnixProcessID); input whose target is DeskMind (the app and
+its helper) is left out of `last_external_at`. An event with no target known counts: the safe side.
+
+Key events reach a tap only with Input Monitoring; CGEventTapCreate may drop the key bits of a mask and still
+return a tap, so whether keys are watched is read from the permission itself (CGPreflightListenEventAccess),
+never from the tap having been made. Where no tap can be made, the caller falls back to the HID idle time, where
+every input counts. Listen-only: nothing is changed or delayed.
 """
 from __future__ import annotations
 
@@ -20,34 +25,17 @@ import time
 OWN_BUNDLES = {"ai.deskmind.app", "ai.deskmind.hands"}
 
 
-def target_of_point(x: float, y: float, windows: list[dict]) -> int | None:
-    """The owner pid of the frontmost on-screen window containing the point, from the window server's list in
-    front-to-back order (every layer: DeskMind's card is a floating panel above the ordinary windows). Windows the
-    pointer cannot hit (fully transparent) are skipped. None when nothing is there."""
-    for w in windows:
-        if float(w.get("kCGWindowAlpha", 1.0) or 0.0) <= 0.0:
-            continue
-        b = w.get("kCGWindowBounds") or {}
-        bx, by, bw, bh = (float(b.get("X", 0)), float(b.get("Y", 0)), float(b.get("Width", 0)), float(b.get("Height", 0)))
-        if bw <= 0 or bh <= 0:
-            continue
-        if bx <= x <= bx + bw and by <= y <= by + bh:
-            pid = w.get("kCGWindowOwnerPID")
-            return int(pid) if pid is not None else None
-    return None
-
-
 class InputWatch:
     """Records when the user last sent input to an application other than DeskMind (`last_external_at`, epoch
-    seconds; 0 before any). `start()` makes the tap on its own thread and returns whether it could."""
+    seconds; 0 before any). `start()` makes the tap on its own thread and returns whether it could; `keys` says
+    whether key events are among what it sees (the Input Monitoring permission), else the caller counts every key
+    press by the HID idle time."""
 
     def __init__(self, own_bundles: set[str] = OWN_BUNDLES):
         self.own_bundles = {b.lower() for b in own_bundles}
         self.last_external_at = 0.0
         self.last_own_at = 0.0
         self.active = False
-        #: Whether the tap sees key events too. A listen-only key tap needs Input Monitoring; when only the mouse
-        #: tap could be made, the caller counts every key press (by the HID idle time), the safe side.
         self.keys = False
         self._pid_bundle: dict[int, str] = {}
         self._thread: threading.Thread | None = None
@@ -55,7 +43,7 @@ class InputWatch:
 
     # -- classification (pure, testable) ---------------------------------------------------------------------
     def is_own(self, pid: int | None) -> bool:
-        if pid is None:
+        if not pid:
             return False
         bundle = self._pid_bundle.get(pid)
         if bundle is None:
@@ -64,7 +52,7 @@ class InputWatch:
         return bundle.lower() in self.own_bundles
 
     def note(self, pid: int | None, at: float | None = None) -> None:
-        """An input event went to `pid`'s process at `at`."""
+        """An input event the window server routed to `pid`'s process (None or 0: no target known) at `at`."""
         at = at or time.time()
         if self.is_own(pid):
             self.last_own_at = max(self.last_own_at, at)
@@ -82,21 +70,13 @@ class InputWatch:
             return ""
 
     @staticmethod
-    def _front_pid() -> int | None:
+    def keys_permitted() -> bool:
+        """Whether this process may listen to key events (Input Monitoring)."""
         try:
-            from AppKit import NSWorkspace
-            app = NSWorkspace.sharedWorkspace().frontmostApplication()
-            return int(app.processIdentifier()) if app else None
-        except Exception:  # noqa: BLE001
-            return None
-
-    def _target(self, type_, event) -> int | None:
-        import Quartz
-        if type_ in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp, Quartz.kCGEventFlagsChanged):
-            return self._front_pid()
-        loc = Quartz.CGEventGetLocation(event)
-        wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements, 0) or []
-        return target_of_point(loc.x, loc.y, list(wins))
+            import Quartz
+            return bool(Quartz.CGPreflightListenEventAccess())
+        except Exception:  # noqa: BLE001 -- no such call: assume not
+            return False
 
     def _callback(self, proxy, type_, event, refcon):
         try:
@@ -105,30 +85,27 @@ class InputWatch:
                 if self._tap is not None:
                     Quartz.CGEventTapEnable(self._tap, True)
                 return event
-            self.note(self._target(type_, event))
+            self.note(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0))
         except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side
             self.last_external_at = time.time()
         return event
 
     def start(self) -> bool:
-        """Make the tap and run it on its own thread; False when the system refuses (no Input Monitoring /
-        Accessibility for this process), in which case nothing is recorded and `active` stays False."""
+        """Make the tap and run it on its own thread; False when the system refuses, in which case nothing is
+        recorded and `active` stays False."""
         try:
             import Quartz
         except ImportError:
             return False
-        mouse = ("kCGEventLeftMouseDown", "kCGEventRightMouseDown", "kCGEventOtherMouseDown", "kCGEventScrollWheel")
-        keys = ("kCGEventKeyDown", "kCGEventFlagsChanged")
-        tap = None
-        for names in (mouse + keys, mouse):
-            mask = 0
-            for t in names:
-                mask |= Quartz.CGEventMaskBit(getattr(Quartz, t))
-            tap = Quartz.CGEventTapCreate(Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap,
-                                          Quartz.kCGEventTapOptionListenOnly, mask, self._callback, None)
-            if tap:
-                self.keys = names is not mouse
-                break
+        self.keys = self.keys_permitted()
+        names = ["kCGEventLeftMouseDown", "kCGEventRightMouseDown", "kCGEventOtherMouseDown", "kCGEventScrollWheel"]
+        if self.keys:
+            names += ["kCGEventKeyDown", "kCGEventFlagsChanged"]
+        mask = 0
+        for t in names:
+            mask |= Quartz.CGEventMaskBit(getattr(Quartz, t))
+        tap = Quartz.CGEventTapCreate(Quartz.kCGAnnotatedSessionEventTap, Quartz.kCGHeadInsertEventTap,
+                                      Quartz.kCGEventTapOptionListenOnly, mask, self._callback, None)
         if not tap:
             return False
         self._tap = tap

@@ -9,9 +9,10 @@ One JSON request per line on stdin, one JSON reply per line on stdout (`{"id", "
     observe   {window, screenshot?}      one window close up: elements, dialog, text
     perform   {action}                   one generic action (click, set_value, type, select, key, scroll,
                                          open_window, close_window, focus_window, wait); its reply carries
-                                         `files` (absolute paths this action wrote: the driver's own writes, or
-                                         the window's document when the app says it saved it during the action)
-                                         and `document` (the file the window shows afterwards, when the app says)
+                                         `files` ([{path, sha256?}]: what this action wrote, with the digest of the
+                                         content written -- the driver's own bytes, or the text the app holds when
+                                         it says it saved the window's document during the action; no digest when
+                                         that is unknown) and `document` (the file the window shows afterwards)
     stop      {}                         the app's stop switch: every later perform is refused
     end       {}
 
@@ -32,7 +33,7 @@ import time
 from pathlib import Path
 
 from .actions import Action, ActionKind, Binding
-from .axdocument import window_document
+from .axdocument import document_text, window_document
 from .drivers.base import ExecResult, Observation
 
 try:
@@ -173,6 +174,10 @@ class HandsExecutor:
         self.epoch = 1
         self.drivers: dict[str, object] = {}
         self.last_obs: dict[str, Observation] = {}       # window id -> last observation (for bindings)
+        #: bundle -> the window its driver observed last: the one whose snapshot and element ids the driver holds.
+        #: An action in another window of the same app is refused until that window is observed again (PR #48 review:
+        #: observe A, observe B, act in A dispatched against B's snapshot).
+        self.current: dict[str, str] = {}
         self.front_cache: dict[str, str] = {}
         os.environ.setdefault("HANDS_PEEKABOO_TRANSPORT", "mcp")
 
@@ -206,14 +211,14 @@ class HandsExecutor:
 
     def _windows_via_peekaboo(self) -> list[dict]:
         out = []
-        apps = self._pk(["app", "list", "--json"]).get("apps") or []
+        apps = (self._pk(["app", "list", "--json"]) or {}).get("apps") or []
         for a in apps:
             if not a.get("window_count"):
                 continue
             bundle = a.get("bundle_id") or ""
             if bundle in self.HIDDEN:
                 continue
-            data = self._pk(["window", "list", "--app", bundle, "--json"])
+            data = self._pk(["window", "list", "--app", bundle, "--json"]) or {}
             for w in data.get("windows") or []:
                 if w.get("window_id") is None or not w.get("is_on_screen", True):
                     continue
@@ -221,13 +226,15 @@ class HandsExecutor:
                             "title": w.get("window_title") or "", "pid": a.get("pid"), "bounds": None})
         return out
 
-    def _pk(self, args: list[str]) -> dict:
+    def _pk(self, args: list[str]) -> dict | None:
+        """Peekaboo's data for a command; None when the command failed, timed out or answered no JSON -- a caller
+        that reads None as success reported a window closed that is still there (PR #48 review)."""
         try:
             p = subprocess.run(["peekaboo", *args], capture_output=True, text=True, timeout=30)
             env = json.loads(p.stdout)
-            return env.get("data") or {} if env.get("success") else {}
+            return (env.get("data") or {}) if env.get("success") else None
         except (OSError, ValueError, subprocess.TimeoutExpired):
-            return {}
+            return None
 
     def _front(self) -> str:
         if AppKit is None:
@@ -283,6 +290,7 @@ class HandsExecutor:
         d._window_id = wid or None
         obs: Observation = d.observe()
         self.last_obs[window] = obs
+        self.current[bundle] = window
         els = []
         texts = []
         for e in obs.elements:
@@ -333,14 +341,23 @@ class HandsExecutor:
         bundle, wid = self._split(window)
         if kind == "close_window":
             data = self._pk(["window", "close", "--window-id", wid, "--json"])
-            return {"status": "ok" if data is not None else "error", "files": []}
+            if data is None:
+                return {"status": "error", "why": f"the window {window} could not be closed (it may be gone already)", "files": []}
+            return {"status": "ok", "files": []}
         if kind == "focus_window":
-            self._pk(["window", "focus", "--window-id", wid, "--json"])
+            if self._pk(["window", "focus", "--window-id", wid, "--json"]) is None:
+                return {"status": "error", "why": f"the window {window} could not be brought forward", "window": window, "files": []}
             return {"status": "ok", "window": window, "files": []}
         d = self._driver(bundle)
         obs = self.last_obs.get(window)
         if obs is None:
             return {"status": "error", "why": "observe the window before acting in it"}
+        if self.current.get(bundle) != window:
+            # the driver's snapshot and element ids are another window's of this app
+            return {"status": "error", "why": f"{window} is not the window last observed in this app "
+                                              f"({self.current.get(bundle)}); observe it again before acting in it"}
+        d._pinned_window = wid or None
+        d._window_id = wid or None
         binding = Binding(observation_id=obs.id, app=bundle, window_id=wid, element_id=action.get("target"))
         try:
             # foreground=True: the driver delivers in the background whenever the app takes that, and may bring the
@@ -379,7 +396,9 @@ class HandsExecutor:
         # any action can open a window (a "new document" button, a sheet that becomes a window): reported so the
         # ledger upstream can credit it to the task, as it does for open_window
         wins = self._windows()
-        fresh = [w for w in wins if w["id"] not in before]
+        # ... a window of the acted app only: another app's window appearing meanwhile (the user's, or a
+        # notification) is not this action's (PR #48 review: a TextEdit click credited a Safari window)
+        fresh = [w for w in wins if w["id"] not in before and w["bundle"] == bundle]
         if fresh:
             w = fresh[-1]
             out["new_window"] = {"id": w["id"], "app": w["app"], "title": w["title"]}
@@ -392,12 +411,18 @@ class HandsExecutor:
         doc1 = state1[0] if state1 else None
         files = list(res.files)
         if doc1 and state0 and state0[1] is True and state1[1] is False and self._reportable(doc1):
-            files.append(doc1)
+            # the digest of what the app holds (its document's text), never of the file on disk: a file another
+            # program rewrote after the app saved then fails the match upstream and stays unconfirmed. No text
+            # (an app that does not answer, a document that is not text): the path alone, told but not credited.
+            files.append((doc1, self._content_digest(window, wins)))
         # `files: []` is a receipt too: this action could not have written a file (typing, scrolling). Around an
         # action that could, the field is there only when a write is known; left out, the driver does not know
         # (an app's own save panel in an app that says nothing of its document), and the layer above credits nothing.
         if files:
-            out["files"] = sorted(set(files))
+            seen: dict[str, str | None] = {}
+            for path, digest in files:
+                seen[path] = seen.get(path) or digest
+            out["files"] = [{"path": p, **({"sha256": seen[p]} if seen[p] else {})} for p in sorted(seen)]
         elif not may_save:
             out["files"] = []
         if doc1:
@@ -411,6 +436,16 @@ class HandsExecutor:
         if info is None or not info.get("pid"):
             return None
         return window_document(int(info["pid"]), info.get("bundle") or "", info.get("title") or "", info.get("bounds"))
+
+    def _content_digest(self, window: str, wins: list[dict]) -> str | None:
+        """SHA-256 of the text the window's app holds for its document, as the app saves plain text (UTF-8, LF);
+        None when the app does not say."""
+        import hashlib
+        info = next((w for w in wins if w["id"] == window), None)
+        if info is None:
+            return None
+        text = document_text(info.get("bundle") or "", info.get("title") or "", info.get("bounds"))
+        return hashlib.sha256(text.encode("utf-8")).hexdigest() if text is not None else None
 
     def _reportable(self, path: str) -> bool:
         """A path that can be a task's file: it exists, and it is not a driver's scratch under the task folder's
@@ -430,25 +465,26 @@ class HandsExecutor:
         if not bundle:
             return {"status": "unsupported", "why": f"no application called {app!r} is running or installed"}
         subprocess.run(["open", "-b", bundle] + ([url] if url else []), capture_output=True, timeout=20)
-        fresh = self._fresh_windows(before, 2.5)
+        fresh = self._fresh_windows(before, 2.5, bundle)
         if not fresh and not url:
             # running already, or launched without a window: ask it for a new document (any scriptable document app
             # answers `make new document`; one that does not just errors), then try the New shortcut
             subprocess.run(["osascript", "-e", f'tell application id "{bundle}"\nactivate\nmake new document\nend tell'], capture_output=True, timeout=20)
-            fresh = self._fresh_windows(before, 3)
+            fresh = self._fresh_windows(before, 3, bundle)
             if not fresh:
                 subprocess.run(["osascript", "-e", 'tell application "System Events" to keystroke "n" using command down'], capture_output=True, timeout=20)
-                fresh = self._fresh_windows(before, 3)
+                fresh = self._fresh_windows(before, 3, bundle)
         if fresh:
             w = fresh[-1]
             allow_flash(bundle)   # a window the task opened is the task's: the app may be brought forward for it
             return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "title": w["title"]}}
         return {"status": "unverified", "why": f"{app} ({bundle}) was asked to open a window; none appeared"}
 
-    def _fresh_windows(self, before: set, seconds: float) -> list[dict]:
+    def _fresh_windows(self, before: set, seconds: float, bundle: str) -> list[dict]:
+        """New windows of `bundle` within `seconds`: only that app's, as the window asked for is its (PR #48 review)."""
         for _ in range(int(seconds / 0.3)):
             time.sleep(0.3)
-            fresh = [w for w in self._windows() if w["id"] not in before]
+            fresh = [w for w in self._windows() if w["id"] not in before and w["bundle"] == bundle]
             if fresh:
                 return fresh
         return []

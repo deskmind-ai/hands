@@ -180,11 +180,14 @@ class ExecResult:
     #: done, so it is neither the planner's failure nor a sign the run is stuck. Set from the driver's words
     #: (USER_BUSY) when not given.
     deferred: bool = False
-    #: The files this action wrote on disk, as absolute paths: the receipt the execution layer above credits a
-    #: screen action's files by (a save-as's target, a scripted save's document). Only paths the driver knows it
-    #: wrote; a driver that cannot tell leaves it empty, and the layer above checks a window's document itself.
-    #: A scratch file of the driver's own (the staged 未命名-N under .hands/) is never one of these.
-    files: tuple[str, ...] = ()
+    #: The files this action wrote on disk, as (absolute path, SHA-256 hex of the content written, or None): the
+    #: receipt the execution layer above credits a screen action's files by (a save-as's target, a scripted save's
+    #: document). The digest is of the content itself -- the bytes the driver wrote, or the text the app holds --
+    #: never of the file read back from disk, which another program may have rewritten meanwhile (PR #16 review,
+    #: tenth and eleventh rounds). No digest: the path is told but cannot be credited. Only files the driver knows
+    #: it wrote; a driver that cannot tell leaves it empty. A scratch file of the driver's own (the staged 未命名-N
+    #: under .hands/) is never one of these.
+    files: tuple[tuple[str, str | None], ...] = ()
 
     def __post_init__(self):
         if not self.ok and (self.detail or "").lower().startswith(USER_BUSY):

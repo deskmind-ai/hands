@@ -1459,7 +1459,8 @@ class PeekabooDriver:
             frames = axchrome.fields_outside_page(pid) if pid else []
         except Exception:   # noqa: BLE001 -- a structure that cannot be read is no browser field
             return None
-        if axchrome.at(frames, self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2):
+        origin = getattr(self, "_origin", None)
+        if origin is not None and axchrome.at(frames, origin.x + r.x + r.w / 2, origin.y + r.y + r.h / 2):
             return self._labels_by_id.get(eid, eid)
         return None
 
@@ -1502,7 +1503,8 @@ class PeekabooDriver:
             bars = axchrome.address_bars(pid) if pid and r is not None else []
         except Exception:   # noqa: BLE001 -- unread: it may be the address bar, so it is refused as one (review)
             return refusal
-        if r is not None and axchrome.at(bars, self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2):
+        origin = getattr(self, "_origin", None)
+        if r is not None and origin is not None and axchrome.at(bars, origin.x + r.x + r.w / 2, origin.y + r.y + r.h / 2):
             return refusal
         return None
 
@@ -3863,7 +3865,7 @@ class PeekabooDriver:
             self._chord_repeat = {chord: self._chord_repeat.get(chord, 0) + 1}
             scripted = self._scripted_command(chord)
             if scripted is not None:
-                return self._settle(scripted.ok, scripted.detail)
+                return self._settle(scripted.ok, scripted.detail, files=scripted.files)
 
         if k is ActionKind.KEY and self._mcp is not None:
             # No menu route. A background click on the menu item that owns a chord is accepted and not executed
@@ -4274,27 +4276,32 @@ class PeekabooDriver:
                 self._scripted_actions += 1
                 # The receipt: where the document was written, asked of TextEdit by the same query
                 # _open_workspace_documents uses. The driver's own scratch file is not a file the task wrote.
-                written: tuple[str, ...] = ()
+                written: tuple[tuple[str, str | None], ...] = ()
                 if was_modified:
                     ok, where = self._osa(f'tell application "TextEdit" to get path of (first document whose name is "{doc}")')
-                    written = self._receipt(where.strip()) if ok else ()
+                    # the digest of what TextEdit holds (plain text as UTF-8, its line breaks and trailing newline as
+                    # they are -- _osa strips its output, so the generic reader is used), not of the file on disk
+                    from ..axdocument import document_text
+                    text = document_text("com.apple.TextEdit", name, None)
+                    content = text.encode("utf-8") if text is not None else None
+                    written = self._receipt(where.strip(), content) if ok else ()
                 return ExecResult(True, f"saved {name!r} (scripted, in the background)" if was_modified
                                   else f"{name!r} had no unsaved changes; nothing to save", files=written)
         return ExecResult(False, f"could not confirm that {name!r} was saved")
 
-    def _receipt(self, *paths: str) -> tuple[str, ...]:
-        """`paths` as a files receipt: absolute, existing, and not the driver's own scratch under .hands/."""
-        out = []
+    def _receipt(self, path: str, data: bytes | None) -> tuple[tuple[str, str | None], ...]:
+        """`path` as a files receipt, (absolute path, SHA-256 of `data`): the content written -- the bytes this driver
+        wrote, or the app's own document text as bytes -- never the file read back from disk, which another program
+        may have rewritten since (PR #16 review, eleventh round). No `data`: the path alone, which upstream tells but
+        never credits. Empty for a relative path and for the driver's own scratch under .hands/."""
+        import hashlib
+        if not path or not path.startswith("/"):
+            return ()
+        full = Path(os.path.realpath(path))
         scratch = (Path(os.path.realpath(str(self.ws))) / ".hands") if getattr(self, "ws", None) is not None else None
-        for p in paths:
-            if not p or not p.startswith("/"):
-                continue
-            full = Path(os.path.realpath(p))
-            if scratch is not None and (full == scratch or scratch in full.parents):
-                continue
-            if full.exists():
-                out.append(str(full))
-        return tuple(out)
+        if scratch is not None and (full == scratch or scratch in full.parents):
+            return ()
+        return ((str(full), hashlib.sha256(data).hexdigest() if data is not None else None),)
 
     def _textedit_projected(self, eid: str, action: Action) -> ExecResult | None:
         pending = self.__dict__.setdefault("_pending_saveas", {})
@@ -4364,7 +4371,8 @@ class PeekabooDriver:
             ok, text = self._osa(f'tell application "TextEdit" to get text of (first document whose name is "{doc}")')
             if not ok:
                 return self._settle(False, f"could not read the document to save it as {name!r}: {text[:160]}")
-            target.write_text(text.replace("\r", "\n"), encoding="utf-8")
+            written = text.replace("\r", "\n").encode("utf-8")
+            target.write_bytes(written)
             self._osa(f'tell application "TextEdit" to close (first document whose name is "{doc}") saving no')
             old = Path(os.path.realpath(str(self.ws))) / ".hands" / self._window_title
             if old.exists():
@@ -4389,7 +4397,7 @@ class PeekabooDriver:
             # "saved '<name>'" first, the form a save is recorded in: "saved the document as ..." was never read as
             # a save, and the oracle labelled one more 保存 after every save-as (audit 09-26).
             return self._settle(True, f"saved {name!r} in {place!r}, as a new document (projected)",
-                                files=self._receipt(str(target)))
+                                files=self._receipt(str(target), written))
         return None
 
     #: Finder's view modes, by the names its View menu uses.
@@ -4685,7 +4693,7 @@ class PeekabooDriver:
             return ok, meta, detail or text[:200]
         raise KeyError(key)
 
-    def _settle(self, ok: bool, detail: str, files: tuple[str, ...] = ()) -> ExecResult:
+    def _settle(self, ok: bool, detail: str, files: tuple[tuple[str, str | None], ...] = ()) -> ExecResult:
         # Any action can move a window, so the snapshot is retired immediately.
         # The loop observes again before the next action, which is what makes a
         # stale binding impossible rather than merely unlikely.

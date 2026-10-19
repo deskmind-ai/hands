@@ -50,3 +50,22 @@ def test_an_app_that_answers_with_nothing_is_asked_again(monkeypatch):
     for _ in range(2):
         assert ad.window_document(1, "com.example.doc", "未命名", None) is None
     assert sum("application id" in s for s in calls) == 2
+
+
+def test_document_text_is_the_apps_own_text_character_for_character(monkeypatch):
+    seen = []
+
+    def osa(script):
+        seen.append(script)
+        return "ok\nalpha\rbeta\ngamma\n\n"     # the document's own breaks (CR and LF, a trailing one), then osascript's line end
+    monkeypatch.setattr(ad, "_osa", osa)
+    ad._NO_SCRIPTING.discard("com.example.doc")
+    assert ad.document_text("com.example.doc", "notes.txt", [10, 20, 300, 200]) == "alpha\rbeta\ngamma\n"
+    assert 'is "notes.txt"' in seen[-1] and "bounds" not in seen[-1]     # by title only
+    # no such window, or no text: None; an app that hangs is asked once
+    monkeypatch.setattr(ad, "_osa", lambda script: "\n")
+    assert ad.document_text("com.example.doc", "other", None) is None
+    monkeypatch.setattr(ad, "_osa", lambda script: None)
+    assert ad.document_text("com.example.doc", "notes.txt", None) is None
+    assert ad.document_text("com.example.doc", "notes.txt", None) is None and "com.example.doc" in ad._NO_SCRIPTING
+    ad._NO_SCRIPTING.discard("com.example.doc")

@@ -119,10 +119,11 @@ def test_perform_carries_the_drivers_files_receipt(tmp_path):
     ex._document = lambda window, wins: None   # noqa: SLF001 -- no desktop: the app says no document
     target = tmp_path / "hello.txt"
     target.write_text("hi", encoding="utf-8")
-    stub.execute = lambda action: ExecResult(True, "saved 'hello.txt'", files=(str(target),))
+    digest = "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"   # sha256("hi")
+    stub.execute = lambda action: ExecResult(True, "saved 'hello.txt'", files=((str(target), digest),))
     ex.observe("com.apple.TextEdit#12")
     r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
-    assert r["status"] == "ok" and r["files"] == [str(target)] and "document" not in r
+    assert r["status"] == "ok" and r["files"] == [{"path": str(target), "sha256": digest}] and "document" not in r
     # a click that wrote nothing the driver knows of, in a window whose document is unknown: no receipt at all
     stub.execute = lambda action: ExecResult(True, "done")
     r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
@@ -138,8 +139,10 @@ def test_perform_credits_the_windows_document_only_on_the_apps_own_word_that_it_
     ex.workspace = tmp_path
     doc = tmp_path / "notes.txt"
     doc.write_text("v1", encoding="utf-8")
-    state = {"now": (str(doc), True)}            # what the app's scripting says: the document, with unsaved changes
+    state = {"now": (str(doc), True), "text": "v1"}   # what the app's scripting says: the document, unsaved, its text
     ex._document = lambda window, wins: state["now"]   # noqa: SLF001
+    import hashlib
+    ex._content_digest = lambda window, wins: hashlib.sha256(state["text"].encode()).hexdigest() if state["text"] is not None else None   # noqa: SLF001
     ex.observe("com.apple.TextEdit#12")
     # a click that saves nothing: still unsaved after -> the document is reported, no file is credited
     r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "T1"})
@@ -156,12 +159,14 @@ def test_perform_credits_the_windows_document_only_on_the_apps_own_word_that_it_
 
     # cmd+S through the app: unsaved before, saved after -> the app's own word, credited
     def save(action):
-        doc.write_text("v3", encoding="utf-8")
-        state["now"] = (str(doc), False)
+        doc.write_text("someone else's v4", encoding="utf-8")   # the app wrote v3; a sync program wrote over it at once
+        state["now"], state["text"] = (str(doc), False), "v3"
         return ExecResult(True, "pressed; could not be confirmed", indeterminate=True)
     stub.execute = save
     r = ex.perform({"kind": "key", "window": "com.apple.TextEdit#12", "chord": "cmd+s"})
-    assert r["status"] == "unverified" and r["files"] == [str(doc)]
+    # the digest is of what the app holds, so upstream's match against the disk fails and nothing is credited
+    assert r["status"] == "unverified" and r["files"] == [{"path": str(doc), "sha256": hashlib.sha256(b"v3").hexdigest()}]
+    assert r["files"][0]["sha256"] != hashlib.sha256(doc.read_bytes()).hexdigest()
     # saved again with nothing to save: no flip, nothing credited
     stub.execute = lambda action: ExecResult(True, "done")
     r = ex.perform({"kind": "key", "window": "com.apple.TextEdit#12", "chord": "cmd+s"})
@@ -173,11 +178,11 @@ def test_perform_credits_the_windows_document_only_on_the_apps_own_word_that_it_
 
     def save_as(action):
         moved.write_text("v3", encoding="utf-8")
-        state["now"] = (str(moved), False)
+        state["now"], state["text"] = (str(moved), False), None   # the app does not give its text
         return ExecResult(True, "done")
     stub.execute = save_as
     r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
-    assert r["files"] == [str(moved)] and r["document"] == str(moved)
+    assert r["files"] == [{"path": str(moved)}] and r["document"] == str(moved)   # the path alone: told, not credited
 
     # only the path is known (accessibility, no scripting): never credited, only told
     state["now"] = (str(moved), None)
@@ -207,3 +212,68 @@ def test_a_drivers_scratch_document_is_never_a_file_of_the_task(tmp_path):
     ex._document = lambda window, wins: (_ for _ in ()).throw(AssertionError("asked"))   # noqa: SLF001
     r = ex.perform({"kind": "type", "window": "com.apple.TextEdit#12", "target": "T1", "text": "more"})
     assert r["files"] == [] and "document" not in r
+
+
+def test_an_action_in_a_window_the_driver_is_not_on_is_refused_until_it_is_observed_again():
+    """observe A, observe B, act in A: the shared driver holds B's snapshot and element ids (PR #48 review)."""
+    ex, stub = _executor()
+    ex.observe("com.apple.TextEdit#12")
+    ex.observe("com.apple.TextEdit#13")
+    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
+    assert r["status"] == "error" and "observe it again" in r["why"] and stub.actions == []
+    ex.observe("com.apple.TextEdit#12")
+    assert ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})["status"] == "ok"
+    assert stub._pinned_window == "12" and stub._window_id == "12"
+    # another app's driver is its own: untouched by this one's bookkeeping
+    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#13", "target": "B2"})
+    assert r["status"] == "error"
+
+
+def test_only_the_acted_apps_windows_are_reported_as_new(monkeypatch):
+    """A window of another app appearing during the action (the user's, a notification) is not this action's
+    (PR #48 review: a TextEdit click credited a Safari window)."""
+    ex, stub = _executor()
+    calls = {"n": 0}
+    base = [{"id": "com.apple.TextEdit#12", "app": "文本编辑", "bundle": "com.apple.TextEdit", "title": "未命名", "pid": 1, "bounds": None}]
+
+    def windows():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return list(base)
+        return base + [{"id": "com.apple.Safari#77", "app": "Safari", "bundle": "com.apple.Safari", "title": "News", "pid": 2, "bounds": None},
+                       {"id": "com.apple.TextEdit#14", "app": "文本编辑", "bundle": "com.apple.TextEdit", "title": "未命名 2", "pid": 1, "bounds": None}]
+    ex._windows = windows   # noqa: SLF001
+    ex._document = lambda window, wins: None   # noqa: SLF001
+    ex.observe("com.apple.TextEdit#12")
+    r = ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
+    assert r["new_window"]["id"] == "com.apple.TextEdit#14"
+    # open_window: the same rule
+    monkeypatch.setattr("deskmind_hands.executor.subprocess.run", lambda *a, **k: None)
+    monkeypatch.setattr("deskmind_hands.executor.resolve_app", lambda *a: "com.apple.TextEdit")
+    monkeypatch.setattr("deskmind_hands.executor.time.sleep", lambda s: None)
+    calls["n"] = 0
+    r = ex.perform({"kind": "open_window", "app": "TextEdit"})
+    assert r["status"] == "ok" and r["new_window"]["id"] == "com.apple.TextEdit#14"
+
+
+def test_a_failed_window_command_is_not_reported_as_done():
+    """peekaboo's failure (window not found, timeout, no JSON) is an error upstream, not a closed or focused window
+    (PR #48 review)."""
+    ex, _ = _executor()
+    ex._pk = lambda args: None   # noqa: SLF001 -- the command failed
+    assert ex.perform({"kind": "close_window", "window": "com.apple.TextEdit#12"})["status"] == "error"
+    assert ex.perform({"kind": "focus_window", "window": "com.apple.TextEdit#12"})["status"] == "error"
+    ex._pk = lambda args: {}   # noqa: SLF001 -- succeeded with nothing to say
+    assert ex.perform({"kind": "close_window", "window": "com.apple.TextEdit#12"})["status"] == "ok"
+    assert ex.perform({"kind": "focus_window", "window": "com.apple.TextEdit#12"})["status"] == "ok"
+
+
+def test_pk_tells_failure_from_an_empty_answer(monkeypatch):
+    from types import SimpleNamespace
+    ex, _ = _executor()
+    monkeypatch.setattr("deskmind_hands.executor.subprocess.run", lambda *a, **k: SimpleNamespace(stdout='{"success": false, "error": "Window not found"}'))
+    assert ex._pk(["window", "close"]) is None   # noqa: SLF001
+    monkeypatch.setattr("deskmind_hands.executor.subprocess.run", lambda *a, **k: SimpleNamespace(stdout='{"success": true}'))
+    assert ex._pk(["window", "close"]) == {}   # noqa: SLF001
+    monkeypatch.setattr("deskmind_hands.executor.subprocess.run", lambda *a, **k: SimpleNamespace(stdout="not json"))
+    assert ex._pk(["window", "close"]) is None   # noqa: SLF001

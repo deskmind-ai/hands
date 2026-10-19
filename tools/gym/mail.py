@@ -35,13 +35,24 @@ EN_REPLIES = ["Got it, thanks", "Sounds good to me", "I will check and get back 
 TIMES = ["09:30", "10:00", "14:00", "15:30", "16:45", "11:15"]
 APPS = [("Mailora", "#246"), ("Mailwise", "#2a6"), ("Inkwell", "#555"), ("信鸽", "#a52"), ("邮筒", "#383")]
 TEXTS = {
-    "zh": {"inbox": "收件箱", "replied": "已回复", "reply": "回复", "delete": "删除", "flag": "加旗标", "unflag": "取消旗标",
+    "zh": {"inbox": "收件箱", "reply": "回复", "delete": "删除", "flag": "加旗标", "unflag": "取消旗标",
            "send": "发送", "cancel": "取消", "confirm": "确认删除", "confirmText": "确定删除这封邮件吗？",
            "body": "回复内容", "draft": "（草稿）", "meeting": "会议时间：%s", "empty": "选择一封邮件"},
-    "en": {"inbox": "Inbox", "replied": "Replied", "reply": "Reply", "delete": "Delete", "flag": "Flag", "unflag": "Unflag",
+    "en": {"inbox": "Inbox", "reply": "Reply", "delete": "Delete", "flag": "Flag", "unflag": "Unflag",
            "send": "Send", "cancel": "Cancel", "confirm": "Delete message", "confirmText": "Delete this message?",
            "body": "Reply text", "draft": " (draft)", "meeting": "Meeting time: %s", "empty": "Select a message"},
 }
+#: Labels the page shows that are no part of a task (its hash is a contract, GymSplit.test_split_1_seeds_unchanged):
+#: merged into the page's texts by page_for(), never into make_task's output.
+PAGE_TEXTS = {"zh": {"replied": "已回复"}, "en": {"replied": "Replied"}}
+
+
+def page_for(task: dict) -> dict:
+    """What the page renders for `task`: its page, with the page-only labels of the task's language."""
+    page = task["page"]
+    return {**page, "texts": {**page["texts"], **PAGE_TEXTS.get(task.get("lang", "zh"), {})}}
+
+
 GOALS = {
     "reply": {"zh": ["在{app}里回复{sender}关于“{subject}”的邮件：“{body}”", "用{app}给{sender}的“{subject}”那封邮件回复“{body}”"],
               "en": ["In {app}, reply to {sender}'s email about \"{subject}\" with \"{body}\"",

@@ -47,7 +47,7 @@ function render() {
   if (!m) { r.innerHTML = `<p>${T.texts.empty}</p>`; }
   else {
     r.innerHTML = `<h3>${m.subject}</h3><p>${m.from}</p>` + m.body.map(l => `<p>${l}</p>`).join('')
-      + S.replies.filter(r => r.to === m.id).map(r => `<p class="replied">↩ ${T.texts.replied || '已回复'}：${r.body}</p>`).join('');
+      + S.replies.filter(r => r.to === m.id).map(r => `<p class="replied">↩ ${T.texts.replied || (T.texts.reply === 'Reply' ? 'Replied' : '已回复')}：${r.body}</p>`).join('');
     if (S.composing) {
       const c = document.createElement('div'); c.id = 'compose';
       c.innerHTML = `<textarea id="body" aria-label="${T.texts.body}" placeholder="${T.texts.body}"></textarea><br>

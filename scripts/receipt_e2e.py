@@ -9,11 +9,13 @@ projected save-as, presses cmd+S on the unchanged result, edits the document (by
 for the user's typing) and presses cmd+S again, prints the replies, and closes only the documents it opened (TextEdit
 is quit again if this script launched it). Nothing of the user's is touched.
 
-Pass: the save-as reply carries files == [<task folder>/hello.txt]; the first cmd+S (nothing to save) carries no
-files and document == that path; the second cmd+S (unsaved changes before, none after) carries the file again.
+Pass: the save-as reply carries files == [{path: <task folder>/hello.txt, sha256: <digest of the file>}]; the first
+cmd+S (nothing to save) carries no files and document == that path; the second cmd+S (unsaved changes before, none
+after) carries the file again, with the digest of its new content.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -70,10 +72,13 @@ def main() -> int:
         r = call("perform", action={"kind": "click", "window": win["id"], "target": "syn:saveas:do"})
         show("SAVE-AS", r)
         target = ws / "hello.txt"
-        if r.get("files") != [str(target)]:
-            failures.append(f"save-as receipt: expected files == [{target}], got {r.get('files')!r}")
+        real = str(target.resolve())
         if not target.exists():
             failures.append("hello.txt was not written")
+        else:
+            want = [{"path": real, "sha256": hashlib.sha256(target.read_bytes()).hexdigest()}]
+            if r.get("files") != want:
+                failures.append(f"save-as receipt: expected files == {want}, got {r.get('files')!r}")
 
         snap = call("snapshot")
         win2 = next((w for w in snap["windows"] if w["title"] == "hello.txt" and "TextEdit" in w["id"]), None)
@@ -85,18 +90,19 @@ def main() -> int:
             show("CMD+S (nothing to save)", r)
             if "files" in r and r["files"]:
                 failures.append(f"cmd+S with nothing to save claimed files: {r['files']!r}")
-            if r.get("document") != str(target):
-                failures.append(f"cmd+S document: expected {target}, got {r.get('document')!r}")
+            if r.get("document") != real:
+                failures.append(f"cmd+S document: expected {real}, got {r.get('document')!r}")
             # the user types into the document (stood in for by TextEdit's scripting), then saves
             subprocess.run(["osascript", "-e", 'tell application "TextEdit" to set text of (first document whose name is "hello.txt") to "hello, edited"'],
                            capture_output=True, timeout=20)
             call("observe", window=win2["id"])
             r = call("perform", action={"kind": "key", "window": win2["id"], "chord": "cmd+s"})
             show("CMD+S (after an edit)", r)
-            if r.get("files") != [str(target)]:
-                failures.append(f"cmd+S after an edit: expected files == [{target}], got {r.get('files')!r}")
             if target.exists() and "edited" not in target.read_text(encoding="utf-8"):
                 failures.append("the edit was not saved to hello.txt")
+            want = [{"path": real, "sha256": hashlib.sha256(target.read_bytes()).hexdigest()}] if target.exists() else []
+            if r.get("files") != want:
+                failures.append(f"cmd+S after an edit: expected files == {want}, got {r.get('files')!r}")
         call("end")
     except Exception as e:  # noqa: BLE001 -- reported below, after the cleanup
         failures.append(str(e))

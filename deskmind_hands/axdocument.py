@@ -89,6 +89,8 @@ def _pick(lines: str, title: str, bounds: list | None) -> DocState | None:
             continue
         rows.append((name, doc, xy, modified))
     same = [r for r in rows if r[0] == (title or "")]
+    # position tells same-titled windows apart on the accessibility rows; an app's scripted `bounds` is not the
+    # screen rectangle (TextEdit, 10-19), so on those rows nothing is near and the first same-titled window is taken
     if len(same) > 1 and bounds and None not in bounds[:2]:
         x, y = float(bounds[0]), float(bounds[1])
         near = [r for r in same if r[2] is not None and abs(r[2][0] - x) < 2 and abs(r[2][1] - y) < 2]
@@ -128,3 +130,29 @@ def window_document(pid: int, bundle: str, title: str, bounds: list | None) -> D
             if from_sc is not None:
                 return (from_sc[0] or (from_ax[0] if from_ax else None), from_sc[1])
     return from_ax
+
+
+def document_text(bundle: str, title: str, bounds: list | None) -> str | None:
+    """The text of the document shown by the window titled `title` of the app `bundle`, from the app's own scripting
+    (the Standard Suite's `text of document`), character for character: a document's line breaks are what it holds
+    (TextEdit saves LF as LF and CR as CR, 10-19), so nothing is normalised. None when the app does not answer or the
+    document has no text (a drawing, a spreadsheet). What the app holds, not what is on disk: the digest of a save is
+    taken from this, so a file another program rewrote after the app saved never matches it (PR #16 review,
+    eleventh round)."""
+    if not bundle or bundle in _NO_SCRIPTING:
+        return None
+    # by title only: an app's scripted `bounds of window` is not the screen rectangle Quartz reports (TextEdit gave
+    # 152,73 for a window Quartz placed at 212,114 on 10-19), so `bounds` cannot tell same-titled windows apart here
+    del bounds
+    out = _osa(f'tell application id "{_q(bundle)}"\nrepeat with w in windows\ntry\n'
+               f'if (name of w) is "{_q(title or "")}" then return "ok" & linefeed & (text of document of w)\n'
+               'end try\nend repeat\nreturn ""\nend tell')
+    if out is None:
+        _NO_SCRIPTING.add(bundle)
+        return None
+    if not out.startswith("ok\n"):
+        return None
+    text = out[3:]
+    if text.endswith("\n"):          # osascript's own line end after the value
+        text = text[:-1]
+    return text

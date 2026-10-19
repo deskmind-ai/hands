@@ -37,7 +37,7 @@ def main() -> int:
     rid = a.run or f"real-{a.seed}-{int(time.time())}"
     server.serve(a.port)
     with server.LOCK:
-        server.TASKS[rid] = task["page"]
+        server.TASKS[rid] = mail.page_for(task)
     url = f"http://127.0.0.1:{a.port}/apps/mail.html?run={rid}&seed={a.seed}"
     n = _open_host(url)
     print(json.dumps({"run": rid, "seed": a.seed, "goal": task["goal"], "kind": task["kind"], "url": url, "port": a.port, "ax_elements": n}, ensure_ascii=False))

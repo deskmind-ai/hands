@@ -1246,6 +1246,9 @@ class PeekabooDriver:
             self._load_in_own_window(wid, url)          # bound first, by its marker title; the page after
             pending.pop(key, None)                      # loaded, or a clear reason kept why not
         self.__dict__.setdefault("_run_windows", set()).add(wid)
+        # the id the app's own script knows this window by: Safari's is the window server's, Chromium's is the
+        # browser's own; kept so a later load into this window (executor._navigate) addresses the same window
+        self.__dict__.setdefault("_own_browser_script", {})[key] = script_id or wid
         self._apart_from_others(bundle, wid, script_id or hint)
         return wid
 

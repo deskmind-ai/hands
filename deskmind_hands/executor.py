@@ -615,38 +615,49 @@ class HandsExecutor:
         return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "title": w["title"]}}
 
     def _navigate(self, d, bundle: str, wid: str, url: str) -> bool:
-        """Load `url` in the run's own browser window `wid` and check that the window's page is now that address:
-        through the driver's own loader where it has one for this browser, else the browser's scripting (the
-        WebKit and Chromium dictionaries both set a tab's URL), read back afterwards. False when it cannot be shown
-        that the page went."""
+        """Load `url` in the run's own browser window `wid` (the window server's id) and check that the window's page
+        is now that address. The window is addressed by the id the browser's own script knows it by, which the
+        driver kept when it made the window (Safari's is the window server's; Chromium's is the browser's own, and
+        a window server id sent to Chromium names some other window -- PR #48 review, sixth round); without that id
+        nothing is sent. A file:// page in Safari is served over http by the driver, so the address expected back is
+        the served one. False when it cannot be shown that the page went."""
         key = bundle.lower()
-        before = self._page_of(bundle, wid)
+        script_id = str(getattr(d, "_own_browser_script", {}).get(key) or "")
+        if not script_id:
+            return False
+        expected = url
         if key == "com.apple.safari" and hasattr(d, "_load_in_own_window"):
+            if url.lower().startswith("file:") and hasattr(d, "_serve_page"):
+                served = d._serve_page(url)
+                if not served or served.startswith("!"):
+                    return False
+                expected = served
             d._load_in_own_window(wid, url)
         else:
             u = _q(url)
-            for form in (f'set URL of current tab of window id {int(wid)} to "{u}"',
-                         f'set URL of active tab of window id {int(wid)} to "{u}"'):
+            for form in (f'set URL of active tab of window id {int(script_id)} to "{u}"',
+                         f'set URL of current tab of window id {int(script_id)} to "{u}"'):
                 try:
                     p = subprocess.run(["osascript", "-e", f'tell application id "{_q(bundle)}" to {form}'], capture_output=True, text=True, timeout=15)
                 except (OSError, subprocess.TimeoutExpired):
                     continue
                 if p.returncode == 0:
                     break
+        want = expected.rstrip("/")
         for _ in range(12):
-            now = self._page_of(bundle, wid)
-            if now and now != before and (now.rstrip("/") == url.rstrip("/") or now.startswith(url.rstrip("/"))):
+            now = self._page_of(bundle, script_id).rstrip("/")
+            if now and (now == want or now.startswith(want + "/") or now.startswith(want + "?") or now.startswith(want + "#")):
                 return True
             time.sleep(0.25)
-        now = self._page_of(bundle, wid)
-        return bool(now) and now.rstrip("/") == url.rstrip("/")
+        return False
 
-    def _page_of(self, bundle: str, wid: str) -> str:
-        """The address the browser window `wid` shows now, by its scripting; "" when it does not say."""
-        for form in (f"URL of current tab of window id {int(wid)}", f"URL of active tab of window id {int(wid)}"):
+    def _page_of(self, bundle: str, script_id: str) -> str:
+        """The address the browser window shows now, by its scripting (the window by the id that script knows);
+        "" when it does not say."""
+        for form in (f"URL of current tab of window id {int(script_id)}", f"URL of active tab of window id {int(script_id)}"):
             try:
                 p = subprocess.run(["osascript", "-e", f'tell application id "{_q(bundle)}" to get {form}'], capture_output=True, text=True, timeout=10)
-            except (OSError, subprocess.TimeoutExpired):
+            except (OSError, subprocess.TimeoutExpired, ValueError):
                 continue
             if p.returncode == 0 and p.stdout.strip():
                 return p.stdout.strip()

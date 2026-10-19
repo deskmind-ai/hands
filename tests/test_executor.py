@@ -504,11 +504,12 @@ class OpenWindow(unittest.TestCase):
             if not state["on"]:
                 state["on"] = [_win("500", bundle=safari, title="A", app="Safari")]
                 pages["now"] = url
+                stub._own_browser_script = {"com.apple.safari": "500"}   # Safari's script id is the window server's
             return "500"
         stub._own_browser_window = own_window
         stub._load_in_own_window = lambda wid, url: pages.__setitem__("now", url) or True
         ex._windows = lambda every=False: state["on"]   # noqa: SLF001
-        ex._page_of = lambda bundle, wid: pages["now"]  # noqa: SLF001
+        ex._page_of = lambda bundle, script_id: pages["now"] if script_id == "500" else ""  # noqa: SLF001
 
         def run(argv, **k):
             from types import SimpleNamespace
@@ -531,6 +532,65 @@ class OpenWindow(unittest.TestCase):
             r3 = ex.perform({"kind": "open_window", "app": "Safari", "url": "https://c.example/"})
             self.assertEqual(r3["status"], "unverified")
             self.assertEqual(r3["window"], f"{safari}#500")
+            # a local page: the driver serves it over http, and that is the address expected back (sixth round)
+            stub._serve_page = lambda url: "http://127.0.0.1:8793/page.html"
+            stub._load_in_own_window = lambda wid, url: pages.__setitem__("now", "http://127.0.0.1:8793/page.html") or True
+            r4 = ex.perform({"kind": "open_window", "app": "Safari", "url": "file:///ws/page.html"})
+            self.assertEqual(r4["status"], "ok")
+
+    def test_a_chromium_window_is_addressed_by_the_browsers_own_id_never_the_window_servers(self):
+        """Chrome's AppleScript `window id` is the browser's own number: the window server's id names some other
+        window there (PR #48 review, sixth round: the user's window with script id 42 was navigated)."""
+        ex, stub = _executor()
+        chrome = "com.google.Chrome"
+        stub.BROWSERS = {"com.google.chrome"}
+        state = {"on": []}
+        pages = {}                                     # script id -> page
+        sent = []
+
+        def own_window(bundle, url=""):
+            if not state["on"]:
+                state["on"] = [_win("42", bundle=chrome, title="A", app="Google Chrome")]   # window server id 42
+                stub._own_browser_script = {"com.google.chrome": "1234"}                       # Chrome's own id 1234
+                pages["1234"] = url
+                pages["42"] = "https://the-users-window.example/"                              # another window, script id 42
+            return "42"
+        stub._own_browser_window = own_window
+        ex._windows = lambda every=False: state["on"]   # noqa: SLF001
+
+        def run(argv, **k):
+            from types import SimpleNamespace
+            import re
+            script = argv[-1]
+            m = re.search(r'set URL of (?:active|current) tab of window id (\d+) to "([^"]+)"', script)
+            if m:
+                sent.append(m.group(1))
+                pages[m.group(1)] = m.group(2)
+                return SimpleNamespace(returncode=0, stdout="")
+            m = re.search(r"URL of (?:current|active) tab of window id (\d+)", script)
+            if m:
+                return SimpleNamespace(returncode=0, stdout=pages.get(m.group(1), "") + "\n")
+            return SimpleNamespace(returncode=0, stdout="")
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
+             mock.patch("deskmind_hands.executor.running_apps", return_value=[("Google Chrome", chrome)]), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value=chrome), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            r1 = ex.perform({"kind": "open_window", "app": "Chrome", "url": "https://a.example/"})
+            self.assertEqual(r1["new_window"]["id"], f"{chrome}#42")
+            r2 = ex.perform({"kind": "open_window", "app": "Chrome", "url": "https://b.example/"})
+        self.assertEqual(r2["status"], "ok")
+        self.assertEqual(sent, ["1234"])                                   # the task's window, by Chrome's own id
+        self.assertEqual(pages["42"], "https://the-users-window.example/")   # the user's window untouched
+        self.assertEqual(pages["1234"], "https://b.example/")
+        # without the script id nothing is sent, and the load is not claimed
+        stub._own_browser_script = {}
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
+             mock.patch("deskmind_hands.executor.running_apps", return_value=[("Google Chrome", chrome)]), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value=chrome), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            r3 = ex.perform({"kind": "open_window", "app": "Chrome", "url": "https://c.example/"})
+        self.assertEqual(r3["status"], "unverified")
+        self.assertEqual(sent, ["1234"])
 
     def test_a_window_an_action_opened_is_registered_with_the_driver(self):
         """The driver started after the window was made had it among the user's windows and refused to use it

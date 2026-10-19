@@ -628,10 +628,13 @@ class HandsExecutor:
         expected = url
         if key == "com.apple.safari" and hasattr(d, "_load_in_own_window"):
             if url.lower().startswith("file:") and hasattr(d, "_serve_page"):
+                # served once, here; the loader is given the served address, so it does not serve the file again
+                # (a second _serve_page restarts the page server on another port, and the address expected back is
+                # then not the one that loaded -- PR #48 review, seventh round)
                 served = d._serve_page(url)
                 if not served or served.startswith("!"):
                     return False
-                expected = served
+                expected = url = served
             d._load_in_own_window(wid, url)
         else:
             u = _q(url)

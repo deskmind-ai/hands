@@ -532,11 +532,23 @@ class OpenWindow(unittest.TestCase):
             r3 = ex.perform({"kind": "open_window", "app": "Safari", "url": "https://c.example/"})
             self.assertEqual(r3["status"], "unverified")
             self.assertEqual(r3["window"], f"{safari}#500")
-            # a local page: the driver serves it over http, and that is the address expected back (sixth round)
-            stub._serve_page = lambda url: "http://127.0.0.1:8793/page.html"
-            stub._load_in_own_window = lambda wid, url: pages.__setitem__("now", "http://127.0.0.1:8793/page.html") or True
+            # a local page: the driver serves it over http, once, and that is the address expected back; a loader
+            # given the file again would serve it again, on another port (sixth and seventh rounds)
+            ports = iter([52689, 52705, 52801])
+
+            def serve(url):
+                self.assertTrue(url.startswith("file:"))
+                return f"http://127.0.0.1:{next(ports)}/page.html"
+            given = []
+
+            def load(wid, url):
+                given.append(url)
+                pages["now"] = serve(url) if url.startswith("file:") else url
+                return True
+            stub._serve_page, stub._load_in_own_window = serve, load
             r4 = ex.perform({"kind": "open_window", "app": "Safari", "url": "file:///ws/page.html"})
             self.assertEqual(r4["status"], "ok")
+            self.assertEqual(given, ["http://127.0.0.1:52689/page.html"])      # the served address, not the file
 
     def test_a_chromium_window_is_addressed_by_the_browsers_own_id_never_the_window_servers(self):
         """Chrome's AppleScript `window id` is the browser's own number: the window server's id names some other

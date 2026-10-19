@@ -35,6 +35,7 @@ from pathlib import Path
 from .actions import Action, ActionKind, Binding
 from .axdocument import document_text, window_document
 from .drivers.base import ExecResult, Observation
+from .inputwatch import InputWatch
 
 try:
     import AppKit
@@ -200,6 +201,10 @@ class HandsExecutor:
         #: had selected meanwhile).
         self._epoch_at = time.time()
         self._inventory: tuple | None = None
+        #: Where the user's input goes (inputwatch): input to DeskMind itself -- answering a card -- is not a change
+        #: of the Mac. None until the first snapshot; stays None when no tap can be made, and every input then counts.
+        self._watch: InputWatch | None = None
+        self._watch_tried = False
         self.drivers: dict[str, object] = {}
         self.last_obs: dict[str, Observation] = {}       # window id -> last observation (for bindings)
         #: bundle -> the window its driver observed last: the one whose snapshot and element ids the driver holds.
@@ -308,7 +313,19 @@ class HandsExecutor:
         return idle < self.USER_ACTIVE_S
 
     def _last_input_at(self) -> float:
-        """When the keyboard or mouse was last touched (epoch seconds); 0 when it cannot be known."""
+        """When the user last sent input to an application other than DeskMind (epoch seconds; 0 when it cannot be
+        known). With the input watch: by each event's target process. Without it (no tap: the permission is not
+        there): when the keyboard or mouse was last touched at all, so answering DeskMind's card counts too."""
+        if not self._watch_tried:
+            self._watch_tried = True
+            w = InputWatch()
+            self._watch = w if w.start() else None
+        if self._watch is not None and self._watch.active:
+            if self._watch.keys or Quartz is None:
+                return self._watch.last_external_at
+            # a mouse-only tap: every key press counts, wherever it went (the safe side)
+            idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGEventKeyDown)
+            return max(self._watch.last_external_at, time.time() - idle)
         if Quartz is None:
             return 0.0
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
@@ -331,6 +348,7 @@ class HandsExecutor:
             self._advance()
         self._inventory = inventory
         return {"epoch": self.epoch, "locked": self.locked(), "front_app": front, "user_active": self.user_active(),
+                "input_watch": ("keys" if self._watch.keys else "mouse") if self._watch is not None and self._watch.active else "",
                 "windows": [{"id": w["id"], "app": w["app"], "title": w["title"], "focused": w["app"] == front} for w in wins]}
 
     # -- see and act ----------------------------------------------------------

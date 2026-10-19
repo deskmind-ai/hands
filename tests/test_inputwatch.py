@@ -25,19 +25,41 @@ class Targets(unittest.TestCase):
     def test_keys_are_watched_only_with_the_permission_not_because_a_tap_was_made(self):
         """CGEventTapCreate may drop a mask's key bits and still return a tap (Apple's documentation), so the
         permission itself decides, and without it every key press counts by the HID idle time."""
+        import sys
+        import types
+        # a stand-in for the macOS Quartz module, so this runs where there is none (Linux CI): inputwatch imports
+        # it inside start()
+        q = types.ModuleType("Quartz")
+        consts = {"kCGEventLeftMouseDown": 1, "kCGEventRightMouseDown": 3, "kCGEventOtherMouseDown": 25, "kCGEventScrollWheel": 22,
+                  "kCGEventKeyDown": 10, "kCGEventFlagsChanged": 12, "kCGAnnotatedSessionEventTap": 2, "kCGHeadInsertEventTap": 0,
+                  "kCGEventTapOptionListenOnly": 1}
+        for k, v in consts.items():
+            setattr(q, k, v)
+        q.CGEventMaskBit = lambda b: 1 << b
+        q.CGPreflightListenEventAccess = lambda: False
+        q.CGEventTapCreate = mock.Mock(return_value=object())
         w = InputWatch()
-        with mock.patch.object(InputWatch, "keys_permitted", return_value=False), \
-             mock.patch("Quartz.CGEventTapCreate", return_value=object()) as make, \
+        with mock.patch.dict(sys.modules, {"Quartz": q}), \
              mock.patch.object(InputWatch, "_callback"), \
              mock.patch("threading.Thread") as thread:
             thread.return_value.start = lambda: None
             w.start()
         self.assertFalse(w.keys)
+        make = q.CGEventTapCreate
         mask = make.call_args[0][3]
-        import Quartz
-        self.assertFalse(mask & Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown))      # not even asked for
-        self.assertTrue(mask & Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown))
-        self.assertEqual(make.call_args[0][0], Quartz.kCGAnnotatedSessionEventTap)   # after the window server's routing
+        self.assertFalse(mask & (1 << consts["kCGEventKeyDown"]))            # not even asked for
+        self.assertTrue(mask & (1 << consts["kCGEventLeftMouseDown"]))
+        self.assertEqual(make.call_args[0][0], consts["kCGAnnotatedSessionEventTap"])   # after the window server's routing
+        # with the permission, keys are asked for
+        q.CGPreflightListenEventAccess = lambda: True
+        w2 = InputWatch()
+        with mock.patch.dict(sys.modules, {"Quartz": q}), \
+             mock.patch.object(InputWatch, "_callback"), \
+             mock.patch("threading.Thread") as thread:
+            thread.return_value.start = lambda: None
+            w2.start()
+        self.assertTrue(w2.keys)
+        self.assertTrue(make.call_args[0][3] & (1 << consts["kCGEventKeyDown"]))
 
     def test_the_executor_uses_the_watch_when_it_runs_and_the_idle_time_otherwise(self):
         from deskmind_hands.executor import HandsExecutor

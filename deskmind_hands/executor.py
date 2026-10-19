@@ -583,6 +583,16 @@ class HandsExecutor:
         fresh: list[dict] = []
         if url and bundle.lower() in getattr(d, "BROWSERS", set()) and hasattr(d, "_own_browser_window"):
             proof = d._own_browser_window(bundle, url)
+            if proof and str(proof) in {self._split(b)[1] for b in before}:
+                # the run's own browser window from earlier, given back as it is: the page asked for now has to be
+                # loaded in it, and that checked, before it is answered (PR #48 review, fifth round: the second
+                # address was never opened). Not a new window.
+                window = f"{bundle}#{proof}"
+                loaded = self._navigate(d, bundle, str(proof), url)
+                if loaded:
+                    return {"status": "ok", "window": window, "why": f"loaded {url} in the task's own browser window"}
+                return {"status": "unverified", "window": window,
+                        "why": f"the task's own browser window is there, but {url} could not be confirmed loaded in it"}
         elif url:
             subprocess.run(["open", "-b", bundle, url], capture_output=True, timeout=20)
             fresh = self._fresh_windows(before, 2.5, bundle)
@@ -603,6 +613,44 @@ class HandsExecutor:
         allow_flash(bundle)   # a window the task opened is the task's: the app may be brought forward for it
         self._own(d, self._split(w["id"])[1])
         return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "title": w["title"]}}
+
+    def _navigate(self, d, bundle: str, wid: str, url: str) -> bool:
+        """Load `url` in the run's own browser window `wid` and check that the window's page is now that address:
+        through the driver's own loader where it has one for this browser, else the browser's scripting (the
+        WebKit and Chromium dictionaries both set a tab's URL), read back afterwards. False when it cannot be shown
+        that the page went."""
+        key = bundle.lower()
+        before = self._page_of(bundle, wid)
+        if key == "com.apple.safari" and hasattr(d, "_load_in_own_window"):
+            d._load_in_own_window(wid, url)
+        else:
+            u = _q(url)
+            for form in (f'set URL of current tab of window id {int(wid)} to "{u}"',
+                         f'set URL of active tab of window id {int(wid)} to "{u}"'):
+                try:
+                    p = subprocess.run(["osascript", "-e", f'tell application id "{_q(bundle)}" to {form}'], capture_output=True, text=True, timeout=15)
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+                if p.returncode == 0:
+                    break
+        for _ in range(12):
+            now = self._page_of(bundle, wid)
+            if now and now != before and (now.rstrip("/") == url.rstrip("/") or now.startswith(url.rstrip("/"))):
+                return True
+            time.sleep(0.25)
+        now = self._page_of(bundle, wid)
+        return bool(now) and now.rstrip("/") == url.rstrip("/")
+
+    def _page_of(self, bundle: str, wid: str) -> str:
+        """The address the browser window `wid` shows now, by its scripting; "" when it does not say."""
+        for form in (f"URL of current tab of window id {int(wid)}", f"URL of active tab of window id {int(wid)}"):
+            try:
+                p = subprocess.run(["osascript", "-e", f'tell application id "{_q(bundle)}" to get {form}'], capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if p.returncode == 0 and p.stdout.strip():
+                return p.stdout.strip()
+        return ""
 
     def _new_document(self, bundle: str) -> str | None:
         """Ask the app for a new document the way any scriptable document app answers (`make new document`), and

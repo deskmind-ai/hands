@@ -491,6 +491,47 @@ class OpenWindow(unittest.TestCase):
         r = self._open(ex, run, running)
         self.assertEqual(r["status"], "unverified")
 
+    def test_a_second_address_is_loaded_in_the_tasks_own_browser_window_not_ignored(self):
+        """The driver gives the run's own browser window back as it is: the page asked for has to be loaded in it
+        and checked, and it is not a new window (PR #48 review, fifth round)."""
+        ex, stub = _executor()
+        stub.BROWSERS = {"com.apple.safari"}
+        pages = {"now": ""}
+        state = {"on": [], "running": True}
+        safari = "com.apple.Safari"
+
+        def own_window(bundle, url=""):        # the driver: a window of the run's own, made on the first ask, kept after
+            if not state["on"]:
+                state["on"] = [_win("500", bundle=safari, title="A", app="Safari")]
+                pages["now"] = url
+            return "500"
+        stub._own_browser_window = own_window
+        stub._load_in_own_window = lambda wid, url: pages.__setitem__("now", url) or True
+        ex._windows = lambda every=False: state["on"]   # noqa: SLF001
+        ex._page_of = lambda bundle, wid: pages["now"]  # noqa: SLF001
+
+        def run(argv, **k):
+            from types import SimpleNamespace
+            return SimpleNamespace(returncode=0, stdout="")
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
+             mock.patch("deskmind_hands.executor.running_apps", return_value=[("Safari", safari)]), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value=safari), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            # first: the driver opened the window on A -- a new window, the task's
+            r1 = ex.perform({"kind": "open_window", "app": "Safari", "url": "https://a.example/"})
+            self.assertEqual(r1["new_window"]["id"], f"{safari}#500")
+            # second: the same window given back -- B is loaded in it and checked; not a new window
+            r2 = ex.perform({"kind": "open_window", "app": "Safari", "url": "https://b.example/"})
+            self.assertEqual(r2["status"], "ok")
+            self.assertEqual(r2["window"], f"{safari}#500")
+            self.assertNotIn("new_window", r2)
+            self.assertEqual(pages["now"], "https://b.example/")
+            # a load that does not go is said so
+            stub._load_in_own_window = lambda wid, url: False
+            r3 = ex.perform({"kind": "open_window", "app": "Safari", "url": "https://c.example/"})
+            self.assertEqual(r3["status"], "unverified")
+            self.assertEqual(r3["window"], f"{safari}#500")
+
     def test_a_window_an_action_opened_is_registered_with_the_driver(self):
         """The driver started after the window was made had it among the user's windows and refused to use it
         (PR #48 review, third round)."""

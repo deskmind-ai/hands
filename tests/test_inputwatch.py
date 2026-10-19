@@ -21,6 +21,10 @@ class Targets(unittest.TestCase):
         self.assertEqual(w.last_external_at, 103.0)
         w.note(None, at=104.0)
         self.assertEqual(w.last_external_at, 104.0)
+        # by application: the textedit click, and the unknown targets on the safe side
+        self.assertEqual(w.last_input_for({"com.apple.textedit"}), 104.0)   # the unknown one is later
+        self.assertEqual(w.last_by_bundle, {"com.apple.textedit": 102.0})
+        self.assertEqual(w.last_input_for(set()), 104.0)
 
     def test_keys_are_watched_only_with_the_permission_not_because_a_tap_was_made(self):
         """CGEventTapCreate may drop a mask's key bits and still return a tap (Apple's documentation), so the
@@ -65,8 +69,10 @@ class Targets(unittest.TestCase):
         from deskmind_hands.executor import HandsExecutor
         ex = HandsExecutor.__new__(HandsExecutor)
         ex._watch_tried, ex._watch = True, None
+        ex.drivers, ex.current = {"com.apple.TextEdit": object()}, {}
         w = InputWatch()
         w.active, w.keys, w.last_external_at = True, True, 123.0
+        w.last_by_bundle = {"com.apple.textedit": 123.0}
         ex._watch = w
         self.assertEqual(ex._last_input_at(), 123.0)
         w.keys = False                                      # no Input Monitoring: key presses count by the idle time too

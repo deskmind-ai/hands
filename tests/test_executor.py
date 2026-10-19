@@ -354,6 +354,7 @@ class Epoch(unittest.TestCase):
         ex._windows = lambda every=False: state["wins"]   # noqa: SLF001
         ex._front = lambda: "文本编辑"                      # noqa: SLF001
         ex._last_input_at = lambda: state["input"]        # noqa: SLF001
+        ex.observe(W12)                                   # the task operates TextEdit
         e0 = ex.snapshot()["epoch"]
         self.assertEqual(ex.snapshot()["epoch"], e0)                  # nothing happened
         state["input"] = time.time()                                  # the user touched the Mac after the epoch was set
@@ -377,6 +378,41 @@ class Epoch(unittest.TestCase):
         ex.perform({"kind": "click", "window": W12, "target": "B2"})
         self.assertEqual(ex.epoch, e0 + 4)
         self.assertEqual(ex.snapshot()["epoch"], e0 + 4)
+
+
+class TaskScope(unittest.TestCase):
+    def test_windows_of_apps_the_task_is_not_operating_do_not_move_the_epoch(self):
+        """A terminal retitling its window while the user types, or a window opening in another app, changes nothing
+        the task decided on (owner, 10-20)."""
+        ex, _ = _executor()
+        state = {"wins": [_win("12"), _win("90", bundle="com.googlecode.iterm2", title="zsh", app="iTerm2")]}
+        ex._windows = lambda every=False: state["wins"]   # noqa: SLF001
+        ex._front = lambda: "iTerm2"                       # noqa: SLF001
+        ex._last_input_at = lambda: 0.0                   # noqa: SLF001
+        ex.observe(W12)
+        e0 = ex.snapshot()["epoch"]
+        state["wins"] = [_win("12"), _win("90", bundle="com.googlecode.iterm2", title="vim notes", app="iTerm2"),
+                         _win("91", bundle="com.googlecode.iterm2", title="zsh", app="iTerm2")]
+        self.assertEqual(ex.snapshot()["epoch"], e0)
+        state["wins"] = [_win("12", title="hello.txt")] + state["wins"][1:]    # the task's own app: a change
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
+
+    def test_input_counts_only_when_it_went_to_an_app_the_task_operates(self):
+        from deskmind_hands.inputwatch import InputWatch
+        ex, _ = _executor()
+        del ex._last_input_at                              # the real one, over a watch fed by hand
+        w = InputWatch()
+        w.active, w.keys = True, True
+        w._pid_bundle = {5: "com.googlecode.iterm2", 6: "com.apple.TextEdit", 7: "ai.deskmind.app"}
+        ex._watch, ex._watch_tried = w, True
+        ex.observe(W12)
+        w.note(5, at=100.0)                                # typing in a terminal
+        w.note(7, at=101.0)                                # answering DeskMind
+        self.assertEqual(ex._last_input_at(), 0.0)         # noqa: SLF001
+        w.note(6, at=102.0)                                # a click in TextEdit, which the task operates
+        self.assertEqual(ex._last_input_at(), 102.0)       # noqa: SLF001
+        w.note(None, at=103.0)                             # target unknown: counts
+        self.assertEqual(ex._last_input_at(), 103.0)       # noqa: SLF001
 
 
 class Sends(unittest.TestCase):

@@ -27,7 +27,7 @@ OWN_BUNDLES = {"ai.deskmind.app", "ai.deskmind.hands"}
 
 class InputWatch:
     """Records when the user last sent input to an application other than DeskMind (`last_external_at`, epoch
-    seconds; 0 before any). `start()` makes the tap on its own thread and returns whether it could; `keys` says
+    seconds; 0 before any), and to which (`last_by_bundle`, `last_input_for`). `start()` makes the tap on its own thread and returns whether it could; `keys` says
     whether key events are among what it sees (the Input Monitoring permission), else the caller counts every key
     press by the HID idle time."""
 
@@ -35,6 +35,9 @@ class InputWatch:
         self.own_bundles = {b.lower() for b in own_bundles}
         self.last_external_at = 0.0
         self.last_own_at = 0.0
+        #: lowercased bundle id -> when input last went to it; input whose target is unknown, apart
+        self.last_by_bundle: dict[str, float] = {}
+        self.last_unknown_at = 0.0
         self.active = False
         self.keys = False
         self._pid_bundle: dict[int, str] = {}
@@ -56,8 +59,17 @@ class InputWatch:
         at = at or time.time()
         if self.is_own(pid):
             self.last_own_at = max(self.last_own_at, at)
+            return
+        self.last_external_at = max(self.last_external_at, at)
+        bundle = (self._pid_bundle.get(pid) or "").lower() if pid else ""
+        if bundle:
+            self.last_by_bundle[bundle] = max(self.last_by_bundle.get(bundle, 0.0), at)
         else:
-            self.last_external_at = max(self.last_external_at, at)
+            self.last_unknown_at = max(self.last_unknown_at, at)
+
+    def last_input_for(self, bundles: set[str]) -> float:
+        """When input last went to one of `bundles` (lowercased), or anywhere unknown: the safe side."""
+        return max([self.last_unknown_at] + [self.last_by_bundle.get(b.lower(), 0.0) for b in bundles])
 
     # -- macOS ---------------------------------------------------------------------------------------------
     @staticmethod

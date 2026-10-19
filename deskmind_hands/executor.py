@@ -312,20 +312,28 @@ class HandsExecutor:
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
         return idle < self.USER_ACTIVE_S
 
+    def _task_bundles(self) -> set[str]:
+        """The applications the task is operating: those whose windows it has observed or acted in (a driver was
+        started for them), lowercased."""
+        return {b.lower() for b in list(self.drivers) + [self._split(w)[0] for w in self.current.values()] if b}
+
     def _last_input_at(self) -> float:
-        """When the user last sent input to an application other than DeskMind (epoch seconds; 0 when it cannot be
-        known). With the input watch: by each event's target process. Without it (no tap: the permission is not
-        there): when the keyboard or mouse was last touched at all, so answering DeskMind's card counts too."""
+        """When the user last sent input to an application the task is operating (epoch seconds; 0 when it cannot
+        be known). With the input watch: by each event's target process -- input to DeskMind is the user answering
+        it, and input to an app the task is not operating (typing in a terminal while a task sends a mail) changes
+        nothing the task decided on (owner, 10-20). An event whose target is unknown counts. Without the watch (no
+        tap: the permission is not there): when the keyboard or mouse was last touched at all."""
         if not self._watch_tried:
             self._watch_tried = True
             w = InputWatch()
             self._watch = w if w.start() else None
         if self._watch is not None and self._watch.active:
+            at = self._watch.last_input_for(self._task_bundles())
             if self._watch.keys or Quartz is None:
-                return self._watch.last_external_at
+                return at
             # a mouse-only tap: every key press counts, wherever it went (the safe side)
             idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGEventKeyDown)
-            return max(self._watch.last_external_at, time.time() - idle)
+            return max(at, time.time() - idle)
         if Quartz is None:
             return 0.0
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
@@ -342,8 +350,11 @@ class HandsExecutor:
         # window that appeared, vanished or was renamed. The epoch is the signal, not the verdict: the layer above
         # observes the target again and goes on when it reads exactly as it did when the action was decided (the
         # user's click on its own consent card is input too, and must not stale the action it approved -- PR #48
-        # review, third round). Which app is in front is no change of anything the task looks at.
-        inventory = tuple(sorted((w["id"], w["title"]) for w in wins))
+        # review, third round). Which app is in front is no change of anything the task looks at, and neither is
+        # input to, or a window of, an application the task is not operating (owner, 10-20: typing in a terminal
+        # kept staling an approved send).
+        task = self._task_bundles()
+        inventory = tuple(sorted((w["id"], w["title"]) for w in wins if (w.get("bundle") or "").lower() in task))
         if self._last_input_at() > self._epoch_at or (self._inventory is not None and inventory != self._inventory):
             self._advance()
         self._inventory = inventory

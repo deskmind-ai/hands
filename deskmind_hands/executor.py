@@ -574,9 +574,13 @@ class HandsExecutor:
                 # the apps sending sound to an output now (CoreAudio): the system's word that something is playing,
                 # which a music app's window cannot give a verdict by its pixels
                 "audio_playing": self._audio_playing(),
-                # app_name: what the user calls the app (its localized name), for cards; app stays as it was
+                # app_name: what the user calls the app (its localized name), for cards; app stays as it was.
+                # browser: the app is a web browser by its structure (browsers.py), present only then -- an
+                # open_window with a url lands in the run's own window only for a browser; any other app opens it
+                # wherever it likes, the user's window included (harness#34 trusts the guarantee only with this)
                 "windows": [{"id": w["id"], "app": w["app"], "app_name": w["app"] or w.get("bundle") or "", "bundle": w.get("bundle") or "",
-                             "title": w["title"], "focused": w["app"] == front} for w in wins]}
+                             "title": w["title"], "focused": w["app"] == front,
+                             **({"browser": True} if is_browser(w.get("bundle") or "") else {})} for w in wins]}
 
     # -- see and act ----------------------------------------------------------
     def _driver(self, bundle: str):

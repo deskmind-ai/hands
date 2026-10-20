@@ -34,8 +34,10 @@ from pathlib import Path
 
 from .actions import Action, ActionKind, Binding
 from .axdocument import _q, document_text, window_document
+from .grounding import STOP
 from .drivers.base import ExecResult, Observation
-from .inputwatch import InputWatch
+from .browsers import is_browser
+from .inputwatch import InputWatch, track_children
 
 try:
     import AppKit
@@ -179,6 +181,26 @@ def sends(role: str, label: str) -> bool:
     return any(text.startswith(v + " ") or (not v.isascii() and text.startswith(v)) for v in SENDS)
 
 
+def app_display_name(bundle: str) -> str:
+    """What the user calls the app with this bundle id: a running copy's localized name, else the installed app's
+    display name, else the bundle id."""
+    if not bundle:
+        return ""
+    for shown, b in running_apps():
+        if b.lower() == bundle.lower() and shown:
+            return shown
+    try:
+        from AppKit import NSWorkspace
+        url = NSWorkspace.sharedWorkspace().URLForApplicationWithBundleIdentifier_(bundle)
+        if url is not None:
+            name = NSWorkspace.sharedWorkspace().displayNameAtPath_(url.path())   # the Finder's, localized
+            if name:
+                return str(name).removesuffix(".app")
+    except Exception:  # noqa: BLE001
+        pass
+    return bundle
+
+
 def _app_name_of_pid(pid: int) -> str:
     app = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid) if AppKit else None
     return (app.localizedName() if app else None) or ""
@@ -194,6 +216,8 @@ class HandsExecutor:
         #: The task's folder: where the projections' save-as puts files ("工作目录顶层"), so a document saved from the
         #: GUI lands where the task's own file tools and the verdict look.
         self.workspace = Path(workspace) if workspace else self.scratch
+        track_children()   # every child's pid recorded as it starts: its posted events are the driver's, not the user's
+        STOP.clear()       # a new run starts unstopped (a stop that came before begin is applied right after this)
         self.epoch = 1
         #: When the epoch was last set, and the inventory it was set on: a user's input after that moment, or a
         #: window appearing, vanishing or renamed, moves the epoch at the next snapshot, so an observation and a
@@ -320,6 +344,20 @@ class HandsExecutor:
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
         return idle < self.USER_ACTIVE_S
 
+    def _needs_foreground(self) -> list[str]:
+        """Bundles of the apps whose steps come to the front: their driver reads them from pixels (input then only
+        goes through a brief flash), or it has already had to bring the app forward for a step. Known once the app
+        has been observed; the flash itself still waits for the Mac to be idle and gives the front back after."""
+        out = []
+        for bundle, d in self.drivers.items():
+            try:
+                vision = bool(getattr(d, "_vision_app", None) and d._vision_app(bundle))
+            except Exception:  # noqa: BLE001
+                vision = False
+            if vision or int(getattr(d, "_foreground_actions", 0) or 0) > 0:
+                out.append(bundle)
+        return sorted(out)
+
     def _task_bundles(self) -> set[str]:
         """The applications the task is operating: those whose windows it has observed or acted in (a driver was
         started for them), lowercased."""
@@ -395,7 +433,12 @@ class HandsExecutor:
         return {"epoch": self.epoch, "locked": self.locked(), "front_app": front, "user_active": self.user_active(),
                 "input_watch": ("keys" if self._watch.keys else "mouse") if self._watch is not None and self._watch.active else "",
                 **({"epoch_reason": self._epoch_reason} if getattr(self, "_epoch_reason", None) else {}),
-                "windows": [{"id": w["id"], "app": w["app"], "title": w["title"], "focused": w["app"] == front} for w in wins]}
+                # the apps whose steps must bring them to the front (read from their pixels, or a step that could not
+                # be delivered in the background): so the plan can say so once, before the run takes the front.
+                "needs_foreground": self._needs_foreground(),
+                # app_name: what the user calls the app (its localized name), for cards; app stays as it was
+                "windows": [{"id": w["id"], "app": w["app"], "app_name": w["app"] or w.get("bundle") or "", "bundle": w.get("bundle") or "",
+                             "title": w["title"], "focused": w["app"] == front} for w in wins]}
 
     # -- see and act ----------------------------------------------------------
     def _driver(self, bundle: str):
@@ -466,7 +509,7 @@ class HandsExecutor:
             if e.rect:
                 el["rect"] = [round(e.rect.x, 1), round(e.rect.y, 1), round(e.rect.w, 1), round(e.rect.h, 1)]
             els.append(el)
-        out = {"epoch": self.epoch, "window": {"id": window, "app": bundle, "title": obs.window_title},
+        out = {"epoch": self.epoch, "window": {"id": window, "app": bundle, "app_name": app_display_name(bundle), "title": obs.window_title},
                "modal": {"title": "dialog"} if obs.dialog else None, "elements": els, "text": "\n".join(texts)[:4000]}
         if screenshot and obs.screenshot_png:
             import base64
@@ -477,10 +520,11 @@ class HandsExecutor:
         """The app's stop switch, straight to the execution layer: every later action is refused here, whatever the
         runtime above still wants."""
         self.stopped = True
+        STOP.set()          # a wait in progress (the vision model starting) gives up at its next slice
         return {"stopped": True}
 
     def perform(self, action: dict) -> dict:
-        if getattr(self, "stopped", False):
+        if getattr(self, "stopped", False) or STOP.is_set():
             return {"status": "error", "why": "stopped by the app"}
         kind = action.get("kind")
         self._advance({"by": "action", "kind": kind or "", "window": action.get("window") or ""})
@@ -544,7 +588,25 @@ class HandsExecutor:
         # typing and scrolling never write a file, and each read asks the app (up to two osascript runs)
         may_save = kind in self.SAVING_KINDS
         state0 = self._document(window, wins) if may_save else None
-        res: ExecResult = d.execute(a)
+        # foreground_ok (the layer above): this step's window is the task's own, or the user's consent covers it --
+        # the app may be brought forward for it (briefly, once the user is still), whatever HANDS_FLASH_APPS names.
+        # The app no longer names the task's apps before a run (deskmind #96), so the list alone left an app that
+        # only takes input in front unreachable. Only for this step: the list is put back after it.
+        flash_before = os.environ.get("HANDS_FLASH_APPS")
+        if action.get("foreground_ok"):
+            have = [b for b in (flash_before or "").split(",") if b.strip()]
+            if bundle.lower() not in {b.lower() for b in have}:
+                os.environ["HANDS_FLASH_APPS"] = ",".join(have + [bundle])
+        try:
+            if getattr(self, "stopped", False) or STOP.is_set():   # read while this step was getting ready: nothing sent
+                return {"status": "error", "why": "stopped by the app"}
+            res: ExecResult = d.execute(a)
+        finally:
+            if action.get("foreground_ok"):
+                if flash_before is None:
+                    os.environ.pop("HANDS_FLASH_APPS", None)
+                else:
+                    os.environ["HANDS_FLASH_APPS"] = flash_before
         status = "ok" if res.ok else "unsupported" if res.unsupported else "error"
         if res.ok and res.indeterminate:
             status = "unverified"
@@ -623,13 +685,36 @@ class HandsExecutor:
         if not bundle:
             return {"status": "unsupported", "why": f"no application called {app!r} is running or installed"}
         was_running = bundle in {b for _, b in running_apps()}
+        launched: list[dict] = []
         if not was_running:
             # Not running: launched first, on its own. What it brings back then -- the last session's windows, as
             # Safari and TextEdit do -- is the user's, not a window this action made (PR #48 review, third round).
+            # An app slow to start (a music player took longer than the 8 s this waited, 10-20) is waited for up to
+            # LAUNCH_WAIT_S, until a window of it appears.
+            before_launch = self._known_windows()
             subprocess.run(["open", "-b", bundle], capture_output=True, timeout=20)
+            launched = self._launch_windows(bundle, before_launch, self.LAUNCH_WAIT_S)
             self._settled(bundle)
         d = self._driver(bundle)      # started now, so the windows it finds are the ones there before the task's
         before = self._known_windows()
+        # A window this open's launch brought up is one the task opened (opened_window): the task may look at it,
+        # move about in it and bring the app forward -- but what is in it stays the user's (a mailbox, a library, a
+        # restored chat), so it is not new_window, which says the task made the window and its content (hands #54
+        # review: "no document" could not tell a music player's main window from Mail's mailbox, and a read that
+        # failed looked the same). Only proof that this action made a window -- the id the app's scripting returned
+        # for a new document, the run's own browser window -- is new_window. Never by the app's name; a browser
+        # (any app that opens https: links) is not handled this way, the run has its own browser window.
+        # A launch window that shows a document (the last session's file, restored) is not even that: the task asked
+        # for a window to work in, and a new document is asked for below.
+        if launched and not url and not is_browser(bundle):
+            wins = self._windows()
+            shown = [w for w in launched if any(x["id"] == w["id"] for x in wins) and self._document(w["id"], wins) is None]
+            if shown:
+                w = shown[-1]
+                allow_flash(bundle)              # the task opened the app: it may bring it forward for its steps
+                return {"status": "ok", "window": w["id"],
+                        "opened_window": {"id": w["id"], "app": w["app"], "app_name": w["app"] or app_display_name(w.get("bundle") or ""), "title": w["title"]},
+                        "why": "the window the app showed when this opened it; what is in it is the user's"}
         # Whose the window is: the task's on proof that this action made it -- the window id the app's scripting
         # returned for the document it made, or a browser window the driver opened and told apart by its marker.
         # A window that merely appeared after the ask is the task's only when the app was running already (a
@@ -637,7 +722,9 @@ class HandsExecutor:
         # to observe, not claimed (PR #48 review, fourth round: the restored #18000 was claimed when the ask failed).
         proof: str | None = None
         fresh: list[dict] = []
-        if url and bundle.lower() in getattr(d, "BROWSERS", set()) and hasattr(d, "_own_browser_window"):
+        if url and is_browser(bundle) and hasattr(d, "_own_browser_window"):
+            # any browser (by what it registers): the driver opens the run's own window where the browser's scripting
+            # allows it, and says why not where it does not -- never the user's window
             proof = d._own_browser_window(bundle, url)
             if proof and str(proof) in {self._split(b)[1] for b in before}:
                 # the run's own browser window from earlier, given back as it is: the page asked for now has to be
@@ -668,7 +755,7 @@ class HandsExecutor:
                     "why": f"a window of {app} is there, but it may be one the app brought back when it launched, not one this action made"}
         allow_flash(bundle)   # a window the task opened is the task's: the app may be brought forward for it
         self._own(d, self._split(w["id"])[1])
-        return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "title": w["title"]}}
+        return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "app_name": w["app"] or app_display_name(w.get("bundle") or ""), "title": w["title"]}}
 
     def _navigate(self, d, bundle: str, wid: str, url: str) -> bool:
         """Load `url` in the run's own browser window `wid` (the window server's id) and check that the window's page
@@ -736,6 +823,22 @@ class HandsExecutor:
         out = (p.stdout or "").strip() if p.returncode == 0 else ""
         return out if out.isdigit() else None
 
+    #: How long a launched app is waited for to show its first window.
+    LAUNCH_WAIT_S = 20.0
+
+    def _launch_windows(self, bundle: str, before: set, seconds: float) -> list[dict]:
+        """The windows of `bundle` that appeared after its launch: waited for up to `seconds` until the first, then a
+        moment more for others coming with it."""
+        t0 = time.time()
+        found: list[dict] = []
+        while time.time() - t0 < seconds:
+            time.sleep(0.3)
+            found = [w for w in self._windows() if w["id"] not in before and w["bundle"] == bundle]
+            if found:
+                time.sleep(1.0)
+                return [w for w in self._windows() if w["id"] not in before and w["bundle"] == bundle]
+        return found
+
     def _settled(self, bundle: str, timeout: float = 10.0) -> None:
         """Wait for a just-launched app to be running and its windows to stop changing (two readings alike)."""
         last = None
@@ -769,21 +872,57 @@ class HandsExecutor:
 
 
 def main() -> None:
-    ex: HandsExecutor | None = None
+    """One request at a time, in order -- except `stop`, which is handled the moment it is read, on its own thread:
+    a stop that came while a step was still waiting (for the vision model, for the user) was read only after that
+    step had returned, and its click went ahead (hands #54 review)."""
+    import queue
+    import threading
+
     out = sys.stdout
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except ValueError:
-            out.write(json.dumps({"id": None, "ok": False, "error": "bad json"}) + "\n"); out.flush()
-            continue
+    out_lock = threading.Lock()
+    state: dict = {"ex": None}
+    requests: "queue.Queue[dict | None]" = queue.Queue()
+
+    def write(obj: dict) -> None:
+        with out_lock:
+            out.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            out.flush()
+
+    def read() -> None:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except ValueError:
+                write({"id": None, "ok": False, "error": "bad json"})
+                continue
+            if req.get("op") == "stop":
+                ex = state["ex"]
+                if ex is None:
+                    # before begin has made the executor: kept, and applied as it is made (hands #54 review)
+                    state["stop_pending"] = True
+                    STOP.set()
+                    write({"id": req.get("id"), "ok": True, "result": {"stopped": True, "pending": True}})
+                else:
+                    write({"id": req.get("id"), "ok": True, "result": ex.stop()})
+                continue
+            requests.put(req)
+        requests.put(None)
+
+    threading.Thread(target=read, name="requests", daemon=True).start()
+    while True:
+        req = requests.get()
+        if req is None:
+            break
         rid, op = req.get("id"), req.get("op")
+        ex = state["ex"]
         try:
             if op == "begin":
-                ex = HandsExecutor(Path(req["scratch"]) if req.get("scratch") else None, Path(req["workspace"]) if req.get("workspace") else None)
+                ex = state["ex"] = HandsExecutor(Path(req["scratch"]) if req.get("scratch") else None, Path(req["workspace"]) if req.get("workspace") else None)
+                if state.get("stop_pending"):
+                    ex.stop()
                 res = ex.snapshot()
             elif ex is None:
                 raise RuntimeError("begin first")
@@ -793,16 +932,13 @@ def main() -> None:
                 res = ex.observe(req["window"], bool(req.get("screenshot")))
             elif op == "perform":
                 res = ex.perform(req["action"])
-            elif op == "stop":
-                res = ex.stop()
             elif op == "end":
                 res = ex.end()
             else:
                 raise RuntimeError(f"unknown op {op}")
-            out.write(json.dumps({"id": rid, "ok": True, "result": res}, ensure_ascii=False) + "\n")
+            write({"id": rid, "ok": True, "result": res})
         except Exception as e:  # noqa: BLE001 -- every failure is reported to the caller, the process stays up
-            out.write(json.dumps({"id": rid, "ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False) + "\n")
-        out.flush()
+            write({"id": rid, "ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
 if __name__ == "__main__":

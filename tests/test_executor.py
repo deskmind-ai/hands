@@ -60,6 +60,14 @@ class StubDriver:
         pass
 
 
+# No LaunchServices queries in these tests (the first one on a Mac can take minutes): which apps are browsers, and
+# what an app is called, are given, except where a test says otherwise.
+import deskmind_hands.browsers as _br   # noqa: E402
+import deskmind_hands.executor as _exe   # noqa: E402
+_br._BROWSERS = set()
+_exe.app_display_name = lambda bundle: bundle
+
+
 def _executor():
     ex = HandsExecutor()
     stub = StubDriver()
@@ -80,7 +88,8 @@ class Mapping(unittest.TestCase):
         self.assertEqual(by_id["P3"]["actions"], ["click", "select"])
         self.assertEqual(by_id["P3"]["options"], ["桌面", "文稿"])
         self.assertEqual(o["text"], "已保存")
-        self.assertEqual(o["window"], {"id": W12, "app": TE, "title": "未命名"})
+        self.assertEqual({k: o["window"][k] for k in ("id", "app", "title")}, {"id": W12, "app": TE, "title": "未命名"})
+        self.assertTrue(o["window"]["app_name"])            # what the user calls it, for cards (bundle id when unknown)
         self.assertIsNone(o["modal"])
         self.assertTrue(json.dumps(o, ensure_ascii=False))   # serialisable as it stands
 
@@ -563,6 +572,80 @@ class UserActive(unittest.TestCase):
                 self.assertTrue(ex.user_active())
 
 
+class NeedsForeground(unittest.TestCase):
+    def test_apps_whose_steps_come_to_the_front_are_named_in_the_snapshot(self):
+        ex, stub = _executor()
+        ex._windows = lambda every=False: [_win("12")]   # noqa: SLF001
+        ex._front = lambda: "文本编辑"                      # noqa: SLF001
+        ex._last_input_at = lambda: 0.0                   # noqa: SLF001
+        ex.drivers = {TE: stub}
+        stub._foreground_actions = 0
+        stub._vision_app = lambda app=None: False
+        self.assertEqual(ex.snapshot()["needs_foreground"], [])
+        stub._vision_app = lambda app=None: True          # read from its pixels
+        self.assertEqual(ex.snapshot()["needs_foreground"], [TE])
+        stub._vision_app = lambda app=None: False
+        stub._foreground_actions = 1                      # a step had to bring it forward
+        self.assertEqual(ex.snapshot()["needs_foreground"], [TE])
+
+
+class ForegroundOK(unittest.TestCase):
+    def test_a_step_the_layer_above_allows_may_bring_its_app_forward_for_that_step_only(self):
+        """The app no longer names the task's apps (deskmind #96): an app that only takes input in front is allowed
+        a flash for a step whose window is the task's or the user's consent covers (foreground_ok), and only then."""
+        ex, stub = _executor()
+        seen = []
+        stub.execute = lambda action: seen.append(os.environ.get("HANDS_FLASH_APPS", "")) or ExecResult(True, "done")
+        ex.observe(W12)
+        with mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": "com.apple.Safari"}):
+            ex.perform({"kind": "click", "window": W12, "target": "B2", "foreground_ok": True})
+            ex.perform({"kind": "click", "window": W12, "target": "B2"})
+            self.assertEqual(os.environ["HANDS_FLASH_APPS"], "com.apple.Safari")   # put back
+        self.assertEqual(seen, [f"com.apple.Safari,{TE}", "com.apple.Safari"])
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HANDS_FLASH_APPS", None)
+            ex.perform({"kind": "click", "window": W12, "target": "B2", "foreground_ok": True})
+            self.assertNotIn("HANDS_FLASH_APPS", os.environ)
+        self.assertEqual(seen[-1], TE)
+
+
+class StopBeforeBegin(unittest.TestCase):
+    def test_a_stop_that_comes_before_begin_is_applied_when_the_executor_is_made(self):
+        """Read on its own thread, a stop can come while begin is still making the executor: kept, not "begin first"
+        and lost (hands #54 review)."""
+        import io
+        import sys as _sys
+        from deskmind_hands import executor as exe
+        from deskmind_hands.grounding import STOP
+        self.addCleanup(STOP.clear)
+        lines = io.StringIO('{"id": 1, "op": "stop"}\n{"id": 2, "op": "begin"}\n{"id": 3, "op": "perform", "action": {"kind": "click", "window": "x#1", "target": "e"}}\n')
+        out = io.StringIO()
+        made = []
+
+        class Fake:
+            def __init__(self, *a, **k):
+                self.stopped = False
+                made.append(self)
+
+            def stop(self):
+                self.stopped = True
+                return {"stopped": True}
+
+            def snapshot(self):
+                return {"epoch": 1}
+
+            def perform(self, action):
+                return {"status": "error", "why": "stopped by the app"} if self.stopped else {"status": "ok"}
+        with mock.patch.object(_sys, "stdin", lines), mock.patch.object(_sys, "stdout", out), \
+             mock.patch.object(exe, "HandsExecutor", Fake):
+            exe.main()
+        replies = [json.loads(l) for l in out.getvalue().splitlines()]
+        by_id = {r["id"]: r for r in replies}
+        self.assertTrue(by_id[1]["ok"])
+        self.assertTrue(made[0].stopped)                          # applied as the executor was made
+        self.assertEqual(by_id[3]["result"]["status"], "error")
+
+
 class Sends(unittest.TestCase):
     def test_send_controls_are_known_by_their_verb(self):
         for role, label in [("button", "发送"), ("button", "Send"), ("button", "Send message"), ("button", "发送消息"),
@@ -601,10 +684,14 @@ class OpenWindow(unittest.TestCase):
     """A Mac with one app: launched, it brings its last session's windows back (late, after the launch looked
     settled); asked by its scripting, it makes a document and says which window."""
 
-    def _mac(self, ex, running: bool, restored: list[dict], answers: bool = True, late: bool = False):
+    def _mac(self, ex, running: bool, restored: list[dict], answers: bool = True, late: bool = False, documents=None):
         from types import SimpleNamespace
         state = {"running": running, "on": [], "off": [], "n": 30000, "events": [], "pending": list(restored), "late": late}
         ex._windows = lambda every=False: state["on"] + (state["off"] if every else [])   # noqa: SLF001
+        ex.LAUNCH_WAIT_S = 0.3
+        # a restored window shows its document (the last session's file); `documents` overrides, by window id
+        docs = documents if documents is not None else {w["id"]: (f"/Users/me/{w['title']}.txt", False) for w in restored}
+        ex._document = lambda window, wins: docs.get(window)   # noqa: SLF001
 
         def run(argv, **k):
             state["events"].append(argv[0] if argv[0] != "open" else argv[:3])
@@ -669,6 +756,43 @@ class OpenWindow(unittest.TestCase):
         self.assertEqual(r["new_window"]["id"], f"{TE}#14")
         self.assertIn("14", stub.__dict__["_run_windows"])
 
+    def test_an_app_slow_to_start_shows_a_window_the_task_opened_but_its_content_stays_the_users(self):
+        """A music player, launched by this open: its main window came after the 8 s this used to wait (10-20).
+        Waited for, and reported as opened_window -- the task may work in it and bring the app forward -- but not
+        new_window: what is in it (a library, a mailbox) is the user's (hands #54 review). No new document is asked
+        for, no cmd+N sent."""
+        ex, stub = _executor()
+        player = "com.example.player"
+        state, run, running = self._mac(ex, running=False, restored=[_win("700", bundle=player, title="Player", app="Player")],
+                                         answers=False, documents={})
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
+             mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda: [("Player", player)] if state["running"] else []), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value=player), \
+             mock.patch("deskmind_hands.executor.is_browser", return_value=False), \
+             mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": ""}), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            r = ex.perform({"kind": "open_window", "app": "Player"})
+            self.assertIn(player, os.environ["HANDS_FLASH_APPS"])   # may be brought forward for its steps
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["window"], f"{player}#700")
+        self.assertEqual(r["opened_window"]["id"], f"{player}#700")
+        self.assertNotIn("new_window", r)
+        self.assertNotIn("700", stub.__dict__.get("_run_windows", set()))
+        self.assertNotIn("osascript", state["events"])
+
+    def test_a_browser_launch_is_not_an_opened_window(self):
+        ex, _ = _executor()
+        state, run, running = self._mac(ex, running=False, restored=[_win("701", bundle="com.example.web", title="Tabs", app="Web")],
+                                         answers=False, documents={})
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
+             mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda: [("Web", "com.example.web")] if state["running"] else []), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value="com.example.web"), \
+             mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            r = ex.perform({"kind": "open_window", "app": "Web"})
+        self.assertNotIn("opened_window", r)
+        self.assertNotIn("new_window", r)
+
     def test_a_launch_that_makes_no_window_is_unverified(self):
         ex, _ = _executor()
         state, run, running = self._mac(ex, running=False, restored=[], answers=False)
@@ -701,6 +825,7 @@ class OpenWindow(unittest.TestCase):
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[("Safari", safari)]), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=safari), \
+             mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
              mock.patch("deskmind_hands.executor.time.sleep"):
             # first: the driver opened the window on A -- a new window, the task's
             r1 = ex.perform({"kind": "open_window", "app": "Safari", "url": "https://a.example/"})
@@ -770,6 +895,7 @@ class OpenWindow(unittest.TestCase):
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[("Google Chrome", chrome)]), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=chrome), \
+             mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
              mock.patch("deskmind_hands.executor.time.sleep"):
             r1 = ex.perform({"kind": "open_window", "app": "Chrome", "url": "https://a.example/"})
             self.assertEqual(r1["new_window"]["id"], f"{chrome}#42")
@@ -783,6 +909,7 @@ class OpenWindow(unittest.TestCase):
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[("Google Chrome", chrome)]), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=chrome), \
+             mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
              mock.patch("deskmind_hands.executor.time.sleep"):
             r3 = ex.perform({"kind": "open_window", "app": "Chrome", "url": "https://c.example/"})
         self.assertEqual(r3["status"], "unverified")

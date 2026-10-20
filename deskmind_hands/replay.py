@@ -48,7 +48,7 @@ def _element(d: dict) -> Element:
                    rect=Rect(*r) if r else None, value=d.get("value"), focused=bool(d.get("focused")),
                    enabled=d.get("enabled", True), settable=bool(d.get("settable")), app=d.get("app", ""),
                    window_id=d.get("window_id", ""), options=list(d.get("options") or []),
-                   synthetic=bool(d.get("synthetic")))
+                   synthetic=bool(d.get("synthetic")), source=d.get("source", "ax"))
 
 
 def observation(rec: dict) -> Observation:

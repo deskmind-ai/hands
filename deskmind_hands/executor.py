@@ -426,7 +426,9 @@ class HandsExecutor:
             role = (e.role or e.ax_role or "").replace("AX", "")
             if role.lower() in {"statictext", "text"} and (e.value or e.label):
                 texts.append(e.value or e.label)
-            el = {"id": e.id, "role": role, "label": e.label, "actions": actions}
+            # where it was read from: the accessibility tree, or the screenshot (an app read from its pixels)
+            el = {"id": e.id, "role": role, "label": e.label, "actions": actions,
+                  "source": "pixels" if e.source == "pixels" else "ax"}
             if sends(role, e.label):
                 el["sends"] = True
             if e.value is not None:

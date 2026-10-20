@@ -82,6 +82,7 @@ def name_unnamed(app: str, els: list, shot: Path, width: float, height: float, p
         n = _cache[key].get(_rkey(e))
         if n:
             e.label = n
+            e.source = "pixels"     # the name is a reading of the image, not what the app reports
             named += 1
     return named
 

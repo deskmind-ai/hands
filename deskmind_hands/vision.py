@@ -304,6 +304,8 @@ def vision_elements(app: str, shot: Path, width: float, height: float, app_name:
         out.append(Element(id=f"ocr:{i}", role="listitem", label=text,
                            rect=Rect(r["x"] * width, r["y"] * height, r["w"] * width, r["h"] * height),
                            app=app_name, window_id=window_id))
+    for e in out:
+        e.source = "pixels"
     return out
 
 

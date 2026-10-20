@@ -65,6 +65,13 @@ class Targets(unittest.TestCase):
         self.assertTrue(w2.keys)
         self.assertTrue(make.call_args[0][3] & (1 << consts["kCGEventKeyDown"]))
 
+    def test_an_event_that_cannot_be_read_counts_as_input_to_an_unknown_target(self):
+        """The callback's failure path is the safe side for every reader, last_input_for included (PR #49 review)."""
+        w = InputWatch()
+        w._callback(None, 1, object(), None)              # not a CGEvent: reading its target raises
+        self.assertGreater(w.last_unknown_at, 0.0)
+        self.assertEqual(w.last_input_for({"com.apple.textedit"}), w.last_unknown_at)
+
     def test_the_executor_uses_the_watch_when_it_runs_and_the_idle_time_otherwise(self):
         from deskmind_hands.executor import HandsExecutor
         ex = HandsExecutor.__new__(HandsExecutor)

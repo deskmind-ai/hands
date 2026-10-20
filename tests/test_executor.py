@@ -397,6 +397,23 @@ class TaskScope(unittest.TestCase):
         state["wins"] = [_win("12", title="hello.txt")] + state["wins"][1:]    # the task's own app: a change
         self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
 
+    def test_starting_to_operate_an_app_is_no_change(self):
+        """begin -> observe -> snapshot: the first observe widens the watched apps; the snapshot after it must not
+        stale the observation just returned (PR #49 review)."""
+        ex, stub = _executor()
+        state = {"wins": [_win("12")]}
+        ex._windows = lambda every=False: state["wins"]   # noqa: SLF001
+        ex._front = lambda: "文本编辑"                      # noqa: SLF001
+        ex._last_input_at = lambda: 0.0                   # noqa: SLF001
+        e0 = ex.snapshot()["epoch"]                       # begin: nothing operated yet
+        ex.observe(W12)
+        self.assertEqual(ex.snapshot()["epoch"], e0)
+        self.assertEqual(ex.perform({"kind": "click", "window": W12, "target": "B2"})["status"], "ok")
+        e1 = ex.epoch
+        self.assertEqual(ex.snapshot()["epoch"], e1)
+        state["wins"] = [_win("12"), _win("13", title="未命名 2")]   # then a real change of that app
+        self.assertEqual(ex.snapshot()["epoch"], e1 + 1)
+
     def test_input_counts_only_when_it_went_to_an_app_the_task_operates(self):
         from deskmind_hands.inputwatch import InputWatch
         ex, _ = _executor()

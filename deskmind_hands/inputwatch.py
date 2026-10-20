@@ -98,8 +98,8 @@ class InputWatch:
                     Quartz.CGEventTapEnable(self._tap, True)
                 return event
             self.note(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0))
-        except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side
-            self.last_external_at = time.time()
+        except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side (an unknown target)
+            self.note(None)
         return event
 
     def start(self) -> bool:

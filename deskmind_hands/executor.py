@@ -200,7 +200,7 @@ class HandsExecutor:
         #: consent decided before it are stale upstream (PR #48 review: a delete approved for A ran on B the user
         #: had selected meanwhile).
         self._epoch_at = time.time()
-        self._inventory: tuple | None = None
+        self._inventory: dict[str, tuple] | None = None
         #: Where the user's input goes (inputwatch): input to DeskMind itself -- answering a card -- is not a change
         #: of the Mac. None until the first snapshot; stays None when no tap can be made, and every input then counts.
         self._watch: InputWatch | None = None
@@ -353,11 +353,22 @@ class HandsExecutor:
         # review, third round). Which app is in front is no change of anything the task looks at, and neither is
         # input to, or a window of, an application the task is not operating (owner, 10-20: typing in a terminal
         # kept staling an approved send).
+        # The inventory is kept per application, and compared only for the applications it already covered: the
+        # task starting to operate another app widens what is watched, it is no change (PR #49 review: the first
+        # observe made the next snapshot a new epoch, and the observation it had just returned was stale).
         task = self._task_bundles()
-        inventory = tuple(sorted((w["id"], w["title"]) for w in wins if (w.get("bundle") or "").lower() in task))
-        if self._last_input_at() > self._epoch_at or (self._inventory is not None and inventory != self._inventory):
+        inventory: dict[str, tuple] = {}
+        for w in wins:
+            b = (w.get("bundle") or "").lower()
+            if b in task:
+                inventory.setdefault(b, [])
+                inventory[b].append((w["id"], w["title"]))
+        inventory = {b: tuple(sorted(v)) for b, v in inventory.items()}
+        before = self._inventory or {}
+        changed = any(inventory.get(b, ()) != before[b] for b in before if b in task)
+        if self._last_input_at() > self._epoch_at or changed:
             self._advance()
-        self._inventory = inventory
+        self._inventory = {b: inventory.get(b, ()) for b in task}
         return {"epoch": self.epoch, "locked": self.locked(), "front_app": front, "user_active": self.user_active(),
                 "input_watch": ("keys" if self._watch.keys else "mouse") if self._watch is not None and self._watch.active else "",
                 "windows": [{"id": w["id"], "app": w["app"], "title": w["title"], "focused": w["app"] == front} for w in wins]}

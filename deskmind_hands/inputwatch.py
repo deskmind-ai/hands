@@ -27,7 +27,7 @@ OWN_BUNDLES = {"ai.deskmind.app", "ai.deskmind.hands"}
 
 class InputWatch:
     """Records when the user last sent input to an application other than DeskMind (`last_external_at`, epoch
-    seconds; 0 before any). `start()` makes the tap on its own thread and returns whether it could; `keys` says
+    seconds; 0 before any), and to which (`last_by_bundle`, `last_input_for`). `start()` makes the tap on its own thread and returns whether it could; `keys` says
     whether key events are among what it sees (the Input Monitoring permission), else the caller counts every key
     press by the HID idle time."""
 
@@ -35,9 +35,18 @@ class InputWatch:
         self.own_bundles = {b.lower() for b in own_bundles}
         self.last_external_at = 0.0
         self.last_own_at = 0.0
+        #: lowercased bundle id -> when input last went to it; input whose target is unknown, apart
+        self.last_by_bundle: dict[str, float] = {}
+        self.last_unknown_at = 0.0
         self.active = False
         self.keys = False
         self._pid_bundle: dict[int, str] = {}
+        #: pid -> whether it is an ordinary app (NSApplicationActivationPolicyRegular). Input to a system surface --
+        #: a notification banner, the Dock, Spotlight, a launcher -- can bring another window of any app forward,
+        #: so it counts as input to an unknown target (PR #49 review: a Messages banner swapped the conversation an
+        #: approved "type and Return" went into).
+        self._pid_regular: dict[int, bool] = {}
+        self._dragging = False
         self._thread: threading.Thread | None = None
         self._tap = None
 
@@ -56,10 +65,33 @@ class InputWatch:
         at = at or time.time()
         if self.is_own(pid):
             self.last_own_at = max(self.last_own_at, at)
+            return
+        self.last_external_at = max(self.last_external_at, at)
+        bundle = (self._pid_bundle.get(pid) or "").lower() if pid and self.is_regular(pid) else ""
+        if bundle:
+            self.last_by_bundle[bundle] = max(self.last_by_bundle.get(bundle, 0.0), at)
         else:
-            self.last_external_at = max(self.last_external_at, at)
+            self.last_unknown_at = max(self.last_unknown_at, at)
+
+    def last_input_for(self, bundles: set[str]) -> float:
+        """When input last went to one of `bundles` (lowercased), or anywhere unknown: the safe side."""
+        return max([self.last_unknown_at] + [self.last_by_bundle.get(b.lower(), 0.0) for b in bundles])
+
+    def is_regular(self, pid: int) -> bool:
+        if pid not in self._pid_regular:
+            self._pid_regular[pid] = self._regular_of(pid)
+        return self._pid_regular[pid]
 
     # -- macOS ---------------------------------------------------------------------------------------------
+    @staticmethod
+    def _regular_of(pid: int) -> bool:
+        try:
+            from AppKit import NSRunningApplication
+            app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+            return bool(app) and int(app.activationPolicy()) == 0     # NSApplicationActivationPolicyRegular
+        except Exception:  # noqa: BLE001 -- not known to be an ordinary app: the safe side
+            return False
+
     @staticmethod
     def _bundle_of(pid: int) -> str:
         try:
@@ -85,9 +117,23 @@ class InputWatch:
                 if self._tap is not None:
                     Quartz.CGEventTapEnable(self._tap, True)
                 return event
+            # a drag goes to whatever is under the pointer when it is let go (a file dragged from Finder into the
+            # task's window), and the press is the source's: the whole drag, and its release, is input to an
+            # unknown target (PR #49 review)
+            drags = (Quartz.kCGEventLeftMouseDragged, Quartz.kCGEventRightMouseDragged, Quartz.kCGEventOtherMouseDragged)
+            ups = (Quartz.kCGEventLeftMouseUp, Quartz.kCGEventRightMouseUp, Quartz.kCGEventOtherMouseUp)
+            if type_ in drags:
+                self._dragging = True
+                self.note(None)
+                return event
+            if type_ in ups:
+                if self._dragging:
+                    self._dragging = False
+                    self.note(None)
+                return event
             self.note(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0))
-        except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side
-            self.last_external_at = time.time()
+        except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side (an unknown target)
+            self.note(None)
         return event
 
     def start(self) -> bool:
@@ -98,7 +144,9 @@ class InputWatch:
         except ImportError:
             return False
         self.keys = self.keys_permitted()
-        names = ["kCGEventLeftMouseDown", "kCGEventRightMouseDown", "kCGEventOtherMouseDown", "kCGEventScrollWheel"]
+        names = ["kCGEventLeftMouseDown", "kCGEventRightMouseDown", "kCGEventOtherMouseDown", "kCGEventScrollWheel",
+                 "kCGEventLeftMouseDragged", "kCGEventRightMouseDragged", "kCGEventOtherMouseDragged",
+                 "kCGEventLeftMouseUp", "kCGEventRightMouseUp", "kCGEventOtherMouseUp"]
         if self.keys:
             names += ["kCGEventKeyDown", "kCGEventFlagsChanged"]
         mask = 0

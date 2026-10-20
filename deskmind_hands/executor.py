@@ -200,7 +200,7 @@ class HandsExecutor:
         #: consent decided before it are stale upstream (PR #48 review: a delete approved for A ran on B the user
         #: had selected meanwhile).
         self._epoch_at = time.time()
-        self._inventory: tuple | None = None
+        self._inventory: dict[str, tuple] | None = None
         #: Where the user's input goes (inputwatch): input to DeskMind itself -- answering a card -- is not a change
         #: of the Mac. None until the first snapshot; stays None when no tap can be made, and every input then counts.
         self._watch: InputWatch | None = None
@@ -312,20 +312,28 @@ class HandsExecutor:
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
         return idle < self.USER_ACTIVE_S
 
+    def _task_bundles(self) -> set[str]:
+        """The applications the task is operating: those whose windows it has observed or acted in (a driver was
+        started for them), lowercased."""
+        return {b.lower() for b in list(self.drivers) + [self._split(w)[0] for w in self.current.values()] if b}
+
     def _last_input_at(self) -> float:
-        """When the user last sent input to an application other than DeskMind (epoch seconds; 0 when it cannot be
-        known). With the input watch: by each event's target process. Without it (no tap: the permission is not
-        there): when the keyboard or mouse was last touched at all, so answering DeskMind's card counts too."""
+        """When the user last sent input to an application the task is operating (epoch seconds; 0 when it cannot
+        be known). With the input watch: by each event's target process -- input to DeskMind is the user answering
+        it, and input to an app the task is not operating (typing in a terminal while a task sends a mail) changes
+        nothing the task decided on (owner, 10-20). An event whose target is unknown counts. Without the watch (no
+        tap: the permission is not there): when the keyboard or mouse was last touched at all."""
         if not self._watch_tried:
             self._watch_tried = True
             w = InputWatch()
             self._watch = w if w.start() else None
         if self._watch is not None and self._watch.active:
+            at = self._watch.last_input_for(self._task_bundles())
             if self._watch.keys or Quartz is None:
-                return self._watch.last_external_at
+                return at
             # a mouse-only tap: every key press counts, wherever it went (the safe side)
             idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGEventKeyDown)
-            return max(self._watch.last_external_at, time.time() - idle)
+            return max(at, time.time() - idle)
         if Quartz is None:
             return 0.0
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
@@ -342,11 +350,25 @@ class HandsExecutor:
         # window that appeared, vanished or was renamed. The epoch is the signal, not the verdict: the layer above
         # observes the target again and goes on when it reads exactly as it did when the action was decided (the
         # user's click on its own consent card is input too, and must not stale the action it approved -- PR #48
-        # review, third round). Which app is in front is no change of anything the task looks at.
-        inventory = tuple(sorted((w["id"], w["title"]) for w in wins))
-        if self._last_input_at() > self._epoch_at or (self._inventory is not None and inventory != self._inventory):
+        # review, third round). Which app is in front is no change of anything the task looks at, and neither is
+        # input to, or a window of, an application the task is not operating (owner, 10-20: typing in a terminal
+        # kept staling an approved send).
+        # The inventory is kept per application, and compared only for the applications it already covered: the
+        # task starting to operate another app widens what is watched, it is no change (PR #49 review: the first
+        # observe made the next snapshot a new epoch, and the observation it had just returned was stale).
+        task = self._task_bundles()
+        inventory: dict[str, tuple] = {}
+        for w in wins:
+            b = (w.get("bundle") or "").lower()
+            if b in task:
+                inventory.setdefault(b, [])
+                inventory[b].append((w["id"], w["title"]))
+        inventory = {b: tuple(sorted(v)) for b, v in inventory.items()}
+        before = self._inventory or {}
+        changed = any(inventory.get(b, ()) != before[b] for b in before if b in task)
+        if self._last_input_at() > self._epoch_at or changed:
             self._advance()
-        self._inventory = inventory
+        self._inventory = {b: inventory.get(b, ()) for b in task}
         return {"epoch": self.epoch, "locked": self.locked(), "front_app": front, "user_active": self.user_active(),
                 "input_watch": ("keys" if self._watch.keys else "mouse") if self._watch is not None and self._watch.active else "",
                 "windows": [{"id": w["id"], "app": w["app"], "title": w["title"], "focused": w["app"] == front} for w in wins]}
@@ -373,6 +395,12 @@ class HandsExecutor:
         d = self._driver(bundle)
         d._pinned_window = wid or None
         d._window_id = wid or None
+        key = bundle.lower()
+        # the first look at an app: its windows *before* the read are the baseline the next snapshots compare
+        # against -- taken after, a page that navigated while the driver read it would be the baseline, and the
+        # observation of the page before would pass (PR #49 review); widening the watch is still no change
+        baseline = (tuple(sorted((w["id"], w["title"]) for w in self._windows() if (w.get("bundle") or "").lower() == key))
+                    if self._inventory is not None and key not in self._inventory else None)
         obs: Observation = d.observe()
         landed = getattr(d, "_pinned_window", None)
         if wid and landed not in (None, wid):
@@ -385,6 +413,8 @@ class HandsExecutor:
                                f"observe that window, or this one again")
         self.last_obs[window] = obs
         self.current[bundle] = window
+        if baseline is not None and self._inventory is not None and key not in self._inventory:
+            self._inventory[key] = baseline
         els = []
         texts = []
         for e in obs.elements:

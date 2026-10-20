@@ -36,6 +36,7 @@ from .actions import Action, ActionKind, Binding
 from .axdocument import _q, document_text, window_document
 from .grounding import STOP
 from .drivers.base import ExecResult, Observation
+from .browsers import is_browser
 from .inputwatch import InputWatch, track_children
 
 try:
@@ -178,27 +179,6 @@ def sends(role: str, label: str) -> bool:
     if text in SENDS:
         return True
     return any(text.startswith(v + " ") or (not v.isascii() and text.startswith(v)) for v in SENDS)
-
-
-_BROWSERS: set[str] | None = None
-
-
-def is_browser(bundle: str) -> bool:
-    """Whether the app is a web browser, by what it registers, not by a list of names: an app the system offers for
-    opening https: links (NSWorkspace URLsForApplicationsToOpenURL). Read once per process."""
-    global _BROWSERS
-    if _BROWSERS is None:
-        found: set[str] = set()
-        try:
-            from AppKit import NSBundle, NSURL, NSWorkspace
-            for u in NSWorkspace.sharedWorkspace().URLsForApplicationsToOpenURL_(NSURL.URLWithString_("https://example.com/")) or []:
-                b = NSBundle.bundleWithURL_(u)
-                if b is not None and b.bundleIdentifier():
-                    found.add(str(b.bundleIdentifier()).lower())
-        except Exception:  # noqa: BLE001 -- not macOS: none known
-            pass
-        _BROWSERS = found
-    return bundle.lower() in _BROWSERS
 
 
 def app_display_name(bundle: str) -> str:
@@ -544,7 +524,7 @@ class HandsExecutor:
         return {"stopped": True}
 
     def perform(self, action: dict) -> dict:
-        if getattr(self, "stopped", False):
+        if getattr(self, "stopped", False) or STOP.is_set():
             return {"status": "error", "why": "stopped by the app"}
         kind = action.get("kind")
         self._advance({"by": "action", "kind": kind or "", "window": action.get("window") or ""})
@@ -618,7 +598,7 @@ class HandsExecutor:
             if bundle.lower() not in {b.lower() for b in have}:
                 os.environ["HANDS_FLASH_APPS"] = ",".join(have + [bundle])
         try:
-            if getattr(self, "stopped", False):     # read while this step was getting ready: nothing is sent
+            if getattr(self, "stopped", False) or STOP.is_set():   # read while this step was getting ready: nothing sent
                 return {"status": "error", "why": "stopped by the app"}
             res: ExecResult = d.execute(a)
         finally:

@@ -49,6 +49,18 @@ def _proc_info(pid: int) -> tuple[int, float] | None:
         return None
 
 
+def libproc_available() -> bool:
+    """Whether process details can be read at all (macOS's libproc); off macOS, children are known by pid alone."""
+    if not hasattr(libproc_available, "ok"):
+        try:
+            import ctypes
+            ctypes.CDLL("/usr/lib/libproc.dylib")
+            libproc_available.ok = True
+        except Exception:  # noqa: BLE001
+            libproc_available.ok = False
+    return libproc_available.ok
+
+
 def _proc_ppid(pid: int) -> int | None:
     info = _proc_info(pid)
     return info[0] if info else None
@@ -79,9 +91,12 @@ def track_children() -> None:
             super().__init__(*a, **k)
             info = _proc_info(self.pid)
             # gone before its start time could be read: not recorded -- a later process given the same pid would
-            # otherwise pass for ours (hands #54 review); its events, if any, then count as the user's (the safe side)
+            # otherwise pass for ours (hands #54 review); its events, if any, then count as the user's (the safe side).
+            # Where no process details can be read at all (not macOS), known by its pid alone.
             if info is not None:
                 OWN_CHILDREN[self.pid] = [info[1], None]
+            elif not libproc_available():
+                OWN_CHILDREN[self.pid] = [None, None]
 
         def _note_exit(self):
             if self.returncode is not None and self.pid in OWN_CHILDREN and OWN_CHILDREN[self.pid][1] is None:
@@ -180,6 +195,8 @@ class InputWatch:
         if not source_pid:
             return False
         pid = int(source_pid)
+        if pid == os.getpid():
+            return True
         now = time.time()
         for p, (_, exited) in list(OWN_CHILDREN.items()):
             if exited is not None and now - exited > OWN_KEEP_S:
@@ -190,7 +207,7 @@ class InputWatch:
             started, exited = mine
             if info is None:                       # gone: ours if it went within the last OWN_KEEP_S (or unreaped)
                 return exited is None or now - exited <= OWN_KEEP_S
-            if abs(info[1] - started) < 0.01:
+            if started is None or abs(info[1] - started) < 0.01:
                 return True                        # the child itself, still running
         if info is None:
             return False                           # gone, and not a child we know: not ours

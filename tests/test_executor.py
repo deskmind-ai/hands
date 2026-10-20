@@ -62,8 +62,9 @@ class StubDriver:
 
 # No LaunchServices queries in these tests (the first one on a Mac can take minutes): which apps are browsers, and
 # what an app is called, are given, except where a test says otherwise.
+import deskmind_hands.browsers as _br   # noqa: E402
 import deskmind_hands.executor as _exe   # noqa: E402
-_exe._BROWSERS = set()
+_br._BROWSERS = set()
 _exe.app_display_name = lambda bundle: bundle
 
 

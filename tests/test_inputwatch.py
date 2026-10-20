@@ -153,7 +153,7 @@ class Targets(unittest.TestCase):
             self.assertTrue(w.posted_by_us(long.pid))
             _t.sleep(0.6)
             self.assertFalse(w.posted_by_us(long.pid))
-        if _sys.platform != "darwin":
+        if not iw.libproc_available():
             return                                        # the parent chain is read with macOS's libproc
         q = subprocess.Popen([_sys.executable, "-c", "import subprocess,sys,time; c=subprocess.Popen([sys.executable,'-c','import time; time.sleep(2)']); print(c.pid, flush=True); c.wait()"],
                              stdout=subprocess.PIPE, text=True)

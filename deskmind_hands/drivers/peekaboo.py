@@ -41,6 +41,7 @@ from ..actions import Action, ActionKind, Binding
 from ..geometry import (ImageTransform, Point, Rect, ScreenGeometry, Size,
                         clamp_to_screen, to_logical)
 from ..apps import APPS
+from ..browsers import BrowserSet
 from ..grounding import STOP, VOCAB, name_unnamed
 from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, vision_elements
 from . import keys
@@ -1656,8 +1657,8 @@ class PeekabooDriver:
             self._post_key(Q, self._keycode(Q, "a"), Q.kCGEventFlagMaskCommand)
             self._post_key(Q, self._keycode(Q, "v"), Q.kCGEventFlagMaskCommand)
             time.sleep(0.4)
-            if before_return is not None and not before_return():
-                return False
+            if (before_return is not None and not before_return()) or STOP.is_set():
+                return False                         # nothing submitted: the text is in the field, not sent
             self._post_key(Q, keys.RETURN)
             time.sleep(0.4)
             return True
@@ -2351,8 +2352,8 @@ class PeekabooDriver:
     #: A browser's own controls: a read with nothing but these has not got the page yet.
     BROWSER_CHROME_ROLES = {"button", "textfield", "image", "group", "window", "splitgroup", "tabgroup", "toolbar",
                             "menubutton", "scrollarea", "radiobutton", "checkbox", "popupbutton", "statictext_toolbar"}
-    BROWSERS = {"com.apple.safari", "com.google.chrome", "com.microsoft.edgemac", "org.mozilla.firefox",
-                "com.brave.browser", "company.thebrowser.browser"}
+    BROWSERS = BrowserSet({"com.apple.safari", "com.google.chrome", "com.microsoft.edgemac", "org.mozilla.firefox",
+                "com.brave.browser", "company.thebrowser.browser"})
 
     def _page_not_read(self, data: dict | None) -> bool:
         """Whether a successful read of a browser window holds its controls only, not the page."""
@@ -2664,6 +2665,9 @@ class PeekabooDriver:
         deadline = time.time() + 60
         t_wait = time.time()
         while True:
+            if STOP.is_set():
+                self._add_wait(time.time() - t_wait)
+                return ExecResult(False, "stopped by the app; nothing was done")
             prev = self._front_bundle()
             idle = hid_idle_seconds()
             if prev != CHAT_APP and idle >= 3:
@@ -2676,6 +2680,8 @@ class PeekabooDriver:
         moved = self._moved_since_seen()
         if moved:
             return ExecResult(False, moved, stale=True)
+        if STOP.is_set():
+            return ExecResult(False, "stopped by the app; nothing was done")
         r = self._rects[eid]
         x, y = self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2
         cur = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
@@ -3215,7 +3221,7 @@ class PeekabooDriver:
                     # Long enough for the paste to land and cmd to be released before Return: at 0.15 s a web
                     # page's search box took the pasted query and never searched.
                     time.sleep(0.4)
-                    if submit:
+                    if submit and not STOP.is_set():                # a stop before Return: typed, not submitted
                         self._post_key(Q, keys.RETURN)               # Return: a search box searches on Enter
                         time.sleep(0.4)
                 finally:
@@ -4028,6 +4034,8 @@ class PeekabooDriver:
             # tree at all -- so leaving it uncommitted leaves the run in a state it cannot inspect: the planner
             # retyped the name five times because nothing it could see had changed. Typing a name and confirming
             # it is one gesture; the driver completes it rather than handing back a half-done edit.
+            if STOP.is_set():
+                return self._settle(False, "stopped by the app: typed, not confirmed with Return")
             self._run("press_fg_window", chord="return", app=self.app, window=self._window_id)
             self._foreground_actions += 1
             time.sleep(self.CHORD_SETTLE_S)
@@ -4076,6 +4084,8 @@ class PeekabooDriver:
         if not ok:
             return self._settle(False, f"multiline type failed on first segment: {detail}")
         for seg in segments[1:]:
+            if STOP.is_set():                       # line by line: a stop between two lines sends no more of them
+                return self._settle(False, "stopped by the app partway: the lines before were typed, no more")
             self._snapshot = None
             self.observe()
             if not self._window_id:

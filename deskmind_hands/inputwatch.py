@@ -47,6 +47,11 @@ class InputWatch:
         #: approved "type and Return" went into).
         self._pid_regular: dict[int, bool] = {}
         self._dragging = False
+        #: this process and its children (Peekaboo, the key-event child): events they post are the driver's own
+        #: input, not the user's -- a driver click that reached the tap after the action had ended was taken for the
+        #: user's input to the task's app and staled the next step (rc.9, 10-20). Refreshed every few seconds.
+        self._own_pids: set[int] = set()
+        self._own_pids_at = 0.0
         self._thread: threading.Thread | None = None
         self._tap = None
 
@@ -75,7 +80,52 @@ class InputWatch:
 
     def last_input_for(self, bundles: set[str]) -> float:
         """When input last went to one of `bundles` (lowercased), or anywhere unknown: the safe side."""
-        return max([self.last_unknown_at] + [self.last_by_bundle.get(b.lower(), 0.0) for b in bundles])
+        return self.last_input_where(bundles)[0]
+
+    def last_input_where(self, bundles: set[str]) -> tuple[float, str]:
+        """(when, where) of the latest input to one of `bundles` or to an unknown target: where is the bundle id, or
+        "unknown" (a system surface, a drag, an event that could not be read)."""
+        best = (self.last_unknown_at, "unknown")
+        for b in bundles:
+            t = self.last_by_bundle.get(b.lower(), 0.0)
+            if t > best[0]:
+                best = (t, b.lower())
+        return best
+
+    def posted_by_us(self, source_pid: int | None) -> bool:
+        """Whether an event was posted by this process or one of its descendants (a hardware event has no source
+        pid, or the window server's)."""
+        if not source_pid:
+            return False
+        now = time.time()
+        if now - self._own_pids_at > 3.0:
+            self._own_pids = self._descendants()
+            self._own_pids_at = now
+        return int(source_pid) in self._own_pids
+
+    @staticmethod
+    def _descendants() -> set[int]:
+        import os
+        import subprocess
+        me = os.getpid()
+        out = {me}
+        try:
+            rows = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=5).stdout.split("\n")
+            parent = {}
+            for row in rows:
+                parts = row.split()
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    parent[int(parts[0])] = int(parts[1])
+            changed = True
+            while changed:
+                changed = False
+                for pid, ppid in parent.items():
+                    if ppid in out and pid not in out:
+                        out.add(pid)
+                        changed = True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return out
 
     def is_regular(self, pid: int) -> bool:
         if pid not in self._pid_regular:
@@ -120,6 +170,8 @@ class InputWatch:
             # a drag goes to whatever is under the pointer when it is let go (a file dragged from Finder into the
             # task's window), and the press is the source's: the whole drag, and its release, is input to an
             # unknown target (PR #49 review)
+            if self.posted_by_us(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUnixProcessID) or 0)):
+                return event                              # the driver's own click or key, not the user's
             drags = (Quartz.kCGEventLeftMouseDragged, Quartz.kCGEventRightMouseDragged, Quartz.kCGEventOtherMouseDragged)
             ups = (Quartz.kCGEventLeftMouseUp, Quartz.kCGEventRightMouseUp, Quartz.kCGEventOtherMouseUp)
             if type_ in drags:

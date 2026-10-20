@@ -88,7 +88,7 @@ class Targets(unittest.TestCase):
         for k, v in {"kCGEventTapDisabledByTimeout": -2, "kCGEventTapDisabledByUserInput": -1,
                      "kCGEventLeftMouseDragged": 6, "kCGEventRightMouseDragged": 7, "kCGEventOtherMouseDragged": 27,
                      "kCGEventLeftMouseUp": 2, "kCGEventRightMouseUp": 4, "kCGEventOtherMouseUp": 26,
-                     "kCGEventTargetUnixProcessID": 40}.items():
+                     "kCGEventTargetUnixProcessID": 40, "kCGEventSourceUnixProcessID": 41}.items():
             setattr(q, k, v)
         q.CGEventGetIntegerValueField = lambda e, f: 0
         w = InputWatch()
@@ -101,6 +101,35 @@ class Targets(unittest.TestCase):
             w._callback(None, 2, object(), None)          # the drop
             self.assertGreaterEqual(w.last_unknown_at, t)
             self.assertFalse(w._dragging)
+
+    def test_events_the_driver_posts_are_not_the_users_input(self):
+        """A click or key the driver (this process, or its Peekaboo child) posts reaches the tap like the user's; it
+        is skipped by its source pid (rc.9, 10-20: a driver click counted as the user's staled the next step)."""
+        import os
+        import sys
+        import types
+        w = InputWatch()
+        self.assertTrue(w.posted_by_us(os.getpid()))
+        self.assertFalse(w.posted_by_us(0))                # a hardware event
+        w._own_pids, w._own_pids_at = {111, 222}, 10**12   # pretend: this process and a child
+        self.assertTrue(w.posted_by_us(222))
+        self.assertFalse(w.posted_by_us(333))
+        q = types.ModuleType("Quartz")
+        for k, v in {"kCGEventTapDisabledByTimeout": -2, "kCGEventTapDisabledByUserInput": -1,
+                     "kCGEventLeftMouseDragged": 6, "kCGEventRightMouseDragged": 7, "kCGEventOtherMouseDragged": 27,
+                     "kCGEventLeftMouseUp": 2, "kCGEventRightMouseUp": 4, "kCGEventOtherMouseUp": 26,
+                     "kCGEventTargetUnixProcessID": 40, "kCGEventSourceUnixProcessID": 41}.items():
+            setattr(q, k, v)
+        fields = {}
+        q.CGEventGetIntegerValueField = lambda e, f: fields.get(f, 0)
+        w._pid_bundle, w._pid_regular = {500: "com.apple.Safari"}, {500: True}
+        with mock.patch.dict(sys.modules, {"Quartz": q}):
+            fields.update({41: 222, 40: 500})              # the driver's click into Safari
+            w._callback(None, 1, object(), None)
+            self.assertEqual(w.last_by_bundle, {})
+            fields.update({41: 0})                          # the user's
+            w._callback(None, 1, object(), None)
+            self.assertIn("com.apple.safari", w.last_by_bundle)
 
     def test_an_event_that_cannot_be_read_counts_as_input_to_an_unknown_target(self):
         """The callback's failure path is the safe side for every reader, last_input_for included (PR #49 review)."""

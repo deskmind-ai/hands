@@ -307,6 +307,14 @@ class HandsExecutor:
         # foreground waits already treat it (PeekabooDriver._takeover).
         if takeover_until() > time.time():
             return False
+        # Like the epoch: the user is in the task's way only when their input goes to an app the task operates, or
+        # somewhere unknown (a system surface, a drag) -- typing in a terminal held a task's first step for two
+        # minutes (rc.9, 10-20). Needs the keyboard watched by target; without it every input counts, as before.
+        # Bringing an app forward is a separate guard: the driver waits for the Mac to be idle everywhere first
+        # (PeekabooDriver's foreground route), so a flash never takes keystrokes meant for another app.
+        w = getattr(self, "_watch", None)
+        if w is not None and w.active and w.keys:
+            return time.time() - w.last_input_for(self._task_bundles()) < self.USER_ACTIVE_S
         if Quartz is None:
             return False
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
@@ -339,9 +347,13 @@ class HandsExecutor:
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
         return time.time() - idle
 
-    def _advance(self) -> None:
+    def _advance(self, reason: dict | None = None) -> None:
         self.epoch += 1
         self._epoch_at = time.time()
+        #: why the epoch last moved, told in every snapshot: an action of the task's, the user's input to an app the
+        #: task operates (which, or "unknown"), or a window list that changed (which app, what appeared, vanished or
+        #: was renamed). A stale step upstream can then say what made it stale (rc.9, 10-20).
+        self._epoch_reason = {"epoch": self.epoch, "at": round(self._epoch_at, 3), **(reason or {"by": "action"})}
 
     def snapshot(self) -> dict:
         wins = self._windows()
@@ -365,12 +377,24 @@ class HandsExecutor:
                 inventory[b].append((w["id"], w["title"]))
         inventory = {b: tuple(sorted(v)) for b, v in inventory.items()}
         before = self._inventory or {}
-        changed = any(inventory.get(b, ()) != before[b] for b in before if b in task)
-        if self._last_input_at() > self._epoch_at or changed:
-            self._advance()
+        changed = [b for b in before if b in task and inventory.get(b, ()) != before[b]]
+        input_at = self._last_input_at()
+        if input_at > self._epoch_at or changed:
+            if input_at > self._epoch_at:
+                where = (self._watch.last_input_where(task)[1] if self._watch is not None and self._watch.active
+                         and self._watch.last_input_for(task) >= input_at else "any (no per-app watch)")
+                reason = {"by": "input", "to": where, "input_at": round(input_at, 3)}
+            else:
+                b = changed[0]
+                was, now = dict(before[b]), dict(inventory.get(b, ()))
+                reason = {"by": "windows", "app": b,
+                          "appeared": sorted(set(now) - set(was))[:5], "vanished": sorted(set(was) - set(now))[:5],
+                          "renamed": [{"id": i, "from": was[i], "to": now[i]} for i in sorted(set(was) & set(now)) if was[i] != now[i]][:5]}
+            self._advance(reason)
         self._inventory = {b: inventory.get(b, ()) for b in task}
         return {"epoch": self.epoch, "locked": self.locked(), "front_app": front, "user_active": self.user_active(),
                 "input_watch": ("keys" if self._watch.keys else "mouse") if self._watch is not None and self._watch.active else "",
+                **({"epoch_reason": self._epoch_reason} if getattr(self, "_epoch_reason", None) else {}),
                 "windows": [{"id": w["id"], "app": w["app"], "title": w["title"], "focused": w["app"] == front} for w in wins]}
 
     # -- see and act ----------------------------------------------------------
@@ -459,7 +483,7 @@ class HandsExecutor:
         if getattr(self, "stopped", False):
             return {"status": "error", "why": "stopped by the app"}
         kind = action.get("kind")
-        self._advance()
+        self._advance({"by": "action", "kind": kind or "", "window": action.get("window") or ""})
         if kind == "wait":
             time.sleep(min(float(action.get("ms") or 0) / 1000, 30))
             return {"status": "ok", "files": []}

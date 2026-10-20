@@ -414,6 +414,24 @@ class TaskScope(unittest.TestCase):
         state["wins"] = [_win("12"), _win("13", title="未命名 2")]   # then a real change of that app
         self.assertEqual(ex.snapshot()["epoch"], e1 + 1)
 
+    def test_a_change_right_after_the_first_observe_is_seen(self):
+        """begin -> first observe -> the window's title changes (a page navigating) -> snapshot: a new epoch, for the
+        first app and for one the task starts operating later (PR #49 review)."""
+        ex, _ = _executor()
+        safari = "com.apple.Safari"
+        state = {"wins": [_win("12"), _win("40", bundle=safari, title="A", app="Safari")]}
+        ex._windows = lambda every=False: state["wins"]   # noqa: SLF001
+        ex._front = lambda: "文本编辑"                      # noqa: SLF001
+        ex._last_input_at = lambda: 0.0                   # noqa: SLF001
+        e0 = ex.snapshot()["epoch"]
+        ex.observe(W12)
+        state["wins"] = [_win("12", title="hello.txt"), state["wins"][1]]
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
+        ex.observe(f"{safari}#40")                        # a second app, first looked at now
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)  # widening the watch is no change
+        state["wins"] = [state["wins"][0], _win("40", bundle=safari, title="B", app="Safari")]
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 2)
+
     def test_input_counts_only_when_it_went_to_an_app_the_task_operates(self):
         from deskmind_hands.inputwatch import InputWatch
         ex, _ = _executor()

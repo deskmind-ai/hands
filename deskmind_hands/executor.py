@@ -407,6 +407,11 @@ class HandsExecutor:
                                f"observe that window, or this one again")
         self.last_obs[window] = obs
         self.current[bundle] = window
+        key = bundle.lower()
+        if self._inventory is not None and key not in self._inventory:
+            # the first look at an app: its windows as they are now are the baseline the next snapshots compare
+            # against, so a change after this observation is seen (PR #49 review) and widening the watch is not one
+            self._inventory[key] = tuple(sorted((w["id"], w["title"]) for w in self._windows() if (w.get("bundle") or "").lower() == key))
         els = []
         texts = []
         for e in obs.elements:

@@ -65,6 +65,7 @@ class StubDriver:
 import deskmind_hands.browsers as _br   # noqa: E402
 import deskmind_hands.executor as _exe   # noqa: E402
 _br._BROWSERS = set()
+_br._INSTALLED = []
 _exe.app_display_name = lambda bundle: bundle
 # ... nor the system's audio objects: nothing is playing, except where a test says otherwise (hands #55 review)
 _exe.playing_apps = lambda: []
@@ -853,6 +854,65 @@ class BrowserFlag(unittest.TestCase):
             wins = {w["id"]: w for w in ex.snapshot()["windows"]}
         self.assertIs(wins["com.google.Chrome#61"]["browser"], True)
         self.assertNotIn("browser", wins[W12])
+
+
+class InstalledBrowsers(unittest.TestCase):
+    def test_the_snapshot_lists_installed_browsers_with_their_names_and_nothing_else(self):
+        """A browser that is not running is listed with the names it goes by; an app that is not a browser is not
+        (harness floor(): a name matching no open window)."""
+        ex, _ = _executor()
+        ex._windows = lambda every=False: [_win("12")]   # noqa: SLF001
+        ex._front = lambda: "文本编辑"   # noqa: SLF001
+        listed = [{"bundle": "com.google.Chrome", "names": ["Google Chrome"]}]
+        with mock.patch.object(_br, "_INSTALLED", listed):
+            got = ex.snapshot()["browsers"]
+        self.assertEqual(got, listed)
+        self.assertNotIn(TE, [b["bundle"] for b in got])
+        got[0]["names"].append("x")                                # a copy: the cache is not the caller's to change
+        with mock.patch.object(_br, "_INSTALLED", listed):
+            self.assertEqual(ex.snapshot()["browsers"][0]["names"], ["Google Chrome"])
+
+    def test_the_scan_keeps_browsers_by_their_schemes_and_merges_their_names(self):
+        """The same structural check as is_browser: http, https and file declared. A link-forwarding app (https
+        only) is left out; names are each kept once, case aside, without ".app"."""
+        import sys as _sys
+        import types
+
+        class B:
+            def __init__(self, bid, schemes, loc, info):
+                self.bid, self.schemes, self.loc, self.info = bid, schemes, loc, info
+
+            def bundleIdentifier(self):
+                return self.bid
+
+            def objectForInfoDictionaryKey_(self, k):
+                return [{"CFBundleURLSchemes": self.schemes}] if k == "CFBundleURLTypes" else self.info.get(k)
+
+            def localizedInfoDictionary(self):
+                return self.loc
+
+        class U:
+            def __init__(self, path):
+                self.p = path
+
+            def path(self):
+                return self.p
+
+            def lastPathComponent(self):
+                return self.p.rsplit("/", 1)[-1]
+        apps = {"/Applications/Google Chrome.app": B("com.google.Chrome", ["http", "https", "file"], {"CFBundleName": "Chrome"}, {"CFBundleName": "Chrome"}),
+                "/Applications/iTerm.app": B("com.googlecode.iterm2", ["http", "https"], {}, {"CFBundleName": "iTerm2"})}
+        appkit = types.ModuleType("AppKit")
+        appkit.NSURL = types.SimpleNamespace(URLWithString_=lambda s: s)
+        appkit.NSWorkspace = types.SimpleNamespace(sharedWorkspace=lambda: types.SimpleNamespace(
+            URLsForApplicationsToOpenURL_=lambda url: [U(p) for p in apps]))
+        appkit.NSBundle = types.SimpleNamespace(bundleWithURL_=lambda u: apps[u.p])
+        appkit.NSFileManager = types.SimpleNamespace(defaultManager=lambda: types.SimpleNamespace(
+            displayNameAtPath_=lambda p: "谷歌浏览器" if "Chrome" in p else "iTerm"))
+        with mock.patch.dict(_sys.modules, {"AppKit": appkit}):
+            found, installed = _br._scan()   # noqa: SLF001
+        self.assertEqual(found, {"com.google.chrome"})
+        self.assertEqual(installed, [{"bundle": "com.google.Chrome", "names": ["谷歌浏览器", "Chrome", "Google Chrome"]}])
 
 
 class Audio(unittest.TestCase):

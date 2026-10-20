@@ -4092,7 +4092,12 @@ class PeekabooDriver:
                              # the folder opened every time: the three observations of one run went root -> 2026 ->
                              # 02. Read as failure, it told the planner it had failed at the one thing it had done
                              # right, and five of them ended the run on the consecutive-failure cap.
-                             "did not return a confirmed outcome")
+                             "did not return a confirmed outcome",
+                             # Peekaboo 4.7's answer when a background click went out and its result could not be
+                             # read back ("...Observe the intended target before retrying"): the click may well
+                             # have landed -- reported as an error, the step was retried and clicked twice (rc.8,
+                             # 10-20). Earlier versions prefixed it "INDETERMINATE:".
+                             "without valid canonical result semantics")
 
     #: How long a command chord needs before its effect is in the accessibility tree. Measured, not guessed: a new
     #: folder in Finder was absent from two consecutive observations taken right after the press, and present on

@@ -1,7 +1,7 @@
 """The run's own browser window, from the 0.4.3-rc.3 live test (10-17, hands 11714c0). Nothing here touches the Mac.
 
 Run 5, 「打开 Safari，搜索新加坡的天气」 with the user's Safari windows minimised and Finder in front: a search, a click,
-a click Peekaboo refused, and DONE -- completed with no judgement of the page at all. A page the driver could not read
+a click Peekaboo could not confirm (sent, its result not read back), and DONE -- completed with no judgement of the page at all. A page the driver could not read
 (or one the judge gave no answer on) passed for "no web page", and a DONE there was taken as it was.
 
 Run 4, 「把网页上的零件表抄进 parts.txt」 with the parts page in the user's window: the run's window stayed on its marker
@@ -40,8 +40,9 @@ from deskmind_hands.runtime import judge   # noqa: E402
 import test_own_browser_window as obw   # noqa: E402
 from test_own_browser_window import PID, SAFARI, FakeMac   # noqa: E402
 
-#: Peekaboo's answer to the second 「百度一下」 click in run 5 (its MCP layer, Peekaboo 4.3.1 fabaadc56).
-REFUSED = ("INDETERMINATE: The click mutation returned without valid canonical result semantics. Hint: Observe the "
+#: Peekaboo's answer to the second 「百度一下」 click in run 5 (its MCP layer, Peekaboo 4.3.1 fabaadc56): a click it
+#: could not confirm, not one it refused -- the driver reports it as dispatched and unverified (hands #51).
+UNCONFIRMED = ("INDETERMINATE: The click mutation returned without valid canonical result semantics. Hint: Observe the "
            "intended target before retrying and update the runtime host.")
 BAIDU = {"url": "https://www.baidu.com/s?wd=%E6%96%B0%E5%8A%A0%E5%9D%A1%E5%A4%A9%E6%B0%94", "title": "新加坡天气_百度搜索",
          "text": "新加坡 天气 29°C 雷阵雨", "browser": True}
@@ -78,7 +79,7 @@ class Safari(MockDriver):
         if action.kind is ActionKind.CLICK:
             self.clicks += 1
             if self.clicks == 2 and self.refuse:
-                return ExecResult(False, REFUSED)
+                return ExecResult(False, UNCONFIRMED)
             return ExecResult(True, indeterminate=True, detail="dispatched but the outcome could not be confirmed")
         return super().execute(action)
 

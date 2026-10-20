@@ -37,7 +37,7 @@ from .axdocument import _q, document_text, window_document
 from .grounding import STOP
 from .drivers.base import ExecResult, Observation
 from .audio import playing_apps
-from .browsers import is_browser
+from .browsers import installed_browsers, is_browser
 from .inputwatch import InputWatch, track_children
 
 try:
@@ -574,6 +574,9 @@ class HandsExecutor:
                 # the apps sending sound to an output now (CoreAudio): the system's word that something is playing,
                 # which a music app's window cannot give a verdict by its pixels
                 "audio_playing": self._audio_playing(),
+                # the browsers installed on this Mac (running or not) and the names they go by: a name that matches no
+                # open window ("Chrome") can still be told for a browser, which a url opens in the task's own window
+                "browsers": installed_browsers(),
                 # app_name: what the user calls the app (its localized name), for cards; app stays as it was.
                 # browser: the app is a web browser by its structure (browsers.py), present only then -- an
                 # open_window with a url lands in the run's own window only for a browser; any other app opens it

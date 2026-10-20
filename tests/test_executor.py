@@ -842,6 +842,19 @@ class Background(unittest.TestCase):
         self.assertEqual(given, ["com.googlecode.iterm2"])
 
 
+class BrowserFlag(unittest.TestCase):
+    def test_a_browsers_windows_say_so_and_no_other_apps_do(self):
+        """harness#34 trusts "a url opens in the task's own window" only for a browser: the snapshot marks a
+        browser's windows, by the app's structure (browsers.py), and leaves the flag off every other window."""
+        ex, _ = _executor()
+        ex._windows = lambda every=False: [_win("12"), _win("61", bundle="com.google.Chrome", title="天气", app="Google Chrome")]   # noqa: SLF001
+        ex._front = lambda: "文本编辑"   # noqa: SLF001
+        with mock.patch.object(_br, "_BROWSERS", {"com.google.chrome"}):
+            wins = {w["id"]: w for w in ex.snapshot()["windows"]}
+        self.assertIs(wins["com.google.Chrome#61"]["browser"], True)
+        self.assertNotIn("browser", wins[W12])
+
+
 class Audio(unittest.TestCase):
     def test_only_the_tasks_apps_are_reported_with_since_when(self):
         """A call in another app is not the task's music; a song already playing before the run began is not one

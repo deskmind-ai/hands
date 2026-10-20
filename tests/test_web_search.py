@@ -347,7 +347,7 @@ class ObservedWindowOnly(unittest.TestCase):
         d._run_windows = {"9"}                          # the run's own window; 7 is the user's
         with mock.patch.dict(sys.modules, {"Quartz": fake_q, "AppKit": types.SimpleNamespace(NSRunningApplication=None)}), \
                 mock.patch.object(skylight, "enter_window_key", lambda pid, wid: ("token", wid)), \
-                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)):
+                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin, key=None: ("Q", wid)):
             return d._background_quartz("com.apple.Safari", observed_only=True), \
                 d._background_quartz("com.apple.Safari"), d._background_quartz("ai.deskmind.gymhost")
 

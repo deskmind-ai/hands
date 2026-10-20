@@ -36,6 +36,7 @@ class Fake:
         self.windows, self.stopped = list(windows), False
         self.sent, self.ax_writes = [], []
         self.on_makekey = None
+        self.auth_ok = False
 
     def post(self, psn, rec):
         what = decode(rec)
@@ -53,7 +54,7 @@ class Fake:
         return True
 
     def patches(self):
-        return [mock.patch.object(skylight, "_load", lambda: {"loaded": True}),
+        return [mock.patch.object(skylight, "_load", lambda: {"loaded": True, "auth_ok": self.auth_ok}),
                 mock.patch.object(skylight, "_psn_for", lambda wid: "psn"),
                 mock.patch.object(skylight, "_post_record", self.post),
                 mock.patch.object(skylight, "focused_window", lambda pid: self.focused),
@@ -61,6 +62,7 @@ class Fake:
                 mock.patch.object(skylight, "front_pid", lambda: self.front),
                 mock.patch.object(skylight, "window_ids", lambda pid: list(self.windows)),
                 mock.patch.object(skylight, "_stopped", lambda: self.stopped),
+                mock.patch.object(skylight, "auth_safe", lambda: self.sent.append(("auth self-test",)) or True),
                 mock.patch.object(skylight, "CONFIRM_S", 0), mock.patch.object(skylight, "AX_CONFIRM_S", 0),
                 mock.patch.object(skylight.time, "sleep", lambda s: None)]
 
@@ -86,6 +88,19 @@ class EnterWindowKey(Patched):
         self.assertEqual(app.sent, [("defocus", PREV), ("focus", TARGET), ("makekey1", TARGET), ("makekey2", TARGET)])
         self.assertEqual((key.via, key.previous), ("records", PREV))
         self.assertEqual(app.ax_writes, [])
+
+    def test_the_auth_self_test_runs_before_any_record(self):
+        app = self.use(Fake())
+        app.auth_ok = True
+        skylight.enter_window_key(PID, TARGET)
+        self.assertEqual(app.sent[0], ("auth self-test",))
+
+    def test_the_third_read_of_the_previous_key_window_counts(self):
+        app = self.use(Fake(focused=None))
+        reads = iter([None, None, PREV])
+        with mock.patch.object(skylight, "focused_window", lambda pid: next(reads, app.focused)):
+            key = skylight.enter_window_key(PID, TARGET)
+        self.assertEqual(key.previous, PREV)
 
     def test_given_back_on_exit(self):
         app = self.use(Fake())
@@ -121,13 +136,16 @@ class EnterWindowKey(Patched):
         self.assertEqual(app.sent, [])
         self.assertTrue(key.interrupted)
         self.assertIn("interrupted by the user", key.note())
+        self.assertIn("restoring its previous key window was skipped", key.note())
 
     def test_a_front_that_cannot_be_read_at_exit_sends_nothing(self):
         app = self.use(Fake())
-        with skylight.enter_window_key(PID, TARGET):
+        with skylight.enter_window_key(PID, TARGET) as key:
             app.sent.clear()
             app.front = None
         self.assertEqual(app.sent, [])
+        self.assertIn("the front app could not be read", key.note())
+        self.assertNotIn("interrupted by the user", key.note())
 
     def test_not_given_back_is_said(self):
         app = self.use(Fake())
@@ -329,6 +347,7 @@ def driver():
     d._rects, d._labels_by_id, d._element_role = {"t1": Rect(0, 30, 600, 500)}, {"t1": "正文"}, {"t1": "textarea"}
     d._element_window = {"t1": "200"}
     d._preexisting = set()
+    d._observed_windows = {"200"}
     d._background_keys = lambda: True
     d._moved_since_seen = lambda: None
     d._ascii_input = lambda: True
@@ -383,7 +402,7 @@ class TypeText(unittest.TestCase):
                    mock.patch.object(axfield, "select", lambda el, replace_all: d.log.append("select") or selects),
                    mock.patch.object(axfield, "all_selected", lambda el, wait=0.5: all_selected),
                    mock.patch.object(skylight, "user_on", lambda pid: user_on),
-                   mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: FakeQ(d, field)),
+                   mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin, key=None: FakeQ(d, field)),
                    mock.patch.object(PeekabooDriver, "_key_event",
                                      classmethod(lambda cls, Q, code, down: {"down": down, "code": code})),
                    mock.patch.object(skylight, "enter_window_key",
@@ -467,6 +486,7 @@ class TypeText(unittest.TestCase):
         d.log.clear()
         d._window_id = d._pinned_window = "201"                         # another window of the same app
         d._element_window = {"t1": "201"}
+        d._observed_windows.add("201")
         d, res = self.run_type(Field("start", takes_insertion=False), d=d, text="third")
         self.assertIn(("ax insert", "third"), d.log)
 
@@ -598,6 +618,12 @@ class TypeText(unittest.TestCase):
         d, res = self.run_type(Field("a", takes_insertion=False), text="b\tc")
         self.assertIn(("key", keys.TAB, 0), d.log)
 
+    def test_a_label_made_from_the_role_is_no_label(self):
+        d = driver()
+        d._labels_by_id, d._role_labels = {"t1": "文本区域"}, {"t1"}          # "text area": a kind, not a name
+        d, res = self.run_type(Field("start", takes_insertion=True, names=()), d=d)
+        self.assertTrue(res.ok, res.detail)
+
     def test_not_the_observed_element_leaves_it_to_the_old_route(self):
         d, res = self.run_type(Field("start", takes_insertion=True, names=("搜索",)))
         self.assertIsNone(res)
@@ -625,13 +651,15 @@ class TypeText(unittest.TestCase):
 
 
 class Chord(unittest.TestCase):
-    def press(self, states, enter=None, chord="cmd+shift+n", windows=(200,), user_on=False, d=None):
+    def press(self, states, enter=None, chord="cmd+shift+n", windows=(200,), user_on=False, d=None, cg=None):
         d = d or driver()
         seq = iter(states)
+        cg = windows if cg is None else cg
         with mock.patch.object(axfield, "window_state", lambda pid, wid: next(seq)), \
                 mock.patch.object(skylight, "window_ids", lambda pid: None if windows is None else list(windows)), \
+                mock.patch.object(skylight, "cg_window_ids", lambda pid: None if cg is None else list(cg)), \
                 mock.patch.object(skylight, "user_on", lambda pid: user_on), \
-                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: "Q"), \
+                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin, key=None: "Q"), \
                 mock.patch.object(skylight, "enter_window_key", enter or (lambda pid, wid: Key(d.log))):
             return d, d._press_in_background(chord)
 
@@ -658,6 +686,18 @@ class Chord(unittest.TestCase):
             self.assertFalse(res.ok)
             self.assertIn("no background route", res.detail)
             self.assertEqual(d.log, [])
+
+    def test_refused_for_a_window_the_user_opened_during_the_run(self):
+        """Not there before the run, but neither opened nor observed by it: the user's."""
+        d, res = self.press([], windows=(200, 300))
+        self.assertFalse(res.ok)
+        self.assertEqual(d.log, [])
+
+    def test_refused_for_a_window_only_the_window_server_lists(self):
+        """Accessibility can miss a window on another Space: both lists must show only the task's windows."""
+        d, res = self.press([], windows=(200,), cg=(200, 300))
+        self.assertFalse(res.ok)
+        self.assertEqual(d.log, [])
 
     def test_refused_when_the_apps_windows_cannot_be_read(self):
         d, res = self.press([], windows=None)
@@ -693,6 +733,155 @@ class Chord(unittest.TestCase):
         self.assertIn("not one this run may type into", res.detail)
 
 
+class FakeQuartz:
+    """Quartz for BackgroundQuartz: every event posted to the process is recorded (none is real)."""
+    kCGEventKeyDown, kCGEventKeyUp, kCGEventFlagsChanged = 10, 11, 12
+    kCGEventMouseMoved, kCGEventLeftMouseDown, kCGEventLeftMouseUp = 5, 1, 2
+    kCGMouseButtonLeft, kCGHIDEventTap, kCGMouseEventClickState, kCGEventFlagMaskCommand = 0, 0, 1, 1 << 20
+
+    def __init__(self):
+        self.posted = []
+
+    def CGEventGetType(self, ev):   # noqa: N802
+        return ev["type"]
+
+    def CGEventCreateMouseEvent(self, src, kind, pt, button):   # noqa: N802
+        return {"type": kind, "pt": pt}
+
+    def CGEventCreateKeyboardEvent(self, src, code, down):   # noqa: N802
+        return {"type": self.kCGEventKeyDown if down else self.kCGEventKeyUp, "code": code}
+
+    def CGEventSetIntegerValueField(self, ev, f, v):   # noqa: N802
+        pass
+
+    def CGEventGetIntegerValueField(self, ev, f):   # noqa: N802
+        return 1
+
+    def CGEventGetLocation(self, ev):   # noqa: N802
+        return types.SimpleNamespace(x=ev["pt"][0], y=ev["pt"][1])
+
+    def CGEventSetFlags(self, ev, f):   # noqa: N802
+        ev["flags"] = f
+
+    def CGEventKeyboardSetUnicodeString(self, ev, n, s):   # noqa: N802
+        ev["text"] = s
+
+    def CGEventPostToPid(self, pid, ev):   # noqa: N802
+        self.posted.append(ev)
+
+
+def background_quartz(key):
+    """A real BackgroundQuartz over FakeQuartz: what it posts, mouse or key, ends up in fake.posted."""
+    fake = FakeQuartz()
+    with mock.patch.dict(sys.modules, {"Quartz": fake}), mock.patch.object(skylight, "_load", lambda: None):
+        q = skylight.BackgroundQuartz(PID, TARGET, (0, 0), key=key)
+    return q, fake
+
+
+class NoKeysToTheUsersApp(unittest.TestCase):
+    """The user is in the app: clicks may go (window-routed), no key event at all (it would land in their key window)."""
+
+    def setUp(self):
+        self.keys_posted = []
+        p = mock.patch.object(skylight, "post_key_event", lambda pid, ev, auth=True: self.keys_posted.append(ev))
+        p.start()
+        self.addCleanup(p.stop)
+        k = mock.patch.object(PeekabooDriver, "_key_event",
+                              classmethod(lambda cls, Q, code, down: Q.CGEventCreateKeyboardEvent(None, code, down)))
+        k.start()
+        self.addCleanup(k.stop)
+
+    def test_background_quartz_refuses_keys_and_passes_clicks(self):
+        q, fake = background_quartz(skylight.NoWindowKey())
+        with mock.patch.object(skylight, "_load", lambda: None):
+            PeekabooDriver._post_click(q, 10, 10)
+            with self.assertRaises(skylight.WindowKeyRefused) as cm:
+                PeekabooDriver._post_key(q, 0, q.kCGEventFlagMaskCommand)
+        self.assertEqual(cm.exception.kind, "front")
+        self.assertEqual(len(fake.posted), 3)                             # move, down, up
+        self.assertEqual(self.keys_posted, [])
+
+    def test_a_held_window_lost_refuses_the_key_down(self):
+        key = skylight.WindowKey(PID, TARGET, PREV, "psn", "records")
+        key.lost = lambda: "window 200 is no longer the app's key window (now 100)"
+        q, _ = background_quartz(key)
+        with self.assertRaises(skylight.WindowKeyRefused):
+            PeekabooDriver._post_key(q, 0)
+        self.assertEqual(self.keys_posted, [])
+        key.lost = lambda: None
+        PeekabooDriver._post_key(q, 0)
+        self.assertEqual(len(self.keys_posted), 2)                        # down and up, while it holds
+
+    def test_address_bar_search_sends_no_key_and_waits(self):
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        from deskmind_hands.drivers import axchrome
+        from deskmind_hands.drivers.base import USER_BUSY
+        from deskmind_hands.drivers.peekaboo import WEB_SEARCH
+        d = driver()
+        d.app, d._run_windows, d._origin = "com.google.Chrome", {"200"}, Point(0, 0)
+        d._address_bar, d._address_bar_rect, d._browser_field_allowed = "e48", Rect(10, 10, 200, 30), WEB_SEARCH
+        del d._post_key                                                  # the driver's own: through q
+        d._projected_actions, d._seen_frame = 0, (0, 0, 800, 600)
+        d._window_frame = lambda: (0, 0, 800, 600)
+        d._wait_until_still = lambda bundle, what="": None
+        d._settle = lambda ok, detail, files=(): __import__("deskmind_hands.drivers.base", fromlist=["x"]).ExecResult(
+            ok, detail)
+        key = skylight.NoWindowKey()
+        q, fake = background_quartz(key)
+        d._background_quartz = lambda bundle, observed_only=False: (q, key)
+        pb = types.SimpleNamespace(pasteboardItems=lambda: [], clearContents=lambda: None,
+                                   setString_forType_=lambda s, t: None, writeObjects_=lambda items: None)
+        appkit = types.SimpleNamespace(NSPasteboard=types.SimpleNamespace(generalPasteboard=lambda: pb),
+                                       NSPasteboardItem=None, NSPasteboardTypeString="public.utf8-plain-text")
+        with mock.patch.dict(sys.modules, {"AppKit": appkit}), mock.patch.object(skylight, "_load", lambda: None), \
+                mock.patch.object(axchrome, "focused_identifier", lambda pid, fr, wid=None: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"):
+            res = d._execute_projected(Action(kind=ActionKind.TYPE_TEXT, text="天气",
+                                              binding=Binding(observation_id="o", app="Chrome", element_id=WEB_SEARCH)))
+        self.assertFalse(res.ok)
+        self.assertIn(USER_BUSY, res.detail)
+        self.assertEqual(self.keys_posted, [])
+
+    def test_a_flash_paste_sends_no_key_and_takes_the_original_path(self):
+        """_vision_act's paste (click, cmd+A, cmd+V) through _flash: refused before the first key, then the path
+        that waits for the user and keeps the flash rules -- here, a browser not allowed forward."""
+        d = driver()
+        d.app = "com.apple.Safari"
+        d._background_input = lambda bundle: True
+        d._wait_until_still = lambda bundle, what="": None
+        key = skylight.NoWindowKey()
+        q, fake = background_quartz(key)
+        d._background_quartz = lambda bundle, observed_only=False: (q, key)
+
+        def perform(Q):
+            PeekabooDriver._post_click(Q, 10, 10)
+            PeekabooDriver._post_key(Q, 0, Q.kCGEventFlagMaskCommand)     # cmd+A: the user's mail body
+            PeekabooDriver._post_key(Q, 9, Q.kCGEventFlagMaskCommand)
+            return "entered"
+        with mock.patch.object(skylight, "_load", lambda: None):
+            ok, detail = d._flash("com.apple.Safari", perform, what="type")
+        self.assertFalse(ok)
+        self.assertIn("not done", detail)
+        self.assertEqual(self.keys_posted, [])
+
+    def test_flash_reports_a_key_window_not_given_back(self):
+        d = driver()
+        d.app = "com.apple.Safari"
+        d._background_input = lambda bundle: True
+        d._wait_until_still = lambda bundle, what="": None
+        token = types.SimpleNamespace(exit=lambda: False,
+                                      note=lambda: "the app's previous key window (100) could not be confirmed given back")
+        d._background_quartz = lambda bundle, observed_only=False: ("Q", token)
+        ok, detail = d._flash("com.apple.Safari", lambda Q: "clicked", what="click")
+        self.assertTrue(ok)
+        self.assertIn("could not be confirmed given back", detail)
+
+    def test_a_plain_type_on_the_users_app_sends_no_key(self):
+        t = TypeText()
+        d, res = t.run_type(Field("start", takes_insertion=False), user_on=True)
+        self.assertIsNone(res)
+        self.assertEqual(d.log, [])
+
+
 class FrontApp(unittest.TestCase):
     def test_background_quartz_sends_no_records_to_the_front_app(self):
         d = driver()
@@ -707,7 +896,7 @@ class FrontApp(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"Quartz": fake_q,
                                            "AppKit": types.SimpleNamespace(NSRunningApplication=None)}), \
                 mock.patch.object(skylight, "enter_window_key", refuse), \
-                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)):
+                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin, key=None: ("Q", wid)):
             with mock.patch.object(skylight, "front_pid", lambda: PID):
                 q, key = d._background_quartz("com.apple.Safari", observed_only=True)
                 self.assertEqual(q, ("Q", 200))

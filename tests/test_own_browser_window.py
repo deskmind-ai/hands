@@ -260,7 +260,7 @@ class OwnWindow(unittest.TestCase):
         d._paste_and_submit = lambda q, text, before_return=None: posted.append(("paste", text)) or True
         with mock.patch.object(skylight, "enter_window_key", lambda pid, wid: focused.append(wid) or "token"), \
                 mock.patch.object(skylight, "give_focus_back", lambda token: None), \
-                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)), \
+                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin, key=None: ("Q", wid)), \
                 mock.patch.object(axchrome, "focused_identifier",
                                   lambda pid, frame, wid=None: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"
                                   if frame == own_frame else "another window"):
@@ -394,7 +394,7 @@ class OwnWindow(unittest.TestCase):
         d = self.mac(mac, stage=())
         d._pinned_window = d._window_id = None
         with mock.patch.object(skylight, "enter_window_key", lambda pid, wid: self.fail(f"focused {wid}")), \
-                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)):
+                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin, key=None: ("Q", wid)):
             self.assertIsNone(d._background_quartz(SAFARI))
 
     def test_focus_app_to_the_browser_already_observed_is_no_success(self):
@@ -610,7 +610,7 @@ class OwnWindow(unittest.TestCase):
         users_frame = mac.find(19116)["frame"]
         with mock.patch.object(skylight, "enter_window_key", lambda pid, wid: focused.append(wid) or "token"), \
                 mock.patch.object(skylight, "give_focus_back", lambda token: None), \
-                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)), \
+                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin, key=None: ("Q", wid)), \
                 mock.patch.object(axchrome, "focused_identifier",
                                   lambda pid, frame, wid=None: "another window" if frame == users_frame
                                   else "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" if frame == own_frame else None):

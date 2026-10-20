@@ -1639,14 +1639,20 @@ class PeekabooDriver:
             time.sleep(0.2)
             focused = on_bar()
             if focused not in axchrome.ADDRESS_BAR_IDS:
-                return self._settle(False, f"not searched: the keyboard focus is not on this window's address bar "
-                                           f"({focused or 'unknown'}), so nothing was pasted")
-            if not self._paste_and_submit(q, text, before_return=lambda: on_bar() in axchrome.ADDRESS_BAR_IDS):
-                return self._settle(False, "not searched: the focus left this window's address bar after the paste, "
-                                           "so Return was not pressed")
+                res = self._settle(False, f"not searched: the keyboard focus is not on this window's address bar "
+                                          f"({focused or 'unknown'}), so nothing was pasted")
+            elif not self._paste_and_submit(q, text, before_return=lambda: on_bar() in axchrome.ADDRESS_BAR_IDS):
+                res = self._settle(False, "not searched: the focus left this window's address bar after the paste, "
+                                          "so Return was not pressed")
+            else:
+                res = self._settle(True, f"searched {text!r} from the address bar (in the background)")
+        except skylight.WindowKeyRefused as exc:
+            # No key reaches the app while the user is on it (or the run's window stopped being its key window):
+            # the user's own field would take them. Deferred, as any step that waits for the user.
+            res = ExecResult(False, f"{USER_BUSY}; not searched: {exc} -- wait")
         finally:
             skylight.give_focus_back(token)
-        return self._settle(True, f"searched {text!r} from the address bar (in the background)")
+        return self._with_key_note(res, token)
 
     def _paste_and_submit(self, Q, text: str, before_return=None) -> bool:
         """Select all, paste `text`, Return, into the focused field; the user's clipboard, every item and type, put
@@ -2521,6 +2527,10 @@ class PeekabooDriver:
         self._app_name = data.get("application_name", "")
         self._window_title = data.get("window_title") or ""
         self._bind_window(data)
+        # The windows this run has observed: with the browser windows it opened (_run_windows), the record of what is
+        # the task's own for keys (_task_window) -- a window the user opens during the run is neither.
+        if self._observed_id():
+            self.__dict__.setdefault("_observed_windows", set()).add(self._observed_id())
 
         png = shot.read_bytes() if shot.exists() else None
         self._shot = shot
@@ -2642,6 +2652,7 @@ class PeekabooDriver:
         self._keep_baseline(els)
         self._labels_by_id = {e.id: e.label or "" for e in els}
         self._element_role = {e.id: e.role or "" for e in els}
+        self._role_labels = {e.id for e in els if e.label_from_role}     # "text area": a kind, not a name
         return els
 
     def _chat_flash_click(self, eid: str) -> ExecResult:
@@ -2759,11 +2770,18 @@ class PeekabooDriver:
                 if STOP.is_set():
                     skylight.give_focus_back(token)
                     return False, "stopped by the app; nothing was done"
+                refused = None
                 try:
                     detail = perform(q)
+                except skylight.WindowKeyRefused as exc:
+                    refused = exc       # a key while the user is on the app (or the window lost key): none was sent
                 finally:
                     skylight.give_focus_back(token)
-                return True, f"{detail} (in the background, {bundle} not brought forward, {time.time() - t0:.1f}s)"
+                note = token.note() if hasattr(token, "note") else ""
+                if refused is None:
+                    return True, (f"{detail} (in the background, {bundle} not brought forward, "
+                                  f"{time.time() - t0:.1f}s)" + (f"; {note}" if note else ""))
+                # Falls through to the path below, as with no background route: its own waits and flash rules.
         allowed = {b.strip().lower() for b in os.environ.get("HANDS_FLASH_APPS", "").split(",") if b.strip()}
         browser = bundle.lower() in self.BROWSERS
         if browser and not (bundle.lower() in allowed and self._in_own_browser_window(bundle)):
@@ -3040,10 +3058,13 @@ class PeekabooDriver:
             if exc.kind == "front" and skylight.front_pid() == pid:
                 # The app is the user's front app: no record goes to it, and the window-routed events go as they did
                 # before key records existed (each caller's own checks, e.g. the address bar's focus, still apply).
-                return skylight.BackgroundQuartz(pid, wid, (b["X"], b["Y"])), skylight.NoWindowKey()
+                # The window-routed clicks go as they did before key records existed; every key event is refused
+                # (BackgroundQuartz with a NoWindowKey): it would land in the app's key window, the user's.
+                key = skylight.NoWindowKey()
+                return skylight.BackgroundQuartz(pid, wid, (b["X"], b["Y"]), key=key), key
             self._bg_refused = str(exc)
             return None
-        return skylight.BackgroundQuartz(pid, wid, (b["X"], b["Y"])), key
+        return skylight.BackgroundQuartz(pid, wid, (b["X"], b["Y"]), key=key), key
 
     def _key_target(self) -> tuple[int, int] | ExecResult | None:
         """(pid, window id) of the observed window, for keys in the background; an ExecResult when it must not be
@@ -3052,10 +3073,27 @@ class PeekabooDriver:
         pid = self._pid_of(self.app) if wid else None
         if not wid or not pid:
             return None
-        if not self._may_use(self.app, wid):
+        if not self._task_window(wid):
             return ExecResult(False, f"not done: window {wid} is not one this run may type into (it was there before "
                                      f"the run, or is the user's)")
         return pid, int(wid)
+
+    def _task_window(self, wid) -> bool:
+        """Whether window `wid` is the task's own, for keys: one the run may use (_may_use) and that the driver itself
+        opened (a browser's, _run_windows) or observed (_observed_windows). A window the user opens during the run is
+        neither, though it was not there before the run."""
+        wid = str(wid)
+        if not self._may_use(self.app, wid):
+            return False
+        if self.app.lower() in self.BROWSERS:
+            return wid in getattr(self, "_run_windows", set())
+        return wid in getattr(self, "_observed_windows", set())
+
+    @staticmethod
+    def _with_key_note(res: ExecResult, key) -> ExecResult:
+        """`res` with what giving the key window back left undone, if anything (WindowKey.note)."""
+        note = key.note() if hasattr(key, "note") else ""
+        return replace(res, detail=f"{res.detail}; {note}"[:400]) if note else res
 
     #: How long a field is read back after the accessibility insertion before keys are tried instead.
     AX_INSERT_WAIT_S = 1.5
@@ -3070,21 +3108,31 @@ class PeekabooDriver:
         role = self._element_role.get(eid, "").lower()
         if axfield.role(field) not in self.FIELD_ROLES.get(role, set()):
             return False
-        label = (self._labels_by_id.get(eid) or "").strip().casefold()
+        label = "" if eid in getattr(self, "_role_labels", set()) else (self._labels_by_id.get(eid) or "")
+        label = label.strip().casefold()
         return not label or label in {n.strip().casefold() for n in axfield.names(field)}
 
-    @staticmethod
-    def _ascii_input() -> bool:
+    #: (ascii, when read): the input source read at most every few seconds, as the layout's letters are.
+    _ascii_read: tuple = (None, 0.0)
+    ASCII_TTL_S = 3.0
+
+    @classmethod
+    def _ascii_input(cls) -> bool:
         """Whether the user's current input source types ASCII by itself (no input method): asked of Text Input
         Sources by its ASCII-capable property, in a child process (asking here registers the run as an app -- see
         _key_event). Unknown is no: a Unicode key event to an input method can start a composition and put up its
         candidate window over the user's work."""
+        value, at = cls._ascii_read
+        if value is not None and time.monotonic() - at < cls.ASCII_TTL_S:
+            return value
         try:
             out = subprocess.run([sys.executable, "-c", keys.INPUT_SOURCE_CHILD], capture_output=True, text=True,
                                  timeout=10).stdout
-            return bool(json.loads(out).get("ascii"))
+            value = bool(json.loads(out).get("ascii"))
         except (OSError, ValueError, subprocess.SubprocessError):
-            return False
+            value = False
+        cls._ascii_read = (value, time.monotonic())
+        return value
 
     def _type_in_background(self, eid: str, text: str, clear_first: bool) -> ExecResult | None:
         """Type `text` into the observed window's field `eid` without bringing anything forward: first the
@@ -3167,7 +3215,7 @@ class PeekabooDriver:
             with skylight.enter_window_key(pid, wid) as key:
                 if not axfield.focus(field):
                     return None
-                q = skylight.BackgroundQuartz(pid, wid, (self._origin.x, self._origin.y))
+                q = skylight.BackgroundQuartz(pid, wid, (self._origin.x, self._origin.y), key=key)
 
                 def lost() -> str | None:
                     if STOP.is_set():
@@ -3182,7 +3230,10 @@ class PeekabooDriver:
                     # window does it, read back the same way. A caret that cannot be put at the end: not this route.
                     if not clear_first or lost():
                         return None
-                    self._post_key(q, self._keycode(q, "a"), q.kCGEventFlagMaskCommand)
+                    try:
+                        self._post_key(q, self._keycode(q, "a"), q.kCGEventFlagMaskCommand)
+                    except skylight.WindowKeyRefused:
+                        return None         # refused before it was sent: nothing typed
                     if not axfield.all_selected(field):
                         return None
                 sent, why = self._post_unicode(q, text, stop=lost)
@@ -3216,8 +3267,8 @@ class PeekabooDriver:
         if not isinstance(target, tuple):
             return target
         pid, wid = target
-        ids = skylight.window_ids(pid)
-        if ids is None or any(not self._may_use(self.app, str(i)) for i in ids):
+        ids, cg = skylight.window_ids(pid), skylight.cg_window_ids(pid)
+        if ids is None or cg is None or any(not self._task_window(i) for i in [*ids, *cg]):
             return self._settle(False, f"{refused} (the app has windows that are not this task's, and a chord can act "
                                        f"on all of them)")
         if skylight.user_on(pid):
@@ -3236,7 +3287,8 @@ class PeekabooDriver:
                 why = "stopped by the app" if STOP.is_set() else key.lost()
                 if why:
                     return ExecResult(False, f"{chord} not pressed: {why}")
-                self._post_key(skylight.BackgroundQuartz(pid, wid, (self._origin.x, self._origin.y)), *parsed)
+                self._post_key(skylight.BackgroundQuartz(pid, wid, (self._origin.x, self._origin.y), key=key),
+                               *parsed)
                 time.sleep(self.CHORD_SETTLE_S)
                 after = axfield.window_state(pid, wid)
         except skylight.WindowKeyRefused as exc:
@@ -3431,25 +3483,32 @@ class PeekabooDriver:
         """Type `text` as Unicode payloads on key code 0 (any script, no layout), in chunks; a newline and a tab as
         the Return and Tab keys. Asks `stop()` before each chunk -- a reason to stop, or None; (characters sent, the
         reason it stopped or None)."""
-        from deskmind_hands.drivers.skylight import text_chunks
+        from deskmind_hands.drivers.skylight import WindowKeyRefused, text_chunks
         sent = 0
         for chunk in text_chunks(text):
             why = stop() if stop is not None else None
             if why:
                 return sent, why
-            if chunk in ("\n", "\r", "\t"):
-                self._post_key(Q, keys.TAB if chunk == "\t" else keys.RETURN)
-            else:
-                units = len(chunk.encode("utf-16-le")) // 2
-                for down in (True, False):
-                    ev = self._key_event(Q, 0, down)
-                    Q.CGEventKeyboardSetUnicodeString(ev, units, chunk)
-                    Q.CGEventSetFlags(ev, 0)
-                    Q.CGEventPost(Q.kCGHIDEventTap, ev)
-                    time.sleep(0.01)
-                time.sleep(0.02)
+            try:
+                self._post_chunk(Q, chunk)
+            except WindowKeyRefused as exc:      # Q refused the key (the window lost key, the user came): not sent
+                return sent, str(exc)
             sent += len(chunk)
         return sent, None
+
+    def _post_chunk(self, Q, chunk: str) -> None:
+        """One run of text as a Unicode payload on key code 0, or a newline / tab as the Return / Tab key."""
+        if chunk in ("\n", "\r", "\t"):
+            self._post_key(Q, keys.TAB if chunk == "\t" else keys.RETURN)
+            return
+        units = len(chunk.encode("utf-16-le")) // 2
+        for down in (True, False):
+            ev = self._key_event(Q, 0, down)
+            Q.CGEventKeyboardSetUnicodeString(ev, units, chunk)
+            Q.CGEventSetFlags(ev, 0)
+            Q.CGEventPost(Q.kCGHIDEventTap, ev)
+            time.sleep(0.01)
+        time.sleep(0.02)
 
     #: Apps found at run time to show no accessibility structure: observed and acted on through the screenshot
     #: (OCR, grounded icons, the foreground flash) like the ones VISION_APPS names in advance.

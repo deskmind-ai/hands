@@ -198,6 +198,22 @@ def window_ids(pid: int) -> list[int] | None:
         return None
 
 
+def cg_window_ids(pid: int) -> list[int] | None:
+    """The app's ordinary (layer-0) windows as the window server lists them, every Space included -- accessibility
+    can miss a window on another Space: those on screen or with a title (a document, a page), not the untitled
+    off-screen surfaces an app keeps (Chrome's, Finder's). None when the list cannot be read."""
+    try:
+        import Quartz
+        out = []
+        for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionAll, 0) or []:
+            if w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowLayer") == 0 \
+                    and (w.get("kCGWindowIsOnscreen") or (w.get("kCGWindowName") or "").strip()):
+                out.append(int(w["kCGWindowNumber"]))
+        return out
+    except Exception:   # noqa: BLE001
+        return None
+
+
 def _psn_for(wid: int):
     """The serial number of the process that owns window `wid`, from its window-server connection; None if unknown.
     Not GetProcessForPID: the Process Manager registers the asking process as an app (see _load)."""
@@ -287,10 +303,13 @@ class WindowKey:
 
     def lost(self) -> str | None:
         """Why keys must not go on (the user is on the app, or the window is no longer the app's key window), or
-        None. Asked before every chunk of text and every chord: a window that closes midway hands key to another
-        window of the app -- the user's document."""
-        if self.user_took_front():
-            return "the user brought the app forward (or its front could not be read)"
+        None. Asked before every chunk of text, every key-down and every chord: a window that closes midway hands key
+        to another window of the app -- the user's document."""
+        front = front_pid()
+        if front is None:
+            return "the front app could not be read"
+        if front == self.pid:
+            return "the user brought the app forward"
         now = focused_window(self.pid)
         if now != self.wid:
             return f"window {self.wid} is no longer the app's key window (now {now})"
@@ -298,9 +317,12 @@ class WindowKey:
 
     def note(self) -> str:
         """What the step's result must say about giving the key window back; empty when it went back."""
+        if self.interrupted == "unknown":
+            return ("the front app could not be read, so restoring the app's previous key window was skipped (no "
+                    "record goes to an app the user may be in)")
         if self.interrupted:
-            return ("interrupted by the user: they brought the app forward, so its key window was left as they have "
-                    "it and nothing was given back")
+            return ("interrupted by the user: they brought the app forward, so restoring its previous key window was "
+                    "skipped and it was left as they have it")
         if self.restored is False:
             return f"the app's previous key window ({self.previous}) could not be confirmed given back"
         return ""
@@ -314,8 +336,9 @@ class WindowKey:
         self.closed = True
         prev = self.previous
         try:
-            if self.user_took_front():
-                self.interrupted, self.restored = True, False
+            front = front_pid()
+            if front is None or front == self.pid:
+                self.interrupted, self.restored = ("unknown" if front is None else "user"), False
                 return False
             if prev is None or prev == self.wid:
                 # It was key already, or none was: the window is only told it lost focus, as an inactive app's is.
@@ -375,19 +398,22 @@ def enter_window_key(pid: int, wid: int) -> WindowKey:
                                "key would move the user's own keyboard focus; nothing was sent")
     if _stopped():
         raise _refuse("stopped", "stopped by the app; nothing was sent")
+    if fns.get("auth_ok"):
+        auth_safe()             # the self-test's child, before the window is held key, not inside the first key
     psn = _psn_for(wid)
     if psn is None:
         raise _refuse("unavailable", f"window {wid} has no owner the window server can name (closed?); nothing was "
                                      f"sent")
-    previous = focused_window(pid)
-    for _ in range(3):
+    previous = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(0.1)
+        previous = focused_window(pid)
         if previous is not None:
             break
         ids = window_ids(pid)
         if ids is not None and [i for i in ids if i != wid] == []:
             break               # the target is its only window: nothing to give back but a defocus
-        time.sleep(0.1)
-        previous = focused_window(pid)
     else:
         raise _refuse("previous", f"the app's key window cannot be read while it has other windows, so it could not "
                                   f"be given back afterwards; nothing was sent")
@@ -531,12 +557,25 @@ class BackgroundQuartz:
     the user's pointer is not touched. Keys reach the window only while it is the app's key window (enter_window_key).
     """
 
-    def __init__(self, pid: int, window_id: int, origin: tuple[float, float]):
+    def __init__(self, pid: int, window_id: int, origin: tuple[float, float], key=None):
         import Quartz
         self._q, self.pid, self.wid, self.origin = Quartz, pid, window_id, origin
         self._group = time.time_ns() & 0x7FFFFFFF
         self._fns = _load()
         self.key_auth = True
+        #: What holds the window key (WindowKey), or NoWindowKey (the app is the user's front app: no key at all).
+        self.key = key
+
+    def _key_allowed(self) -> None:
+        """Raise WindowKeyRefused unless a key-down may go now: never without a WindowKey (to the user's front app
+        it would land in their key window), and only while the window is still the app's key window and the user
+        is not on the app (WindowKey.lost)."""
+        if not isinstance(self.key, WindowKey):
+            raise _refuse("front", "the app is the user's front app: a key would land in its key window, the "
+                                   "user's; none was sent")
+        why = self.key.lost()
+        if why:
+            raise _refuse("front" if "front" in why else "lost", f"{why}; the key was not sent")
 
     def __getattr__(self, name):
         return getattr(self._q, name)
@@ -551,6 +590,8 @@ class BackgroundQuartz:
         q, fns = self._q, self._fns
         kind = q.CGEventGetType(event)
         if kind in (q.kCGEventKeyDown, q.kCGEventKeyUp, q.kCGEventFlagsChanged):
+            if kind != q.kCGEventKeyUp:
+                self._key_allowed()     # a key-up always goes: a key-down already sent is never left held
             post_key_event(self.pid, event, auth=self.key_auth)
             return
         if not fns:

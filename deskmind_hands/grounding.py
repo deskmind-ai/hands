@@ -25,9 +25,64 @@ from .apps import APPS
 GROUNDER_URL = os.environ.get("HANDS_GROUNDER_URL", "http://127.0.0.1:8010/ground")
 
 
+#: When the app's helper was last asked to start the grounder (ensure_grounder), and whether it said it was up.
+_EYES_ASKED = {"at": 0.0, "up": False}
+
+
+def _grounder_listening() -> bool:
+    import socket
+    from urllib.parse import urlparse
+    u = urlparse(GROUNDER_URL)
+    try:
+        with socket.create_connection((u.hostname or "127.0.0.1", u.port or 80), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_grounder(wait_s: float = 30.0) -> bool:
+    """Start the app's vision model on demand: the first time a window has to be read from its pixels, the grounder
+    is asked for, and when it is not listening the app's helper (HANDS_HELPER_SOCKET) is asked to start it and
+    waited for. The app no longer knows before a run which apps it will use, and loading the model for every run
+    cost ~4 GB beside Brain's (deskmind #96 review). Asked again at most once a minute after a failure; nothing to
+    do without the socket (a run not started by the app) or when it is already up."""
+    import json as _json
+    import socket
+    import time as _time
+    sock = os.environ.get("HANDS_HELPER_SOCKET")
+    if not sock or _EYES_ASKED["up"]:
+        return _EYES_ASKED["up"] or not sock
+    if _grounder_listening():
+        _EYES_ASKED["up"] = True
+        return True
+    if _time.time() - _EYES_ASKED["at"] < 60:
+        return False
+    _EYES_ASKED["at"] = _time.time()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(wait_s + 5)
+        s.connect(sock)
+        s.sendall((_json.dumps({"op": "eyes", "wait": wait_s}) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        up = bool(_json.loads(buf.split(b"\n")[0] or b"{}").get("ready"))
+    except (OSError, ValueError):
+        up = False
+    finally:
+        s.close()
+    _EYES_ASKED["up"] = up
+    return up
+
+
 def grounder_headers() -> dict:
     """The grounder's request headers: with HANDS_GROUNDER_TOKEN set (the app sets it), its Bearer token, which the
-    app's grounding server requires so that nothing else on the Mac can answer in its place."""
+    app's grounding server requires so that nothing else on the Mac can answer in its place. Called right before
+    every grounder request, so it is also where the grounder is started on demand (ensure_grounder)."""
+    ensure_grounder()
     h = {"Content-Type": "application/json"}
     if os.environ.get("HANDS_GROUNDER_TOKEN"):
         h["Authorization"] = f"Bearer {os.environ['HANDS_GROUNDER_TOKEN']}"

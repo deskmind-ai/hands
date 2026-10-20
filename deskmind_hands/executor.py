@@ -179,6 +179,26 @@ def sends(role: str, label: str) -> bool:
     return any(text.startswith(v + " ") or (not v.isascii() and text.startswith(v)) for v in SENDS)
 
 
+def app_display_name(bundle: str) -> str:
+    """What the user calls the app with this bundle id: a running copy's localized name, else the installed app's
+    display name, else the bundle id."""
+    if not bundle:
+        return ""
+    for shown, b in running_apps():
+        if b.lower() == bundle.lower() and shown:
+            return shown
+    try:
+        from AppKit import NSWorkspace
+        url = NSWorkspace.sharedWorkspace().URLForApplicationWithBundleIdentifier_(bundle)
+        if url is not None:
+            name = NSWorkspace.sharedWorkspace().displayNameAtPath_(url.path())   # the Finder's, localized
+            if name:
+                return str(name).removesuffix(".app")
+    except Exception:  # noqa: BLE001
+        pass
+    return bundle
+
+
 def _app_name_of_pid(pid: int) -> str:
     app = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid) if AppKit else None
     return (app.localizedName() if app else None) or ""
@@ -413,7 +433,9 @@ class HandsExecutor:
                 # the apps whose steps must bring them to the front (read from their pixels, or a step that could not
                 # be delivered in the background): so the plan can say so once, before the run takes the front.
                 "needs_foreground": self._needs_foreground(),
-                "windows": [{"id": w["id"], "app": w["app"], "title": w["title"], "focused": w["app"] == front} for w in wins]}
+                # app_name: what the user calls the app (its localized name), for cards; app stays as it was
+                "windows": [{"id": w["id"], "app": w["app"], "app_name": w["app"] or w.get("bundle") or "", "bundle": w.get("bundle") or "",
+                             "title": w["title"], "focused": w["app"] == front} for w in wins]}
 
     # -- see and act ----------------------------------------------------------
     def _driver(self, bundle: str):
@@ -484,7 +506,7 @@ class HandsExecutor:
             if e.rect:
                 el["rect"] = [round(e.rect.x, 1), round(e.rect.y, 1), round(e.rect.w, 1), round(e.rect.h, 1)]
             els.append(el)
-        out = {"epoch": self.epoch, "window": {"id": window, "app": bundle, "title": obs.window_title},
+        out = {"epoch": self.epoch, "window": {"id": window, "app": bundle, "app_name": app_display_name(bundle), "title": obs.window_title},
                "modal": {"title": "dialog"} if obs.dialog else None, "elements": els, "text": "\n".join(texts)[:4000]}
         if screenshot and obs.screenshot_png:
             import base64
@@ -562,7 +584,23 @@ class HandsExecutor:
         # typing and scrolling never write a file, and each read asks the app (up to two osascript runs)
         may_save = kind in self.SAVING_KINDS
         state0 = self._document(window, wins) if may_save else None
-        res: ExecResult = d.execute(a)
+        # foreground_ok (the layer above): this step's window is the task's own, or the user's consent covers it --
+        # the app may be brought forward for it (briefly, once the user is still), whatever HANDS_FLASH_APPS names.
+        # The app no longer names the task's apps before a run (deskmind #96), so the list alone left an app that
+        # only takes input in front unreachable. Only for this step: the list is put back after it.
+        flash_before = os.environ.get("HANDS_FLASH_APPS")
+        if action.get("foreground_ok"):
+            have = [b for b in (flash_before or "").split(",") if b.strip()]
+            if bundle.lower() not in {b.lower() for b in have}:
+                os.environ["HANDS_FLASH_APPS"] = ",".join(have + [bundle])
+        try:
+            res: ExecResult = d.execute(a)
+        finally:
+            if action.get("foreground_ok"):
+                if flash_before is None:
+                    os.environ.pop("HANDS_FLASH_APPS", None)
+                else:
+                    os.environ["HANDS_FLASH_APPS"] = flash_before
         status = "ok" if res.ok else "unsupported" if res.unsupported else "error"
         if res.ok and res.indeterminate:
             status = "unverified"
@@ -665,7 +703,7 @@ class HandsExecutor:
                 w = main[-1]
                 allow_flash(bundle)
                 self._own(d, self._split(w["id"])[1])
-                return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "title": w["title"]},
+                return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "app_name": w["app"] or app_display_name(w.get("bundle") or ""), "title": w["title"]},
                         "why": "the app's own window, opened by its launch (no document in it)"}
         # Whose the window is: the task's on proof that this action made it -- the window id the app's scripting
         # returned for the document it made, or a browser window the driver opened and told apart by its marker.
@@ -705,7 +743,7 @@ class HandsExecutor:
                     "why": f"a window of {app} is there, but it may be one the app brought back when it launched, not one this action made"}
         allow_flash(bundle)   # a window the task opened is the task's: the app may be brought forward for it
         self._own(d, self._split(w["id"])[1])
-        return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "title": w["title"]}}
+        return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "app_name": w["app"] or app_display_name(w.get("bundle") or ""), "title": w["title"]}}
 
     def _navigate(self, d, bundle: str, wid: str, url: str) -> bool:
         """Load `url` in the run's own browser window `wid` (the window server's id) and check that the window's page

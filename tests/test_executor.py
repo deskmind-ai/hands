@@ -80,7 +80,8 @@ class Mapping(unittest.TestCase):
         self.assertEqual(by_id["P3"]["actions"], ["click", "select"])
         self.assertEqual(by_id["P3"]["options"], ["桌面", "文稿"])
         self.assertEqual(o["text"], "已保存")
-        self.assertEqual(o["window"], {"id": W12, "app": TE, "title": "未命名"})
+        self.assertEqual({k: o["window"][k] for k in ("id", "app", "title")}, {"id": W12, "app": TE, "title": "未命名"})
+        self.assertTrue(o["window"]["app_name"])            # what the user calls it, for cards (bundle id when unknown)
         self.assertIsNone(o["modal"])
         self.assertTrue(json.dumps(o, ensure_ascii=False))   # serialisable as it stands
 
@@ -578,6 +579,26 @@ class NeedsForeground(unittest.TestCase):
         stub._vision_app = lambda app=None: False
         stub._foreground_actions = 1                      # a step had to bring it forward
         self.assertEqual(ex.snapshot()["needs_foreground"], [TE])
+
+
+class ForegroundOK(unittest.TestCase):
+    def test_a_step_the_layer_above_allows_may_bring_its_app_forward_for_that_step_only(self):
+        """The app no longer names the task's apps (deskmind #96): an app that only takes input in front is allowed
+        a flash for a step whose window is the task's or the user's consent covers (foreground_ok), and only then."""
+        ex, stub = _executor()
+        seen = []
+        stub.execute = lambda action: seen.append(os.environ.get("HANDS_FLASH_APPS", "")) or ExecResult(True, "done")
+        ex.observe(W12)
+        with mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": "com.apple.Safari"}):
+            ex.perform({"kind": "click", "window": W12, "target": "B2", "foreground_ok": True})
+            ex.perform({"kind": "click", "window": W12, "target": "B2"})
+            self.assertEqual(os.environ["HANDS_FLASH_APPS"], "com.apple.Safari")   # put back
+        self.assertEqual(seen, [f"com.apple.Safari,{TE}", "com.apple.Safari"])
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HANDS_FLASH_APPS", None)
+            ex.perform({"kind": "click", "window": W12, "target": "B2", "foreground_ok": True})
+            self.assertNotIn("HANDS_FLASH_APPS", os.environ)
+        self.assertEqual(seen[-1], TE)
 
 
 class Sends(unittest.TestCase):

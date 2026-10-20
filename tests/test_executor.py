@@ -104,6 +104,13 @@ class Mapping(unittest.TestCase):
         for e in pixels:
             self.assertEqual(by_id[e.id]["source"], "pixels", e.id)
         self.assertEqual(Element(id="x", role="button").source, "ax")    # the default: drivers that do not say
+        # kept through a trace: written by to_json only when not "ax", read back by replay
+        from deskmind_hands.replay import _element
+        px = Element(id="ocr:1", role="listitem", label="发送", source="pixels")
+        self.assertEqual(px.to_json()["source"], "pixels")
+        self.assertNotIn("source", Element(id="x", role="button").to_json())
+        self.assertEqual(_element(px.to_json()).source, "pixels")
+        self.assertEqual(_element(Element(id="x", role="button").to_json()).source, "ax")
 
     def test_perform_maps_actions_and_binds_them_to_the_last_observation(self):
         ex, stub = _executor()

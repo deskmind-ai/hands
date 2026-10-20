@@ -30,16 +30,20 @@ def decode(rec) -> tuple:
 class Fake:
     """An app with a focused window that moves when the records (or the accessibility write) say so."""
 
-    def __init__(self, focused=PREV, obeys_records=True, obeys_ax=True, status=0, front=USER):
+    def __init__(self, focused=PREV, obeys_records=True, obeys_ax=True, status=0, front=USER, windows=(PREV, TARGET)):
         self.focused, self.obeys_records, self.obeys_ax, self.status, self.front = focused, obeys_records, obeys_ax, \
             status, front
+        self.windows, self.stopped = list(windows), False
         self.sent, self.ax_writes = [], []
+        self.on_makekey = None
 
     def post(self, psn, rec):
         what = decode(rec)
         self.sent.append(what)
         if self.status == 0 and self.obeys_records and what[0] == "makekey2":
             self.focused = what[1]
+            if self.on_makekey:
+                self.on_makekey()
         return self.status
 
     def set_ax(self, pid, wid):
@@ -55,6 +59,8 @@ class Fake:
                 mock.patch.object(skylight, "focused_window", lambda pid: self.focused),
                 mock.patch.object(skylight, "_set_focused_window", self.set_ax),
                 mock.patch.object(skylight, "front_pid", lambda: self.front),
+                mock.patch.object(skylight, "window_ids", lambda pid: list(self.windows)),
+                mock.patch.object(skylight, "_stopped", lambda: self.stopped),
                 mock.patch.object(skylight, "CONFIRM_S", 0), mock.patch.object(skylight, "AX_CONFIRM_S", 0),
                 mock.patch.object(skylight.time, "sleep", lambda s: None)]
 
@@ -65,6 +71,12 @@ class Patched(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         return fake
+
+    def refused(self, kind: str):
+        with self.assertRaises(skylight.WindowKeyRefused) as cm:
+            skylight.enter_window_key(PID, TARGET)
+        self.assertEqual(cm.exception.kind, kind, str(cm.exception))
+        return cm.exception
 
 
 class EnterWindowKey(Patched):
@@ -81,6 +93,7 @@ class EnterWindowKey(Patched):
             app.sent.clear()
         self.assertEqual(app.sent, [("defocus", TARGET), ("focus", PREV), ("makekey1", PREV), ("makekey2", PREV)])
         self.assertTrue(key.restored)
+        self.assertEqual(key.note(), "")
         self.assertEqual(app.focused, PREV)
 
     def test_given_back_when_the_block_raises(self):
@@ -100,11 +113,39 @@ class EnterWindowKey(Patched):
         self.assertTrue(skylight.give_focus_back(key))
         self.assertEqual(len(app.sent), n)
 
-    def test_no_previous_window_the_target_is_only_defocused(self):
-        app = self.use(Fake(focused=None))
+    def test_the_user_on_the_app_at_exit_no_records_and_said(self):
+        app = self.use(Fake())
+        with skylight.enter_window_key(PID, TARGET) as key:
+            app.sent.clear()
+            app.front = PID                                  # the user clicked into the app meanwhile
+        self.assertEqual(app.sent, [])
+        self.assertTrue(key.interrupted)
+        self.assertIn("interrupted by the user", key.note())
+
+    def test_a_front_that_cannot_be_read_at_exit_sends_nothing(self):
+        app = self.use(Fake())
+        with skylight.enter_window_key(PID, TARGET):
+            app.sent.clear()
+            app.front = None
+        self.assertEqual(app.sent, [])
+
+    def test_not_given_back_is_said(self):
+        app = self.use(Fake())
+        key = skylight.enter_window_key(PID, TARGET)
+        app.obeys_records = app.obeys_ax = False
+        self.assertFalse(key.exit())
+        self.assertIn("could not be confirmed given back", key.note())
+
+    def test_no_previous_window_and_no_other_window_the_target_is_only_defocused(self):
+        app = self.use(Fake(focused=None, windows=(TARGET,)))
         with skylight.enter_window_key(PID, TARGET):
             app.sent.clear()
         self.assertEqual(app.sent, [("defocus", TARGET)])
+
+    def test_no_previous_window_while_others_exist_refused_after_retries(self):
+        app = self.use(Fake(focused=None))
+        self.refused("previous")
+        self.assertEqual(app.sent, [])
 
     def test_records_ignored_then_the_accessibility_write(self):
         app = self.use(Fake(obeys_records=False))
@@ -117,30 +158,57 @@ class EnterWindowKey(Patched):
 
     def test_refused_when_the_focus_is_not_confirmed_and_nothing_left_moved(self):
         app = self.use(Fake(obeys_records=False, obeys_ax=False))
-        with self.assertRaises(skylight.WindowKeyRefused) as cm:
-            skylight.enter_window_key(PID, TARGET)
-        self.assertIn("could not be confirmed", str(cm.exception))
+        self.assertIn("could not be confirmed", str(self.refused("unconfirmed")))
         self.assertEqual(app.focused, PREV)
 
     def test_refused_on_1002(self):
         app = self.use(Fake(status=skylight.INVALID_CONNECTION))
-        with self.assertRaises(skylight.WindowKeyRefused) as cm:
-            skylight.enter_window_key(PID, TARGET)
-        self.assertIn("1002", str(cm.exception))
+        self.assertIn("1002", str(self.refused("1002")))
         self.assertEqual(len(app.sent), 4)          # one pass, no retry, no accessibility write
         self.assertEqual(app.ax_writes, [])
 
     def test_refused_when_the_app_is_the_users_front_app(self):
         app = self.use(Fake(front=PID))
-        with self.assertRaises(skylight.WindowKeyRefused) as cm:
-            skylight.enter_window_key(PID, TARGET)
-        self.assertIn("front app", str(cm.exception))
+        self.assertIn("front app", str(self.refused("front")))
         self.assertEqual(app.sent, [])
+
+    def test_refused_when_the_front_app_cannot_be_read(self):
+        app = self.use(Fake(front=None))
+        self.refused("front")
+        self.assertEqual(app.sent, [])
+
+    def test_the_user_coming_to_the_app_while_it_is_made_key_refuses_and_sends_nothing_back(self):
+        app = self.use(Fake())
+        app.on_makekey = lambda: setattr(app, "front", PID)
+        self.refused("front")
+        self.assertEqual(app.sent[-1], ("makekey2", TARGET))             # nothing after: no records to their app
+
+    def test_stopped_while_it_is_made_key(self):
+        app = self.use(Fake(obeys_records=False))
+        app.on_makekey = None
+        orig = app.post
+
+        def post(psn, rec):
+            app.stopped = True
+            return orig(psn, rec)
+        app.post = post
+        with mock.patch.object(skylight, "_post_record", post):
+            self.refused("stopped")
+        self.assertEqual(app.ax_writes, [])                               # no accessibility write after the stop
 
     def test_refused_without_skylight(self):
         with mock.patch.object(skylight, "_load", lambda: None):
             with self.assertRaises(skylight.WindowKeyRefused):
                 skylight.enter_window_key(PID, TARGET)
+
+    def test_lost_when_another_window_becomes_key(self):
+        app = self.use(Fake())
+        key = skylight.enter_window_key(PID, TARGET)
+        self.assertIsNone(key.lost())
+        app.focused = PREV                                                # the task's window closed: the user's is key
+        self.assertIn("no longer the app's key window", key.lost())
+        app.focused, app.front = TARGET, PID
+        self.assertIn("brought the app forward", key.lost())
 
 
 class PostKeyEvent(unittest.TestCase):
@@ -171,6 +239,25 @@ class PostKeyEvent(unittest.TestCase):
         self.assertIn((skylight.F_PID, PID), fields)
         self.assertIn((skylight.F_SOURCE_STATE, skylight.HID_SYSTEM_STATE), fields)
 
+    def test_no_authentication_when_the_self_test_crashed(self):
+        """A __CGEvent layout that moved crashes the child, not the run: keys then go unauthenticated."""
+        crashed = types.SimpleNamespace(returncode=-11, stdout="")
+        with mock.patch.object(skylight, "_auth_safe", None), \
+                mock.patch("subprocess.run", lambda *a, **k: crashed), \
+                mock.patch.object(skylight, "_authenticate_unchecked",
+                                  side_effect=AssertionError("never read the record here")):
+            self.assertFalse(skylight._authenticate({"auth_ok": True}, 77, PID))
+            self.assertFalse(skylight.auth_safe())
+
+    def test_the_self_test_runs_once(self):
+        calls = []
+        ok = types.SimpleNamespace(returncode=0, stdout="ok\n")
+        with mock.patch.object(skylight, "_auth_safe", None), \
+                mock.patch("subprocess.run", lambda *a, **k: calls.append(1) or ok):
+            self.assertTrue(skylight.auth_safe())
+            self.assertTrue(skylight.auth_safe())
+        self.assertEqual(len(calls), 1)
+
 
 class TextAndChords(unittest.TestCase):
     def test_chunks_keep_characters_whole_and_controls_apart(self):
@@ -195,10 +282,10 @@ class TextAndChords(unittest.TestCase):
 
 
 class Key:
-    """A WindowKey stand-in: records its use."""
+    """A WindowKey stand-in: records its use; `lose_after` chunks typed, it reads as lost."""
 
-    def __init__(self, log, via="records", took=False):
-        self.log, self.via, self.took = log, via, took
+    def __init__(self, log, via="records", lost=None, note=""):
+        self.log, self.via, self._lost, self._note = log, via, lost, note
 
     def __enter__(self):
         self.log.append("enter")
@@ -208,8 +295,31 @@ class Key:
         self.log.append("exit")
         return False
 
-    def user_took_front(self):
-        return self.took
+    def lost(self):
+        return self._lost() if self._lost else None
+
+    def note(self):
+        return self._note
+
+
+class FakeQ:
+    """Quartz as _post_unicode uses it: each Unicode key-down goes into `field` (as an app would type it)."""
+    kCGHIDEventTap, kCGEventFlagMaskCommand = 0, 1 << 20
+
+    def __init__(self, d, field):
+        self.d, self.field = d, field
+
+    def CGEventKeyboardSetUnicodeString(self, ev, n, s):   # noqa: N802
+        ev["text"] = s
+
+    def CGEventSetFlags(self, ev, f):   # noqa: N802
+        ev["flags"] = f
+
+    def CGEventPost(self, tap, ev):   # noqa: N802
+        if ev["down"] and "text" in ev:
+            self.d.log.append(("keys", ev["text"]))
+            if self.d.keys_land:
+                self.field.value += ev["text"].capitalize() if not self.field.value.endswith(" ") else ev["text"]
 
 
 def driver():
@@ -220,8 +330,10 @@ def driver():
     d._element_window = {"t1": "200"}
     d._preexisting = set()
     d._background_keys = lambda: True
-    d.log = []
-    d._post_unicode = lambda q, text, stop=None: d.log.append(("keys", text)) or len(text)
+    d._moved_since_seen = lambda: None
+    d._ascii_input = lambda: True
+    d._background_input = lambda bundle: True
+    d.log, d.keys_land = [], True
     d._post_key = lambda q, code, flags=0: d.log.append(("key", code, flags))
     d._load_keys = lambda: None
     d.CHORD_SETTLE_S = 0
@@ -231,14 +343,16 @@ def driver():
 class Field:
     """A text field whose value the mocked accessibility calls read and write."""
 
-    def __init__(self, value, takes_insertion):
-        self.value, self.takes = value, takes_insertion
+    def __init__(self, value, takes_insertion, role="AXTextArea", names=("正文",), web=False):
+        self.value, self.takes, self.role, self.names, self.web = value, takes_insertion, role, list(names), web
+        self.focused = True
 
 
 class TypeText(unittest.TestCase):
     def run_type(self, field, keys_land=True, enter=None, text="hello 你好", clear=False, selects=True,
-                 all_selected=True, d=None, settle=None, value=None, insert=None, extra=()):
+                 all_selected=True, d=None, settle=None, value=None, insert=None, extra=(), user_on=False):
         d = d or driver()
+        d.keys_land = keys_land
         d._keycode = lambda q, letter: {"a": 0}[letter]
 
         def post_key(q, code, flags=0):                                 # cmd+A selects all: the next keys replace it
@@ -246,25 +360,32 @@ class TypeText(unittest.TestCase):
             if flags:
                 field.value = ""
         d._post_key = post_key
-        if keys_land:
-            d._post_unicode = lambda q, t, stop=None: (d.log.append(("keys", t)),
-                                                       setattr(field, "value", field.value + t.capitalize()))[0] \
-                or len(t)
 
         def ax_insert(el, t, replace_all):
             d.log.append(("ax insert", t))
             if field.takes:
                 field.value = t if replace_all else field.value + t
             return True
+        d.settle_waits = []
+
+        def default_settle(el, before, wait=0.6):
+            d.settle_waits.append(wait)
+            return field.value
         patches = [*extra, mock.patch.object(axfield, "field_at", lambda pid, wid, frame: field),
                    mock.patch.object(axfield, "value", value or (lambda el: field.value)),
                    mock.patch.object(axfield, "insert", insert or ax_insert),
-                   mock.patch.object(axfield, "settled_value", settle or (lambda el, before, wait=0.6: field.value)),
+                   mock.patch.object(axfield, "settled_value", settle or default_settle),
+                   mock.patch.object(axfield, "role", lambda el: field.role),
+                   mock.patch.object(axfield, "names", lambda el: field.names),
+                   mock.patch.object(axfield, "in_web_area", lambda el: field.web),
+                   mock.patch.object(axfield, "is_focused", lambda el: field.focused),
                    mock.patch.object(axfield, "focus", lambda el: d.log.append("focus") or True),
                    mock.patch.object(axfield, "select", lambda el, replace_all: d.log.append("select") or selects),
                    mock.patch.object(axfield, "all_selected", lambda el, wait=0.5: all_selected),
-                   mock.patch.object(skylight, "BackgroundQuartz",
-                                     lambda pid, wid, origin: types.SimpleNamespace(kCGEventFlagMaskCommand=1 << 20)),
+                   mock.patch.object(skylight, "user_on", lambda pid: user_on),
+                   mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: FakeQ(d, field)),
+                   mock.patch.object(PeekabooDriver, "_key_event",
+                                     classmethod(lambda cls, Q, code, down: {"down": down, "code": code})),
                    mock.patch.object(skylight, "enter_window_key",
                                      enter or (lambda pid, wid: d.log.append(("key window", pid, wid)) or Key(d.log)))]
         for p in patches:
@@ -274,6 +395,9 @@ class TypeText(unittest.TestCase):
         finally:
             for p in patches:
                 p.stop()
+
+    def keys_sent(self, d):
+        return [e for e in d.log if isinstance(e, tuple) and e[0] == "keys"]
 
     def test_the_accessibility_insertion_first(self):
         d, res = self.run_type(Field("start\n", takes_insertion=True))
@@ -288,18 +412,10 @@ class TypeText(unittest.TestCase):
         self.assertEqual(d.log, [("ax insert", "hello 你好"), ("key window", PID, 200), "enter", "focus", "select",
                                  ("keys", "hello 你好"), "exit"])
 
-    def test_replace_selects_all_by_key_when_accessibility_will_not(self):
-        field = Field("old", takes_insertion=False)
-        d, res = self.run_type(field, clear=True, selects=False, text="new")
-        self.assertIn(("key", 0, 1 << 20), d.log)                       # cmd+A, then the text
-        self.assertEqual(d.log.index(("key", 0, 1 << 20)) + 1, d.log.index(("keys", "new")))
-        self.assertTrue(res.ok and not res.indeterminate, res.detail)    # "New": TextEdit's capital, still verified
-
-    def test_replace_refused_when_nothing_reads_back_selected(self):
-        d, res = self.run_type(Field("old", takes_insertion=False), clear=True, selects=False, all_selected=False)
-        self.assertFalse(res.ok)
-        self.assertIn("could not be selected", res.detail)
-        self.assertNotIn("keys", [e[0] for e in d.log if isinstance(e, tuple)])
+    def test_nothing_written_no_wait(self):
+        d, res = self.run_type(Field("start", takes_insertion=False), insert=lambda el, t, r: False)
+        self.assertEqual(d.settle_waits[0], 0)
+        self.assertNotIn("200", d.__dict__.get("_ax_noop_windows", set()))   # refused, not a no-op: tried again
 
     def test_an_insertion_shown_late_is_not_typed_again(self):
         """The value shows the insertion only after ~1 s: the wait (1.5 s) sees it, and no key is sent."""
@@ -320,8 +436,8 @@ class TypeText(unittest.TestCase):
                                extra=[mock.patch.object(axfield, "time", fake_time)])
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
         self.assertGreaterEqual(clock[0], 1.0)
-        self.assertEqual([e for e in d.log if e != "select"], [])        # no window made key, no key sent
-        self.assertNotIn(str(200), d.__dict__.get("_ax_noop_windows", set()))
+        self.assertEqual(d.log, [])                                       # no window made key, no key sent
+        self.assertNotIn("200", d.__dict__.get("_ax_noop_windows", set()))
 
     def test_an_insertion_shown_just_before_the_keys_is_not_typed_again(self):
         field = Field("start", takes_insertion=False)
@@ -335,7 +451,7 @@ class TypeText(unittest.TestCase):
         d, res = self.run_type(field, value=value, settle=lambda el, before, wait=0.6: before)
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
         self.assertIn("shown late", res.detail)
-        self.assertNotIn("keys", [e[0] for e in d.log if isinstance(e, tuple)])
+        self.assertEqual(self.keys_sent(d), [])
 
     def test_a_window_where_the_insertion_did_nothing_goes_straight_to_keys(self):
         """Chrome: accepted and nothing changed after the whole wait -- remembered for that window, not the app."""
@@ -354,18 +470,85 @@ class TypeText(unittest.TestCase):
         d, res = self.run_type(Field("start", takes_insertion=False), d=d, text="third")
         self.assertIn(("ax insert", "third"), d.log)
 
+    def test_the_window_changing_midway_stops_the_typing(self):
+        """2000 chars into the task's window, which closes midway: the app makes the user's window key, and the rest
+        must not go there."""
+        d = driver()
+        chunks = [0]
+
+        def lost():
+            chunks[0] += 1
+            return "window 200 is no longer the app's key window (now 100)" if chunks[0] > 3 else None
+        d, res = self.run_type(Field("start", takes_insertion=False), d=d, text="x" * 2000,
+                               enter=lambda pid, wid: Key(d.log, lost=lost))
+        self.assertFalse(res.ok)
+        self.assertTrue(res.indeterminate)
+        self.assertIn("typing stopped after 48 of 2000", res.detail)
+        self.assertIn("no longer the app's key window", res.detail)
+        self.assertEqual(len(self.keys_sent(d)), 3)
+
+    def test_the_field_losing_the_focus_midway_stops_the_typing(self):
+        field = Field("start", takes_insertion=False)
+        d = driver()
+        orig_post = FakeQ.CGEventPost
+
+        def post(self, tap, ev):
+            orig_post(self, tap, ev)
+            field.focused = False                                        # e.g. a Tab moved it, or a dialog took it
+        with mock.patch.object(FakeQ, "CGEventPost", post):
+            d, res = self.run_type(field, d=d, text="y" * 40)
+        self.assertIn("no longer has the focus", res.detail)
+        self.assertEqual(len(self.keys_sent(d)), 1)
+
+    def test_no_cmd_a_when_the_window_is_lost(self):
+        d = driver()
+        d, res = self.run_type(Field("old", takes_insertion=False), d=d, clear=True, selects=False,
+                               enter=lambda pid, wid: Key(d.log, lost=lambda: "window 200 is no longer key"))
+        self.assertIsNone(res)
+        self.assertNotIn(("key", 0, 1 << 20), d.log)
+
+    def test_not_given_back_is_in_the_result(self):
+        d = driver()
+        d, res = self.run_type(Field("start", takes_insertion=False), d=d,
+                               enter=lambda pid, wid: Key(d.log, note="the app's previous key window (100) could not "
+                                                                      "be confirmed given back"))
+        self.assertIn("could not be confirmed given back", res.detail)
+
+    def test_replace_selects_all_by_key_when_accessibility_will_not(self):
+        field = Field("old", takes_insertion=False)
+        d, res = self.run_type(field, clear=True, selects=False, text="new")
+        self.assertIn(("key", 0, 1 << 20), d.log)                       # cmd+A, then the text
+        self.assertEqual(d.log.index(("key", 0, 1 << 20)) + 1, d.log.index(("keys", "new")))
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)    # "New": TextEdit's capital, still verified
+
+    def test_replace_left_to_the_old_route_when_nothing_reads_back_selected(self):
+        d, res = self.run_type(Field("old", takes_insertion=False), clear=True, selects=False, all_selected=False)
+        self.assertIsNone(res)
+        self.assertEqual(self.keys_sent(d), [])
+
     def test_unverified_when_the_keys_do_not_read_back(self):
         d, res = self.run_type(Field("start", takes_insertion=False), keys_land=False)
         self.assertTrue(res.indeterminate)
         self.assertIn("unverified", res.detail)
 
-    def test_refused_and_nothing_typed_when_the_window_is_not_proven_key(self):
+    def test_a_window_that_cannot_be_made_key_leaves_it_to_the_old_route(self):
         def refuse(pid, wid):
-            raise skylight.WindowKeyRefused("window 200 could not be confirmed as the app's key window")
+            raise skylight._refuse("unconfirmed", "window 200 could not be confirmed as the app's key window")
+        d, res = self.run_type(Field("start", takes_insertion=False), enter=refuse)
+        self.assertIsNone(res)
+        self.assertEqual(self.keys_sent(d), [])
+
+    def test_stopped_while_the_window_is_made_key(self):
+        def refuse(pid, wid):
+            raise skylight._refuse("stopped", "stopped by the app")
         d, res = self.run_type(Field("start", takes_insertion=False), enter=refuse)
         self.assertFalse(res.ok)
-        self.assertIn("could not be confirmed", res.detail)
-        self.assertNotIn("keys", [e[0] for e in d.log if isinstance(e, tuple)])
+        self.assertIn("stopped", res.detail)
+
+    def test_the_users_front_app_leaves_it_to_the_old_route(self):
+        d, res = self.run_type(Field("start", takes_insertion=True), user_on=True)
+        self.assertIsNone(res)
+        self.assertEqual(d.log, [])
 
     def test_stopped_before_anything(self):
         STOP.set()
@@ -376,9 +559,62 @@ class TypeText(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertEqual(d.log, [])
 
+    def test_web_content_goes_to_keys_never_the_insertion(self):
+        """A page keeps its own state: an insertion can show in the field and the form submit empty."""
+        d, res = self.run_type(Field("start", takes_insertion=True, web=True))
+        self.assertTrue(res.ok, res.detail)
+        self.assertNotIn("ax insert", [e[0] for e in d.log if isinstance(e, tuple)])
+        self.assertIn(("keys", "hello 你好"), d.log)
+
+    def test_a_web_fields_replace_keeps_the_click_and_paste_route(self):
+        d, res = self.run_type(Field("start", takes_insertion=True, web=True), clear=True)
+        self.assertIsNone(res)
+        self.assertEqual(d.log, [])
+
+    def test_an_input_method_on_no_keys(self):
+        d = driver()
+        d._ascii_input = lambda: False
+        d, res = self.run_type(Field("start", takes_insertion=False), d=d)
+        self.assertIsNone(res)
+        self.assertEqual(self.keys_sent(d), [])
+        d2 = driver()
+        d2._ascii_input = lambda: False
+        d2, res = self.run_type(Field("start", takes_insertion=True), d=d2)   # a native field takes the insertion
+        self.assertTrue(res.ok and "accessibility insertion" in res.detail, res.detail)
+
+    def test_carriage_returns_are_newlines(self):
+        d, res = self.run_type(Field("a", takes_insertion=False), text="b\r\nc\rd")
+        self.assertEqual([e for e in d.log if isinstance(e, tuple) and e[0] in ("keys", "key")],
+                         [("keys", "b"), ("key", keys.RETURN, 0), ("keys", "c"), ("key", keys.RETURN, 0),
+                          ("keys", "d")])
+
+    def test_a_one_line_field_takes_no_newline_or_tab_as_keys(self):
+        for text in ("a\tb", "a\nb", "a\r\nb", "a\rb"):
+            d, res = self.run_type(Field("", takes_insertion=False, role="AXTextField"), text=text)
+            self.assertIsNone(res, text)
+            self.assertEqual(self.keys_sent(d), [], text)
+
+    def test_a_tab_in_a_multiline_field_is_the_tab_key(self):
+        d, res = self.run_type(Field("a", takes_insertion=False), text="b\tc")
+        self.assertIn(("key", keys.TAB, 0), d.log)
+
+    def test_not_the_observed_element_leaves_it_to_the_old_route(self):
+        d, res = self.run_type(Field("start", takes_insertion=True, names=("搜索",)))
+        self.assertIsNone(res)
+        d, res = self.run_type(Field("start", takes_insertion=True, role="AXTextField"))   # a textarea was observed
+        self.assertIsNone(res)
+        self.assertEqual(d.log, [])
+
+    def test_a_moved_window_leaves_it_to_the_old_route(self):
+        d = driver()
+        d._moved_since_seen = lambda: "the window moved"
+        with mock.patch.object(axfield, "field_at", side_effect=AssertionError("not looked up by place")):
+            self.assertIsNone(d._type_in_background("t1", "x", False))
+
     def test_no_field_to_read_back_by_leaves_it_to_the_old_route(self):
         d = driver()
-        with mock.patch.object(axfield, "field_at", lambda pid, wid, frame: None):
+        with mock.patch.object(axfield, "field_at", lambda pid, wid, frame: None), \
+                mock.patch.object(skylight, "user_on", lambda pid: False):
             self.assertIsNone(d._type_in_background("t1", "x", False))
 
     def test_a_window_the_run_does_not_own_is_left_to_the_old_route(self):
@@ -389,10 +625,12 @@ class TypeText(unittest.TestCase):
 
 
 class Chord(unittest.TestCase):
-    def press(self, states, enter=None, chord="cmd+shift+n"):
-        d = driver()
+    def press(self, states, enter=None, chord="cmd+shift+n", windows=(200,), user_on=False, d=None):
+        d = d or driver()
         seq = iter(states)
         with mock.patch.object(axfield, "window_state", lambda pid, wid: next(seq)), \
+                mock.patch.object(skylight, "window_ids", lambda pid: None if windows is None else list(windows)), \
+                mock.patch.object(skylight, "user_on", lambda pid: user_on), \
                 mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: "Q"), \
                 mock.patch.object(skylight, "enter_window_key", enter or (lambda pid, wid: Key(d.log))):
             return d, d._press_in_background(chord)
@@ -410,12 +648,41 @@ class Chord(unittest.TestCase):
         self.assertTrue(res.indeterminate)
         self.assertIn("observe before pressing it again", res.detail)
 
+    def test_refused_when_the_app_has_a_window_that_is_not_the_tasks(self):
+        """cmd+Q, cmd+H act on the whole app: only while every window of it is the task's own -- no chord list."""
+        d = driver()
+        d._preexisting = {"100"}
+        for chord in ("cmd+q", "cmd+h", "cmd+a"):
+            d.log.clear()
+            d, res = self.press([], chord=chord, windows=(100, 200), d=d)
+            self.assertFalse(res.ok)
+            self.assertIn("no background route", res.detail)
+            self.assertEqual(d.log, [])
+
+    def test_refused_when_the_apps_windows_cannot_be_read(self):
+        d, res = self.press([], windows=None)
+        self.assertFalse(res.ok)
+        self.assertEqual(d.log, [])
+
+    def test_refused_as_before_when_the_app_is_the_users_front_app(self):
+        d, res = self.press([], user_on=True)
+        self.assertFalse(res.ok)
+        self.assertIn("no background route", res.detail)
+        self.assertEqual(d.log, [])
+
+    def test_not_pressed_when_the_window_is_lost_after_it_was_made_key(self):
+        d = driver()
+        d, res = self.press([{"title": "t"}], enter=lambda pid, wid: Key(d.log, lost=lambda: "window 200 is gone"),
+                            d=d)
+        self.assertFalse(res.ok)
+        self.assertNotIn("key", [e[0] for e in d.log if isinstance(e, tuple)])
+
     def test_refused_when_the_window_is_not_proven_key(self):
         def refuse(pid, wid):
-            raise skylight.WindowKeyRefused("the app is the user's front app")
+            raise skylight._refuse("unconfirmed", "window 200 could not be confirmed")
         d, res = self.press([None, None], enter=refuse)
         self.assertFalse(res.ok)
-        self.assertIn("front app", res.detail)
+        self.assertIn("could not be confirmed", res.detail)
         self.assertEqual(d.log, [])
 
     def test_not_the_runs_window_not_pressed(self):
@@ -424,6 +691,29 @@ class Chord(unittest.TestCase):
         res = d._press_in_background("cmd+a")
         self.assertFalse(res.ok)
         self.assertIn("not one this run may type into", res.detail)
+
+
+class FrontApp(unittest.TestCase):
+    def test_background_quartz_sends_no_records_to_the_front_app(self):
+        d = driver()
+        d.app = "com.apple.Safari"
+        d._run_windows = {"200"}
+        wins = [{"kCGWindowOwnerPID": PID, "kCGWindowLayer": 0, "kCGWindowNumber": 200,
+                 "kCGWindowBounds": {"X": 0, "Y": 0, "Width": 800, "Height": 600}}]
+        fake_q = types.SimpleNamespace(CGWindowListCopyWindowInfo=lambda opt, wid: wins, kCGWindowListOptionAll=0)
+
+        def refuse(pid, wid):
+            raise skylight._refuse("front", "the app is the user's front app")
+        with mock.patch.dict(sys.modules, {"Quartz": fake_q,
+                                           "AppKit": types.SimpleNamespace(NSRunningApplication=None)}), \
+                mock.patch.object(skylight, "enter_window_key", refuse), \
+                mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)):
+            with mock.patch.object(skylight, "front_pid", lambda: PID):
+                q, key = d._background_quartz("com.apple.Safari", observed_only=True)
+                self.assertEqual(q, ("Q", 200))
+                self.assertIsInstance(key, skylight.NoWindowKey)
+            with mock.patch.object(skylight, "front_pid", lambda: None):     # unknown: fail closed
+                self.assertIsNone(d._background_quartz("com.apple.Safari", observed_only=True))
 
 
 if __name__ == "__main__":

@@ -29,13 +29,15 @@ flowchart LR
 ## Background execution
 
 The driver keeps one Peekaboo MCP session per run (`HANDS_PEEKABOO_TRANSPORT=mcp`). Clicks go to an element of the
-current snapshot. Text goes into a field by an accessibility insertion first; when the field reads back unchanged
-(Chrome), it is typed as keys to the run's window, which is first made its app's key window inside that app only and
-proven so by reading the app's focused window back (`drivers/skylight.py`, `enter_window_key`); the app's previous key
-window is given back afterwards. Chords go to the run's window the same way. Every such step is read back (the field's
-value, the window or its focused element) and reported unverified when the read-back does not show it. Your focused
-app keeps the front and the keyboard: nothing is sent while the target app is your front app. Where macOS offers no
-background route, the step is refused with the reason instead of being performed in the foreground:
+current snapshot. Text goes into a native field by an accessibility insertion first; into a web page's field, or one
+that reads back unchanged (Chrome), it is typed as keys to the run's window, which is first made its app's key window
+inside that app only and proven so by reading the app's focused window back (`drivers/skylight.py`,
+`enter_window_key`), the window and the field's focus checked again before every chunk; the app's previous key window
+is given back afterwards. No keys are typed while an input method is on. Chords go to the run's window the same way,
+and only while every window of that app is the run's own. Every such step is read back (the field's value, the window
+or its focused element) and reported unverified when the read-back does not show it. Your focused app keeps the front
+and the keyboard: no focus record is sent to your front app, and a step on it takes the ordinary path. Where macOS
+offers no background route, the step is refused with the reason instead of being performed in the foreground:
 
 - a chord an app cannot receive in the background is not offered to the planner at all (`ROUTED_CHORDS`);
 - apps that ignore all background input can be allowed a short **foreground flash** (`HANDS_FLASH_APPS`, a list of

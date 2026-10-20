@@ -110,3 +110,24 @@ events = {f"{k}:{int(d)}": base64.b64encode(bytes(Q.CGEventCreateData(None, Q.CG
           .decode() for k in range(128) for d in (True, False)}
 print(json.dumps({"table": table, "events": events}))
 '''
+
+
+#: Run with the driver's python: prints {"ascii": the current keyboard input source types ASCII by itself, "id": its
+#: id (for the trace only)}. Asked of Text Input Sources by its ASCII-capable property, never by name; in a child for
+#: the same reason as CHILD. Anything that fails prints nothing, which the caller reads as "not ASCII".
+INPUT_SOURCE_CHILD = r'''
+import ctypes, ctypes.util, json
+c = ctypes.cdll.LoadLibrary(ctypes.util.find_library("Carbon"))
+cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
+c.TISCopyCurrentKeyboardInputSource.restype = ctypes.c_void_p
+c.TISGetInputSourceProperty.restype = ctypes.c_void_p
+c.TISGetInputSourceProperty.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+cf.CFBooleanGetValue.restype, cf.CFBooleanGetValue.argtypes = ctypes.c_bool, [ctypes.c_void_p]
+cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+src = c.TISCopyCurrentKeyboardInputSource()
+v = c.TISGetInputSourceProperty(src, ctypes.c_void_p.in_dll(c, "kTISPropertyInputSourceIsASCIICapable").value)
+i = c.TISGetInputSourceProperty(src, ctypes.c_void_p.in_dll(c, "kTISPropertyInputSourceID").value)
+buf = ctypes.create_string_buffer(256)
+print(json.dumps({"ascii": bool(v) and cf.CFBooleanGetValue(v),
+                  "id": buf.value.decode() if i and cf.CFStringGetCString(i, buf, 256, 0x08000100) else ""}))
+'''

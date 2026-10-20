@@ -112,14 +112,41 @@ def _selection(el) -> tuple[int, int] | None:
 
 def insert(el, text: str, replace_all: bool) -> bool:
     """`text` in place of the whole text (replace_all) or at the end, by the accessibility insertion
-    (AXSelectedText); True when the app accepted the write -- which is not proof it changed anything."""
+    (AXSelectedText); True when the write was sent and accepted -- which is not proof it changed anything. False:
+    nothing was written (the selection was refused, or the write)."""
     return select(el, replace_all) and _set(el, "AXSelectedText", text)
 
 
 def focus(el) -> bool:
     """The keyboard focus inside its window to the field; True when it reads back focused."""
     _set(el, "AXFocused", True)
+    return is_focused(el)
+
+
+def is_focused(el) -> bool:
     return bool(_get(el, "AXFocused"))
+
+
+def role(el) -> str:
+    return str(_get(el, "AXRole") or "")
+
+
+def names(el) -> list[str]:
+    """What the field is called: its title, description and placeholder, those it has."""
+    return [str(v) for v in (_get(el, a) for a in ("AXTitle", "AXDescription", "AXPlaceholderValue")) if v]
+
+
+def in_web_area(el, depth: int = 80) -> bool:
+    """Whether the field is web content (an AXWebArea above it): a page keeps its own state, which an accessibility
+    insertion can show in the field without changing -- the form would then submit what the page holds."""
+    cur = _get(el, "AXParent")
+    for _ in range(depth):
+        if cur is None:
+            return False
+        if _get(cur, "AXRole") == "AXWebArea":
+            return True
+        cur = _get(cur, "AXParent")
+    return False
 
 
 def settled_value(el, before: str | None, wait: float = 0.6) -> str | None:

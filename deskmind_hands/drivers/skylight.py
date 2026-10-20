@@ -49,7 +49,9 @@ _fns: dict | None = None
 
 
 class WindowKeyRefused(RuntimeError):
-    """The window could not be made (or proven) the app's key window; no key was sent. The message says why."""
+    """The window could not be made (or proven) the app's key window; no key was sent. The message says why, `kind`
+    in a word (see enter_window_key)."""
+    kind = "unconfirmed"
 
 
 def _load() -> dict | None:
@@ -146,16 +148,6 @@ def _make_key_record(window_id: int, kind: int):
     return rec
 
 
-def front_window(pid: int) -> int | None:
-    """The front ordinary window of `pid`: the topmost on-screen one."""
-    import Quartz
-    for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly
-                                               | Quartz.kCGWindowListExcludeDesktopElements, 0) or []:
-        if w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowLayer") == 0:
-            return int(w["kCGWindowNumber"])
-    return None
-
-
 def front_pid() -> int | None:
     """The pid of the user's front app, asked of the window server; None when it cannot be told."""
     fns = _load()
@@ -189,6 +181,21 @@ def _set_focused_window(pid: int, wid: int) -> bool:
     except Exception:   # noqa: BLE001
         pass
     return False
+
+
+def window_ids(pid: int) -> list[int] | None:
+    """The window-server ids of the app's accessibility windows (one unreadable id counts as unknown); None when they
+    cannot be read."""
+    try:
+        from ApplicationServices import AXUIElementCreateApplication
+        from .axchrome import _get, _window_id
+        wins = _get(AXUIElementCreateApplication(pid), "AXWindows")
+        if wins is None:
+            return None
+        ids = [_window_id(w) for w in wins]
+        return None if any(i is None for i in ids) else ids
+    except Exception:   # noqa: BLE001
+        return None
 
 
 def _psn_for(wid: int):
@@ -236,10 +243,26 @@ def _await_focus(pid: int, wid: int, budget: float) -> bool:
 
 
 def _refused_1002() -> WindowKeyRefused:
-    return WindowKeyRefused(
-        f"the window server refused the focus records ({INVALID_CONNECTION}: this process has no window-server "
+    return _refuse(
+        "1002", f"the window server refused the focus records ({INVALID_CONNECTION}: this process has no window-server "
         f"connection of an app -- run hands from the DeskMind app or a terminal app, not as a detached process), so "
         f"no window could be made key and nothing was sent")
+
+
+def _stopped() -> bool:
+    """The app asked the run to stop (grounding.STOP)."""
+    try:
+        from deskmind_hands.grounding import STOP
+        return STOP.is_set()
+    except Exception:   # noqa: BLE001
+        return False
+
+
+def user_on(pid: int) -> bool:
+    """The user's front app is `pid`, or which app is in front cannot be told: either way its key window may be the
+    user's keyboard (fail closed)."""
+    front = front_pid()
+    return front is None or front == pid
 
 
 class WindowKey:
@@ -248,7 +271,7 @@ class WindowKey:
 
     def __init__(self, pid: int, wid: int, previous: int | None, psn, via: str):
         self.pid, self.wid, self.previous, self.psn, self.via = pid, wid, previous, psn, via
-        self.closed, self.restored = False, None
+        self.closed, self.restored, self.interrupted = False, None, False
 
     def __enter__(self) -> WindowKey:
         return self
@@ -258,17 +281,42 @@ class WindowKey:
         return False
 
     def user_took_front(self) -> bool:
-        """The user brought the app forward meanwhile: its key window is now the user's keyboard as well."""
-        return front_pid() == self.pid
+        """The user brought the app forward meanwhile (or the front cannot be told): its key window is now the
+        user's keyboard as well."""
+        return user_on(self.pid)
+
+    def lost(self) -> str | None:
+        """Why keys must not go on (the user is on the app, or the window is no longer the app's key window), or
+        None. Asked before every chunk of text and every chord: a window that closes midway hands key to another
+        window of the app -- the user's document."""
+        if self.user_took_front():
+            return "the user brought the app forward (or its front could not be read)"
+        now = focused_window(self.pid)
+        if now != self.wid:
+            return f"window {self.wid} is no longer the app's key window (now {now})"
+        return None
+
+    def note(self) -> str:
+        """What the step's result must say about giving the key window back; empty when it went back."""
+        if self.interrupted:
+            return ("interrupted by the user: they brought the app forward, so its key window was left as they have "
+                    "it and nothing was given back")
+        if self.restored is False:
+            return f"the app's previous key window ({self.previous}) could not be confirmed given back"
+        return ""
 
     def exit(self) -> bool:
         """The app's previous key window back (the same records, or the accessibility write); True when it reads
-        back. Once only."""
+        back. Once only. Nothing is sent when the user is on the app (or the front cannot be read): their keyboard
+        is in it now."""
         if self.closed:
             return bool(self.restored)
         self.closed = True
         prev = self.previous
         try:
+            if self.user_took_front():
+                self.interrupted, self.restored = True, False
+                return False
             if prev is None or prev == self.wid:
                 # It was key already, or none was: the window is only told it lost focus, as an inactive app's is.
                 self.restored = _post_record(self.psn, _record(self.wid, 0x02)) == 0
@@ -285,27 +333,68 @@ class WindowKey:
         return bool(self.restored)
 
 
+class NoWindowKey:
+    """No window made key (the app is the user's front app: no records go to it); exit gives nothing back."""
+    via, restored, interrupted = "none (the app is in front)", True, False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        return False
+
+    def exit(self) -> bool:
+        return True
+
+    def note(self) -> str:
+        return ""
+
+
+def _refuse(kind: str, why: str) -> WindowKeyRefused:
+    exc = WindowKeyRefused(why)
+    exc.kind = kind
+    return exc
+
+
 def enter_window_key(pid: int, wid: int) -> WindowKey:
     """Make window `wid` the key window of its app `pid` without activating or raising it, proven by reading the
-    app's focused window back; raise WindowKeyRefused (nothing sent) when it cannot be.
+    app's focused window back; raise WindowKeyRefused (nothing left sent) when it cannot be. Its `kind` says why:
+    "front" (the app is the user's front app, or the front cannot be read -- no record is sent to it), "stopped",
+    "1002", "unavailable", "previous" (the app's key window cannot be read while it has other windows, so it could
+    not be given back), "unconfirmed".
 
     The records go out at most twice (WindowServer delivers them asynchronously; the second pass catches an app still
-    handling the first), then the accessibility write of AXFocusedWindow. Refused as well when the app is the user's
-    front app -- its key window is the user's keyboard -- and when the window server has no connection for this
-    process (1002)."""
+    handling the first), then the accessibility write of AXFocusedWindow. Checked again right before returning: the
+    user not on the app, and no stop."""
     fns = _load()
     if not fns:
-        raise WindowKeyRefused("the window server's focus calls are missing on this macOS, so no window can be made "
-                               "key in the background; nothing was sent")
-    if front_pid() == pid:
-        raise WindowKeyRefused("the app is the user's front app: making its window key would move the user's own "
-                               "keyboard focus; nothing was sent")
+        raise _refuse("unavailable", "the window server's focus calls are missing on this macOS, so no window can "
+                                     "be made key in the background; nothing was sent")
+    if user_on(pid):
+        raise _refuse("front", "the app is the user's front app (or the front app cannot be read): making its window "
+                               "key would move the user's own keyboard focus; nothing was sent")
+    if _stopped():
+        raise _refuse("stopped", "stopped by the app; nothing was sent")
     psn = _psn_for(wid)
     if psn is None:
-        raise WindowKeyRefused(f"window {wid} has no owner the window server can name (closed?); nothing was sent")
+        raise _refuse("unavailable", f"window {wid} has no owner the window server can name (closed?); nothing was "
+                                     f"sent")
     previous = focused_window(pid)
+    for _ in range(3):
+        if previous is not None:
+            break
+        ids = window_ids(pid)
+        if ids is not None and [i for i in ids if i != wid] == []:
+            break               # the target is its only window: nothing to give back but a defocus
+        time.sleep(0.1)
+        previous = focused_window(pid)
+    else:
+        raise _refuse("previous", f"the app's key window cannot be read while it has other windows, so it could not "
+                                  f"be given back afterwards; nothing was sent")
     via = None
     for attempt in range(2):
+        if _stopped() or user_on(pid):
+            break
         current = previous if attempt == 0 else focused_window(pid)
         statuses = _send_records(psn, current, wid)
         if INVALID_CONNECTION in statuses:
@@ -313,24 +402,74 @@ def enter_window_key(pid: int, wid: int) -> WindowKey:
         if all(s == 0 for s in statuses) and _await_focus(pid, wid, CONFIRM_S):
             via = "records"
             break
-    if via is None and _set_focused_window(pid, wid) and _await_focus(pid, wid, AX_CONFIRM_S):
+    if via is None and not _stopped() and not user_on(pid) and _set_focused_window(pid, wid) \
+            and _await_focus(pid, wid, AX_CONFIRM_S):
         via = "ax"
+    key = WindowKey(pid, wid, previous, psn, via or "records")
+    # Again right before success (the tries take 0.4-2 s): the user may have come to the app, or the run stopped.
+    if user_on(pid):
+        key.exit()          # sends nothing: the user is on it
+        raise _refuse("front", "the user brought the app forward while its window was being made key; no keys were "
+                               "sent")
+    if _stopped():
+        key.exit()
+        raise _refuse("stopped", "stopped by the app while the window was being made key; no keys were sent")
     if via is None:
         now = focused_window(pid)
         if now != previous:
-            WindowKey(pid, wid, previous, psn, "records").exit()   # whatever the tries moved, put back
-        raise WindowKeyRefused(f"window {wid} could not be confirmed as the app's key window (its focused window "
-                               f"reads {now}), so no keys were sent: they could have gone to another window of the "
-                               f"same app")
-    return WindowKey(pid, wid, previous, psn, via)
+            key.exit()      # whatever the tries moved, put back
+        raise _refuse("unconfirmed", f"window {wid} could not be confirmed as the app's key window (its focused "
+                                     f"window reads {now}), so no keys were sent: they could have gone to another "
+                                     f"window of the same app")
+    return key
 
 
-def give_focus_back(key: WindowKey | None) -> bool:
+def give_focus_back(key: WindowKey | NoWindowKey | None) -> bool:
     """The app's previous key window back (WindowKey.exit); the name the background routes call it by."""
     return key.exit() if key is not None else False
 
 
+#: Whether reading the event record out of a CGEvent and building its authentication message works on this macOS,
+#: found once per process by a child that does exactly that (None: not yet asked). The record is read at fixed
+#: offsets inside __CGEvent (cua's layout, verified live on macOS 27.2, 10-21); a layout that moved would make
+#: objc_msgSend crash the process -- the child's, which then only turns authentication off.
+_auth_safe: bool | None = None
+
+AUTH_SELF_TEST = r"""
+import os, Quartz
+from deskmind_hands.drivers import skylight as s
+fns = s._load()
+ev = Quartz.CGEventCreateKeyboardEvent(None, 0, True)
+print("ok" if fns and s._authenticate_unchecked(fns, s._ptr(ev), os.getpid()) else "no")
+"""
+
+
+def auth_safe() -> bool:
+    """Whether the authenticated key route may be used here (AUTH_SELF_TEST passed in a child, once per process)."""
+    global _auth_safe
+    if _auth_safe is None:
+        import os
+        import subprocess
+        import sys
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in (root, os.environ.get("PYTHONPATH")) if p)}
+        try:
+            r = subprocess.run([sys.executable, "-c", AUTH_SELF_TEST], capture_output=True, text=True, timeout=20,
+                               env=env)
+            _auth_safe = r.returncode == 0 and r.stdout.strip() == "ok"
+        except (OSError, subprocess.SubprocessError):
+            _auth_safe = False
+    return _auth_safe
+
+
 def _authenticate(fns: dict, ev_ptr: int, pid: int) -> bool:
+    """Attach the authentication message, if the self-test passed here; else the key goes unauthenticated."""
+    if not fns.get("auth_ok") or not auth_safe():
+        return False
+    return _authenticate_unchecked(fns, ev_ptr, pid)
+
+
+def _authenticate_unchecked(fns: dict, ev_ptr: int, pid: int) -> bool:
     if not fns.get("auth_ok"):
         return False
     for offset in (24, 32, 16):   # the event record inside __CGEvent, as cua probes it

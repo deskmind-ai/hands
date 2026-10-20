@@ -218,6 +218,7 @@ class HandsExecutor:
         #: GUI lands where the task's own file tools and the verdict look.
         self.workspace = Path(workspace) if workspace else self.scratch
         track_children()   # every child's pid recorded as it starts: its posted events are the driver's, not the user's
+        self._began_at = time.time()
         STOP.clear()       # a new run starts unstopped (a stop that came before begin is applied right after this)
         self.epoch = 1
         #: When the epoch was last set, and the inventory it was set on: a user's input after that moment, or a
@@ -300,6 +301,19 @@ class HandsExecutor:
             pre.discard(wid)
 
     @staticmethod
+    def _make_frontmost(bundle: str) -> bool:
+        """Make the app frontmost through accessibility (AXFrontmost), without a reopen."""
+        try:
+            import ApplicationServices as AS
+            from AppKit import NSRunningApplication
+            apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle)
+            if not apps:
+                return False
+            return AS.AXUIElementSetAttributeValue(AS.AXUIElementCreateApplication(apps[0].processIdentifier()), "AXFrontmost", True) == 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
     def _front_bundle_id() -> str:
         try:
             from AppKit import NSWorkspace
@@ -353,6 +367,27 @@ class HandsExecutor:
             return False
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
         return idle < self.USER_ACTIVE_S
+
+    def _audio_playing(self) -> list[dict]:
+        """The apps the task operates that have an audio output open now, with since when (first seen in this run)
+        and whether that began after the run began. An open output is not proof of sound (a muted call keeps one),
+        and one app's tabs cannot be told apart, so this is evidence to weigh, not a verdict (hands #55 review)."""
+        now = time.time()
+        seen = self.__dict__.setdefault("_audio_seen", {})
+        began = self.__dict__.setdefault("_began_at", now)
+        task = self._task_bundles()
+        playing = playing_apps()
+        now_on = {a["bundle"].lower() for a in playing}
+        for b in list(seen):
+            if b not in now_on:
+                seen.pop(b, None)       # stopped: a later start is a new one
+        out = []
+        for a in playing:
+            b = a["bundle"].lower()
+            first = seen.setdefault(b, now)
+            if b in task:
+                out.append({**a, "playing_since": round(first, 3), "started_after_begin": first > began + 0.5})
+        return out
 
     def _needs_foreground(self) -> list[str]:
         """Bundles of the apps whose steps come to the front: their driver reads them from pixels (input then only
@@ -448,7 +483,7 @@ class HandsExecutor:
                 "needs_foreground": self._needs_foreground(),
                 # the apps sending sound to an output now (CoreAudio): the system's word that something is playing,
                 # which a music app's window cannot give a verdict by its pixels
-                "audio_playing": playing_apps(),
+                "audio_playing": self._audio_playing(),
                 # app_name: what the user calls the app (its localized name), for cards; app stays as it was
                 "windows": [{"id": w["id"], "app": w["app"], "app_name": w["app"] or w.get("bundle") or "", "bundle": w.get("bundle") or "",
                              "title": w["title"], "focused": w["app"] == front} for w in wins]}
@@ -559,6 +594,14 @@ class HandsExecutor:
                 return {"status": "error", "why": f"the window {window} could not be closed (it may be gone already)", "files": []}
             return {"status": "ok", "files": []}
         if kind == "focus_window":
+            # the window the task works in from now on; brought to the front only when the layer above allows the
+            # foreground for this step and the user is not at the keyboard or mouse -- focus took the front without
+            # either (hands #55 review). Otherwise it is the observed window, in the background.
+            if not action.get("foreground_ok") or self.user_active() or is_browser(bundle):
+                d = self._driver(bundle)
+                d._pinned_window = wid or None
+                d._window_id = wid or None
+                return {"status": "ok", "window": window, "files": [], "why": "the window to work in; not brought to the front"}
             if self._pk(["window", "focus", "--window-id", wid, "--json"]) is None:
                 return {"status": "error", "why": f"the window {window} could not be brought forward", "window": window, "files": []}
             return {"status": "ok", "window": window, "files": []}
@@ -625,7 +668,7 @@ class HandsExecutor:
                     os.environ.pop("HANDS_FLASH_APPS", None)
                 else:
                     os.environ["HANDS_FLASH_APPS"] = flash_before
-        if kind in self.SETTLE_KINDS and is_browser(bundle):
+        if res.ok and kind in self.SETTLE_KINDS and is_browser(bundle):
             # a page loads after the action that asked for it, and its title changes when it has: waited for here, so
             # the load lands before the layer above takes its after-action snapshot -- a title that changed later made
             # the next step stale, eleven times in one search (rc.10, 10-21)
@@ -715,11 +758,15 @@ class HandsExecutor:
             # An app slow to start (a music player took longer than the 8 s this waited, 10-20) is waited for up to
             # LAUNCH_WAIT_S, until a window of it appears.
             before_launch = self._known_windows()
+            front_before = self._front_bundle_id()
             # in the background (-g): opening an app is no reason to take the front from the user; it comes forward
             # only for a step, by the flash's rules (the user still, the step allowed) -- `open -b` did take it, and
             # a music app kept jumping in front of the user's work (rc.10, 10-21)
             subprocess.run(["open", "-g", "-b", bundle], capture_output=True, timeout=20)
             launched = self._launch_windows(bundle, before_launch, self.LAUNCH_WAIT_S)
+            if front_before and front_before != bundle and self._front_bundle_id() == bundle:
+                # some apps take the front on their first launch whatever -g says: given back at once
+                self._make_frontmost(front_before)
             self._settled(bundle)
         d = self._driver(bundle)      # started now, so the windows it finds are the ones there before the task's
         before = self._known_windows()
@@ -769,11 +816,9 @@ class HandsExecutor:
             subprocess.run(["open", "-g", "-b", bundle, url], capture_output=True, timeout=20)
             fresh = self._fresh_windows(before, 2.5, bundle)
         else:
+            # the app's own scripting only: cmd+N goes to whichever app is in front, the user's included, and a
+            # check that it is this app races with the user switching (hands #55 review)
             proof = self._new_document(bundle)
-            if not proof and self._front_bundle_id() == bundle:
-                # cmd+N goes to whichever app is in front: sent only when that is this app (the user had it there)
-                subprocess.run(["osascript", "-e", 'tell application "System Events" to keystroke "n" using command down'], capture_output=True, timeout=20)
-                fresh = self._fresh_windows(before, 3, bundle)
         if proof:
             fresh = [w for w in self._fresh_windows(set(), 3, bundle) if self._split(w["id"])[1] == str(proof)]
         if not fresh:

@@ -124,13 +124,24 @@ class BrowserForeground(unittest.TestCase):
         d._resumed = lambda: None
         d._background_input = lambda bundle: False
         d.BROWSERS = {"com.google.chrome"}
-        d._front_bundle = lambda: "com.google.Chrome"
+        d.front = ["com.googlecode.iterm2"]        # the user's terminal is in front
+        d._front_bundle = lambda: d.front[0]
         d._hid_idle = lambda: 100.0
         d._foreground_actions = 0
+        d._browser_front_sid = lambda bundle: None
         d.given_back = []
-        d._give_front_back = lambda prev: d.given_back.append(prev)
+
+        def give_back(prev):
+            d.given_back.append(prev)
+            d.front[0] = prev
+        d._give_front_back = give_back
         d.brought = []
-        d._bring_forward = lambda bundle, browser: d.brought.append((bundle, browser))
+
+        def bring(bundle, browser):
+            d.brought.append((bundle, browser))
+            d.front[0] = bundle
+            return True
+        d._bring_forward = bring
         return d
 
     def test_not_the_runs_own_window_or_not_allowed_nothing_comes_forward(self):
@@ -166,6 +177,40 @@ class BrowserForeground(unittest.TestCase):
             self.assertEqual(ok, expect)
             self.assertEqual(d.brought, [("com.google.Chrome", True)])
         self.assertEqual(sent, [True])                 # only when the run's own window was in front
+
+    def test_not_while_the_user_is_in_that_browser(self):
+        """Raising the run's window in the browser the user is reading would cover their page (hands #55 review)."""
+        import os as _os
+        import sys as _sys
+        import types
+        from unittest import mock
+        d = self._driver(True)
+        d._takeover = lambda: False
+        d.front[0] = "com.google.Chrome"
+        d._announce_wait = lambda waited, bundle, what: True
+        with mock.patch.dict(_os.environ, {"HANDS_FLASH_APPS": "com.google.Chrome", "HANDS_FLASH_WAIT_S": "0"}), \
+             mock.patch.dict(_sys.modules, {"Quartz": types.ModuleType("Quartz")}), \
+             mock.patch("deskmind_hands.drivers.peekaboo.time.sleep"):
+            ok, why = d._flash("com.google.Chrome", lambda Q: "typed")
+        self.assertFalse(ok)
+        self.assertEqual(d.brought, [])
+
+    def test_a_browser_gets_the_front_back_without_a_reopen(self):
+        """`open -b` on a browser is a reopen and can open a window of its own (deskmind#73): the front goes back to
+        a browser through accessibility only (hands #55 review)."""
+        from unittest import mock
+        from deskmind_hands.drivers.peekaboo import PeekabooDriver
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        d.BROWSERS = {"com.google.chrome"}
+        made = []
+        d._make_frontmost = lambda b: made.append(b) or True
+        fronts = iter(["x", "com.google.Chrome"])
+        d._front_bundle = lambda: next(fronts, "com.google.Chrome")
+        with mock.patch("deskmind_hands.drivers.peekaboo.subprocess.run") as run, \
+             mock.patch("deskmind_hands.drivers.peekaboo.time.sleep"):
+            d._give_front_back("com.google.Chrome")
+        run.assert_not_called()
+        self.assertEqual(made[0], "com.google.Chrome")
 
 
 if __name__ == "__main__":

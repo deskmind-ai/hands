@@ -66,6 +66,8 @@ import deskmind_hands.browsers as _br   # noqa: E402
 import deskmind_hands.executor as _exe   # noqa: E402
 _br._BROWSERS = set()
 _exe.app_display_name = lambda bundle: bundle
+# ... nor the system's audio objects: nothing is playing, except where a test says otherwise (hands #55 review)
+_exe.playing_apps = lambda: []
 
 
 def _executor():
@@ -365,10 +367,25 @@ class Windows(unittest.TestCase):
         ex, _ = _executor()
         ex._pk = lambda args: None   # noqa: SLF001 -- the command failed
         self.assertEqual(ex.perform({"kind": "close_window", "window": W12})["status"], "error")
-        self.assertEqual(ex.perform({"kind": "focus_window", "window": W12})["status"], "error")
         ex._pk = lambda args: {}   # noqa: SLF001 -- succeeded with nothing to say
         self.assertEqual(ex.perform({"kind": "close_window", "window": W12})["status"], "ok")
-        self.assertEqual(ex.perform({"kind": "focus_window", "window": W12})["status"], "ok")
+        ex._windows = lambda every=False: []   # noqa: SLF001 -- the window is gone
+        self.assertEqual(ex.perform({"kind": "focus_window", "window": W12})["status"], "error")
+
+    def test_focus_never_takes_the_front(self):
+        """A raise kept the front for good, and the user typing in another app (not the task's, so not counted by
+        the input watch) had their keys go into the task's window (hands #55 review): focus only makes the window
+        the one to work in, whatever the step allows."""
+        ex, stub = _executor()
+        ex._windows = lambda every=False: [_win("12")]   # noqa: SLF001
+        calls = []
+        ex._pk = lambda args: calls.append(args) or {}   # noqa: SLF001
+        for act in ({"kind": "focus_window", "window": W12}, {"kind": "focus_window", "window": W12, "foreground_ok": True}):
+            r = ex.perform(act)
+            self.assertEqual(r["status"], "ok")
+            self.assertIn("not brought to the front", r["why"])
+        self.assertEqual(calls, [])
+        self.assertEqual(stub._pinned_window, "12")
 
     def test_pk_tells_failure_from_an_empty_answer(self):
         from types import SimpleNamespace
@@ -646,6 +663,115 @@ class StopBeforeBegin(unittest.TestCase):
         self.assertEqual(by_id[3]["result"]["status"], "error")
 
 
+class BrowserSettle(unittest.TestCase):
+    def test_after_an_action_in_a_browser_the_title_is_waited_for_until_it_holds(self):
+        """The page an action asked for loads after it, and its title changes then: waited for before perform
+        returns, so the change lands before the after-action snapshot instead of staling the next step (rc.10)."""
+        ex, stub = _executor()
+        chrome = "com.google.Chrome"
+        titles = iter(["新标签页", "新标签页", "百度一下", "今天北京天气_百度搜索", "今天北京天气_百度搜索", "今天北京天气_百度搜索",
+                       "今天北京天气_百度搜索", "今天北京天气_百度搜索", "今天北京天气_百度搜索", "今天北京天气_百度搜索"])
+        seen = []
+
+        def windows(every=False):
+            t = next(titles, "今天北京天气_百度搜索")
+            seen.append(t)
+            return [_win("50", bundle=chrome, title=t, app="Google Chrome")]
+        ex._windows = windows   # noqa: SLF001
+        clock = {"t": 1000.0}
+        with mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
+             mock.patch("deskmind_hands.executor.time.time", side_effect=lambda: clock["t"]), \
+             mock.patch("deskmind_hands.executor.time.sleep", side_effect=lambda d: clock.__setitem__("t", clock["t"] + d)):
+            ex.observe(f"{chrome}#50")
+            ex.perform({"kind": "key", "window": f"{chrome}#50", "chord": "return"})
+        self.assertIn("今天北京天气_百度搜索", seen)              # waited until the search page's title held
+
+    def test_no_wait_outside_a_browser(self):
+        ex, _ = _executor()
+        calls = []
+        ex._settle_title = lambda window: calls.append(window)   # noqa: SLF001
+        with mock.patch("deskmind_hands.executor.is_browser", return_value=False):
+            ex.observe(W12)
+            ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertEqual(calls, [])
+
+
+class Background(unittest.TestCase):
+    def test_opening_an_app_never_takes_the_front_and_sends_no_keystroke(self):
+        """open -g, a new document asked for without activate, no cmd+N: opening an app is no reason to take the
+        front from the user (rc.10, 10-21; hands #55 review)."""
+        from types import SimpleNamespace
+        ex, _ = _executor()
+        ex._windows = lambda every=False: [_win("12")]   # noqa: SLF001
+        ex._settled = lambda bundle, timeout=10.0: None   # noqa: SLF001 -- no real 10 s wait
+        ex.LAUNCH_WAIT_S = 0.2
+        sent = []
+
+        def run(argv, **k):
+            sent.append(argv)
+            return SimpleNamespace(returncode=1, stdout="")
+        ex._front_bundle_id = lambda: "com.googlecode.iterm2"   # noqa: SLF001 -- the user's terminal is in front
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
+             mock.patch("deskmind_hands.executor.running_apps", return_value=[]), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value=TE), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            ex.perform({"kind": "open_window", "app": "TextEdit"})
+        flat = [" ".join(map(str, a)) for a in sent]
+        self.assertTrue(any(f.startswith("open -g -b") for f in flat))
+        self.assertFalse(any("activate" in f for f in flat))
+        self.assertFalse(any("keystroke" in f for f in flat))   # not sent to the user's terminal
+
+    def test_an_app_that_takes_the_front_on_its_first_launch_gives_it_back(self):
+        """Some apps come forward on a first launch whatever -g says: the front goes back to the app the user had
+        there (hands #55 review)."""
+        from types import SimpleNamespace
+        ex, _ = _executor()
+        ex._windows = lambda every=False: [_win("12")]   # noqa: SLF001
+        ex._settled = lambda bundle, timeout=10.0: None   # noqa: SLF001
+        ex.LAUNCH_WAIT_S = 0.2
+        front = ["com.googlecode.iterm2"]
+
+        def run(argv, **k):
+            if argv[:2] == ["open", "-g"]:
+                front[0] = TE                              # it ignored -g
+            return SimpleNamespace(returncode=1, stdout="")
+        ex._front_bundle_id = lambda: front[0]              # noqa: SLF001
+        given = []
+        ex._make_frontmost = lambda b: given.append(b) or True   # noqa: SLF001
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
+             mock.patch("deskmind_hands.executor.running_apps", return_value=[]), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value=TE), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            ex.perform({"kind": "open_window", "app": "TextEdit"})
+        self.assertEqual(given, ["com.googlecode.iterm2"])
+
+
+class Audio(unittest.TestCase):
+    def test_only_the_tasks_apps_are_reported_with_since_when(self):
+        """A call in another app is not the task's music; a song already playing before the run began is not one
+        the run started, however late it is first read (hands #55 review)."""
+        ex, _ = _executor()
+        ex._began_at = 1000.0                                  # noqa: SLF001
+        ex._audio_before = {TE.lower()}                        # noqa: SLF001 -- playing as the run began
+        ex._task_bundles = lambda: {TE.lower()}                # noqa: SLF001
+        playing = [[{"bundle": TE, "app_name": "TE"}, {"bundle": "us.zoom.xos", "app_name": "zoom"}]]
+        clock = [1000.1]
+        with mock.patch("deskmind_hands.executor.playing_apps", side_effect=lambda: playing[0]), \
+             mock.patch("deskmind_hands.executor.time.time", side_effect=lambda: clock[0]):
+            first = ex._audio_playing()                        # noqa: SLF001
+            self.assertEqual([a["bundle"] for a in first], [TE])
+            self.assertFalse(first[0]["started_after_begin"])  # already playing as the run began
+            clock[0] = 1010.0
+            self.assertEqual(ex._audio_playing()[0]["playing_since"], 1000.1)   # noqa: SLF001 -- the first sighting
+            playing[0] = []
+            self.assertEqual(ex._audio_playing(), [])          # noqa: SLF001 -- stopped
+            playing[0] = [{"bundle": TE, "app_name": "TE"}]
+            clock[0] = 1020.0
+            again = ex._audio_playing()                        # noqa: SLF001
+            self.assertTrue(again[0]["started_after_begin"])   # a new start, after the run began
+            self.assertEqual(again[0]["playing_since"], 1020.0)
+
+
 class Sends(unittest.TestCase):
     def test_send_controls_are_known_by_their_verb(self):
         for role, label in [("button", "发送"), ("button", "Send"), ("button", "Send message"), ("button", "发送消息"),
@@ -695,7 +821,7 @@ class OpenWindow(unittest.TestCase):
 
         def run(argv, **k):
             state["events"].append(argv[0] if argv[0] != "open" else argv[:3])
-            if argv[:2] == ["open", "-b"] and not state["running"]:
+            if argv[0] == "open" and "-b" in argv and not state["running"]:
                 state["running"] = True
                 if not state["late"]:
                     state["on"], state["pending"] = state["on"] + state["pending"], []
@@ -726,7 +852,7 @@ class OpenWindow(unittest.TestCase):
         r = self._open(ex, run, running)
         self.assertEqual(r["status"], "ok")
         self.assertEqual(r["new_window"]["id"], f"{TE}#30001")          # the document asked for, not #18000
-        self.assertEqual(state["events"][0], ["open", "-b", TE])         # launched on its own first
+        self.assertEqual(state["events"][0], ["open", "-g", "-b"])       # launched on its own first, in the background
         self.assertIn("30001", stub.__dict__.get("_run_windows", set()))
         self.assertNotIn("18000", stub.__dict__.get("_run_windows", set()))
 
@@ -736,25 +862,28 @@ class OpenWindow(unittest.TestCase):
         ex, stub = _executor()
         state, run, running = self._mac(ex, running=False, restored=[_win("18000", title="上次的文稿")], answers=False, late=True)
         r = self._open(ex, run, running)
-        self.assertEqual(r["status"], "ok")
-        self.assertEqual(r["window"], f"{TE}#18000")
+        # the ask made nothing, and no cmd+N is sent to an app that is not in front: nothing opened (the restored
+        # window is the user's, and is not offered as this action's)
+        self.assertEqual(r["status"], "unverified")
         self.assertNotIn("new_window", r)
         self.assertNotIn("18000", stub.__dict__.get("_run_windows", set()))
 
-    def test_a_window_that_appeared_in_an_app_already_running_is_the_tasks(self):
-        """A running app brings no session back: a window that was not there before the ask was made by it."""
+    def test_no_cmd_n_is_sent_even_when_the_app_is_in_front(self):
+        """cmd+N goes to whichever app is in front, and checking that it is this one races with the user switching:
+        it is never sent; only the app's own scripting makes a window (hands #55 review)."""
         ex, stub = _executor()
         state, run, running = self._mac(ex, running=True, restored=[], answers=False)
         state["on"] = [_win("12")]
+        sent = []
 
         def keystroke_n(argv, **k):
-            r = run(argv, **k)
             if argv[0] == "osascript" and "keystroke" in argv[-1]:
-                state["on"] = state["on"] + [_win("14", title="未命名")]
-            return r
+                sent.append(argv)
+            return run(argv, **k)
+        ex._front_bundle_id = lambda: TE                 # noqa: SLF001 -- the app is in front
         r = self._open(ex, keystroke_n, running)
-        self.assertEqual(r["new_window"]["id"], f"{TE}#14")
-        self.assertIn("14", stub.__dict__["_run_windows"])
+        self.assertEqual(sent, [])
+        self.assertNotIn("new_window", r)
 
     def test_an_app_slow_to_start_shows_a_window_the_task_opened_but_its_content_stays_the_users(self):
         """A music player, launched by this open: its main window came after the 8 s this used to wait (10-20).
@@ -858,6 +987,36 @@ class OpenWindow(unittest.TestCase):
             r4 = ex.perform({"kind": "open_window", "app": "Safari", "url": "file:///ws/page.html"})
             self.assertEqual(r4["status"], "ok")
             self.assertEqual(given, ["http://127.0.0.1:52689/page.html"])      # the served address, not the file
+
+    def test_a_browser_opened_without_an_address_is_the_tasks_own_window(self):
+        """No new document and no cmd+N for a browser (they go to whatever browser window is in front): the run's
+        own window, made or already open (rc.10)."""
+        ex, stub = _executor()
+        chrome = "com.google.Chrome"
+        stub.BROWSERS = {"com.google.chrome"}
+        state = {"on": [_win("60", bundle=chrome, title="用户的窗口", app="Google Chrome")]}
+        asked = []
+
+        def own_window(bundle, url=""):
+            asked.append(url)
+            if not any(w["id"].endswith("#61") for w in state["on"]):
+                state["on"] = state["on"] + [_win("61", bundle=chrome, title="新标签页", app="Google Chrome")]
+            return "61"
+        stub._own_browser_window = own_window
+        ex._windows = lambda every=False: state["on"]   # noqa: SLF001
+        sent = []
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=lambda argv, **k: sent.append(argv)), \
+             mock.patch("deskmind_hands.executor.running_apps", return_value=[("Google Chrome", chrome)]), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value=chrome), \
+             mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            r1 = ex.perform({"kind": "open_window", "app": "Chrome"})
+            r2 = ex.perform({"kind": "open_window", "app": "Chrome"})
+        self.assertEqual(r1["new_window"]["id"], f"{chrome}#61")
+        self.assertEqual((r2["status"], r2["window"]), ("ok", f"{chrome}#61"))
+        self.assertNotIn("new_window", r2)
+        self.assertEqual(asked, ["", ""])
+        self.assertFalse(any("keystroke" in " ".join(map(str, a)) or "make new document" in " ".join(map(str, a)) for a in sent))
 
     def test_a_chromium_window_is_addressed_by_the_browsers_own_id_never_the_window_servers(self):
         """Chrome's AppleScript `window id` is the browser's own number: the window server's id names some other

@@ -36,6 +36,7 @@ from .actions import Action, ActionKind, Binding
 from .axdocument import _q, document_text, window_document
 from .grounding import STOP
 from .drivers.base import ExecResult, Observation
+from .audio import playing_apps
 from .browsers import is_browser
 from .inputwatch import InputWatch, track_children
 
@@ -217,6 +218,10 @@ class HandsExecutor:
         #: GUI lands where the task's own file tools and the verdict look.
         self.workspace = Path(workspace) if workspace else self.scratch
         track_children()   # every child's pid recorded as it starts: its posted events are the driver's, not the user's
+        self._began_at = time.time()
+        # what was already playing as the run began: not something the run started, however late it is first read
+        self._audio_seen = {a["bundle"].lower(): self._began_at for a in playing_apps()}
+        self._audio_before = set(self._audio_seen)
         STOP.clear()       # a new run starts unstopped (a stop that came before begin is applied right after this)
         self.epoch = 1
         #: When the epoch was last set, and the inventory it was set on: a user's input after that moment, or a
@@ -298,6 +303,28 @@ class HandsExecutor:
         if isinstance(pre, set):
             pre.discard(wid)
 
+    @staticmethod
+    def _make_frontmost(bundle: str) -> bool:
+        """Make the app frontmost through accessibility (AXFrontmost), without a reopen."""
+        try:
+            import ApplicationServices as AS
+            from AppKit import NSRunningApplication
+            apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle)
+            if not apps:
+                return False
+            return AS.AXUIElementSetAttributeValue(AS.AXUIElementCreateApplication(apps[0].processIdentifier()), "AXFrontmost", True) == 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _front_bundle_id() -> str:
+        try:
+            from AppKit import NSWorkspace
+            app = NSWorkspace.sharedWorkspace().frontmostApplication()
+            return str(app.bundleIdentifier() or "") if app else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _known_windows(self) -> set[str]:
         """Every window that exists now, on screen or not: a window not among these afterwards was made meanwhile."""
         return {w["id"] for w in self._windows(every=True)}
@@ -343,6 +370,28 @@ class HandsExecutor:
             return False
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
         return idle < self.USER_ACTIVE_S
+
+    def _audio_playing(self) -> list[dict]:
+        """The apps the task operates that have an audio output open now, with since when (first seen in this run)
+        and whether that began after the run began. An open output is not proof of sound (a muted call keeps one),
+        and one app's tabs cannot be told apart, so this is evidence to weigh, not a verdict (hands #55 review)."""
+        now = time.time()
+        seen = self.__dict__.setdefault("_audio_seen", {})
+        task = self._task_bundles()
+        before = self.__dict__.setdefault("_audio_before", set())
+        playing = playing_apps()
+        now_on = {a["bundle"].lower() for a in playing}
+        for b in list(seen):
+            if b not in now_on:
+                seen.pop(b, None)       # stopped: a later start is a new one
+                before.discard(b)
+        out = []
+        for a in playing:
+            b = a["bundle"].lower()
+            first = seen.setdefault(b, now)
+            if b in task:
+                out.append({**a, "playing_since": round(first, 3), "started_after_begin": b not in before})
+        return out
 
     def _needs_foreground(self) -> list[str]:
         """Bundles of the apps whose steps come to the front: their driver reads them from pixels (input then only
@@ -436,6 +485,9 @@ class HandsExecutor:
                 # the apps whose steps must bring them to the front (read from their pixels, or a step that could not
                 # be delivered in the background): so the plan can say so once, before the run takes the front.
                 "needs_foreground": self._needs_foreground(),
+                # the apps sending sound to an output now (CoreAudio): the system's word that something is playing,
+                # which a music app's window cannot give a verdict by its pixels
+                "audio_playing": self._audio_playing(),
                 # app_name: what the user calls the app (its localized name), for cards; app stays as it was
                 "windows": [{"id": w["id"], "app": w["app"], "app_name": w["app"] or w.get("bundle") or "", "bundle": w.get("bundle") or "",
                              "title": w["title"], "focused": w["app"] == front} for w in wins]}
@@ -496,6 +548,11 @@ class HandsExecutor:
             # where it was read from: the accessibility tree, or the screenshot (an app read from its pixels)
             el = {"id": e.id, "role": role, "label": e.label, "actions": actions,
                   "source": "pixels" if e.source == "pixels" else "ax"}
+            # the localized role name, and whether the label is only that (no name of its own): an empty container
+            if getattr(e, "role_description", ""):
+                el["role_description"] = e.role_description
+            if getattr(e, "label_from_role", False):
+                el["label_from_role"] = True
             if sends(role, e.label):
                 el["sends"] = True
             if e.value is not None:
@@ -541,9 +598,16 @@ class HandsExecutor:
                 return {"status": "error", "why": f"the window {window} could not be closed (it may be gone already)", "files": []}
             return {"status": "ok", "files": []}
         if kind == "focus_window":
-            if self._pk(["window", "focus", "--window-id", wid, "--json"]) is None:
-                return {"status": "error", "why": f"the window {window} could not be brought forward", "window": window, "files": []}
-            return {"status": "ok", "window": window, "files": []}
+            # The window the task works in from now on, in the background: never brought to the front. A raise
+            # here kept the front for good, and the user typing in another app (whose input the watch does not
+            # count: it is not the task's) had their keys go into the task's window (hands #55 review). A step
+            # that needs the foreground gets it for that step only, through the driver's flash.
+            if not any(w["id"] == window for w in self._windows(every=True)):
+                return {"status": "error", "why": f"the window {window} is not there", "window": window, "files": []}
+            d = self._driver(bundle)
+            d._pinned_window = wid or None
+            d._window_id = wid or None
+            return {"status": "ok", "window": window, "files": [], "why": "the window to work in; not brought to the front"}
         d = self._driver(bundle)
         obs = self.last_obs.get(window)
         if obs is None:
@@ -607,6 +671,11 @@ class HandsExecutor:
                     os.environ.pop("HANDS_FLASH_APPS", None)
                 else:
                     os.environ["HANDS_FLASH_APPS"] = flash_before
+        if res.ok and kind in self.SETTLE_KINDS and is_browser(bundle):
+            # a page loads after the action that asked for it, and its title changes when it has: waited for here, so
+            # the load lands before the layer above takes its after-action snapshot -- a title that changed later made
+            # the next step stale, eleven times in one search (rc.10, 10-21)
+            self._settle_title(window)
         status = "ok" if res.ok else "unsupported" if res.unsupported else "error"
         if res.ok and res.indeterminate:
             status = "unverified"
@@ -692,8 +761,15 @@ class HandsExecutor:
             # An app slow to start (a music player took longer than the 8 s this waited, 10-20) is waited for up to
             # LAUNCH_WAIT_S, until a window of it appears.
             before_launch = self._known_windows()
-            subprocess.run(["open", "-b", bundle], capture_output=True, timeout=20)
+            front_before = self._front_bundle_id()
+            # in the background (-g): opening an app is no reason to take the front from the user; it comes forward
+            # only for a step, by the flash's rules (the user still, the step allowed) -- `open -b` did take it, and
+            # a music app kept jumping in front of the user's work (rc.10, 10-21)
+            subprocess.run(["open", "-g", "-b", bundle], capture_output=True, timeout=20)
             launched = self._launch_windows(bundle, before_launch, self.LAUNCH_WAIT_S)
+            if front_before and front_before != bundle and self._front_bundle_id() == bundle:
+                # some apps take the front on their first launch whatever -g says: given back at once
+                self._make_frontmost(front_before)
             self._settled(bundle)
         d = self._driver(bundle)      # started now, so the windows it finds are the ones there before the task's
         before = self._known_windows()
@@ -722,10 +798,13 @@ class HandsExecutor:
         # to observe, not claimed (PR #48 review, fourth round: the restored #18000 was claimed when the ask failed).
         proof: str | None = None
         fresh: list[dict] = []
-        if url and is_browser(bundle) and hasattr(d, "_own_browser_window"):
-            # any browser (by what it registers): the driver opens the run's own window where the browser's scripting
-            # allows it, and says why not where it does not -- never the user's window
-            proof = d._own_browser_window(bundle, url)
+        if is_browser(bundle) and hasattr(d, "_own_browser_window"):
+            # a browser, with an address or without: the run's own window (made, or the one it already has) -- never
+            # a new document or cmd+N, which go to whatever browser window is in front, and never the user's window
+            # (the driver opens it where the browser's scripting allows, and says why not where it does not)
+            proof = d._own_browser_window(bundle, url or "")
+            if proof and str(proof) in {self._split(b)[1] for b in before} and not url:
+                return {"status": "ok", "window": f"{bundle}#{proof}", "why": "the task's own browser window, already open"}
             if proof and str(proof) in {self._split(b)[1] for b in before}:
                 # the run's own browser window from earlier, given back as it is: the page asked for now has to be
                 # loaded in it, and that checked, before it is answered (PR #48 review, fifth round: the second
@@ -737,13 +816,12 @@ class HandsExecutor:
                 return {"status": "unverified", "window": window,
                         "why": f"the task's own browser window is there, but {url} could not be confirmed loaded in it"}
         elif url:
-            subprocess.run(["open", "-b", bundle, url], capture_output=True, timeout=20)
+            subprocess.run(["open", "-g", "-b", bundle, url], capture_output=True, timeout=20)
             fresh = self._fresh_windows(before, 2.5, bundle)
         else:
+            # the app's own scripting only: cmd+N goes to whichever app is in front, the user's included, and a
+            # check that it is this app races with the user switching (hands #55 review)
             proof = self._new_document(bundle)
-            if not proof:
-                subprocess.run(["osascript", "-e", 'tell application "System Events" to keystroke "n" using command down'], capture_output=True, timeout=20)
-                fresh = self._fresh_windows(before, 3, bundle)
         if proof:
             fresh = [w for w in self._fresh_windows(set(), 3, bundle) if self._split(w["id"])[1] == str(proof)]
         if not fresh:
@@ -813,7 +891,7 @@ class HandsExecutor:
         """Ask the app for a new document the way any scriptable document app answers (`make new document`), and
         return the window id it got -- the app's own word that this window was made now (NSWindow's number, which is
         its CGWindowID). None when the app does not answer, or does not say which window."""
-        script = (f'tell application id "{_q(bundle)}"\nactivate\nset d to make new document\n'
+        script = (f'tell application id "{_q(bundle)}"\nset d to make new document\n'
                   'repeat with w in windows\ntry\nif document of w is d then return id of w\nend try\nend repeat\n'
                   'try\nreturn id of window 1\nend try\nreturn ""\nend tell')
         try:
@@ -822,6 +900,24 @@ class HandsExecutor:
             return None
         out = (p.stdout or "").strip() if p.returncode == 0 else ""
         return out if out.isdigit() else None
+
+    #: Actions after which a browser page may load (its title then changes).
+    SETTLE_KINDS = {"click", "double_click", "key", "set_value", "type", "select"}
+    #: The title must hold this long to count as settled, waited for at most SETTLE_MAX_S.
+    SETTLE_STILL_S = 0.6
+    SETTLE_MAX_S = 4.0
+
+    def _settle_title(self, window: str) -> None:
+        """Wait until the window's title has held for SETTLE_STILL_S (at most SETTLE_MAX_S), or the app's stop."""
+        t0 = time.time()
+        last, since = None, time.time()
+        while time.time() - t0 < self.SETTLE_MAX_S and not STOP.is_set():
+            title = next((w["title"] for w in self._windows() if w["id"] == window), None)
+            if title != last:
+                last, since = title, time.time()
+            elif time.time() - since >= self.SETTLE_STILL_S:
+                return
+            time.sleep(0.15)
 
     #: How long a launched app is waited for to show its first window.
     LAUNCH_WAIT_S = 20.0

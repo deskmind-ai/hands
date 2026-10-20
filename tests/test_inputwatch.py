@@ -131,6 +131,26 @@ class Targets(unittest.TestCase):
             w._callback(None, 1, object(), None)
             self.assertIn("com.apple.safari", w.last_by_bundle)
 
+    def test_a_short_lived_child_is_known_by_its_pid_even_after_it_exits(self):
+        """A peekaboo CLI child posts its click and is gone before the event reaches the tap: recorded at spawn, it is
+        still ours; a grandchild is ours by its parent chain (PR #53 review)."""
+        import subprocess
+        import sys as _sys
+        from deskmind_hands import inputwatch as iw
+        iw.track_children()
+        w = InputWatch()
+        p = subprocess.Popen([_sys.executable, "-c", "pass"])
+        p.wait()
+        self.assertTrue(w.posted_by_us(p.pid))            # exited, still known
+        if _sys.platform != "darwin":
+            return                                        # the parent chain is read with macOS's libproc
+        q = subprocess.Popen([_sys.executable, "-c", "import subprocess,sys,time; c=subprocess.Popen([sys.executable,'-c','import time; time.sleep(2)']); print(c.pid, flush=True); c.wait()"],
+                             stdout=subprocess.PIPE, text=True)
+        grandchild = int(q.stdout.readline())
+        self.assertTrue(w.posted_by_us(grandchild))       # alive, its parent chain reaches us
+        q.wait()
+        self.assertFalse(w.posted_by_us(1))               # launchd is not ours
+
     def test_an_event_that_cannot_be_read_counts_as_input_to_an_unknown_target(self):
         """The callback's failure path is the safe side for every reader, last_input_for included (PR #49 review)."""
         w = InputWatch()

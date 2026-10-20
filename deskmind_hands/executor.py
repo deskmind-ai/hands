@@ -35,7 +35,7 @@ from pathlib import Path
 from .actions import Action, ActionKind, Binding
 from .axdocument import _q, document_text, window_document
 from .drivers.base import ExecResult, Observation
-from .inputwatch import InputWatch
+from .inputwatch import InputWatch, track_children
 
 try:
     import AppKit
@@ -194,6 +194,7 @@ class HandsExecutor:
         #: The task's folder: where the projections' save-as puts files ("工作目录顶层"), so a document saved from the
         #: GUI lands where the task's own file tools and the verdict look.
         self.workspace = Path(workspace) if workspace else self.scratch
+        track_children()   # every child's pid recorded as it starts: its posted events are the driver's, not the user's
         self.epoch = 1
         #: When the epoch was last set, and the inventory it was set on: a user's input after that moment, or a
         #: window appearing, vanishing or renamed, moves the epoch at the next snapshot, so an observation and a
@@ -320,6 +321,20 @@ class HandsExecutor:
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
         return idle < self.USER_ACTIVE_S
 
+    def _needs_foreground(self) -> list[str]:
+        """Bundles of the apps whose steps come to the front: their driver reads them from pixels (input then only
+        goes through a brief flash), or it has already had to bring the app forward for a step. Known once the app
+        has been observed; the flash itself still waits for the Mac to be idle and gives the front back after."""
+        out = []
+        for bundle, d in self.drivers.items():
+            try:
+                vision = bool(getattr(d, "_vision_app", None) and d._vision_app(bundle))
+            except Exception:  # noqa: BLE001
+                vision = False
+            if vision or int(getattr(d, "_foreground_actions", 0) or 0) > 0:
+                out.append(bundle)
+        return sorted(out)
+
     def _task_bundles(self) -> set[str]:
         """The applications the task is operating: those whose windows it has observed or acted in (a driver was
         started for them), lowercased."""
@@ -395,6 +410,9 @@ class HandsExecutor:
         return {"epoch": self.epoch, "locked": self.locked(), "front_app": front, "user_active": self.user_active(),
                 "input_watch": ("keys" if self._watch.keys else "mouse") if self._watch is not None and self._watch.active else "",
                 **({"epoch_reason": self._epoch_reason} if getattr(self, "_epoch_reason", None) else {}),
+                # the apps whose steps must bring them to the front (read from their pixels, or a step that could not
+                # be delivered in the background): so the plan can say so once, before the run takes the front.
+                "needs_foreground": self._needs_foreground(),
                 "windows": [{"id": w["id"], "app": w["app"], "title": w["title"], "focused": w["app"] == front} for w in wins]}
 
     # -- see and act ----------------------------------------------------------
@@ -623,13 +641,32 @@ class HandsExecutor:
         if not bundle:
             return {"status": "unsupported", "why": f"no application called {app!r} is running or installed"}
         was_running = bundle in {b for _, b in running_apps()}
+        launched: list[dict] = []
         if not was_running:
             # Not running: launched first, on its own. What it brings back then -- the last session's windows, as
             # Safari and TextEdit do -- is the user's, not a window this action made (PR #48 review, third round).
+            # An app slow to start (a music player took longer than the 8 s this waited, 10-20) is waited for up to
+            # LAUNCH_WAIT_S, until a window of it appears.
+            before_launch = self._known_windows()
             subprocess.run(["open", "-b", bundle], capture_output=True, timeout=20)
+            launched = self._launch_windows(bundle, before_launch, self.LAUNCH_WAIT_S)
             self._settled(bundle)
         d = self._driver(bundle)      # started now, so the windows it finds are the ones there before the task's
         before = self._known_windows()
+        # A window the launch opened that is no document's (an app's main window: a music player's, a chat app's)
+        # is the window this open made: nothing of the user's is in it to bring back. A launch window that shows a
+        # document -- the last session's file, restored -- stays the user's. Told apart by the window's document
+        # (AXDocument, or the app's scripting), never by the app's name; a browser's windows are never claimed this
+        # way (they carry pages, not documents, and the run has its own browser window).
+        if launched and not url and bundle.lower() not in getattr(d, "BROWSERS", set()):
+            wins = self._windows()
+            main = [w for w in launched if any(x["id"] == w["id"] for x in wins) and self._document(w["id"], wins) is None]
+            if main:
+                w = main[-1]
+                allow_flash(bundle)
+                self._own(d, self._split(w["id"])[1])
+                return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "title": w["title"]},
+                        "why": "the app's own window, opened by its launch (no document in it)"}
         # Whose the window is: the task's on proof that this action made it -- the window id the app's scripting
         # returned for the document it made, or a browser window the driver opened and told apart by its marker.
         # A window that merely appeared after the ask is the task's only when the app was running already (a
@@ -735,6 +772,22 @@ class HandsExecutor:
             return None
         out = (p.stdout or "").strip() if p.returncode == 0 else ""
         return out if out.isdigit() else None
+
+    #: How long a launched app is waited for to show its first window.
+    LAUNCH_WAIT_S = 20.0
+
+    def _launch_windows(self, bundle: str, before: set, seconds: float) -> list[dict]:
+        """The windows of `bundle` that appeared after its launch: waited for up to `seconds` until the first, then a
+        moment more for others coming with it."""
+        t0 = time.time()
+        found: list[dict] = []
+        while time.time() - t0 < seconds:
+            time.sleep(0.3)
+            found = [w for w in self._windows() if w["id"] not in before and w["bundle"] == bundle]
+            if found:
+                time.sleep(1.0)
+                return [w for w in self._windows() if w["id"] not in before and w["bundle"] == bundle]
+        return found
 
     def _settled(self, bundle: str, timeout: float = 10.0) -> None:
         """Wait for a just-launched app to be running and its windows to stop changing (two readings alike)."""

@@ -21,6 +21,60 @@ from __future__ import annotations
 import threading
 import time
 
+import os
+import struct
+
+#: Children this process started (pid -> when last seen running): recorded at spawn by `track_children()`, so an
+#: event a short-lived child posted is known as ours even after the child is gone. Kept OWN_KEEP_S after exit.
+OWN_CHILDREN: dict[int, float] = {}
+OWN_KEEP_S = 10.0
+
+
+def _proc_ppid(pid: int) -> int | None:
+    """The parent pid of `pid` (libproc's proc_pidinfo, PROC_PIDTBSDINFO), None when it is gone or unreadable."""
+    try:
+        import ctypes
+        lib = _proc_ppid.lib = getattr(_proc_ppid, "lib", None) or ctypes.CDLL("/usr/lib/libproc.dylib")
+        buf = ctypes.create_string_buffer(256)
+        n = lib.proc_pidinfo(int(pid), 3, ctypes.c_uint64(0), buf, 256)
+        if n < 20:
+            return None
+        return struct.unpack_from("I", buf.raw, 16)[0]     # struct proc_bsdinfo: pbi_ppid is the fifth uint32
+    except Exception:  # noqa: BLE001 -- not macOS, or no libproc
+        return None
+
+
+def _alive(pid: int) -> bool:
+    return _proc_ppid(pid) is not None
+
+
+def _descends_from(pid: int, ancestor: int, depth: int = 16) -> bool:
+    for _ in range(depth):
+        if pid == ancestor:
+            return True
+        parent = _proc_ppid(pid)
+        if parent is None or parent <= 1 or parent == pid:
+            return False
+        pid = parent
+    return False
+
+
+def track_children() -> None:
+    """Record the pid of every child this process starts from now on (subprocess.Popen), for posted_by_us."""
+    import subprocess
+    if getattr(subprocess.Popen, "_deskmind_tracked", False):
+        return
+
+    class _Tracked(subprocess.Popen):
+        _deskmind_tracked = True
+
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            OWN_CHILDREN[self.pid] = time.time()
+
+    subprocess.Popen = _Tracked
+
+
 #: DeskMind's own processes: input to them is the user answering DeskMind, not changing their Mac.
 OWN_BUNDLES = {"ai.deskmind.app", "ai.deskmind.hands"}
 
@@ -51,7 +105,7 @@ class InputWatch:
         #: input, not the user's -- a driver click that reached the tap after the action had ended was taken for the
         #: user's input to the task's app and staled the next step (rc.9, 10-20). Refreshed every few seconds.
         self._own_pids: set[int] = set()
-        self._own_pids_at = 0.0
+        self._not_ours: set[int] = set()
         self._thread: threading.Thread | None = None
         self._tap = None
 
@@ -94,38 +148,24 @@ class InputWatch:
 
     def posted_by_us(self, source_pid: int | None) -> bool:
         """Whether an event was posted by this process or one of its descendants (a hardware event has no source
-        pid, or the window server's)."""
+        pid, or the window server's). A child is known three ways, none of them slow enough for the tap's callback:
+        its pid was recorded when it was started here (`own`, kept a while after it exits, since its last events
+        can reach the tap after it is gone); or its parent chain, read with proc_pidinfo, reaches this process; and
+        what was found is remembered (PR #53 review: a ps every 3 s missed short-lived peekaboo CLI children)."""
         if not source_pid:
             return False
+        pid = int(source_pid)
         now = time.time()
-        if now - self._own_pids_at > 3.0:
-            self._own_pids = self._descendants()
-            self._own_pids_at = now
-        return int(source_pid) in self._own_pids
-
-    @staticmethod
-    def _descendants() -> set[int]:
-        import os
-        import subprocess
-        me = os.getpid()
-        out = {me}
-        try:
-            rows = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=5).stdout.split("\n")
-            parent = {}
-            for row in rows:
-                parts = row.split()
-                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                    parent[int(parts[0])] = int(parts[1])
-            changed = True
-            while changed:
-                changed = False
-                for pid, ppid in parent.items():
-                    if ppid in out and pid not in out:
-                        out.add(pid)
-                        changed = True
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        return out
+        for p, t in list(OWN_CHILDREN.items()):
+            if now - t > OWN_KEEP_S and not _alive(p):
+                OWN_CHILDREN.pop(p, None)
+        if pid in OWN_CHILDREN or pid in self._own_pids:
+            return True
+        if pid in self._not_ours:
+            return False
+        ours = _descends_from(pid, os.getpid())
+        (self._own_pids if ours else self._not_ours).add(pid)
+        return ours
 
     def is_regular(self, pid: int) -> bool:
         if pid not in self._pid_regular:

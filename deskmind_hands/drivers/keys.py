@@ -9,6 +9,45 @@ from __future__ import annotations
 #: ANSI key codes, what macOS itself falls back to when a layout types no Latin letter (Russian, Greek, ...).
 ANSI = {"a": 0, "v": 9}
 RETURN = 36
+TAB = 48
+
+#: US ANSI key codes of the keys a chord names by their character: the fallback when the layout cannot be read.
+US = {"a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9, "b": 11, "q": 12, "w": 13,
+      "e": 14, "r": 15, "y": 16, "t": 17, "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "=": 24, "9": 25,
+      "7": 26, "-": 27, "8": 28, "0": 29, "]": 30, "o": 31, "u": 32, "[": 33, "i": 34, "p": 35, "l": 37, "j": 38,
+      "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43, "/": 44, "n": 45, "m": 46, ".": 47, "`": 50}
+#: Keys a chord names by name, the same on every layout.
+NAMED = {"return": RETURN, "enter": RETURN, "tab": TAB, "space": 49, "delete": 51, "backspace": 51, "escape": 53,
+         "esc": 53, "forwarddelete": 117, "home": 115, "end": 119, "pageup": 116, "pagedown": 121, "left": 123,
+         "right": 124, "down": 125, "up": 126}
+#: Modifier names -> CGEventFlags (shift, control, option, command).
+MODIFIERS = {"shift": 1 << 17, "ctrl": 1 << 18, "control": 1 << 18, "option": 1 << 19, "alt": 1 << 19,
+             "opt": 1 << 19, "cmd": 1 << 20, "command": 1 << 20}
+
+
+def parse_chord(chord: str, table: dict[int, str] | None = None) -> tuple[int, int] | None:
+    """("cmd+shift+n", layout table) -> (key code, CGEventFlags), or None when it names no single key. A character
+    key is found on the user's layout (`table`, as for pick_keycodes), else at its US position."""
+    flags, key = 0, None
+    for part in (p.strip().lower() for p in chord.split("+")):
+        if not part:
+            continue
+        if part in MODIFIERS:
+            flags |= MODIFIERS[part]
+        elif key is None:
+            key = part
+        else:
+            return None
+    if key is None:
+        return None
+    if key in NAMED:
+        return NAMED[key], flags
+    if len(key) != 1:
+        return None
+    codes = sorted(code for code, typed in (table or {}).items() if typed.lower() == key)
+    if codes:
+        return codes[0], flags
+    return (US[key], flags) if key in US else None
 
 
 def pick_keycodes(table: dict[int, str], letters: str) -> dict[str, int]:

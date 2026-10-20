@@ -1599,9 +1599,11 @@ class PeekabooDriver:
         if allowed != WEB_SEARCH:
             return ExecResult(False, "not searched from the address bar: what is typed there goes to a website, and "
                                      "nothing judged that this text belongs there")
-        if not self._background_input(self.app):
-            return ExecResult(False, "not searched: the address bar is typed into only in the background, and this "
-                                     "app's windows do not take background input here")
+        if not self._background_keys():
+            # Not an app list: every step below is checked by reading back (the window proven key, the focus on this
+            # window's address bar before the paste and before Return), and a check that fails sends nothing more.
+            return ExecResult(False, "not searched: the address bar is typed into only in the background, and "
+                                     "background input is off or not available on this Mac")
         moved = self._moved_since_seen()
         if moved:
             return ExecResult(False, moved, stale=True)
@@ -1617,8 +1619,10 @@ class PeekabooDriver:
                                      f"observe again", stale=True)
         bg = self._background_quartz(self.app, observed_only=True)
         if bg is None:
-            return ExecResult(False, "not searched: the window this run observes was not found, and no other window "
-                                     "is typed into")
+            refused = getattr(self, "_bg_refused", None)
+            return ExecResult(False, f"not searched: {refused}" if refused else
+                              "not searched: the window this run observes was not found, and no other window is "
+                              "typed into")
         q, token = bg
         text = action.text or ""
         x, y = self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2
@@ -2878,10 +2882,22 @@ class PeekabooDriver:
             waited = self._announce_wait(waited, bundle, what)
             time.sleep(1)
 
-    #: Apps whose windows take clicks and keys in the background (WebKit: Safari, the gym's host). Measured on 09-30;
-    #: CEF and Electron apps (the music app, the chat app) ignore them and keep the brief foreground.
-    #: HANDS_BG_INPUT_APPS adds bundle ids; HANDS_BG_INPUT=0 turns the route off.
+    #: Apps whose screenshot-placed clicks and pastes (_flash, _vision_act) go in the background rather than in the
+    #: brief foreground (WebKit: Safari, the gym's host). Measured on 09-30; CEF and Electron apps (the music app, the
+    #: chat app) ignored background clicks and keep the brief foreground. Only that choice: a background click has no
+    #: read-back that could tell the two kinds of app apart and fall back. Typing and chords do not use this list --
+    #: they are gated by reading back (the window proven key, the text read from the field; _type_in_background,
+    #: _press_in_background). HANDS_BG_INPUT_APPS adds bundle ids; HANDS_BG_INPUT=0 turns every background route off.
     BACKGROUND_INPUT_APPS = {"com.apple.safari", "ai.deskmind.gymhost"}
+
+    @staticmethod
+    def _background_keys() -> bool:
+        """Keys can go to a window in the background on this Mac (whichever app it is: what gates them is the
+        read-back), unless HANDS_BG_INPUT=0."""
+        if os.environ.get("HANDS_BG_INPUT", "1") == "0":
+            return False
+        from deskmind_hands.drivers import skylight
+        return skylight.available()
 
     def _background_input(self, bundle: str) -> bool:
         if os.environ.get("HANDS_BG_INPUT", "1") == "0":
@@ -2993,8 +3009,10 @@ class PeekabooDriver:
 
     def _background_quartz(self, bundle: str, observed_only: bool = False):
         """A Quartz stand-in that delivers to `bundle`'s window (the pinned one, else its largest -- with
-        `observed_only`, the observed one or none), focused without being raised; None when the app or window cannot
-        be found."""
+        `observed_only`, the observed one or none), and the WindowKey that holds that window as its app's key window
+        (skylight.enter_window_key: the user's front app and keyboard untouched; give it back with
+        skylight.give_focus_back). None when the app or window cannot be found, or the window could not be proven key
+        -- then why is in `_bg_refused`."""
         import Quartz
         from AppKit import NSRunningApplication
         from deskmind_hands.drivers import skylight
@@ -3015,10 +3033,138 @@ class PeekabooDriver:
             return None
         w = (pinned or sorted(wins, key=lambda w: -w["kCGWindowBounds"]["Width"] * w["kCGWindowBounds"]["Height"]))[0]
         wid, b = int(w["kCGWindowNumber"]), w["kCGWindowBounds"]
-        token = skylight.focus_without_raise(pid, wid)
-        if token is None:
+        self._bg_refused = None
+        try:
+            key = skylight.enter_window_key(pid, wid)
+        except skylight.WindowKeyRefused as exc:
+            self._bg_refused = str(exc)
             return None
-        return skylight.BackgroundQuartz(pid, wid, (b["X"], b["Y"])), token
+        return skylight.BackgroundQuartz(pid, wid, (b["X"], b["Y"])), key
+
+    def _key_target(self) -> tuple[int, int] | ExecResult | None:
+        """(pid, window id) of the observed window, for keys in the background; an ExecResult when it must not be
+        typed into; None when it is not found."""
+        wid = self._observed_id()
+        pid = self._pid_of(self.app) if wid else None
+        if not wid or not pid:
+            return None
+        if not self._may_use(self.app, wid):
+            return ExecResult(False, f"not done: window {wid} is not one this run may type into (it was there before "
+                                     f"the run, or is the user's)")
+        return pid, int(wid)
+
+    def _type_in_background(self, eid: str, text: str, clear_first: bool) -> ExecResult | None:
+        """Type `text` into the observed window's field `eid` without bringing anything forward: first the
+        accessibility insertion; if the field reads back unchanged, keys (Unicode payloads) to the window, made its
+        app's key window and proven so (skylight.enter_window_key), the field given the focus inside it. Verified by
+        reading the field back, and "unverified" when that read-back does not show the text. None when there is no
+        field to read back by (the caller's route then)."""
+        from deskmind_hands.drivers import axfield, skylight
+        r = self._rects.get(eid)
+        if r is None or not self._background_keys():
+            return None
+        target = self._key_target()
+        if not isinstance(target, tuple):
+            return None             # not found, or not the run's to type into: the caller's route and its own rules
+        pid, wid = target
+        if getattr(self, "_element_window", {}).get(eid) not in (None, "", str(wid)):
+            return None
+        label = self._labels_by_id.get(eid) or eid
+        try:
+            field = axfield.field_at(pid, wid, (self._origin.x + r.x, self._origin.y + r.y, r.w, r.h))
+            before = axfield.value(field) if field is not None else None
+        except Exception:   # noqa: BLE001 -- no accessibility: the caller's route
+            return None
+        if field is None or before is None:
+            return None
+        if STOP.is_set():
+            return ExecResult(False, "stopped by the app; nothing was done")
+
+        def result(after: str | None, how: str) -> ExecResult:
+            if axfield.typed_in(before, after, text, clear_first):
+                return self._settle(True, f"typed {len(text)} chars into {label!r} in the background ({how}), "
+                                          f"verified by read-back")
+            self._snapshot = None
+            return ExecResult(True, indeterminate=True,
+                              detail=f"typed {len(text)} chars into {label!r} in the background ({how}), unverified: "
+                                     f"the field reads {(after or '')[-120:]!r} -- observe before typing again")
+
+        try:
+            axfield.insert(field, text, clear_first)
+        except Exception:   # noqa: BLE001 -- refused or failed: the read-back below says whether anything changed
+            pass
+        after = axfield.settled_value(field, before)
+        if after != before:
+            return result(after, "accessibility insertion")
+        # Unchanged: the app took the insertion as a no-op (Chrome). Keys, then. A newline in a one-line field would
+        # be Return, which submits: not typed that way.
+        if "\n" in text and self._element_role.get(eid, "").lower() != "textarea":
+            return None
+        try:
+            with skylight.enter_window_key(pid, wid) as key:
+                if not axfield.focus(field):
+                    return ExecResult(False, f"not typed into {label!r}: the field could not be given the focus "
+                                             f"inside its window; nothing was sent")
+                q = skylight.BackgroundQuartz(pid, wid, (self._origin.x, self._origin.y))
+                if not axfield.select(field, clear_first):
+                    # Chrome did not take a whole-text selection through accessibility (live, 10-21); cmd+A to the
+                    # window does it, read back the same way. A caret that cannot be put at the end is a refusal.
+                    if clear_first:
+                        self._post_key(q, self._keycode(q, "a"), q.kCGEventFlagMaskCommand)
+                    if not clear_first or not axfield.all_selected(field):
+                        what = "text could not be selected" if clear_first else "caret could not be put at the end"
+                        return ExecResult(False, f"not typed into {label!r}: the {what}; nothing was typed")
+                sent = self._post_unicode(q, text, stop=lambda: STOP.is_set() or key.user_took_front())
+        except skylight.WindowKeyRefused as exc:
+            return ExecResult(False, f"not typed into {label!r}: {exc}")
+        after = axfield.settled_value(field, before)
+        if sent < len(text):
+            self._snapshot = None
+            why = "stopped by the app" if STOP.is_set() else "the user brought the app forward"
+            return ExecResult(False, indeterminate=True,
+                              detail=f"{why} after {sent} of {len(text)} chars into {label!r}; the field reads "
+                                     f"{(after or '')[-120:]!r}")
+        return result(after, f"keys to window {wid}, its app's key window by {key.via}")
+
+    def _press_in_background(self, chord: str) -> ExecResult:
+        """Press `chord` in the observed window without bringing anything forward: the window made its app's key
+        window and proven so (skylight.enter_window_key), the chord sent to that app only. Confirmed when the window,
+        the app's windows or the focused element read back changed; else dispatched and unverified."""
+        from deskmind_hands.drivers import axfield, skylight
+        if not self._background_keys():
+            return self._settle(False, f"{chord} not pressed: background input is off or not available on this Mac, "
+                                       f"and it would have to take the user's keyboard focus -- use another action")
+        target = self._key_target()
+        if target is None:
+            return ExecResult(False, f"{chord} not pressed: the window this run observes was not found")
+        if not isinstance(target, tuple):
+            return target
+        pid, wid = target
+        self._load_keys()
+        parsed = keys.parse_chord(chord, self._layout_table)
+        if parsed is None:
+            return ExecResult(False, f"{chord} is not one key with modifiers; nothing was pressed")
+        if STOP.is_set():
+            return ExecResult(False, "stopped by the app; nothing was done")
+        try:
+            with skylight.enter_window_key(pid, wid) as key:
+                # Read while the window is key: the app's focused element is then this window's, not the one the
+                # key goes back to.
+                before = axfield.window_state(pid, wid)
+                if STOP.is_set() or key.user_took_front():
+                    return ExecResult(False, f"{chord} not pressed: stopped, or the user brought the app forward")
+                self._post_key(skylight.BackgroundQuartz(pid, wid, (self._origin.x, self._origin.y)), *parsed)
+                time.sleep(self.CHORD_SETTLE_S)
+                after = axfield.window_state(pid, wid)
+        except skylight.WindowKeyRefused as exc:
+            return ExecResult(False, f"{chord} not pressed: {exc}")
+        self._snapshot = None
+        done = f"pressed {chord} in window {wid} in the background (its app's key window by {key.via})"
+        if before is not None and after is not None and after != before:
+            changed = ", ".join(k for k in before if before[k] != after.get(k))
+            return ExecResult(True, f"{done}; read back: the {changed} changed")
+        return ExecResult(True, indeterminate=True,
+                          detail=f"{done}; nothing read back shows its effect -- observe before pressing it again")
 
     def _announce_wait(self, already: bool, bundle: str = "", what: str = "") -> bool:
         """Say once that the step is waiting for the user, and what it will do: a paused run that did not say what
@@ -3128,6 +3274,7 @@ class PeekabooDriver:
     #: the driver presses with cmd (select all, paste) on the user's layout. Made once per process (see _key_event).
     _key_blobs: dict = {}
     _letter_codes: dict = {}
+    _layout_table: dict = {}     # key code -> what it types with cmd held, on the user's layout (keys.parse_chord)
     _letters_read_at = 0.0
     #: How long the layout's letters are trusted: a user may switch keyboards during a run, and reading them again
     #: costs a child process, so not before every shortcut.
@@ -3154,7 +3301,8 @@ class PeekabooDriver:
             out = json.loads(subprocess.run([sys.executable, "-c", keys.CHILD], capture_output=True,
                                             text=True, timeout=20).stdout)
             cls._key_blobs = {k: base64.b64decode(v) for k, v in out["events"].items()}
-            cls._letter_codes = keys.pick_keycodes({int(k): v for k, v in out["table"].items()}, "av")
+            cls._layout_table = {int(k): v for k, v in out["table"].items()}
+            cls._letter_codes = keys.pick_keycodes(cls._layout_table, "av")
             cls._letters_read_at = time.monotonic()
             if not out["table"] and not cls.__dict__.get("_said_no_layout"):
                 # Said once, not silently: on a non-US layout the US positions may press another shortcut (#21).
@@ -3189,10 +3337,34 @@ class PeekabooDriver:
     def _post_key(cls, Q, keycode: int, flags: int = 0) -> None:
         for down in (True, False):
             ev = cls._key_event(Q, keycode, down)
-            if flags:
-                Q.CGEventSetFlags(ev, flags)
+            # Always, the empty flags too: an event can carry modifiers held when it was made, and a stray shift or
+            # cmd turns a key into another shortcut (cua's keyboard.rs does the same).
+            Q.CGEventSetFlags(ev, flags)
             Q.CGEventPost(Q.kCGHIDEventTap, ev)
             time.sleep(0.03)
+
+    @classmethod
+    def _post_unicode(cls, Q, text: str, stop=None) -> int:
+        """Type `text` as Unicode payloads on key code 0 (any script, no input method, no layout), in chunks; a
+        newline and a tab as the Return and Tab keys. Checks `stop()` before each chunk; the characters sent."""
+        from deskmind_hands.drivers.skylight import text_chunks
+        sent = 0
+        for chunk in text_chunks(text):
+            if stop is not None and stop():
+                break
+            if chunk in ("\n", "\r", "\t"):
+                cls._post_key(Q, keys.TAB if chunk == "\t" else keys.RETURN)
+            else:
+                units = len(chunk.encode("utf-16-le")) // 2
+                for down in (True, False):
+                    ev = cls._key_event(Q, 0, down)
+                    Q.CGEventKeyboardSetUnicodeString(ev, units, chunk)
+                    Q.CGEventSetFlags(ev, 0)
+                    Q.CGEventPost(Q.kCGHIDEventTap, ev)
+                    time.sleep(0.01)
+                time.sleep(0.02)
+            sent += len(chunk)
+        return sent
 
     @classmethod
     def _post_text(cls, Q, text: str) -> None:
@@ -3919,6 +4091,12 @@ class PeekabooDriver:
                 # refuses it), so where the user allowed the brief foreground it is typed there: click, paste,
                 # Return, as in a screenshot-only app.
                 return self._vision_act(action)
+            if self._element_role.get(eid, "").lower() in ("textfield", "textarea"):
+                # Into the field itself, in the background, whichever app: the accessibility insertion, then keys to
+                # the window proven key; each read back from the field. None: no field there to read back by.
+                typed = self._type_in_background(eid, action.text or "", action.clear_first)
+                if typed is not None:
+                    return typed
             if (action.clear_first and self._background_input(self.app) and eid in self._rects
                     and self._element_role.get(eid, "").lower() in ("textfield", "textarea")):
                 # A web page's field in an app that takes background input: clicked and pasted into, as a person
@@ -4006,13 +4184,12 @@ class PeekabooDriver:
                 return self._settle(scripted.ok, scripted.detail, files=scripted.files)
 
         if k is ActionKind.KEY and self._mcp is not None:
-            # No menu route. A background click on the menu item that owns a chord is accepted and not executed
+            # No scripted route. A background click on the menu item that owns a chord is accepted and not executed
             # (the one save that seemed to work was macOS autosave), and it came back "done in the background" --
-            # a planner was told a folder had been created when nothing had. Without a scripted equivalent, a
-            # chord in background mode is refused, with the reason.
-            chord = "+".join(action.keys)
-            return self._settle(False, f"{chord} has no background route in this app; it would have to take the "
-                                       f"user's keyboard focus, which this run does not do -- use another action")
+            # a planner was told a folder had been created when nothing had. So the chord itself goes to the
+            # observed window, made its app's key window without the user's keyboard (skylight.enter_window_key),
+            # and is reported confirmed only when something read back changed.
+            return self._press_in_background("+".join(action.keys))
 
         if k is ActionKind.KEY:
             chord = "+".join(action.keys)

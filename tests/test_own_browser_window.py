@@ -258,7 +258,7 @@ class OwnWindow(unittest.TestCase):
         d._settle = lambda ok, detail: ExecResult(ok, detail)
         d._post_click = lambda q, x, y: posted.append(("click", x, y))
         d._paste_and_submit = lambda q, text, before_return=None: posted.append(("paste", text)) or True
-        with mock.patch.object(skylight, "focus_without_raise", lambda pid, wid: focused.append(wid) or "token"), \
+        with mock.patch.object(skylight, "enter_window_key", lambda pid, wid: focused.append(wid) or "token"), \
                 mock.patch.object(skylight, "give_focus_back", lambda token: None), \
                 mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)), \
                 mock.patch.object(axchrome, "focused_identifier",
@@ -393,7 +393,7 @@ class OwnWindow(unittest.TestCase):
         mac = FakeMac([{"id": 19116, "title": "我的银行", "on_screen": True, "frame": (0, 0, 1600, 1000)}])
         d = self.mac(mac, stage=())
         d._pinned_window = d._window_id = None
-        with mock.patch.object(skylight, "focus_without_raise", lambda pid, wid: self.fail(f"focused {wid}")), \
+        with mock.patch.object(skylight, "enter_window_key", lambda pid, wid: self.fail(f"focused {wid}")), \
                 mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)):
             self.assertIsNone(d._background_quartz(SAFARI))
 
@@ -608,7 +608,7 @@ class OwnWindow(unittest.TestCase):
         d._post_click = lambda q, x, y: None
         d._paste_and_submit = lambda q, text, before_return=None: True
         users_frame = mac.find(19116)["frame"]
-        with mock.patch.object(skylight, "focus_without_raise", lambda pid, wid: focused.append(wid) or "token"), \
+        with mock.patch.object(skylight, "enter_window_key", lambda pid, wid: focused.append(wid) or "token"), \
                 mock.patch.object(skylight, "give_focus_back", lambda token: None), \
                 mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin: ("Q", wid)), \
                 mock.patch.object(axchrome, "focused_identifier",

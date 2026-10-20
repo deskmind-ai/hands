@@ -1,14 +1,21 @@
 """Input delivered to one app's window in the background: no activation, the pointer does not move, the user's app
-keeps the front.
+keeps the front and the keyboard.
 
 The route trycua/cua's driver takes (MIT; libs/cua-driver/rust/crates/platform-macos/src/input/skylight.rs and
-mouse.rs): the window is given focus without being raised (a pair of SLPSPostEventRecordTo records), each mouse event
-carries the window-local point and the window routing fields and goes to the process with SLEventPostToPid as well as
-CGEventPostToPid, and each key event carries an SLSEventAuthenticationMessage, without which WindowServer drops
-synthetic keys to web content on macOS 14+.
+mouse.rs). Mouse events carry the window-local point and the window routing fields and go to the process with
+SLEventPostToPid as well as CGEventPostToPid. Keys go to the process with SLEventPostToPid and an
+SLSEventAuthenticationMessage (macOS 15+), without which WindowServer drops synthetic keys to web content.
 
-Measured on 09-30: Safari and WebKit pages take clicks, typing and Return this way. The music app (CEF) and the chat
-app (Electron) ignore all of it; they still need the brief foreground (see PeekabooDriver._flash).
+Keys go to the target app's key window, so before any key is sent the window is made the app's key window *inside
+that app* (enter_window_key): focus records sent to the target process only -- defocus its current key window, focus
+the target, then the make-key pair -- and the app's focused window read back through accessibility, the only proof
+that keys will land there. The user's front app is told nothing and keeps the keyboard. On the way out the app's
+previous key window is given back. (The route before, focus_without_raise, told the user's front app that it had lost
+focus; whatever the user typed meanwhile went nowhere.)
+
+Measured 10-21 (macOS 27.2): TextEdit with two windows of its own and Chrome take typing, cmd+A and Chinese text
+this way into the exact window, front app unchanged. A plain CGEventPostToPid, or AppKit's fake activation, leaked
+keys into another window of the same app.
 
 Private SPI, resolved at first use; `available()` is False when any of it is missing, and callers fall back.
 """
@@ -25,8 +32,24 @@ _CG = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
 # window under the pointer, window that can handle it.
 F_CLICK_STATE, F_BUTTON, F_SUBTYPE, F_PID, F_WINDOW, F_GROUP, F_UNDER, F_HANDLER = 1, 3, 7, 40, 51, 58, 91, 92
 SUBTYPE_TOUCH = 3
+#: kCGEventSourceStateID and kCGEventSourceStateHIDSystemState: the key events say they come from the HID system state.
+F_SOURCE_STATE, HID_SYSTEM_STATE = 45, 1
+
+#: SLPSPostEventRecordTo's status when this process has no window-server connection it may post focus records with
+#: (a bare process not attributed to an app; cua's CUA-1777): every record is dropped, so nothing can be made key.
+INVALID_CONNECTION = 1002
+#: Pause after a focus record: an app still handling the defocus can drop the focus that follows (cua, LibreOffice).
+RECORD_SETTLE_S = 0.12
+#: How long the app's focused window is read back after the records, and after the accessibility write.
+CONFIRM_S, AX_CONFIRM_S = 0.4, 0.2
+#: UTF-16 units per key event when text is typed as a Unicode payload (a CGEvent carries at most 20).
+TEXT_CHUNK = 16
 
 _fns: dict | None = None
+
+
+class WindowKeyRefused(RuntimeError):
+    """The window could not be made (or proven) the app's key window; no key was sent. The message says why."""
 
 
 def _load() -> dict | None:
@@ -37,26 +60,28 @@ def _load() -> dict | None:
         sl, cg = ctypes.CDLL(_SKYLIGHT), ctypes.CDLL(_CG)
         objc_lib = ctypes.CDLL(ctypes.util.find_library("objc"))
 
-        def f(name, args, res=None):
+        def f(name, args, res=None, required=True):
             for lib in (sl, cg):
                 fn = getattr(lib, name, None)
                 if fn is not None:
                     fn.argtypes, fn.restype = args, res
                     return fn
-            raise AttributeError(name)
+            if required:
+                raise AttributeError(name)
+            return None
 
         vp, u32, i64 = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64
         fns = {
-            "post": f("SLEventPostToPid", [ctypes.c_int, vp]),
             "set_int": f("SLEventSetIntegerValueField", [vp, u32, i64]),
             "set_loc": f("CGEventSetWindowLocation", [vp, ctypes.c_double, ctypes.c_double]),
-            "set_auth": f("SLEventSetAuthenticationMessage", [vp, vp]),
             "front": f("_SLPSGetFrontProcess", [vp], ctypes.c_int),
             "post_rec": f("SLPSPostEventRecordTo", [vp, vp], ctypes.c_int),
             "cid": f("CGSMainConnectionID", [], u32),
             "owner": f("SLSGetWindowOwner", [u32, u32, ctypes.POINTER(u32)], ctypes.c_int),
             "psn": f("SLSGetConnectionPSN", [u32, vp], ctypes.c_int),
-
+            # Optional: without them an event goes with CGEventPostToPid, unauthenticated (post_event).
+            "post": f("SLEventPostToPid", [ctypes.c_int, vp], required=False),
+            "set_auth": f("SLEventSetAuthenticationMessage", [vp, vp], required=False),
         }
         # The front app's pid from its serial number, asked of the window server (its connection, then that
         # connection's pid); optional. Not GetProcessPID: that Process Manager call registers the asking process with
@@ -75,10 +100,16 @@ def _load() -> dict | None:
             fns["pid_of_psn"] = None
         objc_lib.objc_getClass.restype, objc_lib.objc_getClass.argtypes = vp, [ctypes.c_char_p]
         objc_lib.sel_registerName.restype, objc_lib.sel_registerName.argtypes = vp, [ctypes.c_char_p]
+        objc_lib.object_getClass.restype, objc_lib.object_getClass.argtypes = vp, [vp]
+        objc_lib.class_respondsToSelector.restype = ctypes.c_bool
+        objc_lib.class_respondsToSelector.argtypes = [vp, vp]
         fns["auth_cls"] = objc_lib.objc_getClass(b"SLSEventAuthenticationMessage")
         fns["auth_sel"] = objc_lib.sel_registerName(b"messageWithEventRecord:pid:version:")
         fns["auth_new"] = ctypes.CFUNCTYPE(vp, vp, vp, vp, ctypes.c_int, ctypes.c_uint)(
             ctypes.cast(objc_lib.objc_msgSend, vp).value)
+        # The factory is macOS 15+; the class alone exists on 14, and sending it the selector there would crash.
+        fns["auth_ok"] = bool(fns["auth_cls"] and fns["set_auth"] and objc_lib.class_respondsToSelector(
+            objc_lib.object_getClass(fns["auth_cls"]), fns["auth_sel"]))
         _fns = fns
     except (OSError, AttributeError):
         _fns = {}
@@ -95,6 +126,7 @@ def _ptr(event) -> int:
 
 
 def _record(window_id: int, kind: int):
+    """A focus record: 0x0D at 0x08, the window at 0x3C, 0x01 focus / 0x02 defocus at 0x8A."""
     rec = (ctypes.c_uint8 * 0xF8)()
     rec[0x04], rec[0x08] = 0xF8, 0x0D
     for i in range(4):
@@ -103,8 +135,19 @@ def _record(window_id: int, kind: int):
     return rec
 
 
+def _make_key_record(window_id: int, kind: int):
+    """One of the make-key pair (kind 0x01, then 0x02) for `window_id` (cua's make_key_window_record)."""
+    rec = (ctypes.c_uint8 * 0xF8)()
+    rec[0x04], rec[0x08], rec[0x3A] = 0xF8, kind, 0x10
+    for i in range(4):
+        rec[0x3C + i] = (window_id >> (8 * i)) & 0xFF
+    for i in range(0x20, 0x30):
+        rec[i] = 0xFF
+    return rec
+
+
 def front_window(pid: int) -> int | None:
-    """The front ordinary window of `pid`, which has its key focus: the topmost on-screen one."""
+    """The front ordinary window of `pid`: the topmost on-screen one."""
     import Quartz
     for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly
                                                | Quartz.kCGWindowListExcludeDesktopElements, 0) or []:
@@ -113,61 +156,183 @@ def front_window(pid: int) -> int | None:
     return None
 
 
-class FocusToken:
-    """What focus_without_raise took, to be given back: the user's front app and its key window."""
+def front_pid() -> int | None:
+    """The pid of the user's front app, asked of the window server; None when it cannot be told."""
+    fns = _load()
+    if fns and fns.get("pid_of_psn"):
+        psn, pid = (ctypes.c_uint8 * 8)(), ctypes.c_int(0)
+        if fns["front"](psn) == 0 and fns["pid_of_psn"](psn, ctypes.byref(pid)) == 0 and pid.value:
+            return pid.value
+    return None
 
-    def __init__(self, prev_psn, prev_pid: int, prev_wid: int | None, target_psn, target_wid: int):
-        self.prev_psn, self.prev_pid, self.prev_wid = prev_psn, prev_pid, prev_wid
-        self.target_psn, self.target_wid = target_psn, target_wid
+
+def focused_window(pid: int) -> int | None:
+    """The window-server id of the app's focused window (AXFocusedWindow): where the app routes the keys it gets."""
+    try:
+        from ApplicationServices import AXUIElementCreateApplication
+        from .axchrome import _get, _window_id
+        win = _get(AXUIElementCreateApplication(pid), "AXFocusedWindow")
+        return _window_id(win) if win is not None else None
+    except Exception:   # noqa: BLE001 -- unread is unknown, never a guess
+        return None
 
 
-def focus_without_raise(pid: int, window_id: int) -> FocusToken | None:
-    """Key focus to `window_id` without bringing its app forward: the front app is told it lost focus and the target
-    that it has it, and neither is raised. The front app keeps the front but not the keyboard -- what the user types
-    goes nowhere -- so the focus must be given back (give_focus_back) as soon as the input is delivered."""
+def _set_focused_window(pid: int, wid: int) -> bool:
+    """Write the app's AXFocusedWindow to its window `wid`; True when the write was accepted."""
+    try:
+        from ApplicationServices import AXUIElementCreateApplication, AXUIElementSetAttributeValue
+        from .axchrome import _get, _window_id
+        app = AXUIElementCreateApplication(pid)
+        for win in _get(app, "AXWindows") or []:
+            if _window_id(win) == wid:
+                return AXUIElementSetAttributeValue(app, "AXFocusedWindow", win) == 0
+    except Exception:   # noqa: BLE001
+        pass
+    return False
+
+
+def _psn_for(wid: int):
+    """The serial number of the process that owns window `wid`, from its window-server connection; None if unknown.
+    Not GetProcessForPID: the Process Manager registers the asking process as an app (see _load)."""
     fns = _load()
     if not fns:
         return None
-    prev, target = (ctypes.c_uint8 * 8)(), (ctypes.c_uint8 * 8)()
-    if fns["front"](prev) != 0:
-        return None
-    owner = ctypes.c_uint32(0)
-    if fns["owner"](fns["cid"](), window_id, ctypes.byref(owner)) != 0 or fns["psn"](owner.value, target) != 0:
-        return None
-    prev_pid = ctypes.c_int(0)
-    if fns["pid_of_psn"] is not None:
-        fns["pid_of_psn"](prev, ctypes.byref(prev_pid))
-    token = FocusToken(prev, prev_pid.value, front_window(prev_pid.value), target, window_id)
-    a = fns["post_rec"](prev, _record(window_id, 0x02))
-    b = fns["post_rec"](target, _record(window_id, 0x01))
-    time.sleep(0.05)   # AppKit updates its key window before the events arrive
-    return token if a == 0 and b == 0 else None
-
-
-def give_focus_back(token: FocusToken | None) -> bool:
-    """The keyboard back to the app that had it before focus_without_raise, on its own front window."""
-    fns = _load()
-    if not fns or token is None or token.prev_wid is None:
-        return False
-    a = fns["post_rec"](token.target_psn, _record(token.target_wid, 0x02))
-    b = fns["post_rec"](token.prev_psn, _record(token.prev_wid, 0x01))
-    return a == 0 and b == 0
-
-
-def focus_app(pid: int) -> bool:
-    """Key focus to `pid`'s front window, e.g. to repair a focus left elsewhere; nothing is raised."""
-    fns = _load()
-    wid = front_window(pid)
-    if not fns or wid is None:
-        return False
-    psn = (ctypes.c_uint8 * 8)()
-    owner = ctypes.c_uint32(0)
+    psn, owner = (ctypes.c_uint8 * 8)(), ctypes.c_uint32(0)
     if fns["owner"](fns["cid"](), wid, ctypes.byref(owner)) != 0 or fns["psn"](owner.value, psn) != 0:
+        return None
+    return psn
+
+
+def _post_record(psn, record) -> int:
+    return _load()["post_rec"](psn, record)
+
+
+def _send_records(psn, current: int | None, target: int) -> list[int]:
+    """Key status inside one app from `current` to `target`, every record to that app only: defocus `current`, focus
+    `target`, the make-key pair for `target`. The statuses, in order; whether the app acted is read back by the
+    caller."""
+    out = []
+    if current is not None and current != target:
+        out.append(_post_record(psn, _record(current, 0x02)))
+        time.sleep(RECORD_SETTLE_S)
+    out.append(_post_record(psn, _record(target, 0x01)))
+    time.sleep(RECORD_SETTLE_S)
+    for kind in (0x01, 0x02):
+        out.append(_post_record(psn, _make_key_record(target, kind)))
+    return out
+
+
+def _await_focus(pid: int, wid: int, budget: float) -> bool:
+    """Whether the app's focused window reads as `wid` within `budget` seconds (the records are handled on the app's
+    main thread, so the change trails the post)."""
+    time.sleep(RECORD_SETTLE_S)
+    deadline = time.monotonic() + budget
+    while True:
+        if focused_window(pid) == wid:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.04)
+
+
+def _refused_1002() -> WindowKeyRefused:
+    return WindowKeyRefused(
+        f"the window server refused the focus records ({INVALID_CONNECTION}: this process has no window-server "
+        f"connection of an app -- run hands from the DeskMind app or a terminal app, not as a detached process), so "
+        f"no window could be made key and nothing was sent")
+
+
+class WindowKey:
+    """A window held as its app's key window, in the background; exit() gives the app's previous key window back.
+    A context manager: the key window is given back however the block ends."""
+
+    def __init__(self, pid: int, wid: int, previous: int | None, psn, via: str):
+        self.pid, self.wid, self.previous, self.psn, self.via = pid, wid, previous, psn, via
+        self.closed, self.restored = False, None
+
+    def __enter__(self) -> WindowKey:
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        self.exit()
         return False
-    return fns["post_rec"](psn, _record(wid, 0x01)) == 0
+
+    def user_took_front(self) -> bool:
+        """The user brought the app forward meanwhile: its key window is now the user's keyboard as well."""
+        return front_pid() == self.pid
+
+    def exit(self) -> bool:
+        """The app's previous key window back (the same records, or the accessibility write); True when it reads
+        back. Once only."""
+        if self.closed:
+            return bool(self.restored)
+        self.closed = True
+        prev = self.previous
+        try:
+            if prev is None or prev == self.wid:
+                # It was key already, or none was: the window is only told it lost focus, as an inactive app's is.
+                self.restored = _post_record(self.psn, _record(self.wid, 0x02)) == 0
+                return self.restored
+            ok = False
+            if self.via == "records":
+                if INVALID_CONNECTION not in _send_records(self.psn, self.wid, prev):
+                    ok = _await_focus(self.pid, prev, CONFIRM_S)
+            if not ok:
+                ok = _set_focused_window(self.pid, prev) and _await_focus(self.pid, prev, AX_CONFIRM_S)
+            self.restored = ok
+        except Exception:   # noqa: BLE001 -- giving back must never raise over the step's own result
+            self.restored = False
+        return bool(self.restored)
+
+
+def enter_window_key(pid: int, wid: int) -> WindowKey:
+    """Make window `wid` the key window of its app `pid` without activating or raising it, proven by reading the
+    app's focused window back; raise WindowKeyRefused (nothing sent) when it cannot be.
+
+    The records go out at most twice (WindowServer delivers them asynchronously; the second pass catches an app still
+    handling the first), then the accessibility write of AXFocusedWindow. Refused as well when the app is the user's
+    front app -- its key window is the user's keyboard -- and when the window server has no connection for this
+    process (1002)."""
+    fns = _load()
+    if not fns:
+        raise WindowKeyRefused("the window server's focus calls are missing on this macOS, so no window can be made "
+                               "key in the background; nothing was sent")
+    if front_pid() == pid:
+        raise WindowKeyRefused("the app is the user's front app: making its window key would move the user's own "
+                               "keyboard focus; nothing was sent")
+    psn = _psn_for(wid)
+    if psn is None:
+        raise WindowKeyRefused(f"window {wid} has no owner the window server can name (closed?); nothing was sent")
+    previous = focused_window(pid)
+    via = None
+    for attempt in range(2):
+        current = previous if attempt == 0 else focused_window(pid)
+        statuses = _send_records(psn, current, wid)
+        if INVALID_CONNECTION in statuses:
+            raise _refused_1002()
+        if all(s == 0 for s in statuses) and _await_focus(pid, wid, CONFIRM_S):
+            via = "records"
+            break
+    if via is None and _set_focused_window(pid, wid) and _await_focus(pid, wid, AX_CONFIRM_S):
+        via = "ax"
+    if via is None:
+        now = focused_window(pid)
+        if now != previous:
+            WindowKey(pid, wid, previous, psn, "records").exit()   # whatever the tries moved, put back
+        raise WindowKeyRefused(f"window {wid} could not be confirmed as the app's key window (its focused window "
+                               f"reads {now}), so no keys were sent: they could have gone to another window of the "
+                               f"same app")
+    return WindowKey(pid, wid, previous, psn, via)
+
+
+def give_focus_back(key: WindowKey | None) -> bool:
+    """The app's previous key window back (WindowKey.exit); the name the background routes call it by."""
+    return key.exit() if key is not None else False
 
 
 def _authenticate(fns: dict, ev_ptr: int, pid: int) -> bool:
+    if not fns.get("auth_ok"):
+        return False
     for offset in (24, 32, 16):   # the event record inside __CGEvent, as cua probes it
         record = ctypes.c_void_p.from_address(ev_ptr + offset).value
         if record:
@@ -181,13 +346,50 @@ def _authenticate(fns: dict, ev_ptr: int, pid: int) -> bool:
     return True
 
 
+def post_key_event(pid: int, event, auth: bool = True) -> str:
+    """One key event to `pid`: SLEventPostToPid with an authentication message (macOS 15+; `auth`), else
+    CGEventPostToPid when SkyLight's post is missing. The route taken, for the trace."""
+    import Quartz
+    fns = _load()
+    if not fns or fns.get("post") is None:
+        Quartz.CGEventPostToPid(pid, event)
+        return "cgevent"
+    p = _ptr(event)
+    fns["set_int"](p, F_PID, pid)
+    fns["set_int"](p, F_SOURCE_STATE, HID_SYSTEM_STATE)
+    signed = auth and _authenticate(fns, p, pid)
+    fns["post"](pid, p)
+    return "skylight+auth" if signed else "skylight"
+
+
+def text_chunks(text: str, size: int = TEXT_CHUNK) -> list[str]:
+    """`text` cut into runs of at most `size` UTF-16 units, never inside a character; a newline and a tab are runs
+    of their own (typed as the Return and Tab keys, not as a payload: a payload newline does not submit)."""
+    out, cur, n = [], "", 0
+    for ch in text:
+        w = len(ch.encode("utf-16-le")) // 2
+        if ch in "\n\r\t":
+            if cur:
+                out.append(cur)
+            out.append(ch)
+            cur, n = "", 0
+            continue
+        if n + w > size and cur:
+            out.append(cur)
+            cur, n = "", 0
+        cur, n = cur + ch, n + w
+    if cur:
+        out.append(cur)
+    return out
+
+
 class BackgroundQuartz:
     """Quartz, except that CGEventPost goes to one app's window in the background.
 
     Drop-in for the `Q` the foreground helpers take (PeekabooDriver._post_click, _post_key, pasting): the same event
     sequences, delivered to `pid` with the window-local point and routing fields (mouse) or an authentication message
     (keys), instead of to whatever is under the pointer or in front. Pointer warps and cursor association are no-ops:
-    the user's pointer is not touched.
+    the user's pointer is not touched. Keys reach the window only while it is the app's key window (enter_window_key).
     """
 
     def __init__(self, pid: int, window_id: int, origin: tuple[float, float]):
@@ -195,6 +397,7 @@ class BackgroundQuartz:
         self._q, self.pid, self.wid, self.origin = Quartz, pid, window_id, origin
         self._group = time.time_ns() & 0x7FFFFFFF
         self._fns = _load()
+        self.key_auth = True
 
     def __getattr__(self, name):
         return getattr(self._q, name)
@@ -206,13 +409,15 @@ class BackgroundQuartz:
         return 0
 
     def CGEventPost(self, _tap, event):   # noqa: N802
-        q, fns, p = self._q, self._fns, _ptr(event)
+        q, fns = self._q, self._fns
         kind = q.CGEventGetType(event)
         if kind in (q.kCGEventKeyDown, q.kCGEventKeyUp, q.kCGEventFlagsChanged):
-            fns["set_int"](p, F_PID, self.pid)
-            _authenticate(fns, p, self.pid)
-            fns["post"](self.pid, p)
+            post_key_event(self.pid, event, auth=self.key_auth)
             return
+        if not fns:
+            q.CGEventPostToPid(self.pid, event)
+            return
+        p = _ptr(event)
         loc = q.CGEventGetLocation(event)
         fns["set_loc"](p, loc.x - self.origin[0], loc.y - self.origin[1])
         state = q.CGEventGetIntegerValueField(event, q.kCGMouseEventClickState)
@@ -222,5 +427,6 @@ class BackgroundQuartz:
                              (F_WINDOW, self.wid), (F_GROUP, self._group), (F_UNDER, self.wid),
                              (F_HANDLER, self.wid), (F_PID, self.pid)):
             fns["set_int"](p, field, value)
-        fns["post"](self.pid, p)
+        if fns.get("post") is not None:
+            fns["post"](self.pid, p)
         q.CGEventPostToPid(self.pid, event)   # both transports, as cua sends a click

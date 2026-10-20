@@ -54,5 +54,19 @@ class Receipt(unittest.TestCase):
         self.assertEqual(r.files, receipt)
 
 
+class Indeterminate(unittest.TestCase):
+    def test_a_click_peekaboo_could_not_read_back_is_dispatched_not_failed(self):
+        """Peekaboo 4.7: 'The click mutation returned without valid canonical result semantics. Observe the
+        intended target before retrying...' -- the click may have landed, so it is unverified, never an error that
+        invites a second click (rc.8, 10-20)."""
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        d.app = "com.apple.Safari"
+        r = d._settle(False, "The click mutation returned without valid canonical result semantics. Observe the "
+                             "intended target before retrying and update the runtime host.")
+        self.assertTrue(r.ok)
+        self.assertTrue(r.indeterminate)
+        self.assertIn("could not be confirmed", r.detail)
+
+
 if __name__ == "__main__":
     unittest.main()

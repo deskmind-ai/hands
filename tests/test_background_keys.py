@@ -237,8 +237,8 @@ class Field:
 
 class TypeText(unittest.TestCase):
     def run_type(self, field, keys_land=True, enter=None, text="hello 你好", clear=False, selects=True,
-                 all_selected=True):
-        d = driver()
+                 all_selected=True, d=None, settle=None, value=None, insert=None, extra=()):
+        d = d or driver()
         d._keycode = lambda q, letter: {"a": 0}[letter]
 
         def post_key(q, code, flags=0):                                 # cmd+A selects all: the next keys replace it
@@ -251,15 +251,15 @@ class TypeText(unittest.TestCase):
                                                        setattr(field, "value", field.value + t.capitalize()))[0] \
                 or len(t)
 
-        def insert(el, t, replace_all):
+        def ax_insert(el, t, replace_all):
             d.log.append(("ax insert", t))
             if field.takes:
                 field.value = t if replace_all else field.value + t
             return True
-        patches = [mock.patch.object(axfield, "field_at", lambda pid, wid, frame: field),
-                   mock.patch.object(axfield, "value", lambda el: field.value),
-                   mock.patch.object(axfield, "insert", insert),
-                   mock.patch.object(axfield, "settled_value", lambda el, before, wait=0.6: field.value),
+        patches = [*extra, mock.patch.object(axfield, "field_at", lambda pid, wid, frame: field),
+                   mock.patch.object(axfield, "value", value or (lambda el: field.value)),
+                   mock.patch.object(axfield, "insert", insert or ax_insert),
+                   mock.patch.object(axfield, "settled_value", settle or (lambda el, before, wait=0.6: field.value)),
                    mock.patch.object(axfield, "focus", lambda el: d.log.append("focus") or True),
                    mock.patch.object(axfield, "select", lambda el, replace_all: d.log.append("select") or selects),
                    mock.patch.object(axfield, "all_selected", lambda el, wait=0.5: all_selected),
@@ -300,6 +300,59 @@ class TypeText(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertIn("could not be selected", res.detail)
         self.assertNotIn("keys", [e[0] for e in d.log if isinstance(e, tuple)])
+
+    def test_an_insertion_shown_late_is_not_typed_again(self):
+        """The value shows the insertion only after ~1 s: the wait (1.5 s) sees it, and no key is sent."""
+        field, clock, pending = Field("start", takes_insertion=False), [0.0], []
+        real_settle = axfield.settled_value
+
+        def value(el):
+            if pending and clock[0] >= 1.0:
+                field.value += pending.pop()
+            return field.value
+
+        def insert(el, t, replace_all):
+            pending.append(t)
+            return True
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock[0],
+                                          sleep=lambda dt: clock.__setitem__(0, clock[0] + dt))
+        d, res = self.run_type(field, settle=real_settle, value=value, insert=insert,
+                               extra=[mock.patch.object(axfield, "time", fake_time)])
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+        self.assertGreaterEqual(clock[0], 1.0)
+        self.assertEqual([e for e in d.log if e != "select"], [])        # no window made key, no key sent
+        self.assertNotIn(str(200), d.__dict__.get("_ax_noop_windows", set()))
+
+    def test_an_insertion_shown_just_before_the_keys_is_not_typed_again(self):
+        field = Field("start", takes_insertion=False)
+        reads = []
+
+        def value(el):                       # the read right before the keys is the first to show it
+            reads.append(1)
+            if len(reads) == 2:
+                field.value = "start" + "hello 你好"
+            return field.value
+        d, res = self.run_type(field, value=value, settle=lambda el, before, wait=0.6: before)
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+        self.assertIn("shown late", res.detail)
+        self.assertNotIn("keys", [e[0] for e in d.log if isinstance(e, tuple)])
+
+    def test_a_window_where_the_insertion_did_nothing_goes_straight_to_keys(self):
+        """Chrome: accepted and nothing changed after the whole wait -- remembered for that window, not the app."""
+        d = driver()
+        d, res = self.run_type(Field("start", takes_insertion=False), d=d)
+        self.assertTrue(res.ok, res.detail)
+        self.assertEqual(d._ax_noop_windows, {"200"})
+        d.log.clear()
+        d, res = self.run_type(Field("start", takes_insertion=False), d=d, text="again")
+        self.assertTrue(res.ok, res.detail)
+        self.assertNotIn("ax insert", [e[0] for e in d.log if isinstance(e, tuple)])
+        self.assertIn(("keys", "again"), d.log)
+        d.log.clear()
+        d._window_id = d._pinned_window = "201"                         # another window of the same app
+        d._element_window = {"t1": "201"}
+        d, res = self.run_type(Field("start", takes_insertion=False), d=d, text="third")
+        self.assertIn(("ax insert", "third"), d.log)
 
     def test_unverified_when_the_keys_do_not_read_back(self):
         d, res = self.run_type(Field("start", takes_insertion=False), keys_land=False)

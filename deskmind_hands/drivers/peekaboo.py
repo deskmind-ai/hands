@@ -3053,6 +3053,9 @@ class PeekabooDriver:
                                      f"the run, or is the user's)")
         return pid, int(wid)
 
+    #: How long a field is read back after the accessibility insertion before keys are tried instead.
+    AX_INSERT_WAIT_S = 1.5
+
     def _type_in_background(self, eid: str, text: str, clear_first: bool) -> ExecResult | None:
         """Type `text` into the observed window's field `eid` without bringing anything forward: first the
         accessibility insertion; if the field reads back unchanged, keys (Unicode payloads) to the window, made its
@@ -3089,17 +3092,28 @@ class PeekabooDriver:
                               detail=f"typed {len(text)} chars into {label!r} in the background ({how}), unverified: "
                                      f"the field reads {(after or '')[-120:]!r} -- observe before typing again")
 
-        try:
-            axfield.insert(field, text, clear_first)
-        except Exception:   # noqa: BLE001 -- refused or failed: the read-back below says whether anything changed
-            pass
-        after = axfield.settled_value(field, before)
-        if after != before:
-            return result(after, "accessibility insertion")
+        # Windows of this run where the insertion was accepted and changed nothing after the whole wait (Chrome):
+        # by window, never by app, and only for this run. Typing there again goes straight to keys.
+        noop = self.__dict__.setdefault("_ax_noop_windows", set())
+        if str(wid) not in noop:
+            try:
+                accepted = axfield.insert(field, text, clear_first)
+            except Exception:   # noqa: BLE001 -- refused or failed: the read-back below says whether anything changed
+                accepted = False
+            # Long enough for a slow app to show it: keys after an insertion that only showed late typed it twice.
+            after = axfield.settled_value(field, before, wait=self.AX_INSERT_WAIT_S)
+            if after != before:
+                return result(after, "accessibility insertion")
+            if accepted:
+                noop.add(str(wid))
         # Unchanged: the app took the insertion as a no-op (Chrome). Keys, then. A newline in a one-line field would
         # be Return, which submits: not typed that way.
         if "\n" in text and self._element_role.get(eid, "").lower() != "textarea":
             return None
+        late = axfield.value(field)
+        if late != before:
+            # Read once more right before the keys: an insertion that landed after the wait is not typed again.
+            return result(late, "accessibility insertion, shown late")
         try:
             with skylight.enter_window_key(pid, wid) as key:
                 if not axfield.focus(field):

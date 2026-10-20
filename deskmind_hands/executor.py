@@ -395,6 +395,12 @@ class HandsExecutor:
         d = self._driver(bundle)
         d._pinned_window = wid or None
         d._window_id = wid or None
+        key = bundle.lower()
+        # the first look at an app: its windows *before* the read are the baseline the next snapshots compare
+        # against -- taken after, a page that navigated while the driver read it would be the baseline, and the
+        # observation of the page before would pass (PR #49 review); widening the watch is still no change
+        baseline = (tuple(sorted((w["id"], w["title"]) for w in self._windows() if (w.get("bundle") or "").lower() == key))
+                    if self._inventory is not None and key not in self._inventory else None)
         obs: Observation = d.observe()
         landed = getattr(d, "_pinned_window", None)
         if wid and landed not in (None, wid):
@@ -407,11 +413,8 @@ class HandsExecutor:
                                f"observe that window, or this one again")
         self.last_obs[window] = obs
         self.current[bundle] = window
-        key = bundle.lower()
-        if self._inventory is not None and key not in self._inventory:
-            # the first look at an app: its windows as they are now are the baseline the next snapshots compare
-            # against, so a change after this observation is seen (PR #49 review) and widening the watch is not one
-            self._inventory[key] = tuple(sorted((w["id"], w["title"]) for w in self._windows() if (w.get("bundle") or "").lower() == key))
+        if baseline is not None and self._inventory is not None and key not in self._inventory:
+            self._inventory[key] = baseline
         els = []
         texts = []
         for e in obs.elements:

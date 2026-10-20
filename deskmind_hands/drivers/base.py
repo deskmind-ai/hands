@@ -45,6 +45,10 @@ class Element:
     #: A control the driver presents that is not on screen: a desktop capability projected as the web control
     #: a planner already knows ("move to" as a dropdown). Always reported apart from what the GUI offered.
     synthetic: bool = False
+    #: Where the element was read from: "ax" (the accessibility tree, and the controls projected over it) or
+    #: "pixels" (the screenshot: OCR words and grounded icons, for an app whose tree is empty -- vision.py). A
+    #: pixel element's label and place are a reading of the image, not what the app reports.
+    source: str = "ax"
 
     def to_json(self) -> dict:
         d = {"id": self.id, "role": self.role, "label": self.label,

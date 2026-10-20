@@ -84,6 +84,27 @@ class Mapping(unittest.TestCase):
         self.assertIsNone(o["modal"])
         self.assertTrue(json.dumps(o, ensure_ascii=False))   # serialisable as it stands
 
+    def test_observe_says_whether_each_element_was_read_from_the_tree_or_the_screenshot(self):
+        """An app read from its pixels (vision.py: OCR words, grounded icons, scroll and generic controls) gives
+        elements whose label and place are a reading of the image; the layer above is told so, element by element.
+        Every element vision_elements makes is marked, whatever its id; the tree's are "ax"."""
+        from deskmind_hands import vision
+        rows = [{"text": "林夏 纸船", "x": 0.1, "y": 0.4, "w": 0.3, "h": 0.05, "conf": 0.9}]
+        with mock.patch.object(vision, "ocr", return_value=rows), mock.patch.object(vision, "_icons", return_value={}):
+            pixels = vision.vision_elements("com.example.music", Path("shot.png"), 400, 300, "音乐", "12")
+        self.assertTrue(any(e.id.startswith("ocr:") for e in pixels) and any(e.id.startswith("icon:") for e in pixels))
+        self.assertEqual({e.source for e in pixels}, {"pixels"})
+        ex, stub = _executor()
+        tree = stub.observe
+        stub.observe = lambda: (lambda o: (o.elements.extend(pixels), o)[1])(tree())
+        o = ex.observe(W12)
+        by_id = {e["id"]: e for e in o["elements"]}
+        self.assertEqual(by_id["T1"]["source"], "ax")
+        self.assertEqual(by_id["B2"]["source"], "ax")
+        for e in pixels:
+            self.assertEqual(by_id[e.id]["source"], "pixels", e.id)
+        self.assertEqual(Element(id="x", role="button").source, "ax")    # the default: drivers that do not say
+
     def test_perform_maps_actions_and_binds_them_to_the_last_observation(self):
         ex, stub = _executor()
         self.assertEqual(ex.perform({"kind": "click", "window": W12, "target": "B2"})["status"], "error")   # not observed yet

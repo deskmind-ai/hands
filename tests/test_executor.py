@@ -563,6 +563,23 @@ class UserActive(unittest.TestCase):
                 self.assertTrue(ex.user_active())
 
 
+class NeedsForeground(unittest.TestCase):
+    def test_apps_whose_steps_come_to_the_front_are_named_in_the_snapshot(self):
+        ex, stub = _executor()
+        ex._windows = lambda every=False: [_win("12")]   # noqa: SLF001
+        ex._front = lambda: "文本编辑"                      # noqa: SLF001
+        ex._last_input_at = lambda: 0.0                   # noqa: SLF001
+        ex.drivers = {TE: stub}
+        stub._foreground_actions = 0
+        stub._vision_app = lambda app=None: False
+        self.assertEqual(ex.snapshot()["needs_foreground"], [])
+        stub._vision_app = lambda app=None: True          # read from its pixels
+        self.assertEqual(ex.snapshot()["needs_foreground"], [TE])
+        stub._vision_app = lambda app=None: False
+        stub._foreground_actions = 1                      # a step had to bring it forward
+        self.assertEqual(ex.snapshot()["needs_foreground"], [TE])
+
+
 class Sends(unittest.TestCase):
     def test_send_controls_are_known_by_their_verb(self):
         for role, label in [("button", "发送"), ("button", "Send"), ("button", "Send message"), ("button", "发送消息"),
@@ -601,10 +618,14 @@ class OpenWindow(unittest.TestCase):
     """A Mac with one app: launched, it brings its last session's windows back (late, after the launch looked
     settled); asked by its scripting, it makes a document and says which window."""
 
-    def _mac(self, ex, running: bool, restored: list[dict], answers: bool = True, late: bool = False):
+    def _mac(self, ex, running: bool, restored: list[dict], answers: bool = True, late: bool = False, documents=None):
         from types import SimpleNamespace
         state = {"running": running, "on": [], "off": [], "n": 30000, "events": [], "pending": list(restored), "late": late}
         ex._windows = lambda every=False: state["on"] + (state["off"] if every else [])   # noqa: SLF001
+        ex.LAUNCH_WAIT_S = 0.3
+        # a restored window shows its document (the last session's file); `documents` overrides, by window id
+        docs = documents if documents is not None else {w["id"]: (f"/Users/me/{w['title']}.txt", False) for w in restored}
+        ex._document = lambda window, wins: docs.get(window)   # noqa: SLF001
 
         def run(argv, **k):
             state["events"].append(argv[0] if argv[0] != "open" else argv[:3])
@@ -668,6 +689,24 @@ class OpenWindow(unittest.TestCase):
         r = self._open(ex, keystroke_n, running)
         self.assertEqual(r["new_window"]["id"], f"{TE}#14")
         self.assertIn("14", stub.__dict__["_run_windows"])
+
+    def test_an_app_slow_to_start_whose_launch_window_shows_no_document_is_the_tasks(self):
+        """A music player, launched by this open: its main window came after the 8 s this used to wait and was then
+        the user's (10-20). Waited for; no document in it, so nothing of the user's: the task's window. No new
+        document is asked for, and no cmd+N is sent to it."""
+        ex, stub = _executor()
+        player = "com.example.player"
+        state, run, running = self._mac(ex, running=False, restored=[_win("700", bundle=player, title="Player", app="Player")],
+                                         answers=False, documents={})
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
+             mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda: [("Player", player)] if state["running"] else []), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value=player), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            r = ex.perform({"kind": "open_window", "app": "Player"})
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["new_window"]["id"], f"{player}#700")
+        self.assertIn("700", stub.__dict__.get("_run_windows", set()))
+        self.assertNotIn("osascript", state["events"])     # nothing asked of it, no keystroke sent
 
     def test_a_launch_that_makes_no_window_is_unverified(self):
         ex, _ = _executor()

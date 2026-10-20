@@ -679,6 +679,31 @@ class BrowserSettle(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class Background(unittest.TestCase):
+    def test_opening_an_app_never_takes_the_front_and_cmd_n_goes_only_to_an_app_already_in_front(self):
+        """open -g, a new document asked for without activate, cmd+N only when the app is the front one: opening an
+        app is no reason to take the front from the user (rc.10, 10-21)."""
+        from types import SimpleNamespace
+        ex, _ = _executor()
+        ex._windows = lambda every=False: [_win("12")]   # noqa: SLF001
+        ex.LAUNCH_WAIT_S = 0.2
+        sent = []
+
+        def run(argv, **k):
+            sent.append(argv)
+            return SimpleNamespace(returncode=1, stdout="")
+        ex._front_bundle_id = lambda: "com.googlecode.iterm2"   # noqa: SLF001 -- the user's terminal is in front
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
+             mock.patch("deskmind_hands.executor.running_apps", return_value=[]), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value=TE), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            ex.perform({"kind": "open_window", "app": "TextEdit"})
+        flat = [" ".join(map(str, a)) for a in sent]
+        self.assertTrue(any(f.startswith("open -g -b") for f in flat))
+        self.assertFalse(any("activate" in f for f in flat))
+        self.assertFalse(any("keystroke" in f for f in flat))   # not sent to the user's terminal
+
+
 class Sends(unittest.TestCase):
     def test_send_controls_are_known_by_their_verb(self):
         for role, label in [("button", "发送"), ("button", "Send"), ("button", "Send message"), ("button", "发送消息"),
@@ -728,7 +753,7 @@ class OpenWindow(unittest.TestCase):
 
         def run(argv, **k):
             state["events"].append(argv[0] if argv[0] != "open" else argv[:3])
-            if argv[:2] == ["open", "-b"] and not state["running"]:
+            if argv[0] == "open" and "-b" in argv and not state["running"]:
                 state["running"] = True
                 if not state["late"]:
                     state["on"], state["pending"] = state["on"] + state["pending"], []
@@ -759,7 +784,7 @@ class OpenWindow(unittest.TestCase):
         r = self._open(ex, run, running)
         self.assertEqual(r["status"], "ok")
         self.assertEqual(r["new_window"]["id"], f"{TE}#30001")          # the document asked for, not #18000
-        self.assertEqual(state["events"][0], ["open", "-b", TE])         # launched on its own first
+        self.assertEqual(state["events"][0], ["open", "-g", "-b"])       # launched on its own first, in the background
         self.assertIn("30001", stub.__dict__.get("_run_windows", set()))
         self.assertNotIn("18000", stub.__dict__.get("_run_windows", set()))
 
@@ -769,8 +794,9 @@ class OpenWindow(unittest.TestCase):
         ex, stub = _executor()
         state, run, running = self._mac(ex, running=False, restored=[_win("18000", title="上次的文稿")], answers=False, late=True)
         r = self._open(ex, run, running)
-        self.assertEqual(r["status"], "ok")
-        self.assertEqual(r["window"], f"{TE}#18000")
+        # the ask made nothing, and no cmd+N is sent to an app that is not in front: nothing opened (the restored
+        # window is the user's, and is not offered as this action's)
+        self.assertEqual(r["status"], "unverified")
         self.assertNotIn("new_window", r)
         self.assertNotIn("18000", stub.__dict__.get("_run_windows", set()))
 
@@ -785,6 +811,7 @@ class OpenWindow(unittest.TestCase):
             if argv[0] == "osascript" and "keystroke" in argv[-1]:
                 state["on"] = state["on"] + [_win("14", title="未命名")]
             return r
+        ex._front_bundle_id = lambda: TE                 # noqa: SLF001 -- the app is in front: cmd+N goes to it
         r = self._open(ex, keystroke_n, running)
         self.assertEqual(r["new_window"]["id"], f"{TE}#14")
         self.assertIn("14", stub.__dict__["_run_windows"])

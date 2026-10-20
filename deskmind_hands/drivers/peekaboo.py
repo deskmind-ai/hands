@@ -3452,6 +3452,8 @@ class PeekabooDriver:
                 # a Chinese-language product: the structured channel is already
                 # Chinese text, with no OCR in the path.
                 label=e.get("label") or e.get("title") or e.get("role_description", ""),
+                role_description=e.get("role_description") or "",
+                label_from_role=not (e.get("label") or e.get("title")) and bool(e.get("role_description")),
                 rect=rect,
                 value=e.get("value"),
                 enabled=bool(e.get("is_enabled", True)),

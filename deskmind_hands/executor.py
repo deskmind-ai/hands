@@ -36,6 +36,7 @@ from .actions import Action, ActionKind, Binding
 from .axdocument import _q, document_text, window_document
 from .grounding import STOP
 from .drivers.base import ExecResult, Observation
+from .audio import playing_apps
 from .browsers import is_browser
 from .inputwatch import InputWatch, track_children
 
@@ -298,6 +299,15 @@ class HandsExecutor:
         if isinstance(pre, set):
             pre.discard(wid)
 
+    @staticmethod
+    def _front_bundle_id() -> str:
+        try:
+            from AppKit import NSWorkspace
+            app = NSWorkspace.sharedWorkspace().frontmostApplication()
+            return str(app.bundleIdentifier() or "") if app else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _known_windows(self) -> set[str]:
         """Every window that exists now, on screen or not: a window not among these afterwards was made meanwhile."""
         return {w["id"] for w in self._windows(every=True)}
@@ -436,6 +446,9 @@ class HandsExecutor:
                 # the apps whose steps must bring them to the front (read from their pixels, or a step that could not
                 # be delivered in the background): so the plan can say so once, before the run takes the front.
                 "needs_foreground": self._needs_foreground(),
+                # the apps sending sound to an output now (CoreAudio): the system's word that something is playing,
+                # which a music app's window cannot give a verdict by its pixels
+                "audio_playing": playing_apps(),
                 # app_name: what the user calls the app (its localized name), for cards; app stays as it was
                 "windows": [{"id": w["id"], "app": w["app"], "app_name": w["app"] or w.get("bundle") or "", "bundle": w.get("bundle") or "",
                              "title": w["title"], "focused": w["app"] == front} for w in wins]}
@@ -496,6 +509,11 @@ class HandsExecutor:
             # where it was read from: the accessibility tree, or the screenshot (an app read from its pixels)
             el = {"id": e.id, "role": role, "label": e.label, "actions": actions,
                   "source": "pixels" if e.source == "pixels" else "ax"}
+            # the localized role name, and whether the label is only that (no name of its own): an empty container
+            if getattr(e, "role_description", ""):
+                el["role_description"] = e.role_description
+            if getattr(e, "label_from_role", False):
+                el["label_from_role"] = True
             if sends(role, e.label):
                 el["sends"] = True
             if e.value is not None:
@@ -697,7 +715,10 @@ class HandsExecutor:
             # An app slow to start (a music player took longer than the 8 s this waited, 10-20) is waited for up to
             # LAUNCH_WAIT_S, until a window of it appears.
             before_launch = self._known_windows()
-            subprocess.run(["open", "-b", bundle], capture_output=True, timeout=20)
+            # in the background (-g): opening an app is no reason to take the front from the user; it comes forward
+            # only for a step, by the flash's rules (the user still, the step allowed) -- `open -b` did take it, and
+            # a music app kept jumping in front of the user's work (rc.10, 10-21)
+            subprocess.run(["open", "-g", "-b", bundle], capture_output=True, timeout=20)
             launched = self._launch_windows(bundle, before_launch, self.LAUNCH_WAIT_S)
             self._settled(bundle)
         d = self._driver(bundle)      # started now, so the windows it finds are the ones there before the task's
@@ -745,11 +766,12 @@ class HandsExecutor:
                 return {"status": "unverified", "window": window,
                         "why": f"the task's own browser window is there, but {url} could not be confirmed loaded in it"}
         elif url:
-            subprocess.run(["open", "-b", bundle, url], capture_output=True, timeout=20)
+            subprocess.run(["open", "-g", "-b", bundle, url], capture_output=True, timeout=20)
             fresh = self._fresh_windows(before, 2.5, bundle)
         else:
             proof = self._new_document(bundle)
-            if not proof:
+            if not proof and self._front_bundle_id() == bundle:
+                # cmd+N goes to whichever app is in front: sent only when that is this app (the user had it there)
                 subprocess.run(["osascript", "-e", 'tell application "System Events" to keystroke "n" using command down'], capture_output=True, timeout=20)
                 fresh = self._fresh_windows(before, 3, bundle)
         if proof:
@@ -821,7 +843,7 @@ class HandsExecutor:
         """Ask the app for a new document the way any scriptable document app answers (`make new document`), and
         return the window id it got -- the app's own word that this window was made now (NSWindow's number, which is
         its CGWindowID). None when the app does not answer, or does not say which window."""
-        script = (f'tell application id "{_q(bundle)}"\nactivate\nset d to make new document\n'
+        script = (f'tell application id "{_q(bundle)}"\nset d to make new document\n'
                   'repeat with w in windows\ntry\nif document of w is d then return id of w\nend try\nend repeat\n'
                   'try\nreturn id of window 1\nend try\nreturn ""\nend tell')
         try:

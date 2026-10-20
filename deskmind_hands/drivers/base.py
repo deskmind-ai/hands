@@ -50,6 +50,10 @@ class Element:
     #: the generic controls offered for an app read from its screenshot -- vision.py -- and an unnamed tree button
     #: whose name was grounded from the image -- grounding.name_unnamed). A pixel label is not what the app reports.
     source: str = "ax"
+    #: The accessibility role description, localized ("组", "按钮"), when the app gave one; and whether the label is
+    #: only that -- the element has no name of its own (an empty group reads as its role).
+    role_description: str = ""
+    label_from_role: bool = False
 
     def to_json(self) -> dict:
         d = {"id": self.id, "role": self.role, "label": self.label,

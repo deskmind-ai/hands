@@ -646,6 +646,39 @@ class StopBeforeBegin(unittest.TestCase):
         self.assertEqual(by_id[3]["result"]["status"], "error")
 
 
+class BrowserSettle(unittest.TestCase):
+    def test_after_an_action_in_a_browser_the_title_is_waited_for_until_it_holds(self):
+        """The page an action asked for loads after it, and its title changes then: waited for before perform
+        returns, so the change lands before the after-action snapshot instead of staling the next step (rc.10)."""
+        ex, stub = _executor()
+        chrome = "com.google.Chrome"
+        titles = iter(["新标签页", "新标签页", "百度一下", "今天北京天气_百度搜索", "今天北京天气_百度搜索", "今天北京天气_百度搜索",
+                       "今天北京天气_百度搜索", "今天北京天气_百度搜索", "今天北京天气_百度搜索", "今天北京天气_百度搜索"])
+        seen = []
+
+        def windows(every=False):
+            t = next(titles, "今天北京天气_百度搜索")
+            seen.append(t)
+            return [_win("50", bundle=chrome, title=t, app="Google Chrome")]
+        ex._windows = windows   # noqa: SLF001
+        clock = {"t": 1000.0}
+        with mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
+             mock.patch("deskmind_hands.executor.time.time", side_effect=lambda: clock["t"]), \
+             mock.patch("deskmind_hands.executor.time.sleep", side_effect=lambda d: clock.__setitem__("t", clock["t"] + d)):
+            ex.observe(f"{chrome}#50")
+            ex.perform({"kind": "key", "window": f"{chrome}#50", "chord": "return"})
+        self.assertIn("今天北京天气_百度搜索", seen)              # waited until the search page's title held
+
+    def test_no_wait_outside_a_browser(self):
+        ex, _ = _executor()
+        calls = []
+        ex._settle_title = lambda window: calls.append(window)   # noqa: SLF001
+        with mock.patch("deskmind_hands.executor.is_browser", return_value=False):
+            ex.observe(W12)
+            ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertEqual(calls, [])
+
+
 class Sends(unittest.TestCase):
     def test_send_controls_are_known_by_their_verb(self):
         for role, label in [("button", "发送"), ("button", "Send"), ("button", "Send message"), ("button", "发送消息"),
@@ -858,6 +891,36 @@ class OpenWindow(unittest.TestCase):
             r4 = ex.perform({"kind": "open_window", "app": "Safari", "url": "file:///ws/page.html"})
             self.assertEqual(r4["status"], "ok")
             self.assertEqual(given, ["http://127.0.0.1:52689/page.html"])      # the served address, not the file
+
+    def test_a_browser_opened_without_an_address_is_the_tasks_own_window(self):
+        """No new document and no cmd+N for a browser (they go to whatever browser window is in front): the run's
+        own window, made or already open (rc.10)."""
+        ex, stub = _executor()
+        chrome = "com.google.Chrome"
+        stub.BROWSERS = {"com.google.chrome"}
+        state = {"on": [_win("60", bundle=chrome, title="用户的窗口", app="Google Chrome")]}
+        asked = []
+
+        def own_window(bundle, url=""):
+            asked.append(url)
+            if not any(w["id"].endswith("#61") for w in state["on"]):
+                state["on"] = state["on"] + [_win("61", bundle=chrome, title="新标签页", app="Google Chrome")]
+            return "61"
+        stub._own_browser_window = own_window
+        ex._windows = lambda every=False: state["on"]   # noqa: SLF001
+        sent = []
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=lambda argv, **k: sent.append(argv)), \
+             mock.patch("deskmind_hands.executor.running_apps", return_value=[("Google Chrome", chrome)]), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value=chrome), \
+             mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            r1 = ex.perform({"kind": "open_window", "app": "Chrome"})
+            r2 = ex.perform({"kind": "open_window", "app": "Chrome"})
+        self.assertEqual(r1["new_window"]["id"], f"{chrome}#61")
+        self.assertEqual((r2["status"], r2["window"]), ("ok", f"{chrome}#61"))
+        self.assertNotIn("new_window", r2)
+        self.assertEqual(asked, ["", ""])
+        self.assertFalse(any("keystroke" in " ".join(map(str, a)) or "make new document" in " ".join(map(str, a)) for a in sent))
 
     def test_a_chromium_window_is_addressed_by_the_browsers_own_id_never_the_window_servers(self):
         """Chrome's AppleScript `window id` is the browser's own number: the window server's id names some other

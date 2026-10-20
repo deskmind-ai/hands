@@ -607,6 +607,11 @@ class HandsExecutor:
                     os.environ.pop("HANDS_FLASH_APPS", None)
                 else:
                     os.environ["HANDS_FLASH_APPS"] = flash_before
+        if kind in self.SETTLE_KINDS and is_browser(bundle):
+            # a page loads after the action that asked for it, and its title changes when it has: waited for here, so
+            # the load lands before the layer above takes its after-action snapshot -- a title that changed later made
+            # the next step stale, eleven times in one search (rc.10, 10-21)
+            self._settle_title(window)
         status = "ok" if res.ok else "unsupported" if res.unsupported else "error"
         if res.ok and res.indeterminate:
             status = "unverified"
@@ -722,10 +727,13 @@ class HandsExecutor:
         # to observe, not claimed (PR #48 review, fourth round: the restored #18000 was claimed when the ask failed).
         proof: str | None = None
         fresh: list[dict] = []
-        if url and is_browser(bundle) and hasattr(d, "_own_browser_window"):
-            # any browser (by what it registers): the driver opens the run's own window where the browser's scripting
-            # allows it, and says why not where it does not -- never the user's window
-            proof = d._own_browser_window(bundle, url)
+        if is_browser(bundle) and hasattr(d, "_own_browser_window"):
+            # a browser, with an address or without: the run's own window (made, or the one it already has) -- never
+            # a new document or cmd+N, which go to whatever browser window is in front, and never the user's window
+            # (the driver opens it where the browser's scripting allows, and says why not where it does not)
+            proof = d._own_browser_window(bundle, url or "")
+            if proof and str(proof) in {self._split(b)[1] for b in before} and not url:
+                return {"status": "ok", "window": f"{bundle}#{proof}", "why": "the task's own browser window, already open"}
             if proof and str(proof) in {self._split(b)[1] for b in before}:
                 # the run's own browser window from earlier, given back as it is: the page asked for now has to be
                 # loaded in it, and that checked, before it is answered (PR #48 review, fifth round: the second
@@ -822,6 +830,24 @@ class HandsExecutor:
             return None
         out = (p.stdout or "").strip() if p.returncode == 0 else ""
         return out if out.isdigit() else None
+
+    #: Actions after which a browser page may load (its title then changes).
+    SETTLE_KINDS = {"click", "double_click", "key", "set_value", "type", "select"}
+    #: The title must hold this long to count as settled, waited for at most SETTLE_MAX_S.
+    SETTLE_STILL_S = 0.6
+    SETTLE_MAX_S = 4.0
+
+    def _settle_title(self, window: str) -> None:
+        """Wait until the window's title has held for SETTLE_STILL_S (at most SETTLE_MAX_S), or the app's stop."""
+        t0 = time.time()
+        last, since = None, time.time()
+        while time.time() - t0 < self.SETTLE_MAX_S and not STOP.is_set():
+            title = next((w["title"] for w in self._windows() if w["id"] == window), None)
+            if title != last:
+                last, since = title, time.time()
+            elif time.time() - since >= self.SETTLE_STILL_S:
+                return
+            time.sleep(0.15)
 
     #: How long a launched app is waited for to show its first window.
     LAUNCH_WAIT_S = 20.0

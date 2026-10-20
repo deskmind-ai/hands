@@ -109,5 +109,64 @@ class StopInTheDriver(unittest.TestCase):
         self.assertIn("stopped", d._wait_until_still("com.example.player"))
 
 
+class BrowserForeground(unittest.TestCase):
+    """A browser comes forward only for the run's own window, when the step is allowed to, and nothing is sent
+    unless that window is the one in front (rc.10, 10-21)."""
+
+    def _driver(self, own: bool):
+        from deskmind_hands.grounding import STOP
+        STOP.clear()
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        d.app = "com.google.Chrome"
+        d._window_id = "61"
+        d._run_windows = {"61"} if own else set()
+        d._takeover = lambda: True                 # the user handed the screen over: no wait
+        d._resumed = lambda: None
+        d._background_input = lambda bundle: False
+        d.BROWSERS = {"com.google.chrome"}
+        d._front_bundle = lambda: "com.google.Chrome"
+        d._hid_idle = lambda: 100.0
+        d._foreground_actions = 0
+        d.given_back = []
+        d._give_front_back = lambda prev: d.given_back.append(prev)
+        d.brought = []
+        d._bring_forward = lambda bundle, browser: d.brought.append((bundle, browser))
+        return d
+
+    def test_not_the_runs_own_window_or_not_allowed_nothing_comes_forward(self):
+        import os as _os
+        from unittest import mock
+        for own, allowed in ((False, "com.google.Chrome"), (True, "")):
+            d = self._driver(own)
+            with mock.patch.dict(_os.environ, {"HANDS_FLASH_APPS": allowed}):
+                ok, why = d._flash("com.google.Chrome", lambda Q: "typed")
+            self.assertFalse(ok)
+            self.assertIn("only for the run's own window", why)
+            self.assertEqual(d.brought, [])
+
+    def test_the_runs_own_window_comes_forward_and_nothing_is_sent_unless_it_is_in_front(self):
+        import os as _os
+        import sys as _sys
+        import types
+        from unittest import mock
+        q = types.ModuleType("Quartz")
+        q.CGEventGetLocation = lambda e: (0, 0)
+        q.CGEventCreate = lambda x: None
+        q.CGWarpMouseCursorPosition = lambda p: None
+        q.CGAssociateMouseAndMouseCursorPosition = lambda b: None
+        sent = []
+        for in_front, expect in ((False, False), (True, True)):
+            d = self._driver(True)
+            d._own_window_in_front = lambda bundle, f=in_front: f
+            with mock.patch.dict(_os.environ, {"HANDS_FLASH_APPS": "com.google.Chrome"}), \
+                 mock.patch.dict(_sys.modules, {"Quartz": q}), \
+                 mock.patch("deskmind_hands.drivers.peekaboo._ascii_input_source", return_value=types.SimpleNamespace(restore=lambda: None)), \
+                 mock.patch("deskmind_hands.drivers.peekaboo.time.sleep"):
+                ok, _ = d._flash("com.google.Chrome", lambda Q: sent.append(in_front) or "typed")
+            self.assertEqual(ok, expect)
+            self.assertEqual(d.brought, [("com.google.Chrome", True)])
+        self.assertEqual(sent, [True])                 # only when the run's own window was in front
+
+
 if __name__ == "__main__":
     unittest.main()

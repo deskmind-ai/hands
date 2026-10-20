@@ -60,6 +60,13 @@ class StubDriver:
         pass
 
 
+# No LaunchServices queries in these tests (the first one on a Mac can take minutes): which apps are browsers, and
+# what an app is called, are given, except where a test says otherwise.
+import deskmind_hands.executor as _exe   # noqa: E402
+_exe._BROWSERS = set()
+_exe.app_display_name = lambda bundle: bundle
+
+
 def _executor():
     ex = HandsExecutor()
     stub = StubDriver()
@@ -599,6 +606,43 @@ class ForegroundOK(unittest.TestCase):
             ex.perform({"kind": "click", "window": W12, "target": "B2", "foreground_ok": True})
             self.assertNotIn("HANDS_FLASH_APPS", os.environ)
         self.assertEqual(seen[-1], TE)
+
+
+class StopBeforeBegin(unittest.TestCase):
+    def test_a_stop_that_comes_before_begin_is_applied_when_the_executor_is_made(self):
+        """Read on its own thread, a stop can come while begin is still making the executor: kept, not "begin first"
+        and lost (hands #54 review)."""
+        import io
+        import sys as _sys
+        from deskmind_hands import executor as exe
+        from deskmind_hands.grounding import STOP
+        self.addCleanup(STOP.clear)
+        lines = io.StringIO('{"id": 1, "op": "stop"}\n{"id": 2, "op": "begin"}\n{"id": 3, "op": "perform", "action": {"kind": "click", "window": "x#1", "target": "e"}}\n')
+        out = io.StringIO()
+        made = []
+
+        class Fake:
+            def __init__(self, *a, **k):
+                self.stopped = False
+                made.append(self)
+
+            def stop(self):
+                self.stopped = True
+                return {"stopped": True}
+
+            def snapshot(self):
+                return {"epoch": 1}
+
+            def perform(self, action):
+                return {"status": "error", "why": "stopped by the app"} if self.stopped else {"status": "ok"}
+        with mock.patch.object(_sys, "stdin", lines), mock.patch.object(_sys, "stdout", out), \
+             mock.patch.object(exe, "HandsExecutor", Fake):
+            exe.main()
+        replies = [json.loads(l) for l in out.getvalue().splitlines()]
+        by_id = {r["id"]: r for r in replies}
+        self.assertTrue(by_id[1]["ok"])
+        self.assertTrue(made[0].stopped)                          # applied as the executor was made
+        self.assertEqual(by_id[3]["result"]["status"], "error")
 
 
 class Sends(unittest.TestCase):

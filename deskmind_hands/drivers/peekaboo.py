@@ -41,7 +41,7 @@ from ..actions import Action, ActionKind, Binding
 from ..geometry import (ImageTransform, Point, Rect, ScreenGeometry, Size,
                         clamp_to_screen, to_logical)
 from ..apps import APPS
-from ..grounding import VOCAB, name_unnamed
+from ..grounding import STOP, VOCAB, name_unnamed
 from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, vision_elements
 from . import keys
 from .session import MESSAGES as SESSION_BLOCKED, gui_session, require_usable
@@ -2750,6 +2750,9 @@ class PeekabooDriver:
                 q, token = bg
                 from deskmind_hands.drivers import skylight
                 t0 = time.time()
+                if STOP.is_set():
+                    skylight.give_focus_back(token)
+                    return False, "stopped by the app; nothing was done"
                 try:
                     detail = perform(q)
                 finally:
@@ -2763,6 +2766,8 @@ class PeekabooDriver:
         allowed = {b.strip().lower() for b in os.environ.get("HANDS_FLASH_APPS", "").split(",") if b.strip()}
         if bundle.lower() not in allowed:
             return False, f"{bundle} only responds in the foreground, which this run is not allowed to use"
+        if STOP.is_set():
+            return False, "stopped by the app; nothing was done"
         import Quartz
         deadline = time.time() + float(os.environ.get("HANDS_FLASH_WAIT_S", "60"))
         waited = False
@@ -2775,6 +2780,13 @@ class PeekabooDriver:
         # other app, and a run watched from DeskMind's own window sat "paused" at its first step.
         spectator = {b.strip().lower() for b in os.environ.get("HANDS_SPECTATOR_APPS", "").split(",") if b.strip()}
         while True:
+            # The app's stop (the executor's, on its own thread): checked at every turn of the wait for a still Mac
+            # and again right before anything is sent -- the user's click on "stop" moves the mouse, and once let go
+            # the flash went ahead a second later (hands #54 review).
+            if STOP.is_set():
+                if waited:
+                    self._resumed()
+                return False, "stopped by the app; nothing was done"
             prev = self._front_bundle()
             watching = prev.lower() in spectator or prev.lower() == bundle.lower()
             if self._takeover() or self._hid_idle() >= (1.0 if watching else still):
@@ -2797,6 +2809,9 @@ class PeekabooDriver:
                     continue
                 if waited:
                     self._resumed()
+                if STOP.is_set():
+                    self._give_front_back(prev)
+                    return False, "stopped by the app; nothing was done"
                 self._foreground_actions += 1
                 ime = _ascii_input_source()
                 try:
@@ -2914,6 +2929,10 @@ class PeekabooDriver:
         still = float(os.environ.get("HANDS_BG_STILL_S", "5"))
         waited = False
         while self._hid_idle() < still:
+            if STOP.is_set():
+                if waited:
+                    self._resumed()
+                return "stopped by the app; nothing was done"
             if time.time() > deadline:
                 if waited:
                     self._resumed()
@@ -2922,7 +2941,7 @@ class PeekabooDriver:
             time.sleep(0.5)
         if waited:
             self._resumed()
-        return None
+        return "stopped by the app; nothing was done" if STOP.is_set() else None
 
     def _background_quartz(self, bundle: str, observed_only: bool = False):
         """A Quartz stand-in that delivers to `bundle`'s window (the pinned one, else its largest -- with
@@ -3123,6 +3142,8 @@ class PeekabooDriver:
                 if shot is not None and geo else None
             if pt is None:
                 return ExecResult(False, f"could not place {name!r} on the screen (the grounder did not answer)")
+            if STOP.is_set():                      # stopped while the grounder placed it: nothing is clicked
+                return ExecResult(False, "stopped by the app; nothing was done")
             self._rects[eid] = Rect(pt[0] - 10, pt[1] - 10, 20, 20)
             before = self._window_digest()
         r = self._rects.get(eid)

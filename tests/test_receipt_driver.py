@@ -68,5 +68,46 @@ class Indeterminate(unittest.TestCase):
         self.assertIn("could not be confirmed", r.detail)
 
 
+class StopInTheDriver(unittest.TestCase):
+    """The app's stop reaches the driver's own waits: a flash waiting for a still Mac, the background route's wait,
+    and a pixel click whose target was being placed send nothing (hands #54 review)."""
+
+    def setUp(self):
+        from deskmind_hands.grounding import STOP
+        self.STOP = STOP
+        STOP.clear()
+        self.addCleanup(STOP.clear)
+
+    def _driver(self):
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        d.app = "com.example.player"
+        d._takeover = lambda: False
+        d._resumed = lambda: None
+        d._announce_wait = lambda waited, bundle, what: True
+        d._front_bundle = lambda: "com.apple.Terminal"
+        d._background_input = lambda bundle: False
+        d.BROWSERS = set()
+        return d
+
+    def test_a_flash_waiting_for_a_still_mac_ends_on_stop_and_sends_nothing(self):
+        import os as _os
+        from unittest import mock
+        d = self._driver()
+        d._hid_idle = lambda: 0.0                  # the user is moving the mouse (to click stop)
+        sent = []
+        self.STOP.set()
+        with mock.patch.dict(_os.environ, {"HANDS_FLASH_APPS": "com.example.player"}):
+            ok, why = d._flash("com.example.player", lambda Q: sent.append("click") or "clicked")
+        self.assertFalse(ok)
+        self.assertIn("stopped", why)
+        self.assertEqual(sent, [])
+
+    def test_the_background_routes_wait_ends_on_stop(self):
+        d = self._driver()
+        d._hid_idle = lambda: 0.0
+        self.STOP.set()
+        self.assertIn("stopped", d._wait_until_still("com.example.player"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -237,6 +237,7 @@ class HandsExecutor:
         #: GUI lands where the task's own file tools and the verdict look.
         self.workspace = Path(workspace) if workspace else self.scratch
         track_children()   # every child's pid recorded as it starts: its posted events are the driver's, not the user's
+        STOP.clear()       # a new run starts unstopped (a stop that came before begin is applied right after this)
         self.epoch = 1
         #: When the epoch was last set, and the inventory it was set on: a user's input after that moment, or a
         #: window appearing, vanishing or renamed, moves the epoch at the next snapshot, so an observation and a
@@ -741,7 +742,9 @@ class HandsExecutor:
         # to observe, not claimed (PR #48 review, fourth round: the restored #18000 was claimed when the ask failed).
         proof: str | None = None
         fresh: list[dict] = []
-        if url and is_browser(bundle) and bundle.lower() in getattr(d, "BROWSERS", set()) and hasattr(d, "_own_browser_window"):
+        if url and is_browser(bundle) and hasattr(d, "_own_browser_window"):
+            # any browser (by what it registers): the driver opens the run's own window where the browser's scripting
+            # allows it, and says why not where it does not -- never the user's window
             proof = d._own_browser_window(bundle, url)
             if proof and str(proof) in {self._split(b)[1] for b in before}:
                 # the run's own browser window from earlier, given back as it is: the page asked for now has to be
@@ -917,7 +920,13 @@ def main() -> None:
                 continue
             if req.get("op") == "stop":
                 ex = state["ex"]
-                write({"id": req.get("id"), "ok": ex is not None, **({"result": ex.stop()} if ex is not None else {"error": "begin first"})})
+                if ex is None:
+                    # before begin has made the executor: kept, and applied as it is made (hands #54 review)
+                    state["stop_pending"] = True
+                    STOP.set()
+                    write({"id": req.get("id"), "ok": True, "result": {"stopped": True, "pending": True}})
+                else:
+                    write({"id": req.get("id"), "ok": True, "result": ex.stop()})
                 continue
             requests.put(req)
         requests.put(None)
@@ -932,6 +941,8 @@ def main() -> None:
         try:
             if op == "begin":
                 ex = state["ex"] = HandsExecutor(Path(req["scratch"]) if req.get("scratch") else None, Path(req["workspace"]) if req.get("workspace") else None)
+                if state.get("stop_pending"):
+                    ex.stop()
                 res = ex.snapshot()
             elif ex is None:
                 raise RuntimeError("begin first")

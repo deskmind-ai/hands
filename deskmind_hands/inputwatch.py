@@ -78,7 +78,10 @@ def track_children() -> None:
         def __init__(self, *a, **k):
             super().__init__(*a, **k)
             info = _proc_info(self.pid)
-            OWN_CHILDREN[self.pid] = [info[1] if info else None, None]
+            # gone before its start time could be read: not recorded -- a later process given the same pid would
+            # otherwise pass for ours (hands #54 review); its events, if any, then count as the user's (the safe side)
+            if info is not None:
+                OWN_CHILDREN[self.pid] = [info[1], None]
 
         def _note_exit(self):
             if self.returncode is not None and self.pid in OWN_CHILDREN and OWN_CHILDREN[self.pid][1] is None:
@@ -187,7 +190,7 @@ class InputWatch:
             started, exited = mine
             if info is None:                       # gone: ours if it went within the last OWN_KEEP_S (or unreaped)
                 return exited is None or now - exited <= OWN_KEEP_S
-            if started is None or abs(info[1] - started) < 0.01:
+            if abs(info[1] - started) < 0.01:
                 return True                        # the child itself, still running
         if info is None:
             return False                           # gone, and not a child we know: not ours

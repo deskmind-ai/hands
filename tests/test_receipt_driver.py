@@ -131,7 +131,7 @@ class BrowserForeground(unittest.TestCase):
         d._browser_front_sid = lambda bundle: None
         d.given_back = []
 
-        def give_back(prev, ours=None):
+        def give_back(prev, ours=None, late_s=0.0):
             d.given_back.append(prev)
             d.front[0] = prev
         d._give_front_back = give_back
@@ -277,6 +277,77 @@ class BrowserForeground(unittest.TestCase):
             d._give_front_back("com.apple.finder", ours="com.google.Chrome")
         run.assert_not_called()
         self.assertEqual(made, ["com.apple.finder"])
+
+    def test_a_front_that_cannot_be_read_is_not_taken_for_the_users_choice(self):
+        """An empty answer from System Events is unknown: read again, and the front still goes back."""
+        from unittest import mock
+        from deskmind_hands.drivers.peekaboo import PeekabooDriver
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        made = []
+        fronts = iter(["", "com.google.Chrome", "com.apple.finder"])
+        d._front_bundle = lambda: next(fronts, "com.apple.finder")
+        d._make_frontmost = lambda b: made.append(b) or True
+        with mock.patch("deskmind_hands.drivers.peekaboo.time.sleep"):
+            d._give_front_back("com.apple.finder", ours="com.google.Chrome")
+        self.assertEqual(made, ["com.apple.finder"])
+
+    def test_an_app_that_comes_forward_late_is_given_back_too(self):
+        """Asked forward, it arrived after the wait: the step was dropped, and the front still goes back to the
+        user's app when it comes (hands #55 review)."""
+        import os as _os
+        import sys as _sys
+        import types
+        from unittest import mock
+        q = types.ModuleType("Quartz")
+        q.CGEventGetLocation = lambda e: (0, 0)
+        q.CGEventCreate = lambda x: None
+        d = self._driver(True)
+        del d._give_front_back                         # the real one
+        made = []
+
+        def make(b):
+            made.append(b)
+            d.front[0] = b
+            return True
+        d._make_frontmost = make
+        reads = [0]
+
+        def front():
+            reads[0] += 1
+            if reads[0] == 40:                         # well after the 30 reads the wait makes
+                d.front[0] = "com.google.Chrome"
+            return d.front[0]
+        d._front_bundle = front
+        d._bring_forward = lambda bundle, browser: d.brought.append((bundle, browser)) or True   # asked; not yet there
+        clock = [100.0]
+
+        def sleep(t):
+            clock[0] += t
+        with mock.patch.dict(_os.environ, {"HANDS_FLASH_APPS": "com.google.Chrome"}), \
+             mock.patch.dict(_sys.modules, {"Quartz": q}), \
+             mock.patch("deskmind_hands.drivers.peekaboo.time.time", side_effect=lambda: clock[0]), \
+             mock.patch("deskmind_hands.drivers.peekaboo.time.sleep", side_effect=sleep):
+            ok, why = d._flash("com.google.Chrome", lambda Q: "typed")
+        self.assertFalse(ok)
+        self.assertIn("did not come to the front", why)
+        self.assertEqual(made, ["com.googlecode.iterm2"])
+        self.assertEqual(d.front[0], "com.googlecode.iterm2")
+
+    def test_an_app_without_windows_still_has_a_process_to_give_the_front_to(self):
+        """Finder on a bare desktop has no window: its process is found by bundle id (hands #55 review)."""
+        import sys as _sys
+        import types
+        from unittest import mock
+        from deskmind_hands.drivers.peekaboo import PeekabooDriver
+        appkit = types.ModuleType("AppKit")
+        running = types.SimpleNamespace(processIdentifier=lambda: 412, isTerminated=lambda: False)
+        gone = types.SimpleNamespace(processIdentifier=lambda: 999, isTerminated=lambda: True)
+        appkit.NSRunningApplication = types.SimpleNamespace(
+            runningApplicationsWithBundleIdentifier_=lambda b: [running, gone] if b == "com.apple.finder" else [])
+        with mock.patch.object(PeekabooDriver, "_pid_of", staticmethod(lambda bundle, all_wins=None: None)), \
+             mock.patch.dict(_sys.modules, {"AppKit": appkit}):
+            self.assertEqual(PeekabooDriver._app_pid("com.apple.finder"), 412)
+            self.assertIsNone(PeekabooDriver._app_pid("com.example.none"))
 
     def test_a_browser_gets_the_front_back_without_a_reopen(self):
         """`open -b` on a browser is a reopen and can open a window of its own (deskmind#73): the front goes back to

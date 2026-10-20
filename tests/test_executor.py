@@ -76,6 +76,7 @@ def _executor():
     ex._driver = lambda bundle: stub            # noqa: SLF001 -- the point of the tests is the layer above the driver
     ex._document = lambda window, wins: None   # noqa: SLF001 -- no desktop: the app says no document
     ex._last_input_at = lambda: 0.0            # noqa: SLF001 -- the user has not touched the Mac
+    ex._ax_window_kinds = lambda pid: None      # noqa: SLF001 -- no accessibility: every window counts
     return ex, stub
 
 
@@ -449,6 +450,101 @@ class TaskScope(unittest.TestCase):
                          _win("91", bundle="com.googlecode.iterm2", title="zsh", app="iTerm2")]
         self.assertEqual(ex.snapshot()["epoch"], e0)
         state["wins"] = [_win("12", title="hello.txt")] + state["wins"][1:]    # the task's own app: a change
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
+
+    def test_a_helper_surface_coming_and_going_does_not_move_the_epoch_and_a_dialog_does(self):
+        """A browser's pop-up or helper window, judged by its accessibility role (another subrole, or not among the
+        app's accessibility windows at all), comes and goes without staling anything; a dialog is a change (rc.10
+        weather trace, 10-21). No app name is looked at."""
+        ex, _ = _executor()
+        state = {"wins": [_win("12")], "ax": {"12": "AXStandardWindow"}}
+        ex._windows = lambda every=False: state["wins"]   # noqa: SLF001
+        ex._front = lambda: "文本编辑"                      # noqa: SLF001
+        ex._ax_window_kinds = lambda pid: dict(state["ax"])   # noqa: SLF001
+        ex.observe(W12)
+        e0 = ex.snapshot()["epoch"]
+        state["wins"] = [_win("12"), _win("30746", title="")]                  # not an accessibility window
+        self.assertEqual(ex.snapshot()["epoch"], e0)
+        state["wins"] = [_win("12"), _win("30754", title="")]
+        state["ax"] = {"12": "AXStandardWindow", "30754": "AXUnknown"}         # another subrole
+        self.assertEqual(ex.snapshot()["epoch"], e0)
+        state["wins"] = [_win("12")]                                           # gone again
+        self.assertEqual(ex.snapshot()["epoch"], e0)
+        state["wins"] = [_win("12"), _win("40", title="存储为")]
+        state["ax"] = {"12": "AXStandardWindow", "40": "AXDialog"}             # a dialog: a change
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
+        state["wins"] = [_win("12"), _win("40", title="存储为"), _win("41", title="新文稿")]
+        state["ax"] = {"12": "AXStandardWindow", "40": "AXDialog", "41": "AXStandardWindow"}
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 2)                       # a new standard window: a change
+
+    def test_when_accessibility_cannot_be_read_every_window_counts(self):
+        """No answer from accessibility is no reason to stop seeing windows: unknown, so counted, as before."""
+        ex, _ = _executor()
+        state = {"wins": [_win("12")]}
+        ex._windows = lambda every=False: state["wins"]   # noqa: SLF001
+        ex._front = lambda: "文本编辑"                      # noqa: SLF001
+        ex._ax_window_kinds = lambda pid: None              # noqa: SLF001
+        ex.observe(W12)
+        e0 = ex.snapshot()["epoch"]
+        state["wins"] = [_win("12"), _win("30746", title="")]
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
+        ex._ax_window_kinds = lambda pid: {"12": "AXStandardWindow", "50": ""}   # noqa: SLF001
+        state["wins"] = [_win("12"), _win("30746", title=""), _win("50", title="")]   # 50: subrole unread, counted
+        e1 = ex.snapshot()["epoch"]
+        self.assertEqual(e1, e0 + 2)                     # 30746 vanished from the count, 50 appeared: one change
+
+    def _ax_ex(self, wins, ax):
+        ex, stub = _executor()
+        state = {"wins": wins, "ax": ax}
+        ex._windows = lambda every=False: state["wins"]   # noqa: SLF001
+        ex._front = lambda: "文本编辑"                      # noqa: SLF001
+        ex._ax_window_kinds = lambda pid: None if state["ax"] is None else dict(state["ax"])   # noqa: SLF001
+        return ex, stub, state
+
+    def test_a_helper_window_already_there_at_observe_is_no_change(self):
+        """The baseline is counted like every snapshot: a helper window present at the first observe must not
+        "vanish" at the next snapshot and stale what was just read (hands #56 review; the chat app's full-screen
+        AXUnknown window)."""
+        ex, _, state = self._ax_ex([_win("12"), _win("30746", title="")], {"12": "AXStandardWindow"})
+        ex.observe(W12)
+        e0 = ex.epoch
+        self.assertEqual(ex.snapshot()["epoch"], e0)
+
+    def test_a_window_the_task_works_in_counts_whatever_its_role(self):
+        """A frameless main window (AXUnknown) the task observed: its retitling or closing is a change; observing
+        such a window of an app already watched is none by itself (hands #56 review)."""
+        ex, _, state = self._ax_ex([_win("12"), _win("13", title="会话")], {"12": "AXStandardWindow", "13": "AXUnknown"})
+        ex.observe(W12)
+        e0 = ex.snapshot()["epoch"]
+        ex.observe(f"{TE}#13")
+        self.assertEqual(ex.snapshot()["epoch"], e0)                 # now the task's: counted, no change by itself
+        state["wins"] = [_win("12"), _win("13", title="另一个会话")]
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)             # retitled: a change
+        state["wins"] = [_win("12")]
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 2)             # closed: a change
+
+    def test_a_window_whose_id_cannot_be_read_is_unknown_and_counts(self):
+        ex, _, state = self._ax_ex([_win("12")], {"12": "AXStandardWindow", "?": ""})
+        ex.observe(W12)
+        e0 = ex.snapshot()["epoch"]
+        state["wins"] = [_win("12"), _win("60")]
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
+
+    def test_an_app_whose_accessibility_stops_answering_keeps_its_last_reading(self):
+        """Answers that come and go must not flip a helper window between counted and not (hands #56 review)."""
+        ex, _, state = self._ax_ex([_win("12"), _win("30746", title="")], {"12": "AXStandardWindow"})
+        ex.observe(W12)
+        e0 = ex.snapshot()["epoch"]
+        state["ax"] = None
+        self.assertEqual(ex.snapshot()["epoch"], e0)
+        state["ax"] = {"12": "AXStandardWindow"}
+        self.assertEqual(ex.snapshot()["epoch"], e0)
+
+    def test_a_sheet_opening_on_a_counted_window_is_a_change(self):
+        ex, _, state = self._ax_ex([_win("12")], {"12": "AXStandardWindow"})
+        ex.observe(W12)
+        e0 = ex.snapshot()["epoch"]
+        state["ax"] = {"12": "AXStandardWindow", "12/sheet": "AXSheet"}
         self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
 
     def test_starting_to_operate_an_app_is_no_change(self):

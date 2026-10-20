@@ -442,6 +442,98 @@ class HandsExecutor:
         #: was renamed). A stale step upstream can then say what made it stale (rc.9, 10-20).
         self._epoch_reason = {"epoch": self.epoch, "at": round(self._epoch_at, 3), **(reason or {"by": "action"})}
 
+    #: Window subroles that are windows the task or the user works in: what appears, vanishes or is renamed among
+    #: them is a change. Other surfaces an app puts up for a moment (a browser's pop-ups and helper windows) are not:
+    #: three stales in one rc.10 weather run came from Chrome windows that came and went (owner's trace, 10-21).
+    EPOCH_SUBROLES = {"AXStandardWindow", "AXDialog", "AXSystemDialog"}
+
+    def _ax_window_kinds(self, pid: int) -> dict[str, str] | None:
+        """{window-server id: AX subrole ("" when unread)} of the app's accessibility windows, plus "<id>/sheet" for a
+        window with a sheet open and "?" when some window's id could not be read; None when they cannot be read at
+        all (no permission, no answer)."""
+        try:
+            import ApplicationServices as AS
+            from .drivers.axchrome import _get, _window_id
+            app = AS.AXUIElementCreateApplication(int(pid))
+            AS.AXUIElementSetMessagingTimeout(app, 1.0)
+            out: dict[str, str] = {}
+            for win in _get(app, "AXWindows") or []:
+                i = _window_id(win)
+                if i is None:
+                    out["?"] = ""       # a window not tied to its id: unmatched windows are unknown, not helpers
+                    continue
+                out[str(i)] = str(_get(win, "AXSubrole") or "")
+                if any(str(_get(c, "AXRole") or "") == "AXSheet" for c in (_get(win, "AXChildren") or [])):
+                    out[f"{i}/sheet"] = "AXSheet"
+            return out or None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _ax_known(self, pid, cache: dict) -> tuple[dict | None, bool]:
+        """The app's accessibility windows, read once per snapshot: (map, remembered). An app whose accessibility
+        does not answer this time keeps its last successful reading (its sheets), and each window the decision made
+        on it then (_counts_for_epoch), so windows do not flip between counted and not as answers come and go (hands
+        #56 review)."""
+        if pid not in cache:
+            fresh = self._ax_window_kinds(pid)
+            last = self.__dict__.setdefault("_ax_last", {})
+            if fresh is not None:
+                last[pid] = fresh
+                cache[pid] = (fresh, False)
+            else:
+                cache[pid] = (last.get(pid), True)
+        return cache[pid]
+
+    def _task_windows(self) -> set[str]:
+        """The windows the task itself has to do with: observed, being worked in, or opened by this run."""
+        out = set(self.current.values()) | set(self.last_obs)
+        for b, d in self.drivers.items():
+            out |= {f"{b}#{w}" for w in getattr(d, "__dict__", {}).get("_run_windows", ())}
+        return out
+
+    def _counts_for_epoch(self, w: dict, cache: dict, keep: set | frozenset = frozenset()) -> bool:
+        """Whether a window of a task app enters the epoch's inventory, judged by the window itself, never by the app
+        it belongs to. Always counted: a window the task observed, works in or opened (`keep`), whatever its role --
+        a frameless main window is still the one being read (hands #56 review). Otherwise counted: a standard window
+        or a dialog, a window whose subrole or id cannot be read, and every window of an app whose accessibility
+        windows cannot be read. Not counted: a window accessibility names with another subrole, or one that is not
+        among the app's accessibility windows at all (a pop-up, a tooltip, a helper surface)."""
+        if w["id"] in keep:
+            return True
+        pid = w.get("pid")
+        if not pid:
+            return True
+        known, remembered = self._ax_known(pid, cache)
+        decided = self.__dict__.setdefault("_ax_decided", {})
+        if remembered:
+            # accessibility did not answer this time: each window keeps what its last answered reading made of it;
+            # a window newer than that is unknown, so counted
+            return decided.get(w["id"], True)
+        if known is None:
+            return True
+        sub = known.get(str(w["id"]).partition("#")[2])
+        # not listed: a helper surface -- unless some window's id was unreadable
+        counts = ("?" in known) if sub is None else (sub == "" or sub in self.EPOCH_SUBROLES)
+        decided[w["id"]] = counts
+        return counts
+
+    def _epoch_entries(self, wins: list[dict], bundles: set[str], keep: set | frozenset = frozenset(),
+                       cache: dict | None = None) -> dict[str, tuple]:
+        """{bundle: sorted (id, title) of its counted windows}, for the apps in `bundles`; a counted window with a sheet
+        open adds an entry of its own, so a sheet coming or going is a change of that window."""
+        cache = {} if cache is None else cache
+        inv: dict[str, list] = {}
+        for w in wins:
+            b = (w.get("bundle") or "").lower()
+            if b not in bundles or not self._counts_for_epoch(w, cache, keep):
+                continue
+            inv.setdefault(b, []).append((w["id"], w["title"]))
+            pid = w.get("pid")
+            known = self._ax_known(pid, cache)[0] if pid else None
+            if known and known.get(str(w["id"]).partition("#")[2] + "/sheet"):
+                inv[b].append((w["id"] + "/sheet", ""))
+        return {b: tuple(sorted(v)) for b, v in inv.items()}
+
     def snapshot(self) -> dict:
         wins = self._windows()
         front = self._front()
@@ -456,13 +548,7 @@ class HandsExecutor:
         # task starting to operate another app widens what is watched, it is no change (PR #49 review: the first
         # observe made the next snapshot a new epoch, and the observation it had just returned was stale).
         task = self._task_bundles()
-        inventory: dict[str, tuple] = {}
-        for w in wins:
-            b = (w.get("bundle") or "").lower()
-            if b in task:
-                inventory.setdefault(b, [])
-                inventory[b].append((w["id"], w["title"]))
-        inventory = {b: tuple(sorted(v)) for b, v in inventory.items()}
+        inventory = self._epoch_entries(wins, task, keep=self._task_windows())
         before = self._inventory or {}
         changed = [b for b in before if b in task and inventory.get(b, ()) != before[b]]
         input_at = self._last_input_at()
@@ -518,7 +604,10 @@ class HandsExecutor:
         # the first look at an app: its windows *before* the read are the baseline the next snapshots compare
         # against -- taken after, a page that navigated while the driver read it would be the baseline, and the
         # observation of the page before would pass (PR #49 review); widening the watch is still no change
-        baseline = (tuple(sorted((w["id"], w["title"]) for w in self._windows() if (w.get("bundle") or "").lower() == key))
+        # -- counted by the same rule as every snapshot (hands #56 review: a helper window there at observe time was
+        # in the baseline and "vanished" at the next snapshot, staling the observation just made)
+        pre = self._windows()
+        baseline = (self._epoch_entries(pre, {key}, keep=self._task_windows() | {window}).get(key, ())
                     if self._inventory is not None and key not in self._inventory else None)
         obs: Observation = d.observe()
         landed = getattr(d, "_pinned_window", None)
@@ -534,6 +623,12 @@ class HandsExecutor:
         self.current[bundle] = window
         if baseline is not None and self._inventory is not None and key not in self._inventory:
             self._inventory[key] = baseline
+        elif self._inventory is not None and key in self._inventory and window not in {i for i, _ in self._inventory[key]}:
+            # a window of an app already watched, not counted until now (a frameless main window): observing it makes
+            # it the task's, counted from here on with the title it had before the read -- no change by itself
+            title = next((w["title"] for w in pre if w["id"] == window), None)
+            if title is not None:
+                self._inventory[key] = tuple(sorted(self._inventory[key] + ((window, title),)))
         els = []
         texts = []
         for e in obs.elements:

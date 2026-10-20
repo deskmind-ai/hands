@@ -76,6 +76,7 @@ def _executor():
     ex._driver = lambda bundle: stub            # noqa: SLF001 -- the point of the tests is the layer above the driver
     ex._document = lambda window, wins: None   # noqa: SLF001 -- no desktop: the app says no document
     ex._last_input_at = lambda: 0.0            # noqa: SLF001 -- the user has not touched the Mac
+    ex._ax_window_kinds = lambda pid: None      # noqa: SLF001 -- no accessibility: every window counts
     return ex, stub
 
 
@@ -450,6 +451,47 @@ class TaskScope(unittest.TestCase):
         self.assertEqual(ex.snapshot()["epoch"], e0)
         state["wins"] = [_win("12", title="hello.txt")] + state["wins"][1:]    # the task's own app: a change
         self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
+
+    def test_a_helper_surface_coming_and_going_does_not_move_the_epoch_and_a_dialog_does(self):
+        """A browser's pop-up or helper window, judged by its accessibility role (another subrole, or not among the
+        app's accessibility windows at all), comes and goes without staling anything; a dialog is a change (rc.10
+        weather trace, 10-21). No app name is looked at."""
+        ex, _ = _executor()
+        state = {"wins": [_win("12")], "ax": {"12": "AXStandardWindow"}}
+        ex._windows = lambda every=False: state["wins"]   # noqa: SLF001
+        ex._front = lambda: "文本编辑"                      # noqa: SLF001
+        ex._ax_window_kinds = lambda pid: dict(state["ax"])   # noqa: SLF001
+        ex.observe(W12)
+        e0 = ex.snapshot()["epoch"]
+        state["wins"] = [_win("12"), _win("30746", title="")]                  # not an accessibility window
+        self.assertEqual(ex.snapshot()["epoch"], e0)
+        state["wins"] = [_win("12"), _win("30754", title="")]
+        state["ax"] = {"12": "AXStandardWindow", "30754": "AXUnknown"}         # another subrole
+        self.assertEqual(ex.snapshot()["epoch"], e0)
+        state["wins"] = [_win("12")]                                           # gone again
+        self.assertEqual(ex.snapshot()["epoch"], e0)
+        state["wins"] = [_win("12"), _win("40", title="存储为")]
+        state["ax"] = {"12": "AXStandardWindow", "40": "AXDialog"}             # a dialog: a change
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
+        state["wins"] = [_win("12"), _win("40", title="存储为"), _win("41", title="新文稿")]
+        state["ax"] = {"12": "AXStandardWindow", "40": "AXDialog", "41": "AXStandardWindow"}
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 2)                       # a new standard window: a change
+
+    def test_when_accessibility_cannot_be_read_every_window_counts(self):
+        """No answer from accessibility is no reason to stop seeing windows: unknown, so counted, as before."""
+        ex, _ = _executor()
+        state = {"wins": [_win("12")]}
+        ex._windows = lambda every=False: state["wins"]   # noqa: SLF001
+        ex._front = lambda: "文本编辑"                      # noqa: SLF001
+        ex._ax_window_kinds = lambda pid: None              # noqa: SLF001
+        ex.observe(W12)
+        e0 = ex.snapshot()["epoch"]
+        state["wins"] = [_win("12"), _win("30746", title="")]
+        self.assertEqual(ex.snapshot()["epoch"], e0 + 1)
+        ex._ax_window_kinds = lambda pid: {"12": "AXStandardWindow", "50": ""}   # noqa: SLF001
+        state["wins"] = [_win("12"), _win("30746", title=""), _win("50", title="")]   # 50: subrole unread, counted
+        e1 = ex.snapshot()["epoch"]
+        self.assertEqual(e1, e0 + 2)                     # 30746 vanished from the count, 50 appeared: one change
 
     def test_starting_to_operate_an_app_is_no_change(self):
         """begin -> observe -> snapshot: the first observe widens the watched apps; the snapshot after it must not

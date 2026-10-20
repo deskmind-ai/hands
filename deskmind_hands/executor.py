@@ -442,6 +442,47 @@ class HandsExecutor:
         #: was renamed). A stale step upstream can then say what made it stale (rc.9, 10-20).
         self._epoch_reason = {"epoch": self.epoch, "at": round(self._epoch_at, 3), **(reason or {"by": "action"})}
 
+    #: Window subroles that are windows the task or the user works in: what appears, vanishes or is renamed among
+    #: them is a change. Other surfaces an app puts up for a moment (a browser's pop-ups and helper windows) are not:
+    #: three stales in one rc.10 weather run came from Chrome windows that came and went (owner's trace, 10-21).
+    EPOCH_SUBROLES = {"AXStandardWindow", "AXDialog", "AXSystemDialog"}
+
+    def _ax_window_kinds(self, pid: int) -> dict[str, str] | None:
+        """{window-server id: AX subrole ("" when unread)} of the app's accessibility windows; None when they cannot
+        be read (no permission, no answer), which leaves every window counted."""
+        try:
+            import ApplicationServices as AS
+            from .drivers.axchrome import _get, _window_id
+            app = AS.AXUIElementCreateApplication(int(pid))
+            AS.AXUIElementSetMessagingTimeout(app, 1.0)
+            out: dict[str, str] = {}
+            for win in _get(app, "AXWindows") or []:
+                i = _window_id(win)
+                if i is not None:
+                    out[str(i)] = str(_get(win, "AXSubrole") or "")
+            return out or None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _counts_for_epoch(self, w: dict, cache: dict) -> bool:
+        """Whether a window of a task app enters the epoch's inventory, judged by the window's own role, never by the
+        app it belongs to. Counted: a standard window or a dialog, a window whose subrole cannot be read, and every
+        window of an app whose accessibility windows cannot be read (as before). Not counted: a window accessibility
+        names with another subrole, or one that is not among the app's accessibility windows at all (a pop-up, a
+        tooltip, a helper surface). A real window not yet listed there is counted at the next snapshot."""
+        pid = w.get("pid")
+        if not pid:
+            return True
+        if pid not in cache:
+            cache[pid] = self._ax_window_kinds(pid)
+        known = cache[pid]
+        if known is None:
+            return True
+        sub = known.get(str(w["id"]).partition("#")[2])
+        if sub is None:
+            return False
+        return sub == "" or sub in self.EPOCH_SUBROLES
+
     def snapshot(self) -> dict:
         wins = self._windows()
         front = self._front()
@@ -457,9 +498,10 @@ class HandsExecutor:
         # observe made the next snapshot a new epoch, and the observation it had just returned was stale).
         task = self._task_bundles()
         inventory: dict[str, tuple] = {}
+        kinds: dict = {}
         for w in wins:
             b = (w.get("bundle") or "").lower()
-            if b in task:
+            if b in task and self._counts_for_epoch(w, kinds):
                 inventory.setdefault(b, [])
                 inventory[b].append((w["id"], w["title"]))
         inventory = {b: tuple(sorted(v)) for b, v in inventory.items()}

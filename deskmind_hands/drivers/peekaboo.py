@@ -2687,6 +2687,7 @@ class PeekabooDriver:
         cur = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
         t0 = time.time()
         self._foreground_actions += 1
+        arrived = False
         try:
             subprocess.run(["/usr/bin/open", "-b", CHAT_APP], capture_output=True, timeout=10)
             for _ in range(30):
@@ -2695,6 +2696,7 @@ class PeekabooDriver:
                 time.sleep(0.05)
             else:
                 return ExecResult(False, "the chat app did not come to the front; nothing was clicked")
+            arrived = True
             time.sleep(0.15)
             for kind in (Quartz.kCGEventMouseMoved, Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
                 Quartz.CGEventPost(Quartz.kCGHIDEventTap,
@@ -2704,7 +2706,7 @@ class PeekabooDriver:
         finally:
             Quartz.CGWarpMouseCursorPosition(cur)
             Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-            self._give_front_back(prev, ours=CHAT_APP)
+            self._give_front_back(prev, ours=CHAT_APP, late_s=0.0 if arrived else self.LATE_FRONT_S)
         self._snapshot = None
         if label.startswith("发送"):
             self._chat_sends += 1
@@ -2816,11 +2818,14 @@ class PeekabooDriver:
 
                 def back(prev=prev, restore=restore):
                     # The front goes back only if it is still the app brought forward: the user who clicked another
-                    # app meanwhile keeps it (hands #55 review). The browser's stacking is put back whoever had the
-                    # front, the user's own window included when they were in this browser (takeover).
+                    # app meanwhile keeps it (hands #55 review). An app asked forward that had not arrived is watched
+                    # for a moment longer, so one that comes late is given back too. The browser's stacking is put
+                    # back whoever had the front, the user's own window included when they were in this browser
+                    # (takeover).
                     try:
-                        if prev.lower() != bundle.lower() and self._front_bundle().lower() == bundle.lower():
-                            self._give_front_back(prev, ours=bundle)
+                        if prev.lower() != bundle.lower():
+                            late = self.LATE_FRONT_S if brought and not arrived else 0.0
+                            self._give_front_back(prev, ours=bundle, late_s=late)
                     except Exception:  # noqa: BLE001
                         pass
                     if restore:
@@ -2828,11 +2833,12 @@ class PeekabooDriver:
                             self._osa(f'tell application id "{self._q(bundle)}" to set index of window id {restore} to 1')
                         except Exception:  # noqa: BLE001
                             pass
-                retry, sent, ime = False, False, None
+                retry, sent, ime, brought, arrived = False, False, None, False, False
                 # Everything after the app may have come forward is inside the try: a timeout reading the front app
                 # or an input source that throws still gives the front back (hands #55 review)
                 try:
-                    if not self._bring_forward(bundle, browser):
+                    brought = self._bring_forward(bundle, browser)
+                    if not brought:
                         return False, f"the run's own {bundle} window could not be raised; nothing was done"
                     for _ in range(30):
                         if self._front_bundle().lower() == bundle.lower():
@@ -2840,6 +2846,7 @@ class PeekabooDriver:
                         time.sleep(0.05)
                     else:
                         return False, f"{bundle} did not come to the front; nothing was done"
+                    arrived = True
                     time.sleep(0.15)
                     # Touched while it came forward -- any input since the idle check, the spectator's too: nothing
                     # has been sent yet, so step back and wait again.
@@ -2904,6 +2911,25 @@ class PeekabooDriver:
         mine = [p for p in pids if p and (getattr(NSRunningApplication.runningApplicationWithProcessIdentifier_(p),
                                                     "bundleIdentifier", lambda: None)() or "").lower() == bundle.lower()]
         return max(mine) if mine else None
+
+    @classmethod
+    def _app_pid(cls, bundle: str) -> int | None:
+        """The process of `bundle`: the one with windows if any (_pid_of), else the newest running instance by bundle
+        id -- an app with no window open (Finder on a bare desktop) can still be given the front (hands #55
+        review)."""
+        try:
+            pid = cls._pid_of(bundle)
+        except Exception:  # noqa: BLE001
+            pid = None
+        if pid:
+            return pid
+        try:
+            from AppKit import NSRunningApplication
+            apps = [a for a in (NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle) or [])
+                    if not a.isTerminated()]
+            return max(int(a.processIdentifier()) for a in apps) if apps else None
+        except Exception:  # noqa: BLE001
+            return None
 
     #: A pop-up's own prompt, not a choice: "Choose…", "Select…", "请选择".
     POPUP_PROMPT = re.compile(r"^(?:choose|select|pick|please select|请选择|--)|[…]$|\.\.\.$", re.I)
@@ -3075,7 +3101,7 @@ class PeekabooDriver:
         """Make the app frontmost through accessibility (its AXFrontmost), without a reopen."""
         try:
             import ApplicationServices as AS
-            pid = self._pid_of(bundle)
+            pid = self._app_pid(bundle)
             if not pid:
                 return False
             app = AS.AXUIElementCreateApplication(pid)
@@ -3096,18 +3122,33 @@ class PeekabooDriver:
         except Exception:  # noqa: BLE001
             return False
 
-    def _give_front_back(self, prev: str, ours: str | None = None) -> None:
+    #: How long an app asked forward that had not arrived is still watched for, to give the front back if it comes.
+    LATE_FRONT_S = 2.0
+
+    def _give_front_back(self, prev: str, ours: str | None = None, late_s: float = 0.0) -> None:
         """Give `prev` the front again, through accessibility (AXFrontmost) for every app: `open -b` is a reopen,
         which un-minimises a browser's windows (deskmind#73) and opens a new Finder window on a bare desktop (hands
-        #55 review). With `ours`, the app the driver brought forward: given back only while that one is still in
-        front, and the tries stop once the user has gone to a third app."""
-        for _ in range(20):
-            front = self._front_bundle()
+        #55 review). With `ours`, the app the driver brought forward: given back only while that one is in front,
+        and the tries stop once the user has gone to a third app. A front that cannot be read is not taken for the
+        user's choice: it is read again. With `late_s`, `prev` still in front is watched that long, so an app that
+        comes forward late is given back as well."""
+        deadline = time.time() + late_s
+        tries = 0
+        while tries < 20:
+            front = self._front_bundle() or ""
+            if not front:
+                tries += 1          # unknown, not "the user went elsewhere"
+                time.sleep(0.1)
+                continue
             if front.lower() == prev.lower():
-                return
+                if time.time() >= deadline:
+                    return
+                time.sleep(0.1)     # watching for a late arrival
+                continue
             if ours is not None and front.lower() != ours.lower():
-                return      # the user went elsewhere: theirs to keep
+                return              # the user went elsewhere: theirs to keep
             self._make_frontmost(prev)
+            tries += 1
             time.sleep(0.1)
 
     @staticmethod

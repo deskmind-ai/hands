@@ -458,6 +458,7 @@ class TaskScope(unittest.TestCase):
         w = InputWatch()
         w.active, w.keys = True, True
         w._pid_bundle = {5: "com.googlecode.iterm2", 6: "com.apple.TextEdit", 7: "ai.deskmind.app"}
+        w._pid_regular = {5: True, 6: True, 7: True}
         ex._watch, ex._watch_tried = w, True
         ex.observe(W12)
         w.note(5, at=100.0)                                # typing in a terminal

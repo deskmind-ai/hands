@@ -34,3 +34,20 @@ for e in other_refusals:
     print("   ", (e.get("why") or "")[:140])
 if lat:
     print("step latency ms: median", round(statistics.median(lat)), "max", round(max(lat)), "n", len(lat))
+
+# the raw executor events (harness #27): what the hands driver could hear, and why each consent was asked
+trace_file = os.path.join(d, "trace.jsonl")
+if os.path.exists(trace_file):
+    trace = [json.loads(line) for line in open(trace_file, encoding="utf-8")]
+    begin = next((e for e in trace if e.get("kind") == "executor.begin"), {})
+    iw = begin.get("input_watch")
+    meaning = {"keys": "keyboard and mouse, by target (what the #49 check needs)",
+               "mouse": "mouse only -- no Input Monitoring for DeskMind Hands: every key press counts, the #49 check is void",
+               "": "no tap -- every input counts, the #49 check is void"}
+    print("input_watch:", repr(iw), "-", meaning.get(iw, "not reported (hands older than the field)"))
+    asked = [e for e in trace if e.get("kind") == "executor.consent_needed"]
+    print("consent asked:", len(asked))
+    for e in asked:
+        print("   ", (e.get("why") or "")[:160])
+else:
+    print("trace.jsonl: none (harness older than #27): input_watch and consent reasons are not recorded")

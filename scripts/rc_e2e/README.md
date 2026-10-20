@@ -64,12 +64,14 @@ python3 scripts/rc_e2e/summarize.py; osascript -e 'tell application "System Even
 
 ```
 rm -rf /tmp/dm-hello2 && mkdir -p /tmp/dm-hello2
-uv run --extra macos python scripts/rc_e2e/press_shift.py 90 &       # 每秒按放一次 Shift（不打出字），落在前台应用
+uv run --extra macos python scripts/rc_e2e/press_shift.py 90 com.apple.Terminal &   # 每次先把终端带到前台，再按放 Shift（不打出字）
 DM_CONFIG=ark-evolving python3 scripts/rc_e2e/run_task.py /tmp/rc-typing.log /tmp/dm-hello2 "在文本编辑里新建一个文档，写上「你好 DeskMind」，保存为 hello.txt 放到任务目录"
 wait; python3 scripts/rc_e2e/summarize.py
 ```
 
-`press_shift.py` 结束时打印每次按键时的前台应用。过：outcome `succeeded`；前台是终端等非任务应用时的按键不引起 stale（stale 次数为 0 或只出现在任务应用自己在前台的时候）。若 `front` 显示 `com.apple.loginwindow`，屏幕锁了，这次不算。
+`press_shift.py` 每次按键前把指定应用（默认终端）带到前台，结束时打印每次按键时的前台应用；不到一半落在指定应用上会警告。`summarize.py` 打印 `input_watch`：要是 `keys` 这项才有效；`mouse` 表示 DeskMind Hands 没有「输入监控」（键盘全算，这项白测），空表示连 tap 都没有（需要 harness #27 之后的版本才记录这个字段）。
+
+过：`input_watch` 是 `keys`；outcome `succeeded`；stale 次数为 0（按键都落在终端，不是任务应用）。注意任务的前台路线会把任务应用短暂带到前台，那时的按键落在任务应用上，引起 stale 是对的。若前台显示 `com.apple.loginwindow`，屏幕锁了，这次不算。
 
 ## 不同模型之间能不能比
 

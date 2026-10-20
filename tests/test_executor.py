@@ -365,33 +365,27 @@ class Windows(unittest.TestCase):
         """peekaboo's failure (window not found, timeout, no JSON) is an error upstream, not a closed or focused
         window (PR #48 review)."""
         ex, _ = _executor()
-        ex.user_active = lambda: False   # noqa: SLF001
-        focus = {"kind": "focus_window", "window": W12, "foreground_ok": True}
         ex._pk = lambda args: None   # noqa: SLF001 -- the command failed
         self.assertEqual(ex.perform({"kind": "close_window", "window": W12})["status"], "error")
-        self.assertEqual(ex.perform(focus)["status"], "error")
         ex._pk = lambda args: {}   # noqa: SLF001 -- succeeded with nothing to say
         self.assertEqual(ex.perform({"kind": "close_window", "window": W12})["status"], "ok")
-        self.assertEqual(ex.perform(focus)["status"], "ok")
+        ex._windows = lambda every=False: []   # noqa: SLF001 -- the window is gone
+        self.assertEqual(ex.perform({"kind": "focus_window", "window": W12})["status"], "error")
 
-    def test_focus_takes_the_front_only_when_the_step_allows_it_and_the_user_is_still(self):
-        """focus_window raised the window whatever the layer above said and whatever the user was doing (hands #55
-        review): without foreground_ok, or with the user active, it only makes it the window to work in."""
-        ex, _ = _executor()
+    def test_focus_never_takes_the_front(self):
+        """A raise kept the front for good, and the user typing in another app (not the task's, so not counted by
+        the input watch) had their keys go into the task's window (hands #55 review): focus only makes the window
+        the one to work in, whatever the step allows."""
+        ex, stub = _executor()
+        ex._windows = lambda every=False: [_win("12")]   # noqa: SLF001
         calls = []
         ex._pk = lambda args: calls.append(args) or {}   # noqa: SLF001
-        for allowed, active in ((False, False), (True, True)):
-            ex.user_active = lambda a=active: a   # noqa: SLF001
-            act = {"kind": "focus_window", "window": W12}
-            if allowed:
-                act["foreground_ok"] = True
+        for act in ({"kind": "focus_window", "window": W12}, {"kind": "focus_window", "window": W12, "foreground_ok": True}):
             r = ex.perform(act)
             self.assertEqual(r["status"], "ok")
             self.assertIn("not brought to the front", r["why"])
         self.assertEqual(calls, [])
-        ex.user_active = lambda: False   # noqa: SLF001
-        ex.perform({"kind": "focus_window", "window": W12, "foreground_ok": True})
-        self.assertEqual(calls[0][:2], ["window", "focus"])
+        self.assertEqual(stub._pinned_window, "12")
 
     def test_pk_tells_failure_from_an_empty_answer(self):
         from types import SimpleNamespace
@@ -755,9 +749,10 @@ class Background(unittest.TestCase):
 class Audio(unittest.TestCase):
     def test_only_the_tasks_apps_are_reported_with_since_when(self):
         """A call in another app is not the task's music; a song already playing before the run began is not one
-        the run started (hands #55 review)."""
+        the run started, however late it is first read (hands #55 review)."""
         ex, _ = _executor()
         ex._began_at = 1000.0                                  # noqa: SLF001
+        ex._audio_before = {TE.lower()}                        # noqa: SLF001 -- playing as the run began
         ex._task_bundles = lambda: {TE.lower()}                # noqa: SLF001
         playing = [[{"bundle": TE, "app_name": "TE"}, {"bundle": "us.zoom.xos", "app_name": "zoom"}]]
         clock = [1000.1]

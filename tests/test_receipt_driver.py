@@ -131,7 +131,7 @@ class BrowserForeground(unittest.TestCase):
         d._browser_front_sid = lambda bundle: None
         d.given_back = []
 
-        def give_back(prev):
+        def give_back(prev, ours=None):
             d.given_back.append(prev)
             d.front[0] = prev
         d._give_front_back = give_back
@@ -194,6 +194,89 @@ class BrowserForeground(unittest.TestCase):
             ok, why = d._flash("com.google.Chrome", lambda Q: "typed")
         self.assertFalse(ok)
         self.assertEqual(d.brought, [])
+
+    def test_the_user_who_went_to_another_app_meanwhile_is_not_pulled_back(self):
+        """They clicked Slack while the step ran: the front is theirs, not given back to the app they had before
+        (hands #55 review)."""
+        import os as _os
+        import sys as _sys
+        import types
+        from unittest import mock
+        from deskmind_hands.drivers.peekaboo import PeekabooDriver
+        q = types.ModuleType("Quartz")
+        q.CGEventGetLocation = lambda e: (0, 0)
+        q.CGEventCreate = lambda x: None
+        q.CGWarpMouseCursorPosition = lambda p: None
+        q.CGAssociateMouseAndMouseCursorPosition = lambda b: None
+        d = self._driver(True)
+        d._own_window_in_front = lambda bundle: True
+        del d._give_front_back                         # the real one
+        made = []
+        d._make_frontmost = lambda b: made.append(b) or True
+
+        def step(Q):
+            d.front[0] = "com.tinyspeck.slackmacgap"   # the user clicked Slack
+            return "typed"
+        with mock.patch.dict(_os.environ, {"HANDS_FLASH_APPS": "com.google.Chrome"}), \
+             mock.patch.dict(_sys.modules, {"Quartz": q}), \
+             mock.patch("deskmind_hands.drivers.peekaboo._ascii_input_source", return_value=types.SimpleNamespace(restore=lambda: None)), \
+             mock.patch("deskmind_hands.drivers.peekaboo.subprocess.run") as run, \
+             mock.patch("deskmind_hands.drivers.peekaboo.time.sleep"):
+            ok, _ = d._flash("com.google.Chrome", step)
+        self.assertTrue(ok)
+        self.assertEqual(made, [])
+        self.assertEqual(d.front[0], "com.tinyspeck.slackmacgap")
+        run.assert_not_called()
+
+    def test_any_input_since_the_idle_check_steps_back(self):
+        """A click in the few hundred ms the raise takes is the user's: nothing is sent, the front goes back
+        (hands #55 review: only the last 0.3 s was looked at)."""
+        import os as _os
+        import sys as _sys
+        import types
+        from unittest import mock
+        q = types.ModuleType("Quartz")
+        q.CGEventGetLocation = lambda e: (0, 0)
+        q.CGEventCreate = lambda x: None
+        d = self._driver(True)
+        d._takeover = lambda: False
+        d._own_window_in_front = lambda bundle: True
+        d._announce_wait = lambda waited, bundle, what: True
+        clock = [100.0]
+        idle = iter([10.0, 0.5])                       # still at the check; touched 0.5 s ago, 1 s after it
+        d._hid_idle = lambda: next(idle, 0.0)
+
+        def bring(bundle, browser):
+            d.brought.append((bundle, browser))
+            d.front[0] = bundle
+            clock[0] += 1.5
+            return True
+        d._bring_forward = bring
+        sent = []
+        with mock.patch.dict(_os.environ, {"HANDS_FLASH_APPS": "com.google.Chrome", "HANDS_FLASH_WAIT_S": "0"}), \
+             mock.patch.dict(_sys.modules, {"Quartz": q}), \
+             mock.patch("deskmind_hands.drivers.peekaboo.time.time", side_effect=lambda: clock[0]), \
+             mock.patch("deskmind_hands.drivers.peekaboo.time.sleep"):
+            ok, _ = d._flash("com.google.Chrome", lambda Q: sent.append(1) or "typed")
+        self.assertFalse(ok)
+        self.assertEqual(sent, [])
+        self.assertEqual(d.given_back, ["com.googlecode.iterm2"])
+
+    def test_no_app_gets_the_front_back_by_a_reopen(self):
+        """`open -b com.apple.finder` on a bare desktop opens a Finder window (hands #55 review): every app gets the
+        front back through accessibility."""
+        from unittest import mock
+        from deskmind_hands.drivers.peekaboo import PeekabooDriver
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        made = []
+        fronts = iter(["com.google.Chrome", "com.apple.finder"])
+        d._front_bundle = lambda: next(fronts, "com.apple.finder")
+        d._make_frontmost = lambda b: made.append(b) or True
+        with mock.patch("deskmind_hands.drivers.peekaboo.subprocess.run") as run, \
+             mock.patch("deskmind_hands.drivers.peekaboo.time.sleep"):
+            d._give_front_back("com.apple.finder", ours="com.google.Chrome")
+        run.assert_not_called()
+        self.assertEqual(made, ["com.apple.finder"])
 
     def test_a_browser_gets_the_front_back_without_a_reopen(self):
         """`open -b` on a browser is a reopen and can open a window of its own (deskmind#73): the front goes back to

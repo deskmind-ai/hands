@@ -2704,11 +2704,7 @@ class PeekabooDriver:
         finally:
             Quartz.CGWarpMouseCursorPosition(cur)
             Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-            for _ in range(20):
-                subprocess.run(["/usr/bin/open", "-b", prev], capture_output=True, timeout=10)
-                time.sleep(0.1)
-                if self._front_bundle() == prev:
-                    break
+            self._give_front_back(prev, ours=CHAT_APP)
         self._snapshot = None
         if label.startswith("发送"):
             self._chat_sends += 1
@@ -2811,6 +2807,7 @@ class PeekabooDriver:
                 continue
             watching = prev.lower() in spectator or prev.lower() == bundle.lower()
             if self._takeover() or self._hid_idle() >= (1.0 if watching else still):
+                checked_at = time.time()   # the user was still up to here: any input after it is theirs
                 cur = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
                 t0 = time.time()
                 # a browser: its own front window noted first, so the stacking is put back after (the run's window
@@ -2818,45 +2815,61 @@ class PeekabooDriver:
                 restore = self._browser_front_sid(bundle) if browser else None
 
                 def back(prev=prev, restore=restore):
-                    self._give_front_back(prev)
+                    # The front goes back only if it is still the app brought forward: the user who clicked another
+                    # app meanwhile keeps it (hands #55 review). The browser's stacking is put back whoever had the
+                    # front, the user's own window included when they were in this browser (takeover).
+                    try:
+                        if prev.lower() != bundle.lower() and self._front_bundle().lower() == bundle.lower():
+                            self._give_front_back(prev, ours=bundle)
+                    except Exception:  # noqa: BLE001
+                        pass
                     if restore:
-                        self._osa(f'tell application id "{self._q(bundle)}" to set index of window id {restore} to 1')
-                if not self._bring_forward(bundle, browser):
-                    back()
-                    return False, f"the run's own {bundle} window could not be raised; nothing was done"
-                for _ in range(30):
-                    if self._front_bundle().lower() == bundle.lower():
-                        break
-                    time.sleep(0.05)
-                else:
-                    back()
-                    return False, f"{bundle} did not come to the front; nothing was done"
-                time.sleep(0.15)
-                if not self._takeover() and not watching and self._hid_idle() < 0.3:
-                    # Touched while it came forward: nothing has been sent yet, so step back and wait again.
-                    back()
-                    waited = self._announce_wait(waited, bundle, what)
-                    still = min(still * 2, 30.0)
-                    continue
-                if browser and not self._own_window_in_front(bundle):
-                    # the run's own window is not the one in front (the user's came up): nothing is sent into it
-                    back()
-                    return False, f"the run's own {bundle} window could not be put in front; nothing was done"
-                if waited:
-                    self._resumed()
-                if STOP.is_set():
-                    back()
-                    return False, "stopped by the app; nothing was done"
-                self._foreground_actions += 1
-                ime = _ascii_input_source()
+                        try:
+                            self._osa(f'tell application id "{self._q(bundle)}" to set index of window id {restore} to 1')
+                        except Exception:  # noqa: BLE001
+                            pass
+                retry, sent, ime = False, False, None
+                # Everything after the app may have come forward is inside the try: a timeout reading the front app
+                # or an input source that throws still gives the front back (hands #55 review)
                 try:
+                    if not self._bring_forward(bundle, browser):
+                        return False, f"the run's own {bundle} window could not be raised; nothing was done"
+                    for _ in range(30):
+                        if self._front_bundle().lower() == bundle.lower():
+                            break
+                        time.sleep(0.05)
+                    else:
+                        return False, f"{bundle} did not come to the front; nothing was done"
+                    time.sleep(0.15)
+                    # Touched while it came forward -- any input since the idle check, the spectator's too: nothing
+                    # has been sent yet, so step back and wait again.
+                    if not self._takeover() and self._hid_idle() < time.time() - checked_at:
+                        retry = True
+                        continue
+                    if browser and not self._own_window_in_front(bundle):
+                        # the run's own window is not the one in front (the user's came up): nothing is sent into it
+                        return False, f"the run's own {bundle} window could not be put in front; nothing was done"
+                    if waited:
+                        self._resumed()
+                    if STOP.is_set():
+                        return False, "stopped by the app; nothing was done"
+                    self._foreground_actions += 1
+                    ime = _ascii_input_source()
+                    sent = True
                     detail = perform(Quartz)
                 finally:
-                    ime.restore()
-                    Quartz.CGWarpMouseCursorPosition(cur)
-                    Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-                    if prev.lower() != bundle.lower():
-                        back()
+                    if ime is not None:
+                        try:
+                            ime.restore()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if sent:
+                        Quartz.CGWarpMouseCursorPosition(cur)
+                        Quartz.CGAssociateMouseAndMouseCursorPosition(True)
+                    back()
+                    if retry:
+                        waited = self._announce_wait(waited, bundle, what)
+                        still = min(still * 2, 30.0)
                 return True, f"{detail} ({bundle} in front {time.time() - t0:.1f}s, then {prev} again)"
             if time.time() > deadline:
                 if waited:
@@ -3083,20 +3096,19 @@ class PeekabooDriver:
         except Exception:  # noqa: BLE001
             return False
 
-    def _give_front_back(self, prev: str) -> None:
-        # a browser gets the front back through accessibility, never `open -b` (a reopen: deskmind#73)
-        if prev.lower() in self.BROWSERS:
-            for _ in range(20):
-                self._make_frontmost(prev)
-                time.sleep(0.1)
-                if self._front_bundle() == prev:
-                    return
-            return
+    def _give_front_back(self, prev: str, ours: str | None = None) -> None:
+        """Give `prev` the front again, through accessibility (AXFrontmost) for every app: `open -b` is a reopen,
+        which un-minimises a browser's windows (deskmind#73) and opens a new Finder window on a bare desktop (hands
+        #55 review). With `ours`, the app the driver brought forward: given back only while that one is still in
+        front, and the tries stop once the user has gone to a third app."""
         for _ in range(20):
-            subprocess.run(["/usr/bin/open", "-b", prev], capture_output=True, timeout=10)
+            front = self._front_bundle()
+            if front.lower() == prev.lower():
+                return
+            if ours is not None and front.lower() != ours.lower():
+                return      # the user went elsewhere: theirs to keep
+            self._make_frontmost(prev)
             time.sleep(0.1)
-            if self._front_bundle() == prev:
-                break
 
     @staticmethod
     def _post_click(Q, x: float, y: float, count: int = 1) -> None:

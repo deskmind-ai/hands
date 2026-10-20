@@ -219,6 +219,9 @@ class HandsExecutor:
         self.workspace = Path(workspace) if workspace else self.scratch
         track_children()   # every child's pid recorded as it starts: its posted events are the driver's, not the user's
         self._began_at = time.time()
+        # what was already playing as the run began: not something the run started, however late it is first read
+        self._audio_seen = {a["bundle"].lower(): self._began_at for a in playing_apps()}
+        self._audio_before = set(self._audio_seen)
         STOP.clear()       # a new run starts unstopped (a stop that came before begin is applied right after this)
         self.epoch = 1
         #: When the epoch was last set, and the inventory it was set on: a user's input after that moment, or a
@@ -374,19 +377,20 @@ class HandsExecutor:
         and one app's tabs cannot be told apart, so this is evidence to weigh, not a verdict (hands #55 review)."""
         now = time.time()
         seen = self.__dict__.setdefault("_audio_seen", {})
-        began = self.__dict__.setdefault("_began_at", now)
         task = self._task_bundles()
+        before = self.__dict__.setdefault("_audio_before", set())
         playing = playing_apps()
         now_on = {a["bundle"].lower() for a in playing}
         for b in list(seen):
             if b not in now_on:
                 seen.pop(b, None)       # stopped: a later start is a new one
+                before.discard(b)
         out = []
         for a in playing:
             b = a["bundle"].lower()
             first = seen.setdefault(b, now)
             if b in task:
-                out.append({**a, "playing_since": round(first, 3), "started_after_begin": first > began + 0.5})
+                out.append({**a, "playing_since": round(first, 3), "started_after_begin": b not in before})
         return out
 
     def _needs_foreground(self) -> list[str]:
@@ -594,17 +598,16 @@ class HandsExecutor:
                 return {"status": "error", "why": f"the window {window} could not be closed (it may be gone already)", "files": []}
             return {"status": "ok", "files": []}
         if kind == "focus_window":
-            # the window the task works in from now on; brought to the front only when the layer above allows the
-            # foreground for this step and the user is not at the keyboard or mouse -- focus took the front without
-            # either (hands #55 review). Otherwise it is the observed window, in the background.
-            if not action.get("foreground_ok") or self.user_active() or is_browser(bundle):
-                d = self._driver(bundle)
-                d._pinned_window = wid or None
-                d._window_id = wid or None
-                return {"status": "ok", "window": window, "files": [], "why": "the window to work in; not brought to the front"}
-            if self._pk(["window", "focus", "--window-id", wid, "--json"]) is None:
-                return {"status": "error", "why": f"the window {window} could not be brought forward", "window": window, "files": []}
-            return {"status": "ok", "window": window, "files": []}
+            # The window the task works in from now on, in the background: never brought to the front. A raise
+            # here kept the front for good, and the user typing in another app (whose input the watch does not
+            # count: it is not the task's) had their keys go into the task's window (hands #55 review). A step
+            # that needs the foreground gets it for that step only, through the driver's flash.
+            if not any(w["id"] == window for w in self._windows(every=True)):
+                return {"status": "error", "why": f"the window {window} is not there", "window": window, "files": []}
+            d = self._driver(bundle)
+            d._pinned_window = wid or None
+            d._window_id = wid or None
+            return {"status": "ok", "window": window, "files": [], "why": "the window to work in; not brought to the front"}
         d = self._driver(bundle)
         obs = self.last_obs.get(window)
         if obs is None:

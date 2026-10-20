@@ -75,7 +75,17 @@ class InputWatch:
 
     def last_input_for(self, bundles: set[str]) -> float:
         """When input last went to one of `bundles` (lowercased), or anywhere unknown: the safe side."""
-        return max([self.last_unknown_at] + [self.last_by_bundle.get(b.lower(), 0.0) for b in bundles])
+        return self.last_input_where(bundles)[0]
+
+    def last_input_where(self, bundles: set[str]) -> tuple[float, str]:
+        """(when, where) of the latest input to one of `bundles` or to an unknown target: where is the bundle id, or
+        "unknown" (a system surface, a drag, an event that could not be read)."""
+        best = (self.last_unknown_at, "unknown")
+        for b in bundles:
+            t = self.last_by_bundle.get(b.lower(), 0.0)
+            if t > best[0]:
+                best = (t, b.lower())
+        return best
 
     def is_regular(self, pid: int) -> bool:
         if pid not in self._pid_regular:

@@ -498,6 +498,43 @@ class TaskScope(unittest.TestCase):
         self.assertEqual(ex._last_input_at(), 103.0)       # noqa: SLF001
 
 
+class EpochReason(unittest.TestCase):
+    def test_every_snapshot_says_why_the_epoch_last_moved(self):
+        """An action of the task's, the user's input to an app the task operates (which), or a window list that
+        changed (what): a stale step upstream can say what made it stale (rc.9, 10-20)."""
+        from deskmind_hands.inputwatch import InputWatch
+        ex, _ = _executor()
+        del ex._last_input_at
+        w = InputWatch()
+        w.active, w.keys = True, True
+        w._pid_bundle = {6: "com.apple.TextEdit"}
+        w._pid_regular = {6: True}
+        ex._watch, ex._watch_tried = w, True
+        state = {"wins": [_win("12")]}
+        ex._windows = lambda every=False: state["wins"]   # noqa: SLF001
+        ex._front = lambda: "文本编辑"                      # noqa: SLF001
+        ex.snapshot()
+        ex.observe(W12)
+        ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        r = ex.snapshot()["epoch_reason"]
+        self.assertEqual((r["by"], r["kind"], r["window"]), ("action", "click", W12))
+        time.sleep(0.01)
+        w.note(6, at=time.time())                          # the user clicked in TextEdit
+        s = ex.snapshot()
+        self.assertEqual(s["epoch_reason"]["by"], "input")
+        self.assertEqual(s["epoch_reason"]["to"], "com.apple.textedit")
+        self.assertEqual(s["epoch_reason"]["epoch"], s["epoch"])
+        time.sleep(0.01)
+        w.note(None, at=time.time())                       # a banner, a drag: unknown target
+        self.assertEqual(ex.snapshot()["epoch_reason"]["to"], "unknown")
+        state["wins"] = [_win("12", title="hello.txt"), _win("13", title="未命名 2")]
+        r = ex.snapshot()["epoch_reason"]
+        self.assertEqual(r["by"], "windows")
+        self.assertEqual(r["app"], "com.apple.textedit")
+        self.assertEqual(r["appeared"], [f"{TE}#13"])
+        self.assertEqual(r["renamed"], [{"id": W12, "from": "未命名", "to": "hello.txt"}])
+
+
 class Sends(unittest.TestCase):
     def test_send_controls_are_known_by_their_verb(self):
         for role, label in [("button", "发送"), ("button", "Send"), ("button", "Send message"), ("button", "发送消息"),

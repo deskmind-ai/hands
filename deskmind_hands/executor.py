@@ -307,6 +307,14 @@ class HandsExecutor:
         # foreground waits already treat it (PeekabooDriver._takeover).
         if takeover_until() > time.time():
             return False
+        # Like the epoch: the user is in the task's way only when their input goes to an app the task operates, or
+        # somewhere unknown (a system surface, a drag) -- typing in a terminal held a task's first step for two
+        # minutes (rc.9, 10-20). Needs the keyboard watched by target; without it every input counts, as before.
+        # Bringing an app forward is a separate guard: the driver waits for the Mac to be idle everywhere first
+        # (PeekabooDriver's foreground route), so a flash never takes keystrokes meant for another app.
+        w = getattr(self, "_watch", None)
+        if w is not None and w.active and w.keys:
+            return time.time() - w.last_input_for(self._task_bundles()) < self.USER_ACTIVE_S
         if Quartz is None:
             return False
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)

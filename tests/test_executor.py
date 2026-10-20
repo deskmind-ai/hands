@@ -535,6 +535,34 @@ class EpochReason(unittest.TestCase):
         self.assertEqual(r["renamed"], [{"id": W12, "from": "未命名", "to": "hello.txt"}])
 
 
+class UserActive(unittest.TestCase):
+    def test_the_user_is_in_the_way_only_when_their_input_goes_to_an_app_the_task_operates(self):
+        """Typing in a terminal held a task's first step for two minutes (rc.9, 10-20): with the keyboard watched by
+        target, only input to the task's apps, or to an unknown target, counts."""
+        from deskmind_hands.inputwatch import InputWatch
+        ex, _ = _executor()
+        w = InputWatch()
+        w.active, w.keys = True, True
+        w._pid_bundle = {5: "com.apple.Terminal", 6: "com.apple.TextEdit"}
+        w._pid_regular = {5: True, 6: True}
+        ex._watch, ex._watch_tried = w, True
+        ex.observe(W12)                                    # the task operates TextEdit
+        with mock.patch.dict(os.environ, {"HANDS_TAKEOVER_FILE": ""}):
+            w.note(5, at=time.time())                      # typing in the terminal
+            self.assertFalse(ex.user_active())
+            w.note(6, at=time.time())                      # a click in TextEdit
+            self.assertTrue(ex.user_active())
+            w.last_by_bundle.clear()
+            w.note(None, at=time.time())                   # a banner
+            self.assertTrue(ex.user_active())
+            w.last_unknown_at = time.time() - 10           # all of it long ago
+            self.assertFalse(ex.user_active())
+            w.keys = False                                 # no Input Monitoring: the global idle time, as before
+            with mock.patch("deskmind_hands.executor.Quartz") as q:
+                q.CGEventSourceSecondsSinceLastEventType.return_value = 0.5
+                self.assertTrue(ex.user_active())
+
+
 class Sends(unittest.TestCase):
     def test_send_controls_are_known_by_their_verb(self):
         for role, label in [("button", "发送"), ("button", "Send"), ("button", "Send message"), ("button", "发送消息"),

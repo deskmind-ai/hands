@@ -1,6 +1,7 @@
 """Where the user's input went: input to DeskMind is the user answering DeskMind, not changing their Mac."""
 from __future__ import annotations
 
+import os
 import unittest
 from unittest import mock
 
@@ -108,12 +109,14 @@ class Targets(unittest.TestCase):
         import os
         import sys
         import types
+        from deskmind_hands import inputwatch as iw
         w = InputWatch()
         self.assertTrue(w.posted_by_us(os.getpid()))
         self.assertFalse(w.posted_by_us(0))                # a hardware event
-        w._own_pids, w._own_pids_at = {111, 222}, 10**12   # pretend: this process and a child
-        self.assertTrue(w.posted_by_us(222))
-        self.assertFalse(w.posted_by_us(333))
+        iw.OWN_CHILDREN[999222] = [None, None]             # pretend: a child of ours, gone before being reaped
+        self.addCleanup(iw.OWN_CHILDREN.pop, 999222, None)
+        self.assertTrue(w.posted_by_us(999222))
+        self.assertFalse(w.posted_by_us(999333))           # gone, and never ours
         q = types.ModuleType("Quartz")
         for k, v in {"kCGEventTapDisabledByTimeout": -2, "kCGEventTapDisabledByUserInput": -1,
                      "kCGEventLeftMouseDragged": 6, "kCGEventRightMouseDragged": 7, "kCGEventOtherMouseDragged": 27,
@@ -124,7 +127,7 @@ class Targets(unittest.TestCase):
         q.CGEventGetIntegerValueField = lambda e, f: fields.get(f, 0)
         w._pid_bundle, w._pid_regular = {500: "com.apple.Safari"}, {500: True}
         with mock.patch.dict(sys.modules, {"Quartz": q}):
-            fields.update({41: 222, 40: 500})              # the driver's click into Safari
+            fields.update({41: 999222, 40: 500})           # the driver's click into Safari
             w._callback(None, 1, object(), None)
             self.assertEqual(w.last_by_bundle, {})
             fields.update({41: 0})                          # the user's
@@ -142,6 +145,14 @@ class Targets(unittest.TestCase):
         p = subprocess.Popen([_sys.executable, "-c", "pass"])
         p.wait()
         self.assertTrue(w.posted_by_us(p.pid))            # exited, still known
+        # a child that ran longer than OWN_KEEP_S: still ours right after it exits, then not
+        import time as _t
+        with mock.patch.object(iw, "OWN_KEEP_S", 0.5):
+            long = subprocess.Popen([_sys.executable, "-c", "import time; time.sleep(0.8)"])
+            long.wait()
+            self.assertTrue(w.posted_by_us(long.pid))
+            _t.sleep(0.6)
+            self.assertFalse(w.posted_by_us(long.pid))
         if _sys.platform != "darwin":
             return                                        # the parent chain is read with macOS's libproc
         q = subprocess.Popen([_sys.executable, "-c", "import subprocess,sys,time; c=subprocess.Popen([sys.executable,'-c','import time; time.sleep(2)']); print(c.pid, flush=True); c.wait()"],
@@ -150,6 +161,17 @@ class Targets(unittest.TestCase):
         self.assertTrue(w.posted_by_us(grandchild))       # alive, its parent chain reaches us
         q.wait()
         self.assertFalse(w.posted_by_us(1))               # launchd is not ours
+
+    def test_a_reused_pid_is_asked_anew(self):
+        """Remembered by (pid, start time): the same pid given to another process later is not taken for ours."""
+        from deskmind_hands import inputwatch as iw
+        w = InputWatch()
+        with mock.patch.object(iw, "_proc_info", return_value=(os.getpid(), 100.0)), \
+             mock.patch.object(iw, "_descends_from", return_value=True):
+            self.assertTrue(w.posted_by_us(424242))
+        with mock.patch.object(iw, "_proc_info", return_value=(1, 200.0)), \
+             mock.patch.object(iw, "_descends_from", return_value=False):
+            self.assertFalse(w.posted_by_us(424242))       # a new process with that pid
 
     def test_an_event_that_cannot_be_read_counts_as_input_to_an_unknown_target(self):
         """The callback's failure path is the safe side for every reader, last_input_for included (PR #49 review)."""

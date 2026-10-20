@@ -711,10 +711,11 @@ class OpenWindow(unittest.TestCase):
         self.assertEqual(r["new_window"]["id"], f"{TE}#14")
         self.assertIn("14", stub.__dict__["_run_windows"])
 
-    def test_an_app_slow_to_start_whose_launch_window_shows_no_document_is_the_tasks(self):
-        """A music player, launched by this open: its main window came after the 8 s this used to wait and was then
-        the user's (10-20). Waited for; no document in it, so nothing of the user's: the task's window. No new
-        document is asked for, and no cmd+N is sent to it."""
+    def test_an_app_slow_to_start_shows_a_window_the_task_opened_but_its_content_stays_the_users(self):
+        """A music player, launched by this open: its main window came after the 8 s this used to wait (10-20).
+        Waited for, and reported as opened_window -- the task may work in it and bring the app forward -- but not
+        new_window: what is in it (a library, a mailbox) is the user's (hands #54 review). No new document is asked
+        for, no cmd+N sent."""
         ex, stub = _executor()
         player = "com.example.player"
         state, run, running = self._mac(ex, running=False, restored=[_win("700", bundle=player, title="Player", app="Player")],
@@ -722,12 +723,30 @@ class OpenWindow(unittest.TestCase):
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda: [("Player", player)] if state["running"] else []), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=player), \
+             mock.patch("deskmind_hands.executor.is_browser", return_value=False), \
+             mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": ""}), \
              mock.patch("deskmind_hands.executor.time.sleep"):
             r = ex.perform({"kind": "open_window", "app": "Player"})
+            self.assertIn(player, os.environ["HANDS_FLASH_APPS"])   # may be brought forward for its steps
         self.assertEqual(r["status"], "ok")
-        self.assertEqual(r["new_window"]["id"], f"{player}#700")
-        self.assertIn("700", stub.__dict__.get("_run_windows", set()))
-        self.assertNotIn("osascript", state["events"])     # nothing asked of it, no keystroke sent
+        self.assertEqual(r["window"], f"{player}#700")
+        self.assertEqual(r["opened_window"]["id"], f"{player}#700")
+        self.assertNotIn("new_window", r)
+        self.assertNotIn("700", stub.__dict__.get("_run_windows", set()))
+        self.assertNotIn("osascript", state["events"])
+
+    def test_a_browser_launch_is_not_an_opened_window(self):
+        ex, _ = _executor()
+        state, run, running = self._mac(ex, running=False, restored=[_win("701", bundle="com.example.web", title="Tabs", app="Web")],
+                                         answers=False, documents={})
+        with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
+             mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda: [("Web", "com.example.web")] if state["running"] else []), \
+             mock.patch("deskmind_hands.executor.resolve_app", return_value="com.example.web"), \
+             mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
+             mock.patch("deskmind_hands.executor.time.sleep"):
+            r = ex.perform({"kind": "open_window", "app": "Web"})
+        self.assertNotIn("opened_window", r)
+        self.assertNotIn("new_window", r)
 
     def test_a_launch_that_makes_no_window_is_unverified(self):
         ex, _ = _executor()
@@ -761,6 +780,7 @@ class OpenWindow(unittest.TestCase):
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[("Safari", safari)]), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=safari), \
+             mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
              mock.patch("deskmind_hands.executor.time.sleep"):
             # first: the driver opened the window on A -- a new window, the task's
             r1 = ex.perform({"kind": "open_window", "app": "Safari", "url": "https://a.example/"})
@@ -830,6 +850,7 @@ class OpenWindow(unittest.TestCase):
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[("Google Chrome", chrome)]), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=chrome), \
+             mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
              mock.patch("deskmind_hands.executor.time.sleep"):
             r1 = ex.perform({"kind": "open_window", "app": "Chrome", "url": "https://a.example/"})
             self.assertEqual(r1["new_window"]["id"], f"{chrome}#42")
@@ -843,6 +864,7 @@ class OpenWindow(unittest.TestCase):
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[("Google Chrome", chrome)]), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=chrome), \
+             mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
              mock.patch("deskmind_hands.executor.time.sleep"):
             r3 = ex.perform({"kind": "open_window", "app": "Chrome", "url": "https://c.example/"})
         self.assertEqual(r3["status"], "unverified")

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import urllib.request
 from pathlib import Path
 
@@ -25,8 +26,12 @@ from .apps import APPS
 GROUNDER_URL = os.environ.get("HANDS_GROUNDER_URL", "http://127.0.0.1:8010/ground")
 
 
-#: When the app's helper was last asked to start the grounder (ensure_grounder), and whether it said it was up.
-_EYES_ASKED = {"at": 0.0, "up": False}
+#: When the app's helper was last asked to start the grounder (ensure_grounder), whether it is up, and when that
+#: was last seen.
+_EYES_ASKED = {"at": 0.0, "up": False, "seen": 0.0}
+#: Set by the executor's stop: a wait for the grounder gives up at its next slice.
+STOP = threading.Event()
+RECHECK_S = 30.0
 
 
 def _grounder_listening() -> bool:
@@ -40,42 +45,58 @@ def _grounder_listening() -> bool:
         return False
 
 
-def ensure_grounder(wait_s: float = 30.0) -> bool:
-    """Start the app's vision model on demand: the first time a window has to be read from its pixels, the grounder
-    is asked for, and when it is not listening the app's helper (HANDS_HELPER_SOCKET) is asked to start it and
-    waited for. The app no longer knows before a run which apps it will use, and loading the model for every run
-    cost ~4 GB beside Brain's (deskmind #96 review). Asked again at most once a minute after a failure; nothing to
-    do without the socket (a run not started by the app) or when it is already up."""
+def _ask_helper(sock: str) -> bool:
+    """Ask the app's helper to start the vision model, without waiting for it (op "eyes", wait 0)."""
     import json as _json
     import socket
-    import time as _time
-    sock = os.environ.get("HANDS_HELPER_SOCKET")
-    if not sock or _EYES_ASKED["up"]:
-        return _EYES_ASKED["up"] or not sock
-    if _grounder_listening():
-        _EYES_ASKED["up"] = True
-        return True
-    if _time.time() - _EYES_ASKED["at"] < 60:
-        return False
-    _EYES_ASKED["at"] = _time.time()
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        s.settimeout(wait_s + 5)
+        s.settimeout(5)
         s.connect(sock)
-        s.sendall((_json.dumps({"op": "eyes", "wait": wait_s}) + "\n").encode())
+        s.sendall((_json.dumps({"op": "eyes", "wait": 0}) + "\n").encode())
         buf = b""
         while b"\n" not in buf:
             chunk = s.recv(4096)
             if not chunk:
                 break
             buf += chunk
-        up = bool(_json.loads(buf.split(b"\n")[0] or b"{}").get("ready"))
+        return bool(_json.loads(buf.split(b"\n")[0] or b"{}").get("starting", True))
     except (OSError, ValueError):
-        up = False
+        return False
     finally:
         s.close()
-    _EYES_ASKED["up"] = up
-    return up
+
+
+def ensure_grounder(wait_s: float = 30.0) -> bool:
+    """Start the app's vision model on demand: the first time a window has to be read from its pixels, the grounder
+    is asked for, and when it is not listening the app's helper (HANDS_HELPER_SOCKET) is asked to start it and it is
+    waited for in short slices, each one checking the app's stop (STOP) -- a stop must not wait for the model.
+    Seen up, it is looked at again every RECHECK_S, so a model that died is started again. Asked at most once a
+    minute after a failure; nothing to do without the socket (a run not started by the app)."""
+    import time as _time
+    sock = os.environ.get("HANDS_HELPER_SOCKET")
+    if not sock:
+        return True
+    now = _time.time()
+    if _EYES_ASKED["up"] and now - _EYES_ASKED["seen"] < RECHECK_S:
+        return True
+    if _grounder_listening():
+        _EYES_ASKED.update(up=True, seen=now)
+        return True
+    _EYES_ASKED["up"] = False
+    if now - _EYES_ASKED["at"] < 60 or STOP.is_set():
+        return False
+    _EYES_ASKED["at"] = now
+    if not _ask_helper(sock):
+        return False
+    end = now + wait_s
+    while _time.time() < end:
+        if STOP.wait(0.5):
+            return False
+        if _grounder_listening():
+            _EYES_ASKED.update(up=True, seen=_time.time())
+            return True
+    return False
 
 
 def grounder_headers() -> dict:

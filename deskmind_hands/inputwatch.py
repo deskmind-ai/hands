@@ -24,28 +24,34 @@ import time
 import os
 import struct
 
-#: Children this process started (pid -> when last seen running): recorded at spawn by `track_children()`, so an
-#: event a short-lived child posted is known as ours even after the child is gone. Kept OWN_KEEP_S after exit.
-OWN_CHILDREN: dict[int, float] = {}
+#: Children this process started: pid -> [process start time, when it exited or None]. Recorded at spawn and at
+#: reaping by `track_children()`, so an event a child posted is known as ours while it runs and for OWN_KEEP_S after
+#: it exits -- its last events can reach the tap after it is gone (hands #54 review: kept from spawn, a child that ran
+#: longer than that fell off the list the moment it exited).
+OWN_CHILDREN: dict[int, list] = {}
 OWN_KEEP_S = 10.0
 
 
-def _proc_ppid(pid: int) -> int | None:
-    """The parent pid of `pid` (libproc's proc_pidinfo, PROC_PIDTBSDINFO), None when it is gone or unreadable."""
+def _proc_info(pid: int) -> tuple[int, float] | None:
+    """(parent pid, start time) of `pid` from libproc's proc_pidinfo (PROC_PIDTBSDINFO); None when it is gone or
+    unreadable. The start time tells a reused pid from the process that had it."""
     try:
         import ctypes
-        lib = _proc_ppid.lib = getattr(_proc_ppid, "lib", None) or ctypes.CDLL("/usr/lib/libproc.dylib")
+        lib = _proc_info.lib = getattr(_proc_info, "lib", None) or ctypes.CDLL("/usr/lib/libproc.dylib")
         buf = ctypes.create_string_buffer(256)
         n = lib.proc_pidinfo(int(pid), 3, ctypes.c_uint64(0), buf, 256)
-        if n < 20:
+        if n < 136:
             return None
-        return struct.unpack_from("I", buf.raw, 16)[0]     # struct proc_bsdinfo: pbi_ppid is the fifth uint32
+        ppid = struct.unpack_from("I", buf.raw, 16)[0]                 # struct proc_bsdinfo: pbi_ppid
+        sec, usec = struct.unpack_from("QQ", buf.raw, 120)             # pbi_start_tvsec, pbi_start_tvusec
+        return ppid, sec + usec / 1e6
     except Exception:  # noqa: BLE001 -- not macOS, or no libproc
         return None
 
 
-def _alive(pid: int) -> bool:
-    return _proc_ppid(pid) is not None
+def _proc_ppid(pid: int) -> int | None:
+    info = _proc_info(pid)
+    return info[0] if info else None
 
 
 def _descends_from(pid: int, ancestor: int, depth: int = 16) -> bool:
@@ -60,7 +66,8 @@ def _descends_from(pid: int, ancestor: int, depth: int = 16) -> bool:
 
 
 def track_children() -> None:
-    """Record the pid of every child this process starts from now on (subprocess.Popen), for posted_by_us."""
+    """Record every child this process starts from now on (subprocess.Popen): its start time when it starts, the
+    time it exits when it is reaped."""
     import subprocess
     if getattr(subprocess.Popen, "_deskmind_tracked", False):
         return
@@ -70,7 +77,23 @@ def track_children() -> None:
 
         def __init__(self, *a, **k):
             super().__init__(*a, **k)
-            OWN_CHILDREN[self.pid] = time.time()
+            info = _proc_info(self.pid)
+            OWN_CHILDREN[self.pid] = [info[1] if info else None, None]
+
+        def _note_exit(self):
+            if self.returncode is not None and self.pid in OWN_CHILDREN and OWN_CHILDREN[self.pid][1] is None:
+                OWN_CHILDREN[self.pid][1] = time.time()
+
+        def wait(self, *a, **k):
+            try:
+                return super().wait(*a, **k)
+            finally:
+                self._note_exit()
+
+        def poll(self):
+            r = super().poll()
+            self._note_exit()
+            return r
 
     subprocess.Popen = _Tracked
 
@@ -104,8 +127,8 @@ class InputWatch:
         #: this process and its children (Peekaboo, the key-event child): events they post are the driver's own
         #: input, not the user's -- a driver click that reached the tap after the action had ended was taken for the
         #: user's input to the task's app and staled the next step (rc.9, 10-20). Refreshed every few seconds.
-        self._own_pids: set[int] = set()
-        self._not_ours: set[int] = set()
+        self._own_pids: set[tuple] = set()
+        self._not_ours: set[tuple] = set()
         self._thread: threading.Thread | None = None
         self._tap = None
 
@@ -148,23 +171,33 @@ class InputWatch:
 
     def posted_by_us(self, source_pid: int | None) -> bool:
         """Whether an event was posted by this process or one of its descendants (a hardware event has no source
-        pid, or the window server's). A child is known three ways, none of them slow enough for the tap's callback:
-        its pid was recorded when it was started here (`own`, kept a while after it exits, since its last events
-        can reach the tap after it is gone); or its parent chain, read with proc_pidinfo, reaches this process; and
-        what was found is remembered (PR #53 review: a ps every 3 s missed short-lived peekaboo CLI children)."""
+        pid, or the window server's). A child started here is ours while it runs and for OWN_KEEP_S after it exits
+        (OWN_CHILDREN); any other pid is ours when its parent chain, read with proc_pidinfo, reaches this process.
+        Answers are remembered by (pid, start time), so a pid the system gives to someone else later is asked anew."""
         if not source_pid:
             return False
         pid = int(source_pid)
         now = time.time()
-        for p, t in list(OWN_CHILDREN.items()):
-            if now - t > OWN_KEEP_S and not _alive(p):
+        for p, (_, exited) in list(OWN_CHILDREN.items()):
+            if exited is not None and now - exited > OWN_KEEP_S:
                 OWN_CHILDREN.pop(p, None)
-        if pid in OWN_CHILDREN or pid in self._own_pids:
+        info = _proc_info(pid)
+        mine = OWN_CHILDREN.get(pid)
+        if mine is not None:
+            started, exited = mine
+            if info is None:                       # gone: ours if it went within the last OWN_KEEP_S (or unreaped)
+                return exited is None or now - exited <= OWN_KEEP_S
+            if started is None or abs(info[1] - started) < 0.01:
+                return True                        # the child itself, still running
+        if info is None:
+            return False                           # gone, and not a child we know: not ours
+        key = (pid, round(info[1], 3))
+        if key in self._own_pids:
             return True
-        if pid in self._not_ours:
+        if key in self._not_ours:
             return False
         ours = _descends_from(pid, os.getpid())
-        (self._own_pids if ours else self._not_ours).add(pid)
+        (self._own_pids if ours else self._not_ours).add(key)
         return ours
 
     def is_regular(self, pid: int) -> bool:

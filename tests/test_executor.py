@@ -1529,6 +1529,15 @@ class StepPictures(unittest.TestCase):
                 self.assertNotIn("shot", r)
             self.assertEqual(list(Path(d).iterdir()), [])
 
+    def test_no_picture_of_a_window_the_step_closed(self):
+        ex, _ = self._ex()
+        ex._pk = lambda args: {}                         # noqa: SLF001 -- the close went through
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch("deskmind_hands.drivers.capture.capture_window", lambda wid, path: self.fail("no picture of a closed window")):
+            r = ex.perform({"kind": "close_window", "window": W12}, str(Path(d) / "c.png"))
+        self.assertEqual(r["status"], "ok")
+        self.assertNotIn("shot", r)
+
 
 class ShotRequest(unittest.TestCase):
     def test_the_requests_shot_reaches_perform_and_its_absence_leaves_perform_as_it_was(self):

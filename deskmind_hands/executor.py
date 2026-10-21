@@ -731,7 +731,8 @@ class HandsExecutor:
                 frames = {}
         out = self._perform(action)
         out.update(frames)
-        if shot and out.get("status") in ("ok", "unverified"):
+        # no picture of a window the step closed: there is nothing to take, only a slow capture that fails
+        if shot and out.get("status") in ("ok", "unverified") and action.get("kind") != "close_window":
             target = out.get("window") or (out.get("new_window") or {}).get("id") or window
             if target and "#" in target:
                 taken = self._shot(target, Path(shot))

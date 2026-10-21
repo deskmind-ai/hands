@@ -117,10 +117,17 @@ def insert(el, text: str, replace_all: bool) -> bool:
     return select(el, replace_all) and _set(el, "AXSelectedText", text)
 
 
-def focus(el) -> bool:
-    """The keyboard focus inside its window to the field; True when it reads back focused."""
+def focus(el, wait: float = 0.5) -> bool:
+    """The keyboard focus inside its window to the field; True when it reads back focused within `wait` seconds
+    (Chrome takes some 60 ms to say so: a read at once said no, and the first typing in a field fell back)."""
     _set(el, "AXFocused", True)
-    return is_focused(el)
+    deadline = time.monotonic() + wait
+    while True:
+        if is_focused(el):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def is_focused(el) -> bool:

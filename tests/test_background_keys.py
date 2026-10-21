@@ -291,6 +291,20 @@ class TextAndChords(unittest.TestCase):
         self.assertIsNone(keys.parse_chord("cmd+a+b"))
         self.assertIsNone(keys.parse_chord("cmd"))
 
+    def test_focus_waits_for_the_field_to_say_so(self):
+        """Chrome reads back focused some 60 ms after AXFocused is set: a read at once said no, and the first
+        typing in a web field fell back (hands#58 live check)."""
+        reads = iter([False, False, True])
+        with mock.patch.object(axfield, "_set", return_value=True), \
+                mock.patch.object(axfield, "is_focused", side_effect=lambda el: next(reads)), \
+                mock.patch.object(axfield.time, "sleep"):
+            self.assertTrue(axfield.focus(object()))
+        with mock.patch.object(axfield, "_set", return_value=True), \
+                mock.patch.object(axfield, "is_focused", return_value=False), \
+                mock.patch.object(axfield.time, "sleep"), \
+                mock.patch.object(axfield.time, "monotonic", side_effect=[0.0, 0.1, 0.3, 0.6]):
+            self.assertFalse(axfield.focus(object()))
+
     def test_typed_in_is_lenient_on_case_and_strict_on_change(self):
         self.assertTrue(axfield.typed_in("start\n", "start\nAbc XYZ", "abc XYZ", False))   # TextEdit autocapitalises
         self.assertFalse(axfield.typed_in("start", "start", "abc", False))

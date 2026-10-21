@@ -1484,14 +1484,22 @@ class StepPictures(unittest.TestCase):
     def test_the_receipt_says_where_the_window_and_the_target_were_before_acting(self):
         ex, _ = self._ex()
         ex.observe(W12)
-        r = ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        r = ex.perform({"kind": "click", "window": W12, "target": "B2"}, frames=True)
         self.assertEqual(r["window_frame"], {"x": 100.0, "y": 50.0, "w": 800.0, "h": 600.0})
         self.assertEqual(r["target_frame"], {"x": 140.0, "y": 90.0, "w": 60.0, "h": 24.0})
-        r = ex.perform({"kind": "key", "window": W12, "chord": "cmd+s"})   # no element: the window only
+        r = ex.perform({"kind": "key", "window": W12, "chord": "cmd+s"}, frames=True)   # no element: the window only
         self.assertNotIn("target_frame", r)
         self.assertIn("window_frame", r)
-        self.assertNotIn("target_frame", ex.perform({"kind": "wait", "ms": 1}))
+        self.assertNotIn("target_frame", ex.perform({"kind": "wait", "ms": 1}, frames=True))
         self.assertNotIn("shot", r)                                          # no picture unless asked for
+        # nothing asked for: nothing extra, not even the window list
+        listed = []
+        ex._windows = lambda every=False: (listed.append(1), [dict(_win("12"), bounds=[100.0, 50.0, 800.0, 600.0])])[1]   # noqa: SLF001
+        r = ex.perform({"kind": "type", "window": W12, "target": "T1", "text": "x"})
+        plain = len(listed)
+        self.assertNotIn("window_frame", r)
+        ex.perform({"kind": "type", "window": W12, "target": "T1", "text": "x"}, frames=True)
+        self.assertEqual(len(listed), 2 * plain + 1)                         # frames cost one list; none without
 
     def test_a_picture_is_taken_after_the_step_when_asked_scaled_down_and_capped(self):
         from PIL import Image
@@ -1508,7 +1516,9 @@ class StepPictures(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d, mock.patch("deskmind_hands.drivers.capture.capture_window", capture):
             shot = Path(d) / "shots" / "st_1.png"
             r = ex.perform({"kind": "click", "window": W12, "target": "B2"}, str(shot))
-            self.assertEqual(r["shot"], str(shot))
+            # the reply does not wait for the picture: it says where it will be
+            self.assertEqual((r["shot"], r["shot_pending"]), (str(shot), True))
+            ex.wait_shots(30)
             self.assertLessEqual(shot.stat().st_size, HandsExecutor.SHOT_MAX_BYTES)
             with Image.open(shot) as im:
                 self.assertLessEqual(max(im.size), HandsExecutor.SHOT_MAX_SIDE)
@@ -1520,8 +1530,9 @@ class StepPictures(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             with mock.patch("deskmind_hands.drivers.capture.capture_window", lambda wid, path: False):
                 r = ex.perform({"kind": "click", "window": W12, "target": "B2"}, str(Path(d) / "a.png"))
+                ex.wait_shots(10)
                 self.assertEqual(r["status"], "ok")
-                self.assertNotIn("shot", r)
+                self.assertFalse((Path(d) / "a.png").exists())                 # promised, could not be taken: no file
             stub.execute = lambda action: ExecResult(False, "the button is disabled")
             with mock.patch("deskmind_hands.drivers.capture.capture_window", lambda wid, path: self.fail("no picture of a failed step")):
                 r = ex.perform({"kind": "click", "window": W12, "target": "B2"}, str(Path(d) / "b.png"))
@@ -1544,8 +1555,9 @@ class ShotRequest(unittest.TestCase):
         import io
         import sys as _sys
         from deskmind_hands import executor as exe
-        lines = io.StringIO('{"id": 1, "op": "begin"}\n{"id": 2, "op": "perform", "action": {"kind": "wait", "ms": 1}, "shot": "/tmp/x/st_1.png"}\n'
-                            '{"id": 3, "op": "perform", "action": {"kind": "wait", "ms": 1}}\n')
+        lines = io.StringIO('{"id": 1, "op": "begin"}\n{"id": 2, "op": "perform", "action": {"kind": "wait", "ms": 1}, "shot": "/tmp/x/st_1.png", "frames": true}\n'
+                            '{"id": 3, "op": "perform", "action": {"kind": "wait", "ms": 1}}\n'
+                            '{"id": 4, "op": "perform", "action": {"kind": "wait", "ms": 1}, "frames": true}\n')
         out, seen = io.StringIO(), []
 
         class Fake:
@@ -1555,9 +1567,9 @@ class ShotRequest(unittest.TestCase):
             def snapshot(self):
                 return {"epoch": 1}
 
-            def perform(self, action, shot=None):
-                seen.append(shot)
+            def perform(self, action, shot=None, frames=False):
+                seen.append((shot, frames))
                 return {"status": "ok"}
         with mock.patch.object(_sys, "stdin", lines), mock.patch.object(_sys, "stdout", out), mock.patch.object(exe, "HandsExecutor", Fake):
             exe.main()
-        self.assertEqual(seen, ["/tmp/x/st_1.png", None])
+        self.assertEqual(seen, [("/tmp/x/st_1.png", True), (None, False), (None, True)])

@@ -254,6 +254,7 @@ class OwnWindow(unittest.TestCase):
         focused, posted = [], []
         d._address_bar, d._address_bar_rect = "e48", Rect(275, 18, 237, 31)
         d._background_input = lambda bundle: True
+        d._background_keys = lambda: True                  # the address-bar search's gate (no SkyLight on Linux CI)
         d._wait_until_still = lambda bundle, what="": None
         d._settle = lambda ok, detail: ExecResult(ok, detail)
         d._post_click = lambda q, x, y: posted.append(("click", x, y))
@@ -603,6 +604,7 @@ class OwnWindow(unittest.TestCase):
         own_frame, focused = mac.find(own)["frame"], []
         d._address_bar, d._address_bar_rect = "e48", Rect(275, 18, 237, 31)
         d._background_input = lambda bundle: True
+        d._background_keys = lambda: True                  # the address-bar search's gate (no SkyLight on Linux CI)
         d._wait_until_still = lambda bundle, what="": None
         d._settle = lambda ok, detail: ExecResult(ok, detail)
         d._post_click = lambda q, x, y: None

@@ -149,9 +149,15 @@ def document_text(bundle: str, title: str, bounds: list | None) -> str | None:
     del bounds
     # one window of that title, or unknown: two cannot be told apart here, and the first one's text was another
     # document's (PR #48 review)
-    out = _osa(f'tell application id "{_q(bundle)}"\nset n to 0\nset t to ""\nrepeat with w in windows\ntry\n'
-               f'if (name of w) is "{_q(title or "")}" then\nset n to n + 1\nset t to (text of document of w)\nend if\n'
-               'end try\nend repeat\nif n is 1 then return "ok" & linefeed & t\nreturn "n=" & n\nend tell')
+    # a window of that title whose text cannot be read (an app with no `text` on its documents: the read errors, or
+    # gives no value) makes the answer unknown, never "" -- counted only after the read, an error used to leave the
+    # empty start value standing, and an iWork-like document read as blank (hands#60 review)
+    out = _osa(f'tell application id "{_q(bundle)}"\nset n to 0\nset bad to false\nset t to ""\nrepeat with w in windows\n'
+               'set nm to ""\ntry\nset nm to (name of w)\nend try\n'
+               f'if nm is "{_q(title or "")}" then\nset n to n + 1\ntry\nset v to (text of document of w)\n'
+               'if v is missing value then\nset bad to true\nelse\nset t to (v as text)\nend if\n'
+               'on error\nset bad to true\nend try\nend if\nend repeat\n'
+               'if bad then return "unread"\nif n is 1 then return "ok" & linefeed & t\nreturn "n=" & n\nend tell')
     if out is None:
         _NO_SCRIPTING.add(bundle)
         return None

@@ -98,6 +98,11 @@ class Asking(unittest.TestCase):
         # two windows of that title: unknown, never the first one's text
         with mock.patch.object(ad, "_osa", lambda script: "n=2\n"):
             self.assertIsNone(ad.document_text(APP, "notes.txt", None))
+        # a window of that title whose text the app cannot give (an error, no value): unknown, never "" (hands#60 review)
+        with mock.patch.object(ad, "_osa", lambda script: "unread\n"):
+            self.assertIsNone(ad.document_text(APP, "notes.txt", None))
+        self.assertIn("set bad to true", seen[-1])
+        self.assertLess(seen[-1].index("set v to (text of document of w)"), seen[-1].index("on error\nset bad to true"))
         # no such window: None; an app that hangs is asked once
         with mock.patch.object(ad, "_osa", lambda script: "n=0\n"):
             self.assertIsNone(ad.document_text(APP, "other", None))

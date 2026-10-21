@@ -1021,7 +1021,7 @@ class CreatedWindows(unittest.TestCase):
 
     def test_a_window_with_content_is_not_reported(self):
         # a reply opened with the quoted mail: no file, but text the task did not write
-        ex, _, _ = self._desk({f"{TE}#14": (None, True)}, {f"{TE}#14": "> 原邮件：明天开会"}, [_win("14", title="回复")])
+        ex, _, _ = self._desk({f"{TE}#14": (None, False)}, {f"{TE}#14": "> 原邮件：明天开会"}, [_win("14", title="回复")])
         r = self._click(ex)
         self.assertNotIn("new_window", r)
         self.assertEqual(r["appeared"], [{"id": f"{TE}#14", "why": "it holds content"}])
@@ -1087,26 +1087,72 @@ class CreatedWindows(unittest.TestCase):
         self.assertNotIn("new_window", r)
         self.assertEqual(len(r["appeared"]), 2)
 
-    def test_a_window_the_driver_followed_is_waited_for_until_it_is_on_screen(self):
-        ex, stub, state = self._desk({f"{TE}#14": (None, False)}, {f"{TE}#14": ""}, [])
-        calls = {"n": 0}
-        on = ex._windows
+    def test_a_users_minimised_blank_draft_brought_back_is_not_claimed(self):
+        """It existed before the action, off screen: whatever it holds, the action did not make it (hands#60 review)."""
+        ex, stub = _executor()
+        draft = _win("100", title="未命名")
+        state = {"on": [_win("12", title="打开")], "off": [draft]}
+        ex._windows = lambda every=False: state["on"] + (state["off"] if every else [])   # noqa: SLF001
+        ex._document = lambda window, wins: (None, False) if window == draft["id"] else None   # noqa: SLF001
+        ex._text = lambda w: ""                                                                # noqa: SLF001
+        ex.snapshot()
+        ex.observe(W12)
 
-        def windows(every=False):
-            calls["n"] += 1
-            if calls["n"] == 3:                       # on screen a moment after the action returned
-                state["on"] = state["on"] + [_win("14", title="未命名-1")]
-            return on(every)
-        ex._windows = windows                         # noqa: SLF001
+        def restores(action):
+            state["on"], state["off"] = state["on"] + [draft], []
+            return ExecResult(True, "done")
+        stub.execute = restores
+        r = self._click(ex)
+        self.assertNotIn("new_window", r)
+        self.assertNotIn("100", stub.__dict__.get("_run_windows", set()))
 
-        def follows(action):
-            stub._pinned_window = "14"                # the driver now points at the window it opened
-            return ExecResult(True, "opened a new document")
-        stub.execute = follows
-        calls["n"] = 0
-        with mock.patch("deskmind_hands.executor.time.sleep"):
-            r = self._click(ex)
-        self.assertEqual(r["new_window"]["id"], f"{TE}#14")
+    def test_a_document_with_unsaved_changes_is_not_claimed_whatever_its_text_reads(self):
+        # an iWork-like app: the document has edits, its text cannot be read (and an older read gave "" for that)
+        ex, _, _ = self._desk({f"{TE}#14": (None, True)}, {f"{TE}#14": ""}, [_win("14", title="未命名")])
+        r = self._click(ex)
+        self.assertNotIn("new_window", r)
+        self.assertEqual(r["appeared"], [{"id": f"{TE}#14", "why": "its document has unsaved changes"}])
+
+    def test_the_users_input_between_the_list_before_and_the_action_is_counted(self):
+        """The list before is taken, then the window's document is read (up to two osascript runs): a cmd+N of the
+        user's meanwhile makes a window the action did not make (hands#60 review)."""
+        ex, stub = _executor()
+        state = {"on": [_win("12", title="打开")]}
+        ex._windows = lambda every=False: list(state["on"])   # noqa: SLF001
+        made = _win("14", title="未命名-9")
+        pressed = {"at": 0.0}
+
+        def document(window, wins):
+            if window == W12 and not pressed["at"]:            # the read before the action: the user presses cmd+N
+                pressed["at"] = time.time()
+                state["on"].append(made)
+            return (None, False) if window == made["id"] else None
+        ex._document = document                              # noqa: SLF001
+        ex._text = lambda w: ""                              # noqa: SLF001
+        ex.observe(W12)
+        ex._last_input_at = lambda: pressed["at"]            # noqa: SLF001
+        stub.execute = lambda action: ExecResult(True, "done")
+        r = ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertNotIn("new_window", r)
+        self.assertNotIn("14", stub.__dict__.get("_run_windows", set()))
+
+    def test_a_browser_pop_up_is_the_drivers_to_use_but_not_a_window_the_task_made(self):
+        """A page's pop-up (an OAuth window, window.open) or cmd+N in the task's browser window: the driver may use
+        and follow it, as before; it shows a page, so it is not new_window (no proof it holds nothing of the user's)."""
+        ch = "com.google.Chrome"
+        ex, stub = _executor()
+        state = {"on": [_win("12", bundle=ch, title="登录", app="Google Chrome")]}
+        ex._windows = lambda every=False: list(state["on"])   # noqa: SLF001
+        ex.observe(f"{ch}#12")
+
+        def pops(action):
+            state["on"] = state["on"] + [_win("20", bundle=ch, title="Sign in", app="Google Chrome")]
+            return ExecResult(True, "done")
+        stub.execute = pops
+        r = ex.perform({"kind": "click", "window": f"{ch}#12", "target": "B2"})
+        self.assertNotIn("new_window", r)
+        self.assertEqual(r["appeared"], [{"id": f"{ch}#20", "why": "its document could not be read"}])
+        self.assertIn("20", stub.__dict__["_run_windows"])
 
 
 class BrowserFields(unittest.TestCase):

@@ -12,7 +12,11 @@ One JSON request per line on stdin, one JSON reply per line on stdout (`{"id", "
                                          `files` ([{path, sha256?}]: what this action wrote, with the digest of the
                                          content written -- the driver's own bytes, or the text the app holds when
                                          it says it saved the window's document during the action; no digest when
-                                         that is unknown) and `document` (the file the window shows afterwards)
+                                         that is unknown), `document` (the file the window shows afterwards),
+                                         `new_window` ({id, app, app_name, bundle, title}: a window this action
+                                         made -- any action, not only open_window; see _created for the proof) and
+                                         `appeared` ([{id, why}]: windows of the acted app that came on screen
+                                         during the action and are not claimed, with why)
     stop      {}                         the app's stop switch: every later perform is refused
     end       {}
 
@@ -565,6 +569,8 @@ class HandsExecutor:
                           "renamed": [{"id": i, "from": was[i], "to": now[i]} for i in sorted(set(was) & set(now)) if was[i] != now[i]][:5]}
             self._advance(reason)
         self._inventory = {b: inventory.get(b, ()) for b in task}
+        # every window this task has been shown: one of them coming back later is not a window an action made
+        self.__dict__.setdefault("_listed", set()).update(w["id"] for w in wins)
         return {"epoch": self.epoch, "locked": self.locked(), "front_app": front, "user_active": self.user_active(),
                 "input_watch": ("keys" if self._watch.keys else "mouse") if self._watch is not None and self._watch.active else "",
                 **({"epoch_reason": self._epoch_reason} if getattr(self, "_epoch_reason", None) else {}),
@@ -628,6 +634,7 @@ class HandsExecutor:
                                f"observe that window, or this one again")
         self.last_obs[window] = obs
         self.current[bundle] = window
+        self.__dict__.setdefault("_listed", set()).add(window)
         if baseline is not None and self._inventory is not None and key not in self._inventory:
             self._inventory[key] = baseline
         elif self._inventory is not None and key in self._inventory and window not in {i for i, _ in self._inventory[key]}:
@@ -749,7 +756,9 @@ class HandsExecutor:
             # the layer above judged this step (its judge, or the person); the driver's own guard against writing
             # into a browser's address bar or search field takes that as the one-step allowance it asks for
             d.allow_browser_field(action.get("target"))
-        before = self._known_windows()
+        # what was on screen just before the action, as a snapshot lists it: a window not among these afterwards
+        # appeared during it (_created)
+        shown = {w["id"] for w in wins}
         # the window's document is read only around an action that can save (a click, a key chord, a choice):
         # typing and scrolling never write a file, and each read asks the app (up to two osascript runs)
         may_save = kind in self.SAVING_KINDS
@@ -766,6 +775,7 @@ class HandsExecutor:
         try:
             if getattr(self, "stopped", False) or STOP.is_set():   # read while this step was getting ready: nothing sent
                 return {"status": "error", "why": "stopped by the app"}
+            acted_at = time.time()
             res: ExecResult = d.execute(a)
         finally:
             if action.get("foreground_ok"):
@@ -782,17 +792,15 @@ class HandsExecutor:
         if res.ok and res.indeterminate:
             status = "unverified"
         out = {"status": status, "why": res.detail, "window": window}
-        # any action can open a window (a "new document" button, a sheet that becomes a window): reported so the
-        # ledger upstream can credit it to the task, as it does for open_window
-        wins = self._windows()
-        # ... a window of the acted app only, and one that did not exist before (a minimised window brought back is
-        # not new): another app's window appearing meanwhile (the user's, a notification) is not this action's
-        # (PR #48 review: a TextEdit click credited a Safari window; a restored window passed for made)
-        fresh = [w for w in wins if w["id"] not in before and w["bundle"] == bundle]
-        if fresh:
-            w = fresh[-1]
-            out["new_window"] = {"id": w["id"], "app": w["app"], "title": w["title"]}
-            self._own(d, self._split(w["id"])[1])
+        # any action can open a window (a "new document" button in an open panel, cmd+N): one the task made is
+        # reported as new_window, so the ledger upstream credits it to the task as it does for open_window -- only
+        # on positive proof (_created); a window that appeared and is not claimed is told apart, with why
+        made, appeared, wins = self._created(window, bundle, d, shown, acted_at)
+        if made is not None:
+            out["new_window"] = made
+            self._own(d, self._split(made["id"])[1])
+        if appeared:
+            out["appeared"] = appeared
         # the files receipt: what the driver knows it wrote, plus the window's own document when the app itself says
         # it saved it during this action -- unsaved changes before (modified true), none after (false). A document
         # that merely changed on disk is not credited: a sync program may have written it at that moment (PR #16
@@ -847,6 +855,87 @@ class HandsExecutor:
         if full == scratch or scratch in full.parents:
             return False
         return full.exists()
+
+    #: How long a window the driver followed during an action may take to come on screen after it (seconds).
+    APPEAR_WAIT_S = 1.5
+
+    def _created(self, window: str, bundle: str, d, shown: set, acted_at: float) -> tuple[dict | None, list[dict], list[dict]]:
+        """The window this action made, if it can be proved, and the windows that appeared and are not claimed (each
+        with why); with the windows on screen after the action.
+
+        A window is the task's own -- created -- when all of these hold, by structure, never by an app's name:
+        (a) it appeared through this action: on screen after it, not before it, and no input of the user's reached an
+            app the task operates while it ran (the epoch moved by the action alone);
+        (b) it was never listed in this task before (a window the task saw, hidden and brought back, is not new);
+        (c) it holds no saved document and no content: the app says its document has no file (or only the driver's
+            own empty staging file under the task folder's .hands/), and the document's text, read from the app, is
+            empty -- a user's file restored from disk shows its file, and a reply opened with the quoted mail has text;
+        (d) it belongs to the app acted in: another app's window appearing meanwhile (the user's, a notification) is
+            not this action's (PR #48 review: a TextEdit click credited a Safari window).
+        Positive proof only: what cannot be read (no title, an app that does not answer) is not claimed. Exactly one
+        such window is claimed; two that both qualify are not told apart, and neither is."""
+        wins = self._windows()
+        fresh = [w for w in wins if w["id"] not in shown and (w.get("bundle") or "") == bundle]
+        # a window the driver followed (it now points at a window that was not on screen) may still be coming on
+        # screen as the action returns: waited for briefly, and only then
+        pinned = getattr(d, "_pinned_window", None)
+        followed = f"{bundle}#{pinned}" if pinned else ""
+        if not fresh and followed and followed != window and followed not in shown:
+            deadline = time.time() + self.APPEAR_WAIT_S
+            while not fresh and time.time() < deadline:
+                time.sleep(0.15)
+                wins = self._windows()
+                fresh = [w for w in wins if w["id"] not in shown and (w.get("bundle") or "") == bundle]
+        if not fresh:
+            return None, [], wins
+        user = self._last_input_at() > acted_at
+        listed = self.__dict__.setdefault("_listed", set())
+        made: list[dict] = []
+        appeared: list[dict] = []
+        for w in fresh:
+            why = ("the user's input reached an app the task operates while the action ran" if user
+                   else "listed earlier in this task" if w["id"] in listed
+                   else self._not_blank(w))
+            if why:
+                appeared.append({"id": w["id"], "why": why})
+            else:
+                made.append(w)
+        if len(made) > 1:
+            appeared += [{"id": w["id"], "why": "more than one window appeared that could be the one made"} for w in made]
+            made = []
+        if not made:
+            return None, appeared, wins
+        w = made[0]
+        return ({"id": w["id"], "app": w["app"], "app_name": w["app"] or app_display_name(w.get("bundle") or ""),
+                 "bundle": w.get("bundle") or "", "title": w["title"]}, appeared, wins)
+
+    def _not_blank(self, w: dict) -> str | None:
+        """Why the window cannot be proved to hold no saved document and no content; None when it is proved."""
+        if not w.get("pid") or not (w.get("title") or "").strip():
+            return "its title or its app could not be read"
+        state = self._document(w["id"], [w])
+        if state is None:
+            return "its document could not be read"
+        if state[0] and not self._staging(state[0]):
+            return "it shows a file"
+        text = self._text(w)
+        if text is None:
+            return "its content could not be read"
+        if text.strip():
+            return "it holds content"
+        return None
+
+    @staticmethod
+    def _text(w: dict) -> str | None:
+        """The text of the window's document as its app holds it; None when the app does not say."""
+        return document_text(w.get("bundle") or "", w.get("title") or "", w.get("bounds"))
+
+    def _staging(self, path: str) -> bool:
+        """A path under the task folder's .hands/: the driver's own scratch (the empty file a new document is opened
+        from), never a file of the user's."""
+        full = Path(os.path.realpath(path))
+        scratch = Path(os.path.realpath(str(self.workspace))) / ".hands"
+        return scratch in full.parents
 
     def _open_window(self, app: str, url: str | None) -> dict:
         """Open a window of `app` (a bundle id, or a name as the snapshot shows it) and wait for it. No app is named
@@ -935,7 +1024,7 @@ class HandsExecutor:
                     "why": f"a window of {app} is there, but it may be one the app brought back when it launched, not one this action made"}
         allow_flash(bundle)   # a window the task opened is the task's: the app may be brought forward for it
         self._own(d, self._split(w["id"])[1])
-        return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "app_name": w["app"] or app_display_name(w.get("bundle") or ""), "title": w["title"]}}
+        return {"status": "ok", "window": w["id"], "new_window": {"id": w["id"], "app": w["app"], "app_name": w["app"] or app_display_name(w.get("bundle") or ""), "bundle": w.get("bundle") or "", "title": w["title"]}}
 
     def _navigate(self, d, bundle: str, wid: str, url: str) -> bool:
         """Load `url` in the run's own browser window `wid` (the window server's id) and check that the window's page

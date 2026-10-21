@@ -76,6 +76,7 @@ def _executor():
     stub = StubDriver()
     ex._driver = lambda bundle: stub            # noqa: SLF001 -- the point of the tests is the layer above the driver
     ex._document = lambda window, wins: None   # noqa: SLF001 -- no desktop: the app says no document
+    ex._text = lambda w: None                  # noqa: SLF001 -- ... nor what a document holds
     ex._last_input_at = lambda: 0.0            # noqa: SLF001 -- the user has not touched the Mac
     ex._ax_window_kinds = lambda pid: None      # noqa: SLF001 -- no accessibility: every window counts
     return ex, stub
@@ -324,7 +325,8 @@ class Windows(unittest.TestCase):
 
     def test_only_the_acted_apps_windows_that_did_not_exist_before_are_new(self):
         """A window of another app appearing during the action is not this action's, and neither is a minimised
-        window of the acted app that a launch or an `open` brought back (PR #48 review, both rounds)."""
+        window of the acted app that a launch or an `open` brought back (PR #48 review, both rounds): what it shows
+        is the user's, so it is not proved blank (_created (c))."""
         ex, stub = _executor()
         state = {"on": [_win("12")], "off": [_win("100", title="用户的笔记")]}   # #100: the user's, minimised
         ex._windows = lambda every=False: state["on"] + (state["off"] if every else [])   # noqa: SLF001
@@ -338,12 +340,15 @@ class Windows(unittest.TestCase):
         r = ex.perform({"kind": "click", "window": W12, "target": "B2"})
         self.assertNotIn("new_window", r)
 
-        def makes(action):      # a window that did not exist in any form before
+        def makes(action):      # a window that did not exist in any form before: an empty untitled document
             state["on"] = state["on"] + [_win("14", title="未命名 2")]
             return ExecResult(True, "done")
         stub.execute = makes
+        ex._document = lambda window, wins: (None, False) if window == f"{TE}#14" else None   # noqa: SLF001
+        ex._text = lambda w: ""                                                              # noqa: SLF001
         r = ex.perform({"kind": "click", "window": W12, "target": "B2"})
         self.assertEqual(r["new_window"]["id"], f"{TE}#14")
+        ex._document = lambda window, wins: None   # noqa: SLF001
 
         # open_window: the same rule -- the reopen restores the user's minimised window, which is not the task's
         state = {"on": [_win("12")], "off": [_win("101", title="用户的另一篇")]}
@@ -961,6 +966,149 @@ class Sends(unittest.TestCase):
         self.assertNotIn("sends", by_id["B2"])          # 保存
 
 
+class CreatedWindows(unittest.TestCase):
+    """A window any action made is the task's (new_window) only on positive proof: it came on screen during the
+    task's own action, was never listed before, belongs to the app acted in, and holds no saved document and no
+    content (rc.11 run_69ec2a5a: 「新建纯文本文稿」 in TextEdit's open panel made 未命名-1, which stayed the user's and
+    asked a card for every step in it)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _desk(self, docs: dict, texts: dict, appears: list[dict]):
+        """A click that brings `appears` on screen; `docs` / `texts` are what each window's app says of its document
+        (a window missing from them cannot be read)."""
+        ex, stub = _executor()
+        ex.workspace = self.ws
+        state = {"on": [_win("12", title="打开")]}
+        ex._windows = lambda every=False: list(state["on"])   # noqa: SLF001
+        ex._document = lambda window, wins: docs.get(window)  # noqa: SLF001
+        ex._text = lambda w: texts.get(w["id"])               # noqa: SLF001
+        ex.observe(W12)
+
+        def click(action):
+            state["on"] = state["on"] + appears
+            return ExecResult(True, "done")
+        stub.execute = click
+        return ex, stub, state
+
+    def _click(self, ex):
+        return ex.perform({"kind": "click", "window": W12, "target": "B2"})
+
+    def test_an_untitled_empty_window_after_a_click_is_reported(self):
+        ex, stub, _ = self._desk({f"{TE}#14": (None, False)}, {f"{TE}#14": ""}, [_win("14", title="未命名-1")])
+        r = self._click(ex)
+        self.assertEqual(r["new_window"], {"id": f"{TE}#14", "app": "文本编辑", "app_name": "文本编辑", "bundle": TE, "title": "未命名-1"})
+        self.assertNotIn("appeared", r)
+        self.assertIn("14", stub.__dict__["_run_windows"])
+
+    def test_the_drivers_own_empty_staging_file_is_no_document_of_the_users(self):
+        staged = self.ws / ".hands" / "未命名-1"
+        staged.parent.mkdir()
+        staged.write_text("", encoding="utf-8")
+        ex, _, _ = self._desk({f"{TE}#14": (str(staged), False)}, {f"{TE}#14": ""}, [_win("14", title="未命名-1")])
+        self.assertEqual(self._click(ex)["new_window"]["id"], f"{TE}#14")
+
+    def test_a_window_showing_a_file_is_not_reported(self):
+        ex, _, _ = self._desk({f"{TE}#14": ("/Users/me/notes.txt", False)}, {f"{TE}#14": ""}, [_win("14", title="notes.txt")])
+        r = self._click(ex)
+        self.assertNotIn("new_window", r)
+        self.assertEqual(r["appeared"], [{"id": f"{TE}#14", "why": "it shows a file"}])
+
+    def test_a_window_with_content_is_not_reported(self):
+        # a reply opened with the quoted mail: no file, but text the task did not write
+        ex, _, _ = self._desk({f"{TE}#14": (None, True)}, {f"{TE}#14": "> 原邮件：明天开会"}, [_win("14", title="回复")])
+        r = self._click(ex)
+        self.assertNotIn("new_window", r)
+        self.assertEqual(r["appeared"], [{"id": f"{TE}#14", "why": "it holds content"}])
+
+    def test_a_window_whose_document_or_content_cannot_be_read_is_not_reported(self):
+        for docs, texts, why in (({}, {f"{TE}#14": ""}, "its document could not be read"),
+                                 ({f"{TE}#14": (None, False)}, {}, "its content could not be read")):
+            ex, _, _ = self._desk(docs, texts, [_win("14", title="未命名-1")])
+            r = self._click(ex)
+            self.assertNotIn("new_window", r)
+            self.assertEqual(r["appeared"], [{"id": f"{TE}#14", "why": why}])
+        # no title to ask the app by: nothing is read at all
+        ex, _, _ = self._desk({f"{TE}#14": (None, False)}, {f"{TE}#14": ""}, [_win("14", title="")])
+        self.assertNotIn("new_window", self._click(ex))
+
+    def test_another_apps_window_is_not_reported(self):
+        other = _win("77", bundle="com.apple.Notes", title="未命名", app="备忘录")
+        ex, _, _ = self._desk({other["id"]: (None, False)}, {other["id"]: ""}, [other])
+        r = self._click(ex)
+        self.assertNotIn("new_window", r)
+        self.assertNotIn("appeared", r)
+
+    def test_a_window_that_appeared_without_a_task_action_is_not_reported(self):
+        """Between actions (the epoch moves by windows), or while an action ran with the user's input reaching a task
+        app (the epoch is not the action's alone)."""
+        ex, stub, state = self._desk({f"{TE}#14": (None, False)}, {f"{TE}#14": ""}, [])
+        ex.snapshot()
+        state["on"] = state["on"] + [_win("14", title="未命名-1")]     # the user pressed cmd+N themselves
+        snap = ex.snapshot()
+        self.assertEqual(snap["epoch_reason"]["by"], "windows")
+        stub.execute = lambda action: ExecResult(True, "done")
+        ex.observe(W12)
+        r = self._click(ex)
+        self.assertNotIn("new_window", r)
+        self.assertNotIn("appeared", r)
+
+        ex, _, _ = self._desk({f"{TE}#15": (None, False)}, {f"{TE}#15": ""}, [_win("15", title="未命名-2")])
+        ex._last_input_at = lambda: time.time() + 1     # noqa: SLF001 -- the user's input, after the action began
+        r = self._click(ex)
+        self.assertNotIn("new_window", r)
+        self.assertEqual(r["appeared"][0]["why"], "the user's input reached an app the task operates while the action ran")
+
+    def test_a_window_listed_earlier_in_the_task_is_not_reported(self):
+        ex, stub, state = self._desk({f"{TE}#14": (None, False)}, {f"{TE}#14": ""}, [])
+        state["on"] = state["on"] + [_win("14", title="未命名-1")]
+        ex.snapshot()                                   # the task was shown it
+        state["on"] = [w for w in state["on"] if w["id"] != f"{TE}#14"]      # hidden
+        ex.snapshot()
+
+        def back(action):
+            state["on"] = state["on"] + [_win("14", title="未命名-1")]
+            return ExecResult(True, "done")
+        stub.execute = back
+        ex.observe(W12)
+        r = self._click(ex)
+        self.assertNotIn("new_window", r)
+        self.assertEqual(r["appeared"], [{"id": f"{TE}#14", "why": "listed earlier in this task"}])
+
+    def test_two_blank_windows_are_not_told_apart(self):
+        ex, _, _ = self._desk({f"{TE}#14": (None, False), f"{TE}#15": (None, False)}, {f"{TE}#14": "", f"{TE}#15": ""},
+                              [_win("14", title="未命名-1"), _win("15", title="未命名-2")])
+        r = self._click(ex)
+        self.assertNotIn("new_window", r)
+        self.assertEqual(len(r["appeared"]), 2)
+
+    def test_a_window_the_driver_followed_is_waited_for_until_it_is_on_screen(self):
+        ex, stub, state = self._desk({f"{TE}#14": (None, False)}, {f"{TE}#14": ""}, [])
+        calls = {"n": 0}
+        on = ex._windows
+
+        def windows(every=False):
+            calls["n"] += 1
+            if calls["n"] == 3:                       # on screen a moment after the action returned
+                state["on"] = state["on"] + [_win("14", title="未命名-1")]
+            return on(every)
+        ex._windows = windows                         # noqa: SLF001
+
+        def follows(action):
+            stub._pinned_window = "14"                # the driver now points at the window it opened
+            return ExecResult(True, "opened a new document")
+        stub.execute = follows
+        calls["n"] = 0
+        with mock.patch("deskmind_hands.executor.time.sleep"):
+            r = self._click(ex)
+        self.assertEqual(r["new_window"]["id"], f"{TE}#14")
+
+
 class BrowserFields(unittest.TestCase):
     def test_an_approved_write_into_a_field_is_the_drivers_one_step_allowance(self):
         """The layer above judged the step; the driver's guard against writing into a browser's own field takes
@@ -1250,6 +1398,8 @@ class OpenWindow(unittest.TestCase):
         stub._preexisting = {"14"}        # what the driver, started late, took for the user's
         state = {"on": [_win("12")]}
         ex._windows = lambda every=False: state["on"]   # noqa: SLF001
+        ex._document = lambda window, wins: (None, False) if window == f"{TE}#14" else None   # noqa: SLF001 -- empty, untitled
+        ex._text = lambda w: ""                                                              # noqa: SLF001
         ex.observe(W12)
 
         def makes(action):

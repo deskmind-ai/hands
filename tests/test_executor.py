@@ -1460,3 +1460,116 @@ class OpenWindow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StepPictures(unittest.TestCase):
+    """What the app's live view and step timeline need from a step (harness M0): where the window and the element acted
+    on were on screen before acting, and a small picture of the window after it -- only when the layer above asks
+    (it does for steps that change something), only when the step went through, and never larger than the cap."""
+
+    def _ex(self):
+        ex, stub = _executor()
+        wins = [dict(_win("12"), bounds=[100.0, 50.0, 800.0, 600.0])]
+        ex._windows = lambda every=False: wins          # noqa: SLF001 -- no desktop: one window, here
+        stub.screen_rect = lambda eid: [140.0, 90.0, 60.0, 24.0] if eid == "B2" else None
+        return ex, stub
+
+    def test_observe_says_where_the_window_is(self):
+        ex, _ = self._ex()
+        self.assertEqual(ex.observe(W12)["window"]["frame"], [100.0, 50.0, 800.0, 600.0])
+        ex2, _ = _executor()
+        ex2._windows = lambda every=False: [_win("12")]   # noqa: SLF001 -- bounds unknown: no frame, nothing made up
+        self.assertNotIn("frame", ex2.observe(W12)["window"])
+
+    def test_the_receipt_says_where_the_window_and_the_target_were_before_acting(self):
+        ex, _ = self._ex()
+        ex.observe(W12)
+        r = ex.perform({"kind": "click", "window": W12, "target": "B2"}, frames=True)
+        self.assertEqual(r["window_frame"], {"x": 100.0, "y": 50.0, "w": 800.0, "h": 600.0})
+        self.assertEqual(r["target_frame"], {"x": 140.0, "y": 90.0, "w": 60.0, "h": 24.0})
+        r = ex.perform({"kind": "key", "window": W12, "chord": "cmd+s"}, frames=True)   # no element: the window only
+        self.assertNotIn("target_frame", r)
+        self.assertIn("window_frame", r)
+        self.assertNotIn("target_frame", ex.perform({"kind": "wait", "ms": 1}, frames=True))
+        self.assertNotIn("shot", r)                                          # no picture unless asked for
+        # nothing asked for: nothing extra, not even the window list
+        listed = []
+        ex._windows = lambda every=False: (listed.append(1), [dict(_win("12"), bounds=[100.0, 50.0, 800.0, 600.0])])[1]   # noqa: SLF001
+        r = ex.perform({"kind": "type", "window": W12, "target": "T1", "text": "x"})
+        plain = len(listed)
+        self.assertNotIn("window_frame", r)
+        ex.perform({"kind": "type", "window": W12, "target": "T1", "text": "x"}, frames=True)
+        self.assertEqual(len(listed), 2 * plain + 1)                         # frames cost one list; none without
+
+    def test_a_picture_is_taken_after_the_step_when_asked_scaled_down_and_capped(self):
+        from PIL import Image
+        import random
+        ex, _ = self._ex()
+        ex.observe(W12)
+        rnd = random.Random(7)
+
+        def capture(wid, path):          # a big, noisy window: the worst case for a PNG's size
+            self.assertEqual(str(wid), "12")
+            Image.frombytes("RGB", (2400, 1600), bytes(rnd.getrandbits(8) for _ in range(2400 * 1600 * 3))).save(path)
+            return True
+
+        with tempfile.TemporaryDirectory() as d, mock.patch("deskmind_hands.drivers.capture.capture_window", capture):
+            shot = Path(d) / "shots" / "st_1.png"
+            r = ex.perform({"kind": "click", "window": W12, "target": "B2"}, str(shot))
+            # the reply does not wait for the picture: it says where it will be
+            self.assertEqual((r["shot"], r["shot_pending"]), (str(shot), True))
+            ex.wait_shots(30)
+            self.assertLessEqual(shot.stat().st_size, HandsExecutor.SHOT_MAX_BYTES)
+            with Image.open(shot) as im:
+                self.assertLessEqual(max(im.size), HandsExecutor.SHOT_MAX_SIDE)
+            self.assertEqual(sorted(p.name for p in shot.parent.iterdir()), ["st_1.png"])     # the raw capture is gone
+
+    def test_no_picture_of_a_step_that_did_not_go_through_or_could_not_be_captured(self):
+        ex, stub = self._ex()
+        ex.observe(W12)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch("deskmind_hands.drivers.capture.capture_window", lambda wid, path: False):
+                r = ex.perform({"kind": "click", "window": W12, "target": "B2"}, str(Path(d) / "a.png"))
+                ex.wait_shots(10)
+                self.assertEqual(r["status"], "ok")
+                self.assertFalse((Path(d) / "a.png").exists())                 # promised, could not be taken: no file
+            stub.execute = lambda action: ExecResult(False, "the button is disabled")
+            with mock.patch("deskmind_hands.drivers.capture.capture_window", lambda wid, path: self.fail("no picture of a failed step")):
+                r = ex.perform({"kind": "click", "window": W12, "target": "B2"}, str(Path(d) / "b.png"))
+                self.assertEqual(r["status"], "error")
+                self.assertNotIn("shot", r)
+            self.assertEqual(list(Path(d).iterdir()), [])
+
+    def test_no_picture_of_a_window_the_step_closed(self):
+        ex, _ = self._ex()
+        ex._pk = lambda args: {}                         # noqa: SLF001 -- the close went through
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch("deskmind_hands.drivers.capture.capture_window", lambda wid, path: self.fail("no picture of a closed window")):
+            r = ex.perform({"kind": "close_window", "window": W12}, str(Path(d) / "c.png"))
+        self.assertEqual(r["status"], "ok")
+        self.assertNotIn("shot", r)
+
+
+class ShotRequest(unittest.TestCase):
+    def test_the_requests_shot_reaches_perform_and_its_absence_leaves_perform_as_it_was(self):
+        import io
+        import sys as _sys
+        from deskmind_hands import executor as exe
+        lines = io.StringIO('{"id": 1, "op": "begin"}\n{"id": 2, "op": "perform", "action": {"kind": "wait", "ms": 1}, "shot": "/tmp/x/st_1.png", "frames": true}\n'
+                            '{"id": 3, "op": "perform", "action": {"kind": "wait", "ms": 1}}\n'
+                            '{"id": 4, "op": "perform", "action": {"kind": "wait", "ms": 1}, "frames": true}\n')
+        out, seen = io.StringIO(), []
+
+        class Fake:
+            def __init__(self, *a, **k):
+                pass
+
+            def snapshot(self):
+                return {"epoch": 1}
+
+            def perform(self, action, shot=None, frames=False):
+                seen.append((shot, frames))
+                return {"status": "ok"}
+        with mock.patch.object(_sys, "stdin", lines), mock.patch.object(_sys, "stdout", out), mock.patch.object(exe, "HandsExecutor", Fake):
+            exe.main()
+        self.assertEqual(seen, [("/tmp/x/st_1.png", True), (None, False), (None, True)])

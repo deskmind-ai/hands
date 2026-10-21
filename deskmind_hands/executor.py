@@ -7,7 +7,7 @@ One JSON request per line on stdin, one JSON reply per line on stdout (`{"id", "
     begin     {scratch?}                 start; the first inventory
     snapshot  {}                         the whole computer: locked, front app, every on-screen window of every app
     observe   {window, screenshot?}      one window close up: elements, dialog, text
-    perform   {action}                   one generic action (click, set_value, type, select, key, scroll,
+    perform   {action, shot?, frames?}   one generic action (click, set_value, type, select, key, scroll,
                                          open_window, close_window, focus_window, wait); its reply carries
                                          `files` ([{path, sha256?}]: what this action wrote, with the digest of the
                                          content written -- the driver's own bytes, or the text the app holds when
@@ -16,7 +16,13 @@ One JSON request per line on stdin, one JSON reply per line on stdout (`{"id", "
                                          `new_window` ({id, app, app_name, bundle, title}: a window this action
                                          made -- any action, not only open_window; see _created for the proof) and
                                          `appeared` ([{id, why}]: windows of the acted app that came on screen
-                                         during the action and are not claimed, with why)
+                                         during the action and are not claimed, with why); with `frames` or `shot`,
+                                         `window_frame` and `target_frame` ({x, y, w, h}, screen points, top-left
+                                         origin: the window and the element acted on, as they were before acting --
+                                         for the app's cursor); and, when `shot` names a file and the step went
+                                         through, `shot` (that file) with `shot_pending`: a downscaled PNG of the
+                                         window after the action, written on a thread after the reply (see _shot;
+                                         never written when the capture fails)
     stop      {}                         the app's stop switch: every later perform is refused
     end       {}
 
@@ -33,6 +39,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -675,7 +682,11 @@ class HandsExecutor:
             if e.rect:
                 el["rect"] = [round(e.rect.x, 1), round(e.rect.y, 1), round(e.rect.w, 1), round(e.rect.h, 1)]
             els.append(el)
-        out = {"epoch": self.epoch, "window": {"id": window, "app": bundle, "app_name": app_display_name(bundle), "title": obs.window_title},
+        frame = self._frame(window, pre)
+        out = {"epoch": self.epoch, "window": {"id": window, "app": bundle, "app_name": app_display_name(bundle), "title": obs.window_title,
+                                               # where the window is on screen (points, top-left origin): an element's
+                                               # rect is local to it, so the app can place a mark on a picture of it
+                                               **({"frame": frame} if frame else {})},
                "modal": {"title": "dialog"} if obs.dialog else None, "elements": els, "text": "\n".join(texts)[:4000]}
         if screenshot and obs.screenshot_png:
             import base64
@@ -689,7 +700,102 @@ class HandsExecutor:
         STOP.set()          # a wait in progress (the vision model starting) gives up at its next slice
         return {"stopped": True}
 
-    def perform(self, action: dict) -> dict:
+    #: A step's picture (`shot`): the longest side at most this many pixels, and the file at most this many bytes.
+    SHOT_MAX_SIDE = 1024
+    SHOT_MAX_BYTES = 200_000
+
+    @staticmethod
+    def _frame(window: str, wins: list[dict]) -> list[float] | None:
+        """The window's frame on screen, [x, y, w, h] in points (top-left origin), from the inventory; None if unknown."""
+        w = next((w for w in wins if w["id"] == window), None)
+        b = (w or {}).get("bounds")
+        if not b or any(v is None for v in b):
+            return None
+        return [round(float(v), 1) for v in b]
+
+    def perform(self, action: dict, shot: str | None = None, frames: bool = False) -> dict:
+        """One action. With `frames`, where the window and the element acted on were on screen before acting. With
+        `shot` (a file path the layer above chose, in its run folder), a picture of the window after it -- taken on a
+        thread of its own while the reply goes out (`shot_pending`): the file appears at that path written whole (a
+        rename), or not at all when the capture fails. Neither asked for: nothing extra, not even a window list."""
+        window = action.get("window") or ""
+        where: dict = {}
+        if (frames or shot) and window and action.get("kind") not in (None, "wait", "open_window"):
+            try:
+                wf = self._frame(window, self._windows())
+                if wf:
+                    where["window_frame"] = dict(zip("xywh", wf))
+                bundle = self._split(window)[0]
+                # only on the window the app's driver last observed (whose element ids it holds): that driver exists
+                d = self._driver(bundle) if action.get("target") and self.current.get(bundle) == window else None
+                if d is not None and hasattr(d, "screen_rect"):
+                    tf = d.screen_rect(action.get("target"))
+                    if tf:
+                        where["target_frame"] = dict(zip("xywh", (round(float(v), 1) for v in tf)))
+            except Exception:  # noqa: BLE001 -- where things are is for the picture only: never a reason to fail a step
+                where = {}
+        out = self._perform(action)
+        out.update(where)
+        # no picture of a window the step closed: there is nothing to take, only a slow capture that fails
+        if shot and out.get("status") in ("ok", "unverified") and action.get("kind") != "close_window":
+            target = out.get("window") or (out.get("new_window") or {}).get("id") or window
+            if target and "#" in target and self._split(target)[1].isdigit():
+                # off the action's path: the reply goes now and the picture follows (taken inline it cost a changing
+                # step an estimated 200-400 ms)
+                t = threading.Thread(target=self._shot, args=(target, Path(shot)), name="shot", daemon=True)
+                self.__dict__.setdefault("_shots", []).append(t)
+                t.start()
+                out["shot"] = shot
+                out["shot_pending"] = True
+        return out
+
+    def wait_shots(self, timeout: float = 5.0) -> None:
+        """Let the pictures still being taken finish, at most `timeout` seconds in all (the end of a run, tests)."""
+        until = time.time() + timeout
+        for t in self.__dict__.get("_shots", []):
+            t.join(max(0.0, until - time.time()))
+        self._shots = [t for t in self.__dict__.get("_shots", []) if t.is_alive()]
+
+    def _shot(self, window: str, path: Path) -> str | None:
+        """A picture of `window` to `path`: captured in the background (ScreenCaptureKit, `screencapture -l`), scaled down
+        so its longest side is at most SHOT_MAX_SIDE pixels, then made smaller (a 256-colour palette, then halving) until
+        the file is at most SHOT_MAX_BYTES. Made under a temporary name and renamed into place, so a reader never sees
+        half a file. The path, or None when it could not be taken (then nothing is at `path`)."""
+        _, wid = self._split(window)
+        if not wid.isdigit():
+            return None
+        raw = path.with_name(path.stem + ".raw.png")
+        part = path.with_name(path.stem + ".part.png")
+        try:
+            from PIL import Image
+            from .drivers.capture import capture_window
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not capture_window(wid, raw):
+                return None
+            with Image.open(raw) as im:
+                im = im.convert("RGB")
+                scale = min(1.0, self.SHOT_MAX_SIDE / max(im.size))
+                if scale < 1.0:
+                    im = im.resize((max(1, round(im.width * scale)), max(1, round(im.height * scale))), Image.LANCZOS)
+                im.save(part, "PNG", optimize=True)
+                small = im
+                while part.stat().st_size > self.SHOT_MAX_BYTES and max(small.size) > 256:
+                    small.quantize(colors=256).save(part, "PNG", optimize=True)
+                    if part.stat().st_size <= self.SHOT_MAX_BYTES:
+                        break
+                    small = small.resize((max(1, small.width // 2), max(1, small.height // 2)), Image.LANCZOS)
+                    small.save(part, "PNG", optimize=True)
+            if part.stat().st_size > self.SHOT_MAX_BYTES:
+                return None
+            os.replace(part, path)
+            return str(path)
+        except Exception:  # noqa: BLE001 -- a picture that cannot be taken costs the step nothing
+            return None
+        finally:
+            raw.unlink(missing_ok=True)
+            part.unlink(missing_ok=True)
+
+    def _perform(self, action: dict) -> dict:
         if getattr(self, "stopped", False) or STOP.is_set():
             return {"status": "error", "why": "stopped by the app"}
         kind = action.get("kind")
@@ -1146,6 +1252,7 @@ class HandsExecutor:
         return []
 
     def end(self) -> dict:
+        self.wait_shots()
         for d in self.drivers.values():
             try:
                 d.close()
@@ -1215,7 +1322,8 @@ def main() -> None:
             elif op == "observe":
                 res = ex.observe(req["window"], bool(req.get("screenshot")))
             elif op == "perform":
-                res = ex.perform(req["action"])
+                res = (ex.perform(req["action"], req.get("shot") or None, bool(req.get("frames")))
+                       if req.get("shot") or req.get("frames") else ex.perform(req["action"]))
             elif op == "end":
                 res = ex.end()
             else:

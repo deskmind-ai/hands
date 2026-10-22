@@ -11,13 +11,19 @@ A listen-only tap at the annotated session point (kCGAnnotatedSessionEventTap) s
 server has decided its target process (kCGEventTargetUnixProcessID); input whose target is DeskMind (the app and
 its helper) is left out of `last_external_at`. An event with no target known counts: the safe side.
 
-A key event's target is not always the app it is typed into: a key pressed with Command held (the app switcher's
-Command-Tab) comes with the Dock as its target, which is no ordinary app, and some come with none. While the owner
-worked in a terminal and switched apps, each such key was input to an unknown target and staled the steps of a task
-working in a music app (rc.13, 10-22, run_fd8ab281: 4 stale refusals said "to: unknown"). Keyboard input goes to the
-key window of the app in front, so a key event whose target is not an ordinary app (or DeskMind) is input to the app
-that had the keyboard when it arrived -- read then, not later: during a step's flash the task's app is in front and
-the keys typed then do land in it. Only when that cannot be known either is the target unknown, and it counts.
+A key event's target is not always an ordinary app: a key pressed with Command held comes with the Dock as its
+target -- it may act on the app switcher (Command-Tab), which changes only which app is in front, no change of
+anything a task looks at -- and some come with none. While the owner worked in a terminal and switched apps, each such
+key was input to an unknown target and staled the steps of a task working in a music app (rc.13, 10-22,
+run_fd8ab281: 4 stale refusals said "to: unknown"). Such a key (target neither an ordinary app nor DeskMind) is input
+to the app that had the keyboard then, as plain typing is, under three guards, each on the safe side:
+- during a step of the task's (the executor marks each one, `step_began`/`step_ended`: the step may bring the task's
+  app forward, a flash), plus STEP_MARGIN_S around it, the key counts for the task's app, whoever has the keyboard
+  when the callback runs -- it can run late, waiting for the interpreter while the executor works;
+- otherwise the app with the keyboard is read only when the callback runs within KEY_FRESH_S of the event's own
+  timestamp; a late callback would read a front that has moved on, so the key keeps its target and counts;
+- when the app with the keyboard cannot be read (no answer within FRONT_DEADLINE_S, accessibility refused), or is
+  itself no ordinary app (Spotlight's field), the key keeps its target and counts.
 
 Key events reach a tap only with Input Monitoring; CGEventTapCreate may drop the key bits of a mask and still
 return a tap, so whether keys are watched is read from the permission itself (CGPreflightListenEventAccess),
@@ -26,6 +32,7 @@ every input counts. Listen-only: nothing is changed or delayed.
 """
 from __future__ import annotations
 
+import queue
 import threading
 import time
 
@@ -127,6 +134,56 @@ def track_children() -> None:
 #: DeskMind's own processes: input to them is the user answering DeskMind, not changing their Mac.
 OWN_BUNDLES = {"ai.deskmind.app", "ai.deskmind.hands"}
 
+#: How old a key event may be when its callback runs for the app with the keyboard to be read for it then.
+KEY_FRESH_S = 0.05
+#: Around a step of the task's (before its start, after its end): a key needing an app counts for the step's app. The
+#: end side covers the front given back late (the driver's LATE_FRONT_S watch) and the event clock's rounding.
+STEP_MARGIN_S = 0.5
+#: How long the tap's callback waits for the accessibility server to name the app with the keyboard; after a read
+#: that failed or did not answer, none is tried for FRONT_BACKOFF_S (each key then keeps its target and counts).
+FRONT_DEADLINE_S = 0.1
+FRONT_BACKOFF_S = 0.5
+
+
+def _uptime_ns() -> int:
+    """Nanoseconds since boot, not counting sleep: mach_absolute_time's clock, which CGEventGetTimestamp counts on."""
+    clock = getattr(time, "CLOCK_UPTIME_RAW", None)
+    return time.clock_gettime_ns(clock) if clock is not None else time.monotonic_ns()
+
+
+def _mach_ticks() -> tuple[int, float] | None:
+    """(mach_absolute_time now, nanoseconds per tick); None off macOS."""
+    try:
+        import ctypes
+        lib = _mach_ticks.lib = getattr(_mach_ticks, "lib", None) or ctypes.CDLL("/usr/lib/libSystem.dylib")
+        if not hasattr(_mach_ticks, "scale"):
+            class _Timebase(ctypes.Structure):
+                _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+            tb = _Timebase()
+            lib.mach_timebase_info(ctypes.byref(tb))
+            lib.mach_absolute_time.restype = ctypes.c_uint64
+            _mach_ticks.scale = tb.numer / tb.denom if tb.denom else 1.0
+        return int(lib.mach_absolute_time()), _mach_ticks.scale
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def event_age(ts: int) -> float | None:
+    """Seconds since an event stamped `ts` (CGEventGetTimestamp) happened; None when it cannot be told. The stamp is
+    documented as nanoseconds since boot, and on Apple silicon is reported to be in mach_absolute_time ticks (one
+    tick is 41.67 ns there): read both ways, the reading that gives a plausible age (under a minute, not ahead of
+    now) is the one, and with neither the age is not known -- the safe side (the key keeps its target)."""
+    if not ts or ts <= 0:
+        return None
+    ages = [(_uptime_ns() - ts) / 1e9]
+    ticks = _mach_ticks()
+    if ticks is not None:
+        ages.append((ticks[0] - ts) * ticks[1] / 1e9)
+    for age in ages:
+        if -0.01 <= age <= 60.0:
+            return max(age, 0.0)
+    return None
+
 
 class InputWatch:
     """Records when the user last sent input to an application other than DeskMind (`last_external_at`, epoch
@@ -159,6 +216,13 @@ class InputWatch:
         self._not_ours: set[tuple] = set()
         self._thread: threading.Thread | None = None
         self._tap = None
+        #: the task's steps, newest last: [lowercased bundle, began at, ended at or None] (epoch seconds)
+        self._steps: list[list] = []
+        #: the reader of the app with the keyboard, on its own thread (front_now)
+        self._front_q: queue.Queue | None = None
+        self._front_pending: threading.Event | None = None
+        self._front_backoff_until = 0.0
+        self._front_lock = threading.Lock()
 
     # -- classification (pure, testable) ---------------------------------------------------------------------
     def is_own(self, pid: int | None) -> bool:
@@ -170,13 +234,20 @@ class InputWatch:
             self._pid_bundle[pid] = bundle
         return bundle.lower() in self.own_bundles
 
-    def note(self, pid: int | None, at: float | None = None, key: bool = False) -> None:
+    def note(self, pid: int | None, at: float | None = None, key: bool = False, age: float | None = None) -> None:
         """An input event the window server routed to `pid`'s process (None or 0: no target known) at `at`. A key
-        event (`key`) whose target is not an ordinary app nor DeskMind went to the app that has the keyboard, read
-        now: the caller notes an event as it arrives."""
+        event (`key`) whose target is neither an ordinary app nor DeskMind: inside a step of the task's, input to the
+        step's app; else, when the event is `age` seconds old at most KEY_FRESH_S, input to the app that has the
+        keyboard now; else its target is kept (see the module's docstring)."""
         at = at or time.time()
         if key and not self.is_own(pid) and not (pid and self.is_regular(pid)):
-            pid = self.front_now() or pid
+            step = self.step_at(at)
+            if step:
+                self.last_external_at = max(self.last_external_at, at)
+                self.last_by_bundle[step] = max(self.last_by_bundle.get(step, 0.0), at)
+                return
+            if age is not None and 0.0 <= age <= KEY_FRESH_S:
+                pid = self.front_now() or pid
         if self.is_own(pid):
             self.last_own_at = max(self.last_own_at, at)
             return
@@ -187,12 +258,56 @@ class InputWatch:
         else:
             self.last_unknown_at = max(self.last_unknown_at, at)
 
+    # -- the task's steps (told by the executor) -------------------------------------------------------------
+    def step_began(self, bundle: str) -> list:
+        """A step of the task's in `bundle` begins: its app may be brought forward until `step_ended(token)`."""
+        token = [(bundle or "").lower(), time.time(), None]
+        self._steps = (self._steps + [token])[-32:]
+        return token
+
+    @staticmethod
+    def step_ended(token: list) -> None:
+        token[2] = time.time()
+
+    def step_at(self, at: float) -> str:
+        """The app of the task's step under way at `at` (within STEP_MARGIN_S of one), or ""."""
+        for bundle, began, ended in reversed(self._steps):
+            if bundle and began - STEP_MARGIN_S <= at <= (ended if ended is not None else time.time()) + STEP_MARGIN_S:
+                return bundle
+        return ""
+
+    # -- the app with the keyboard ---------------------------------------------------------------------------
     def front_now(self) -> int:
-        """The pid of the app that has the keyboard now; 0 when it cannot be known (the key then keeps its target)."""
-        try:
-            return int(self.front_pid() or 0)
-        except Exception:  # noqa: BLE001 -- not known: the safe side
+        """The pid of the app that has the keyboard now; 0 when it cannot be known (the key then keeps its target).
+        Read on a thread of its own, waited for at most FRONT_DEADLINE_S: a read that hangs never holds the tap,
+        and no process-wide accessibility setting is changed for it (a messaging timeout set on the system-wide
+        element is every AX call's in this process -- the address-bar guard's reads included). While one read is
+        still out, or for FRONT_BACKOFF_S after one failed, none is tried."""
+        if time.monotonic() < self._front_backoff_until:
             return 0
+        with self._front_lock:
+            if self._front_pending is not None and not self._front_pending.is_set():
+                return 0                                   # the last read has not come back
+            if self._front_q is None:
+                self._front_q = queue.Queue()
+                threading.Thread(target=self._front_worker, name="input-watch-front", daemon=True).start()
+            done, box = threading.Event(), {}
+            self._front_pending = done
+        self._front_q.put((done, box))
+        pid = box.get("pid", 0) if done.wait(FRONT_DEADLINE_S) else 0
+        if not pid:
+            self._front_backoff_until = time.monotonic() + FRONT_BACKOFF_S
+        return pid
+
+    def _front_worker(self) -> None:
+        while True:
+            done, box = self._front_q.get()
+            try:
+                box["pid"] = int(self.front_pid() or 0)
+            except Exception:  # noqa: BLE001 -- not known: the safe side
+                box["pid"] = 0
+            finally:
+                done.set()
 
     def last_input_for(self, bundles: set[str]) -> float:
         """When input last went to one of `bundles` (lowercased), or anywhere unknown: the safe side."""
@@ -259,23 +374,19 @@ class InputWatch:
     @staticmethod
     def _front_pid() -> int:
         """The app that has the keyboard now, asked of the accessibility server (the system-wide element's
-        AXFocusedApplication). Not NSWorkspace's frontmostApplication: in a process whose main thread runs no event
-        loop (this one) it keeps the app that was in front when it was first read, which a probe on 10-22 showed
-        while the keyboard moved between four apps. The accessibility server answers only a process that has spoken to
-        the window server (before that: kAXErrorCannotComplete, every time), so a cheap window list is asked for once
-        first, and again before one retry. 0 when it cannot be read."""
+        AXFocusedApplication); called on front_now's thread, which bounds the wait -- no messaging timeout is set
+        here, as one set on the system-wide element is the whole process's. Not NSWorkspace's frontmostApplication:
+        in a process whose main thread runs no event loop (this one) it keeps the app that was in front when it was
+        first read, which a probe on 10-22 showed while the keyboard moved between four apps. The accessibility
+        server answers only a process that has spoken to the window server (before that: kAXErrorCannotComplete,
+        every time), so a cheap window list is asked for first. 0 when it cannot be read."""
         try:
             import ApplicationServices as AS
             import Quartz
-            sw = getattr(InputWatch, "_system_wide", None)
-            if sw is None:
+            if not getattr(InputWatch, "_window_server_seen", False):
                 Quartz.CGWindowListCreate(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
-                sw = InputWatch._system_wide = AS.AXUIElementCreateSystemWide()
-                AS.AXUIElementSetMessagingTimeout(sw, 0.25)   # on the tap's thread: never wait long
-            err, app = AS.AXUIElementCopyAttributeValue(sw, "AXFocusedApplication", None)
-            if err != 0 or app is None:
-                Quartz.CGWindowListCreate(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
-                err, app = AS.AXUIElementCopyAttributeValue(sw, "AXFocusedApplication", None)
+                InputWatch._window_server_seen = True
+            err, app = AS.AXUIElementCopyAttributeValue(AS.AXUIElementCreateSystemWide(), "AXFocusedApplication", None)
             if err != 0 or app is None:
                 return 0
             err, pid = AS.AXUIElementGetPid(app, None)
@@ -324,11 +435,21 @@ class InputWatch:
                     self._dragging = False
                     self.note(None)
                 return event
+            key = type_ in (Quartz.kCGEventKeyDown, Quartz.kCGEventFlagsChanged)
+            age = self._event_age(Quartz, event) if key else None
             self.note(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0),
-                      key=type_ in (Quartz.kCGEventKeyDown, Quartz.kCGEventFlagsChanged))
+                      at=time.time() - age if age is not None and age >= 0 else None, key=key, age=age)
         except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side (an unknown target)
             self.note(None)
         return event
+
+    @staticmethod
+    def _event_age(Quartz, event) -> float | None:
+        """How long ago the event happened (seconds, by its own timestamp); None when that cannot be read."""
+        try:
+            return event_age(int(Quartz.CGEventGetTimestamp(event) or 0))
+        except Exception:  # noqa: BLE001
+            return None
 
     def start(self) -> bool:
         """Make the tap and run it on its own thread; False when the system refuses, in which case nothing is

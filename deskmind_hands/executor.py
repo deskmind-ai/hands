@@ -445,6 +445,18 @@ class HandsExecutor:
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
         return time.time() - idle
 
+    def _step_began(self, bundle: str):
+        """Tell the input watch a step of the task's in `bundle` begins: the step may bring the app forward (the
+        driver's flash), and a key that needs an app to be counted against counts for this one until it ends
+        (inputwatch: the tap's callback can run late, after the front has gone back)."""
+        w = getattr(self, "_watch", None)
+        return w.step_began(bundle) if w is not None and hasattr(w, "step_began") else None
+
+    def _step_ended(self, token) -> None:
+        w = getattr(self, "_watch", None)
+        if token is not None and w is not None:
+            w.step_ended(token)
+
     def _advance(self, reason: dict | None = None) -> None:
         self.epoch += 1
         self._epoch_at = time.time()
@@ -880,11 +892,13 @@ class HandsExecutor:
             have = [b for b in (flash_before or "").split(",") if b.strip()]
             if bundle.lower() not in {b.lower() for b in have}:
                 os.environ["HANDS_FLASH_APPS"] = ",".join(have + [bundle])
+        step = self._step_began(bundle)
         try:
             if getattr(self, "stopped", False) or STOP.is_set():   # read while this step was getting ready: nothing sent
                 return {"status": "error", "why": "stopped by the app"}
             res: ExecResult = d.execute(a)
         finally:
+            self._step_ended(step)
             if action.get("foreground_ok"):
                 if flash_before is None:
                     os.environ.pop("HANDS_FLASH_APPS", None)
@@ -1056,6 +1070,7 @@ class HandsExecutor:
             # LAUNCH_WAIT_S, until a window of it appears.
             before_launch = self._known_windows()
             front_before = self._front_bundle_id()
+            step = self._step_began(bundle)        # some apps take the front on their first launch: see below
             # in the background (-g): opening an app is no reason to take the front from the user; it comes forward
             # only for a step, by the flash's rules (the user still, the step allowed) -- `open -b` did take it, and
             # a music app kept jumping in front of the user's work (rc.10, 10-21)
@@ -1064,6 +1079,7 @@ class HandsExecutor:
             if front_before and front_before != bundle and self._front_bundle_id() == bundle:
                 # some apps take the front on their first launch whatever -g says: given back at once
                 self._make_frontmost(front_before)
+            self._step_ended(step)
             self._settled(bundle)
         d = self._driver(bundle)      # started now, so the windows it finds are the ones there before the task's
         before = self._known_windows()

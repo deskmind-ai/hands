@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import os
+import sys
+import threading
+import time
+import types
 import unittest
 from unittest import mock
 
@@ -213,14 +217,19 @@ def _quartz(fields: dict):
                  "kCGEventTargetUnixProcessID": 40, "kCGEventSourceUnixProcessID": 41}.items():
         setattr(q, k, v)
     q.CGEventGetIntegerValueField = lambda e, f: fields.get(f, 0)
+    # the event's own timestamp (mach_absolute_time's clock, in nanoseconds here): fresh unless a test says otherwise
+    q.CGEventGetTimestamp = lambda e: fields.get("ts") or _uptime_ns()
     return q
 
 
-class KeysGoToTheAppInFront(unittest.TestCase):
-    """A key event can reach the tap with no target, or with one that is no ordinary app (a Command-key press comes
-    with the Dock as its target); keyboard input goes to the key window of the app in front, so it is input to the
-    app that had the keyboard when it arrived (rc.13, 10-22: the owner working in iTerm2 while a task worked in
-    NetEase Music came out as input to an unknown target and staled 4 steps of run_fd8ab281)."""
+def _uptime_ns() -> int:
+    clock = getattr(time, "CLOCK_UPTIME_RAW", None)
+    return time.clock_gettime_ns(clock) if clock is not None else time.monotonic_ns()
+
+
+class _KeysCase(unittest.TestCase):
+    """A watch fed through the tap's callback, a fake source for the app with the keyboard, and an executor whose
+    task operates NetEase Music."""
 
     def setUp(self):
         import sys
@@ -241,6 +250,13 @@ class KeysGoToTheAppInFront(unittest.TestCase):
 
     def key(self):
         self.w._callback(None, 10, object(), None)
+
+
+class KeysGoToTheAppInFront(_KeysCase):
+    """A key event can reach the tap with no target, or with one that is no ordinary app (a Command-key press comes
+    with the Dock as its target); keyboard input goes to the key window of the app in front, so it is input to the
+    app that had the keyboard when it arrived (rc.13, 10-22: the owner working in iTerm2 while a task worked in
+    NetEase Music came out as input to an unknown target and staled 4 steps of run_fd8ab281)."""
 
     def test_keys_with_no_target_while_another_app_is_in_front_do_not_stale_the_task(self):
         self.front["pid"] = ITERM                          # typing in the terminal
@@ -268,7 +284,7 @@ class KeysGoToTheAppInFront(unittest.TestCase):
             for unknown in (lambda: 0, lambda: None, mock.Mock(side_effect=RuntimeError("no accessibility"))):
                 self.fields[40] = target
                 self.w.front_pid = unknown
-                self.w.last_unknown_at = 0.0
+                self.w.last_unknown_at = self.w._front_backoff_until = 0.0
                 self.key()
                 self.assertGreater(self.w.last_unknown_at, 0.0)
                 self.assertEqual(self.w.last_input_where({NE})[1], "unknown")
@@ -276,7 +292,7 @@ class KeysGoToTheAppInFront(unittest.TestCase):
         # the app with the keyboard is itself no ordinary app (Spotlight's field, say): unknown, it counts
         self.front["pid"] = DOCK
         self.w.front_pid = lambda: self.front["pid"]
-        self.w.last_unknown_at = 0.0
+        self.w.last_unknown_at = self.w._front_backoff_until = 0.0
         self.fields[40] = 0
         self.key()
         self.assertGreater(self.w.last_unknown_at, 0.0)
@@ -321,6 +337,129 @@ class KeysGoToTheAppInFront(unittest.TestCase):
         s = ex.snapshot()
         self.assertEqual(s["epoch"], e0 + 1)
         self.assertEqual((s["epoch_reason"]["by"], s["epoch_reason"]["to"]), ("input", TE.lower()))
+
+class KeysAtTheFlashsEdge(_KeysCase):
+    """The tap's callback runs when the interpreter lets it, which can be well after the key: while the executor
+    works through a flash, up to about half a second (hands#62 review). A front read then is not the front the key
+    met. Each test here fails on the PR's first head (0568e82)."""
+
+    def test_a_late_callback_does_not_read_the_front_for_the_key(self):
+        """A key typed in the task's app during a flash, its callback run after the front went back to iTerm2: the
+        key keeps its target and counts, as before the PR, rather than being put on iTerm2."""
+        calls = []
+        self.w.front_pid = lambda: calls.append(1) or ITERM
+        self.fields[40] = DOCK
+        self.fields["ts"] = _uptime_ns() - 300_000_000      # the key happened 0.3 s before its callback
+        self.key()
+        self.assertGreater(self.w.last_unknown_at, 0.0)
+        self.assertNotIn("com.googlecode.iterm2", self.w.last_by_bundle)
+        self.assertGreater(self.ex._last_input_at(), 0.0)   # noqa: SLF001 -- the task is staled
+        self.assertEqual(calls, [])                          # the front is not even asked
+        self.assertLess(time.time() - self.w.last_unknown_at - 0.3, 0.1)   # noted at the key's own time
+
+    def test_a_key_inside_a_step_counts_for_the_steps_app_whoever_is_in_front_later(self):
+        step = self.w.step_began(NE)                       # the executor: a step in NetEase Music begins (a flash)
+        self.front["pid"] = ITERM                          # the front already went back by the time the callback runs
+        self.fields[40] = DOCK
+        self.key()                                         # fresh, during the step
+        self.assertEqual(self.w.last_input_where({NE})[1], NE)
+        self.assertEqual(self.w.last_unknown_at, 0.0)
+        self.w.step_ended(step)
+        self.w.last_by_bundle.clear()
+        self.fields["ts"] = _uptime_ns() - 200_000_000      # typed 0.2 s ago, inside the step; its callback runs late
+        self.key()
+        self.assertIn(NE, self.w.last_by_bundle)
+        self.assertGreater(self.ex._last_input_at(), 0.0)   # noqa: SLF001
+        # long after the step (and its margin): the front decides again
+        step[1] -= 10
+        step[2] -= 10
+        self.w.last_by_bundle.clear()
+        self.fields.pop("ts")
+        self.key()
+        self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001
+        self.assertIn("com.googlecode.iterm2", self.w.last_by_bundle)
+
+    def test_the_executor_marks_each_step_for_the_watch(self):
+        from test_executor import TE, W12, _executor, _win
+        ex, stub = _executor()
+        ex._watch, ex._watch_tried = self.w, True
+        ex._windows = lambda every=False: [_win("12")]     # noqa: SLF001 -- no desktop
+        ex._front = lambda: "文本编辑"                       # noqa: SLF001
+        seen = []
+        real = stub.execute
+        stub.execute = lambda a: seen.append(self.w.step_at(time.time())) or real(a)
+        ex.observe(W12)
+        ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        self.assertEqual(seen, [TE.lower()])
+        self.assertIsNotNone(self.w._steps[-1][2])        # and its end
+
+
+class FrontRead(unittest.TestCase):
+    """Who has the keyboard is asked of the accessibility server without changing anything process-wide, within a
+    deadline, and not again for a moment after it failed (hands#62 review)."""
+
+    def test_the_watch_never_sets_the_process_wide_ax_messaging_timeout(self):
+        """AXUIElementSetMessagingTimeout on the system-wide element is every AX call's in the process
+        (AXUIElement.h): at 0.25 s the address-bar guard's reads of a stalled browser came back empty."""
+        calls = []
+        ax = types.ModuleType("ApplicationServices")
+        sw, app = object(), object()
+        ax.AXUIElementCreateSystemWide = lambda: calls.append("CreateSystemWide") or sw
+        ax.AXUIElementSetMessagingTimeout = lambda el, t: calls.append(("SetMessagingTimeout", el, t)) or 0
+        ax.AXUIElementCopyAttributeValue = lambda el, attr, _: calls.append(("Copy", attr)) or (0, app)
+        ax.AXUIElementGetPid = lambda el, _: (0, ITERM)
+        fields = {40: DOCK}
+        q = _quartz(fields)
+        q.kCGWindowListOptionOnScreenOnly, q.kCGNullWindowID = 1, 0
+        q.CGWindowListCreate = lambda *a: calls.append("CGWindowListCreate") or ()
+        for attr in ("_system_wide", "_window_server_seen"):
+            if attr in InputWatch.__dict__:
+                self.addCleanup(setattr, InputWatch, attr, InputWatch.__dict__[attr])
+                delattr(InputWatch, attr)
+        w = InputWatch()
+        w._pid_bundle = {ITERM: "com.googlecode.iterm2", DOCK: "com.apple.dock"}
+        w._pid_regular = {ITERM: True, DOCK: False}
+        with mock.patch.dict(sys.modules, {"Quartz": q, "ApplicationServices": ax}):
+            w._callback(None, 10, object(), None)
+            w._callback(None, 10, object(), None)
+        self.assertIn(("Copy", "AXFocusedApplication"), calls)         # the read was made
+        self.assertIn("com.googlecode.iterm2", w.last_by_bundle)
+        self.assertFalse([c for c in calls if c[0] == "SetMessagingTimeout"], calls)
+
+    def test_a_read_that_hangs_or_fails_is_bounded_and_not_repeated_for_every_key(self):
+        from deskmind_hands import inputwatch as iw
+        w = InputWatch()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        hung = []
+        w.front_pid = lambda: hung.append(1) or release.wait(5) and ITERM
+        t0 = time.monotonic()
+        self.assertEqual(w.front_now(), 0)                  # no answer within the deadline: not known
+        self.assertLess(time.monotonic() - t0, iw.FRONT_DEADLINE_S + 0.2)
+        w._front_backoff_until = 0.0
+        self.assertEqual(w.front_now(), 0)                  # still out: not asked again
+        self.assertEqual(len(hung), 1)
+        release.set()
+        time.sleep(0.05)
+        failing = mock.Mock(return_value=0)
+        w.front_pid = failing
+        w._front_backoff_until = 0.0
+        for _ in range(20):                                 # a burst of keys while the read fails
+            self.assertEqual(w.front_now(), 0)
+        self.assertEqual(failing.call_count, 1)             # once, then the backoff
+        w._front_backoff_until = time.monotonic() - 1      # the backoff over
+        w.front_pid = lambda: ITERM
+        self.assertEqual(w.front_now(), ITERM)
+
+    def test_the_event_clock_is_read_either_way_and_an_implausible_stamp_is_no_age(self):
+        from deskmind_hands import inputwatch as iw
+        self.assertAlmostEqual(iw.event_age(_uptime_ns() - 30_000_000), 0.03, delta=0.02)
+        ticks = iw._mach_ticks()
+        if ticks is not None:                               # macOS: a stamp in mach_absolute_time ticks
+            now, scale = ticks
+            self.assertAlmostEqual(iw.event_age(now - int(0.03e9 / scale)), 0.03, delta=0.02)
+        self.assertIsNone(iw.event_age(0))
+        self.assertIsNone(iw.event_age(_uptime_ns() + 10**9))   # ahead of now
 
 if __name__ == "__main__":
     unittest.main()

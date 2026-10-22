@@ -74,8 +74,11 @@ class FocusGuard(unittest.TestCase):
         from deskmind_hands.drivers.peekaboo import PeekabooDriver
         d = PeekabooDriver.__new__(PeekabooDriver)
         d.app, d._mcp, d._foreground_actions = "com.apple.Safari", object(), 0
-        seq = iter(fronts)
-        d._front_app = lambda: (next(seq), "")         # (name, bundle id): names only here
+        # the front read by name (_frontmost, main) and by name and bundle id (_front_app, hands#62) alike, so these
+        # run unchanged on both
+        seq, seq2 = iter(fronts), iter(fronts)
+        d._frontmost = lambda: next(seq)
+        d._front_app = lambda: (next(seq2), "")
         d._hid_idle = lambda: idle
         d._task_windows = lambda: []
         import time
@@ -108,58 +111,37 @@ class FocusGuard(unittest.TestCase):
         self.assertEqual(d.activated, [])
         self.assertNotIn("given back", res.detail)
 
-    def _task_app_came_forward(self, idle: float, watch: bool, clicked: bool):
-        """A step of the music app's driver (known by its bundle id) after which the music app is in front, the user's
-        terminal before; with an input watch running (or none), the user's press in the music app during the step
-        recorded by it (or not), and the HID idle time `idle`."""
-        import time
-        from deskmind_hands import inputwatch as iw
-        from deskmind_hands.inputwatch import InputWatch
+    def test_the_give_back_is_mains_whatever_the_step(self):
+        """hands#62 keeps main's give-back exactly (focus give-back is a follow-up): the same branches, the same
+        name-based _ours, the same outcomes -- including foreground=True steps, which the executor sends for every
+        click, type and key. This table passes on origin/main's driver and on this branch's."""
+        from deskmind_hands.actions import Action, ActionKind, Binding
         ne = "com.netease.163music"
-        self.addCleanup(iw.FLASHES.clear)
-        self.addCleanup(setattr, iw, "CURRENT", getattr(iw, "CURRENT", None))
-        w = InputWatch()
-        w.active, w.keys = True, True
-        w._pid_bundle, w._pid_regular = {31: "com.googlecode.iterm2", 32: ne}, {31: True, 32: True}
-        iw.CURRENT = w if watch else None
-        d, act = self._driver([], idle=idle)
-        d.app = ne
-        seq = iter([("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", ne)])
-        d._front_app = lambda: next(seq)
-
-        def step(action):
-            w.note(31)                                     # the user typing in their terminal
-            if clicked:
-                try:
-                    w.note(32, click=True)                 # ... or clicking into the music app to watch it
-                except TypeError:                          # a watch that does not tell presses apart (f0520a8)
-                    w.note(32)
-            time.sleep(0.02)
-            return ExecResult(True, "clicked")
-        d._execute_inner = step
-        t0 = time.time()
-        d._execute_outer(act)
-        self.assertIn(ne, iw.flash_at(t0 + 0.01))          # the watch is told in every case
-        return d
-
-    def test_a_task_app_that_came_forward_while_the_user_typed_elsewhere_is_given_back(self):
-        """Typing in the terminal while a step's background click brought the app forward: the HID idle time says
-        only that the user touched something; left there, their next keys went into the task's app (hands#62
-        re-review at f0520a8)."""
-        d = self._task_app_came_forward(idle=0.01, watch=True, clicked=False)
-        self.assertEqual(d.activated, ['tell application "iTerm2" to activate'])
-        self.assertEqual(d._foreground_actions, 1)
-
-    def test_a_task_app_the_user_clicked_into_during_the_step_is_left_to_them(self):
-        """Their press in the music app, by the watch's own record of where the window server routed it: they chose
-        it, and keep it -- whatever the HID idle time says (it reads 1e9 when it cannot be read)."""
-        d = self._task_app_came_forward(idle=1e9, watch=True, clicked=True)
-        self.assertEqual(d.activated, [])
-        self.assertEqual(d._foreground_actions, 0)         # not counted as the task's front take: the user's
-
-    def test_with_no_watch_running_the_front_is_given_back(self):
-        d = self._task_app_came_forward(idle=0.01, watch=False, clicked=True)
-        self.assertEqual(d.activated, ['tell application "iTerm2" to activate'])
+        given = ['tell application "iTerm2" to activate']
+        # (driver app, front before, front after, HID idle, foreground) -> (activated, counted as a front take)
+        table = [
+            ("com.apple.Safari", ("iTerm2", "com.googlecode.iterm2"), ("Finder", "com.apple.finder"), 60, False, given, 1),
+            ("com.apple.Safari", ("iTerm2", "com.googlecode.iterm2"), ("Finder", "com.apple.finder"), 0.01, True, given, 1),
+            (ne, ("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", ne), 60, False, given, 0),
+            (ne, ("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", ne), 60, True, [], 0),
+            (ne, ("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", ne), 0.01, False, [], 0),
+            ("com.apple.Notes", ("Finder", "com.apple.finder"), ("备忘录", "com.apple.Notes"), 60, False, [], 0),
+            ("com.apple.Safari", ("iTerm2", "com.googlecode.iterm2"), ("Some Updater", "com.example.updater"), 60, False, given, 0),
+            ("com.apple.Safari", ("iTerm2", "com.googlecode.iterm2"), ("Some Updater", "com.example.updater"), 60, True, [], 0),
+            ("com.apple.Safari", ("iTerm2", "com.googlecode.iterm2"), ("Mail", "com.apple.mail"), 0.01, False, [], 0),
+            ("com.apple.Safari", ("iTerm2", "com.googlecode.iterm2"), ("iTerm2", "com.googlecode.iterm2"), 60, False, [], 0),
+            ("com.apple.Safari", ("", ""), ("Finder", "com.apple.finder"), 60, False, [], 0),
+        ]
+        for app, before, after, idle, fg, activated, counted in table:
+            with self.subTest(app=app, before=before[0], after=after[0], idle=idle, foreground=fg):
+                d, _ = self._driver([], idle=idle)
+                d.app = app
+                names, apps = iter([before[0], after[0]]), iter([before, after])
+                d._frontmost = lambda: next(names)
+                d._front_app = lambda: next(apps)
+                d._execute_outer(Action(kind=ActionKind.CLICK, foreground=fg, binding=Binding(element_id="elem_1")))
+                self.assertEqual(d.activated, activated)
+                self.assertEqual(d._foreground_actions, counted)
 
     def test_an_intended_foreground_step_is_left_alone(self):
         from deskmind_hands.actions import Action, ActionKind

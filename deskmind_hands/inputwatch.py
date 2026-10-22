@@ -181,29 +181,6 @@ def front_given_back(token: list | None) -> None:
         token[2] = time.time()
 
 
-#: The input watch this process runs, once its tap is on (InputWatch.start); None before, or with none.
-CURRENT = None
-
-
-def user_chose(bundle: str, since: float) -> bool | None:
-    """Whether the front belongs to `bundle`'s app by the user's latest choice: since `since` (epoch seconds) they
-    pressed a mouse button in it, and nothing they did after that press went anywhere else -- no input to another app,
-    to an unknown target or to DeskMind is newer than it (input to the app itself after the press is still choosing
-    it). By the window server's target of the user's own presses; the driver's own events never reach these records
-    (posted_by_us). None when no watch runs to say."""
-    w = CURRENT
-    if w is None or not getattr(w, "active", False):
-        return None
-    b = (bundle or "").lower()
-    if not b:
-        return False
-    with w.lock:
-        clicked = w.last_click_by_bundle.get(b, 0.0)
-        elsewhere = max([w.last_unknown_at, w.last_own_at]
-                        + [t for k, t in w.last_by_bundle.items() if k != b])
-    return clicked >= since and clicked > elsewhere
-
-
 def flash_at(at: float) -> list[str]:
     """Every app a flash had in front at `at` (to FLASH_MARGIN_S after it ended), newest first; [] for none. All of
     them, not the newest only: a flash told from a step's start for the app found in front at its end (Finder) also
@@ -270,9 +247,6 @@ class InputWatch:
         self.last_own_at = 0.0
         #: lowercased bundle id -> when input last went to it; input whose target is unknown, apart
         self.last_by_bundle: dict[str, float] = {}
-        #: lowercased bundle id -> when the user last pressed a mouse button in it (the window server's target; the
-        #: driver's own clicks are skipped by their source): whether the user chose an app (user_chose)
-        self.last_click_by_bundle: dict[str, float] = {}
         self.last_unknown_at = 0.0
         self.active = False
         self.keys = False
@@ -312,7 +286,7 @@ class InputWatch:
         return bundle.lower() in self.own_bundles
 
     def note(self, pid: int | None, at: float | None = None, key: bool = False, age: float | None = None,
-             t0: float | None = None, click: bool = False) -> None:
+             t0: float | None = None) -> None:
         """An input event the window server routed to `pid`'s process (None or 0: no target known). `age` is the
         event's age at `t0` (time.monotonic(), sampled once when the callback began; now when not given). `at`: a
         fixed record time, for tests.
@@ -391,10 +365,6 @@ class InputWatch:
                 self.last_by_bundle[b] = max(self.last_by_bundle.get(b, 0.0), when)
             if not bundles:
                 self.last_unknown_at = max(self.last_unknown_at, when)
-            if click and dest == "regular":
-                # a press of the user's that the window server routed to an ordinary app: the user chose that app
-                for b in bundles:
-                    self.last_click_by_bundle[b] = max(self.last_click_by_bundle.get(b, 0.0), when)
 
     def stamp(self) -> float:
         """Now, strictly later than any time stamped before (epoch seconds); called with `lock` held."""
@@ -596,12 +566,10 @@ class InputWatch:
                     self.note(None)
                 return event
             key = type_ in (Quartz.kCGEventKeyDown, Quartz.kCGEventFlagsChanged)
-            click = type_ in {getattr(Quartz, n, None) for n in ("kCGEventLeftMouseDown", "kCGEventRightMouseDown",
-                                                                 "kCGEventOtherMouseDown")} - {None}
             t0 = time.monotonic()                          # sampled once: the key's age is as of t0
             age = self._event_age(Quartz, event) if key else None
             self.note(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0),
-                      key=key, age=age, t0=t0, click=click)
+                      key=key, age=age, t0=t0)
         except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side (an unknown target)
             self.note(None)
         return event
@@ -643,8 +611,6 @@ class InputWatch:
             Quartz.CFRunLoopAddSource(loop, src, Quartz.kCFRunLoopCommonModes)
             Quartz.CGEventTapEnable(tap, True)
             self.active = True
-            global CURRENT
-            CURRENT = self                                 # the watch this process runs (user_chose)
             ready.set()
             Quartz.CFRunLoopRun()
 

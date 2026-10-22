@@ -116,7 +116,8 @@ def safari_with_no_window(scratch: Path):
     d._run, d._osa = run, osa
     d.clipboard = lambda: d.calls.append(("clipboard", "read")) or ""
     d._set_clipboard = lambda value: d.calls.append(("clipboard", "write"))
-    d._front_app = lambda: ("Finder", "com.apple.finder")
+    d._frontmost = lambda: "Finder"
+    d._front_app = lambda: ("Finder", "com.apple.finder")   # hands#62: the front by name and bundle id
     return d
 
 

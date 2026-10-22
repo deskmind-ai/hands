@@ -555,7 +555,7 @@ class LookupDelaysProperty(_EpochCase):
         w._regular_of = slow("regular", lambda pid: regulars.get(pid, False))
         w.front_pid = slow("front", lambda: front_app)
         w.step_at = slow("step", w.step_at)
-        w.flash_at = slow("flash", getattr(w, "flash_at", lambda at: ""))
+        w.flash_at = slow("flash", getattr(w, "flash_at", lambda at: []))
         if in_step:
             w.step_began("com.apple.TextEdit")
         self.fields[40] = DOCK                             # a key whose target is no ordinary app
@@ -662,6 +662,11 @@ class FlashesTold(_EpochCase):
         self.iw = iw
         self.addCleanup(lambda: iw.__dict__.get("FLASHES", []).clear())
 
+    def flashes(self, at: float) -> list:
+        """The apps a flash had in front at `at` (flash_at: a list since c0c5a4f's re-review, the newest app before)."""
+        r = self.iw.flash_at(at)
+        return ([r] if r else []) if isinstance(r, str) else list(r)
+
     def test_a_key_in_the_flashs_last_moment_counts_though_the_read_answers_the_users_app(self):
         ex, _, _ = self._task()
         e = ex.epoch
@@ -690,7 +695,6 @@ class FlashesTold(_EpochCase):
         self.fields[40] = DOCK
         self.fields.pop("ts", None)                        # fresh
         self.key()
-        self.assertNotIn("com.googlecode.iterm2", self.w.last_by_bundle)
         s = ex.snapshot()
         self.assertEqual(s["epoch"], e + 1)
         self.assertEqual(s["epoch_reason"]["to"], "com.apple.textedit")
@@ -715,7 +719,7 @@ class FlashesTold(_EpochCase):
 
         def give_back(prev, ours=None, late_s=0.0):
             inside.append(time.time())
-            seen.append(self.iw.flash_at(inside[-1]))      # while the front goes back
+            seen.append(self.flashes(inside[-1]))      # while the front goes back
             stub_back(prev, ours, late_s)
         d._give_front_back = give_back
         with mock.patch.dict(_os.environ, {"HANDS_FLASH_APPS": "com.google.Chrome"}), \
@@ -725,22 +729,21 @@ class FlashesTold(_EpochCase):
              mock.patch("deskmind_hands.drivers.peekaboo.time.sleep"):
             ok, _ = d._flash("com.google.Chrome", lambda Q: "typed")
         self.assertTrue(ok)
-        self.assertEqual(seen, ["com.google.chrome"])
-        self.assertEqual(self.iw.flash_at(inside[0]), "com.google.chrome")    # afterwards too: the interval
-        self.assertEqual(self.iw.flash_at(time.time() + 1.0), "")    # ended
+        self.assertEqual(len(seen), 1)
+        self.assertIn("com.google.chrome", seen[0])
+        self.assertIn("com.google.chrome", self.flashes(inside[0]))    # afterwards too: the interval
+        self.assertEqual(self.flashes(time.time() + 1.0), [])          # ended
 
-    def _outer(self, fronts: list[tuple[str, str]], idle: float = 60.0):
+    def _outer(self, fronts: list[tuple[str, str]], idle: float = 60.0, app: str = NE):
         """A driver for NetEase Music (an app no name list knows) whose step ran while the front went from the first
-        of `fronts` to the second, through the real _ours; the front read by name (_frontmost, as before) and by
-        name and bundle id (_front_app) alike."""
+        of `fronts` to the second (name, bundle id), through the real _ours."""
         from deskmind_hands.actions import Action, ActionKind, Binding
         from deskmind_hands.drivers.base import ExecResult
         from deskmind_hands.drivers.peekaboo import PeekabooDriver
         d = PeekabooDriver.__new__(PeekabooDriver)
-        d.app, d._mcp, d._foreground_actions = NE, object(), 0
-        apps, names = iter(fronts), iter([n for n, _ in fronts])
+        d.app, d._mcp, d._foreground_actions = app, object(), 0
+        apps = iter(fronts)
         d._front_app = lambda: next(apps)
-        d._frontmost = lambda: next(names)
         d._hid_idle = lambda: idle
         d._task_windows = lambda: []
         d.activated = []
@@ -754,16 +757,39 @@ class FlashesTold(_EpochCase):
         """By bundle id, with the real _ours: the music app's name (网易云音乐) never matched its bundle id, so it went
         down the stranger's branch and no flash was told (hands#62 review at 50f176a)."""
         d, t0 = self._outer([("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", NE)])
-        self.assertEqual(self.iw.flash_at(t0 + 0.02), NE.lower())
+        self.assertIn(NE.lower(), self.flashes(t0 + 0.02))
         self.assertEqual(d._foreground_actions, 1)          # counted as the task's own front take
         self.assertEqual(d.activated, ['tell application "iTerm2" to activate'])
+
+    def test_a_name_list_app_in_front_at_a_steps_end_is_told_with_the_steps_own_app(self):
+        """Finder (a name-list app) in front at the end of a Notes step: told for Finder and for Notes alike, from the
+        step's start -- where there is doubt a key counts for both (hands#62 re-review at c0c5a4f)."""
+        d, t0 = self._outer([("iTerm2", "com.googlecode.iterm2"), ("访达", "com.apple.finder")], app="com.apple.Notes")
+        self.assertEqual(set(self.flashes(t0 + 0.02)), {"com.apple.finder", "com.apple.notes"})
+
+    def test_a_flash_told_over_the_steps_inner_flash_does_not_hide_it(self):
+        """The inner flash (the step's own app, TextEdit here) told first, the Finder front found at the step's end
+        told after from the step's start: a Command key at the inner time stales the TextEdit task."""
+        ex, _, _ = self._task()
+        e = ex.epoch
+        t = time.time()
+        inner = self.iw.front_taken("com.apple.TextEdit", t - 0.5)
+        inner[2] = t - 0.1
+        self.iw.front_given_back(self.iw.front_taken("com.apple.finder", t - 1.0))
+        self.front["pid"] = ITERM
+        self.fields[40] = DOCK
+        self.fields["ts"] = _uptime_ns() - int((time.time() - (t - 0.3)) * 1e9)   # the key at the inner flash's time
+        self.key()
+        s = ex.snapshot()
+        self.assertEqual(s["epoch"], e + 1)
+        self.assertEqual(s["epoch_reason"]["to"], "com.apple.textedit")
 
     def test_another_app_that_came_forward_during_a_step_is_told_too(self):
         """The stranger's branch hands the front back too; the app it took it from may be one the task operates
         through another driver, so it is told as well."""
         d, t0 = self._outer([("iTerm2", "com.googlecode.iterm2"), ("音乐", "com.apple.Music")])
         self.assertEqual(d.activated, ['tell application "iTerm2" to activate'])
-        self.assertEqual(self.iw.flash_at(t0 + 0.02), "com.apple.music")
+        self.assertIn("com.apple.music", self.flashes(t0 + 0.02))
 
     def test_the_chat_flash_is_told(self):
         import os as _os
@@ -782,7 +808,7 @@ class FlashesTold(_EpochCase):
         fronts = iter(["com.googlecode.iterm2", pk.CHAT_APP])
         d._front_bundle = lambda: next(fronts, pk.CHAT_APP)
         seen = []
-        d._give_front_back = lambda prev, ours=None, late_s=0.0: seen.append(self.iw.flash_at(time.time()))
+        d._give_front_back = lambda prev, ours=None, late_s=0.0: seen.append(self.flashes(time.time()))
         q = types.ModuleType("Quartz")
         for k in ("kCGEventMouseMoved", "kCGEventLeftMouseDown", "kCGEventLeftMouseUp", "kCGMouseButtonLeft", "kCGHIDEventTap"):
             setattr(q, k, 0)
@@ -799,7 +825,8 @@ class FlashesTold(_EpochCase):
              mock.patch.object(pk.time, "sleep"):
             res = d._chat_flash_click("B1")
         self.assertTrue(res.ok, res.detail)
-        self.assertEqual(seen, [chat])       # told before the front went back
+        self.assertEqual(len(seen), 1)
+        self.assertIn(chat, seen[0])                        # told before the front went back
         self.assertIsNotNone(self.iw.FLASHES[-1][2])        # and ended after
 
     def test_a_front_taken_while_staging_is_told(self):
@@ -813,10 +840,9 @@ class FlashesTold(_EpochCase):
         d._mcp = object()
         fronts = iter([("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", NE)])
         d._front_app = lambda: next(fronts)
-        d._frontmost = lambda: "iTerm2"
         d.activated = []
         seen = []
-        d._osa = lambda script: (d.activated.append(script), seen.append(self.iw.flash_at(time.time())))[0] or (True, "")
+        d._osa = lambda script: (d.activated.append(script), seen.append(self.flashes(time.time())))[0] or (True, "")
         d._run = lambda key, _extra=None, **fmt: (False, {}, "not here")
         d.clipboard = lambda: ""
         d._set_clipboard = lambda value: None
@@ -826,7 +852,33 @@ class FlashesTold(_EpochCase):
             except Exception:  # noqa: BLE001 -- what staging does after the give-back is not this test's
                 pass
         self.assertIn('tell application "iTerm2" to activate', d.activated)
-        self.assertEqual(seen[d.activated.index('tell application "iTerm2" to activate')], NE.lower())
+        self.assertIn(NE.lower(), seen[d.activated.index('tell application "iTerm2" to activate')])
+
+    def test_a_staging_app_known_only_by_name_is_ours(self):
+        """app_bundle gives the name back for an app it does not know: the staging set then holds a name, which the
+        front's name is compared with as well as its bundle id."""
+        import os as _os
+        import tempfile
+        from deskmind_hands.drivers import peekaboo as pk
+        scratch = Path(tempfile.mkdtemp())
+        (scratch / "ws").mkdir()
+        with mock.patch.dict(_os.environ, {"HANDS_PERMISSIONS_VERIFIED": "1"}):
+            d = pk.PeekabooDriver(app="com.example.other", binary=sys.executable, scratch=scratch)
+        d._mcp = object()
+        d._stage_apps = ["网易云音乐"]
+        fronts = iter([("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", NE)])
+        d._front_app = lambda: next(fronts)
+        d.activated = []
+        d._osa = lambda script: d.activated.append(script) or (True, "")
+        d._run = lambda key, _extra=None, **fmt: (False, {}, "not here")
+        d.clipboard = lambda: ""
+        d._set_clipboard = lambda value: None
+        with mock.patch.object(pk, "gui_session", return_value="active"):
+            try:
+                d._start(scratch / "ws")
+            except Exception:  # noqa: BLE001
+                pass
+        self.assertIn('tell application "iTerm2" to activate', d.activated)
 
     def test_a_cold_launch_that_took_the_front_is_told(self):
         from deskmind_hands import executor as exe
@@ -846,7 +898,7 @@ class FlashesTold(_EpochCase):
              mock.patch.object(exe.subprocess, "run"):
             with self.assertRaises(RuntimeError):
                 ex._open_window(NE, None)                  # noqa: SLF001
-        self.assertEqual(self.iw.flash_at(t + 0.001), NE.lower())
+        self.assertIn(NE.lower(), self.flashes(t + 0.001))
 
 
 class StepsClose(_KeysCase):

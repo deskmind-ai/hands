@@ -18,9 +18,10 @@ key was input to an unknown target and staled the steps of a task working in a m
 run_fd8ab281: 4 stale refusals said "to: unknown"). A key whose target is neither an ordinary app nor DeskMind
 goes, first match:
 - its own time inside a flash -- the driver had a task's app in front, from when it took the front to when it gave
-  it back (FLASHES: front_taken/front_given_back, plus FLASH_MARGIN_S after) -- to that app: a key that landed in the
-  flashed app in the flash's last moment, its front read answered after the front went back, would read the user's
-  app (hands#62 review);
+  it back (FLASHES: front_taken/front_given_back, plus FLASH_MARGIN_S after) -- to every app a flash had in front
+  then, and to the step's app: a key that landed in the flashed app in the flash's last moment, its front read
+  answered after the front went back, would read the user's app (hands#62 review). Where there is doubt the key
+  counts for every candidate; so the flash check, made again as the last lookup, never moves a key away from one;
 - to the app with the keyboard (AXFocusedApplication) when the callback runs within KEY_FRESH_S of the event's own
   timestamp, the read answers within it too, and names an ordinary app (or DeskMind);
 - else, the event's time inside a step of the task's (the executor marks each one, `step_began`/`step_ended`, plus
@@ -180,13 +181,16 @@ def front_given_back(token: list | None) -> None:
         token[2] = time.time()
 
 
-def flash_at(at: float) -> str:
-    """The app a flash had in front at `at` (to FLASH_MARGIN_S after it ended), or ""."""
+def flash_at(at: float) -> list[str]:
+    """Every app a flash had in front at `at` (to FLASH_MARGIN_S after it ended), newest first; [] for none. All of
+    them, not the newest only: a flash told from a step's start for the app found in front at its end (Finder) also
+    covers the step's own inner flash (Notes), and a key in it belongs to either (hands#62 re-review at c0c5a4f)."""
+    out = []
     for bundle, began, ended, deadline in reversed(list(FLASHES)):
         end = ended if ended is not None else min(time.time(), deadline)
-        if bundle and began <= at <= end + FLASH_MARGIN_S:
-            return bundle
-    return ""
+        if bundle and began <= at <= end + FLASH_MARGIN_S and bundle not in out:
+            out.append(bundle)
+    return out
 
 
 def _uptime_ns() -> int:
@@ -320,30 +324,36 @@ class InputWatch:
         # -- 1. lookups: nothing shared is written (only the lookups' own caches)
         target = kind(pid) if pid else "unknown"
         event_at = (at if at is not None else wall0) - (age if age is not None and age >= 0 else 0.0)
-        flash, front, front_kind, step = "", 0, "unknown", ""
+        flashes, front, front_kind, step = [], 0, "unknown", ""
         if key and target not in ("own", "regular"):
-            flash = self.flash_at(event_at)
-            if not flash:
-                if age is not None and 0.0 <= age + (time.monotonic() - t0) <= KEY_FRESH_S:
-                    front = self.front_now()               # not even asked for a key already past its freshness
-                    if front:
-                        front_kind = kind(front)
-                step = self.step_at(event_at)
-                # the flash check is the last lookup: a flash the driver told while the read was out (its give-back
-                # then answered the read) is found here (hands#62 review at 50f176a)
-                flash = self.flash_at(event_at)
+            flashes = list(self.flash_at(event_at))
+            if not flashes and age is not None and 0.0 <= age + (time.monotonic() - t0) <= KEY_FRESH_S:
+                front = self.front_now()                   # not even asked for a key already past its freshness
+                if front:
+                    front_kind = kind(front)
+            step = self.step_at(event_at)
+            # the flash check is the last lookup: a flash the driver told while the read was out (its give-back
+            # then answered the read) is found here (hands#62 review at 50f176a)
+            flashes += [b for b in self.flash_at(event_at) if b not in flashes]
         # -- 2. freshness, once, after every lookup
         fresh = age is not None and 0.0 <= age + (time.monotonic() - t0) <= KEY_FRESH_S
-        if flash:
-            dest = "flash"                                 # the flashed app: it can only make the key count
+        if flashes:
+            dest = "flash"                                 # the flashed apps: it can only make the key count
         elif front and fresh and front_kind in ("regular", "own"):
             dest, pid = front_kind, front
         elif step:
             dest = "step"                                  # the task's app: it can only make the key count
         else:
             dest = target
-        bundle = (flash if dest == "flash" else step if dest == "step"
-                  else (self._pid_bundle.get(pid) or "").lower() if dest == "regular" else "")
+        # where there is doubt the key counts everywhere it may have gone: a key put on a flash goes to every app a
+        # flash had in front then, the step's app and the app a fresh read named too (the watch does not know which
+        # are the task's; a key recorded for an app the task does not operate stales nothing)
+        read = ([(self._pid_bundle.get(front) or "").lower()]
+                if front and fresh and front_kind == "regular" else [])     # what a fresh read named, kept too
+        bundles = (list(dict.fromkeys(flashes + ([step] if step else []) + read)) if dest == "flash"
+                   else [step] if dest == "step"
+                   else [(self._pid_bundle.get(pid) or "").lower()] if dest == "regular" else [])
+        bundles = [b for b in bundles if b]
         # -- 3. the record, its time taken last, under the lock the epoch's mark is stamped under
         with self.lock:
             when = at if at is not None else self.stamp()
@@ -351,9 +361,9 @@ class InputWatch:
                 self.last_own_at = max(self.last_own_at, when)
                 return
             self.last_external_at = max(self.last_external_at, when)
-            if bundle:
-                self.last_by_bundle[bundle] = max(self.last_by_bundle.get(bundle, 0.0), when)
-            else:
+            for b in bundles:
+                self.last_by_bundle[b] = max(self.last_by_bundle.get(b, 0.0), when)
+            if not bundles:
                 self.last_unknown_at = max(self.last_unknown_at, when)
 
     def stamp(self) -> float:
@@ -383,8 +393,8 @@ class InputWatch:
         token[2] = time.time()
 
     @staticmethod
-    def flash_at(at: float) -> str:
-        """The app a driver's flash had in front at `at` (module flash_at)."""
+    def flash_at(at: float) -> list[str]:
+        """The apps the driver's flashes had in front at `at` (module flash_at)."""
         return flash_at(at)
 
     def step_at(self, at: float) -> str:

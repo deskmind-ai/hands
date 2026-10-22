@@ -206,7 +206,7 @@ class OwnWindow(unittest.TestCase):
         d._run, d._osa, d._pid_of = mac.peekaboo, mac.osa, mac.pid_of
         d.clipboard = lambda: ""
         d._set_clipboard = lambda value: None
-        d._frontmost = lambda: "Finder"
+        d._front_app = lambda: ("Finder", "com.apple.finder")
         d._sparse_tree = lambda data: False
         d._element_cache = lambda data, origin: setattr(d, "_real_read", 1) or []
         d.start(ws or self.scratch / "ws")

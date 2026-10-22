@@ -108,6 +108,24 @@ class FocusGuard(unittest.TestCase):
         self.assertEqual(d.activated, [])
         self.assertNotIn("given back", res.detail)
 
+    def test_a_task_app_the_user_clicked_into_during_the_step_is_left_to_them(self):
+        """The music app (known by its bundle id, no name list) came forward during the step because the user clicked
+        into it to watch: they keep it -- DeskMind never takes the foreground but on the user's click. The input
+        watch is still told (hands#62 re-review at c0c5a4f). An idle time that cannot be read: left as well."""
+        from deskmind_hands import inputwatch as iw
+        self.addCleanup(iw.FLASHES.clear)
+        ne = "com.netease.163music"
+        for idle in (0.01, RuntimeError("no HID idle")):
+            d, act = self._driver([], idle=0)
+            d.app = ne
+            seq = iter([("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", ne)])
+            d._front_app = lambda: next(seq)
+            d._hid_idle = (lambda i=idle: (_ for _ in ()).throw(i)) if isinstance(idle, Exception) else (lambda i=idle: i)
+            t0 = __import__("time").time()
+            d._execute_outer(act)
+            self.assertEqual(d.activated, [])
+            self.assertIn(ne, iw.flash_at(t0 + 0.1))
+
     def test_an_intended_foreground_step_is_left_alone(self):
         from deskmind_hands.actions import Action, ActionKind
         d, _ = self._driver(["iTerm2", "Some Updater"], idle=60)

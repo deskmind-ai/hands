@@ -15,20 +15,20 @@ A key event's target is not always an ordinary app: a key pressed with Command h
 target -- it may act on the app switcher (Command-Tab), which changes only which app is in front, no change of
 anything a task looks at -- and some come with none. While the owner worked in a terminal and switched apps, each such
 key was input to an unknown target and staled the steps of a task working in a music app (rc.13, 10-22,
-run_fd8ab281: 4 stale refusals said "to: unknown"). Such a key (target neither an ordinary app nor DeskMind) is input
-to the app that had the keyboard then, as plain typing is, under three guards, each on the safe side:
-- during a step of the task's (the executor marks each one, `step_began`/`step_ended`: the step may bring the task's
-  app forward, a flash), plus STEP_MARGIN_S around it, the key counts for the task's app, whoever has the keyboard
-  when the callback runs -- it can run late, waiting for the interpreter while the executor works. A step whose end
-  is never told closes at its own deadline (`max_s`);
-- otherwise the app with the keyboard is read only when the callback runs within KEY_FRESH_S of the event's own
-  timestamp, and taken only if the answer comes within it too; a late callback or a slow answer could name a front
-  that has moved on, so the key keeps its target and counts;
-- when the app with the keyboard cannot be read (no answer within FRONT_DEADLINE_S, accessibility refused), or is
-  itself no ordinary app (Spotlight's field), the key keeps its target and counts.
-The event's own time only decides where a key went; every input is recorded when it is known (after any read),
-since the epoch's mark is compared with when input was seen -- backdated, a key seen after an action ended fell
-before the mark. What is learned about a key after its freshness can only make it count, never un-count it.
+run_fd8ab281: 4 stale refusals said "to: unknown"). Where a key goes (InputWatch.note), first match:
+- while the driver lends the keyboard to a task's app in the background (LENDS, skylight.enter_window_key), any key
+  not routed to DeskMind counts for that app: the user's app keeps the front then, not the keys;
+- a key whose target is neither an ordinary app nor DeskMind goes to the app with the keyboard (AXFocusedApplication)
+  when the callback runs within KEY_FRESH_S of the event's own timestamp, the read answers within it too, and names
+  an ordinary app (or DeskMind) -- during a flash that is the task's app;
+- else, the event's time inside a step of the task's (the executor marks each one, `step_began`/`step_ended`, plus
+  STEP_MARGIN_S; a step never closed ends at its `max_s`): the step's app -- a late callback or a slow or failed read
+  at a flash's edge. Only the fallback: a step spans the driver's wait for the user to pause, and keys typed in the
+  terminal then are the user's (hands#62 re-review);
+- else it keeps its target: unknown, and it counts.
+Invariants: nothing learned about a key after its freshness window can un-count it (only make it count); and a key's
+record time is never earlier than the moment it becomes visible -- it is stamped last, under the lock the executor's
+epoch mark is stamped under (`mark`), so a key looked into while an action moved the mark is never behind it.
 
 Key events reach a tap only with Input Monitoring; CGEventTapCreate may drop the key bits of a mask and still
 return a tap, so whether keys are watched is read from the permission itself (CGPreflightListenEventAccess),
@@ -152,6 +152,37 @@ FRONT_BACKOFF_S = 0.5
 STEP_MAX_S = 180.0
 
 
+#: The keyboard lent to a task's app in the background (drivers/skylight.enter_window_key: the app's window held key
+#: without activating it), process-wide: [pid, began, ended or None, deadline] (epoch seconds), newest last. While it
+#: is, the user's app keeps the front but not the keys -- what the user types goes to the lent window, or nowhere --
+#: so the app with the keyboard, as the accessibility server names it, says nothing of where a key went.
+LENDS: list[list] = []
+#: The longest a lend is taken to last when its end is never told.
+LEND_MAX_S = 30.0
+
+
+def keyboard_lent(pid: int) -> list:
+    """The driver lends `pid`'s window the keyboard from now (skylight.enter_window_key); a token for keyboard_returned."""
+    now = time.time()
+    token = [int(pid or 0), now, None, now + LEND_MAX_S]
+    LENDS[:] = (LENDS + [token])[-32:]
+    return token
+
+
+def keyboard_returned(token: list | None) -> None:
+    if token is not None and token[2] is None:
+        token[2] = time.time()
+
+
+def lent_at(at: float) -> int:
+    """The pid the keyboard was lent to at `at` (within STEP_MARGIN_S of a lend), or 0."""
+    for pid, began, ended, deadline in reversed(list(LENDS)):
+        end = ended if ended is not None else min(time.time(), deadline)
+        if pid and began - STEP_MARGIN_S <= at <= end + STEP_MARGIN_S:
+            return pid
+    return 0
+
+
 def _uptime_ns() -> int:
     """Nanoseconds since boot, not counting sleep: mach_absolute_time's clock, which CGEventGetTimestamp counts on."""
     clock = getattr(time, "CLOCK_UPTIME_RAW", None)
@@ -230,6 +261,9 @@ class InputWatch:
         self._front_pending: threading.Event | None = None
         self._front_backoff_until = 0.0
         self._front_lock = threading.Lock()
+        #: held while an input is recorded and while the executor's epoch mark is stamped (note, mark)
+        self.lock = threading.Lock()
+        self._last_stamp = 0.0
 
     # -- classification (pure, testable) ---------------------------------------------------------------------
     def is_own(self, pid: int | None) -> bool:
@@ -241,43 +275,90 @@ class InputWatch:
             self._pid_bundle[pid] = bundle
         return bundle.lower() in self.own_bundles
 
-    def note(self, pid: int | None, at: float | None = None, key: bool = False, age: float | None = None) -> None:
-        """An input event the window server routed to `pid`'s process (None or 0: no target known), noted at `at`
-        (the callback's time). A key event (`key`) whose target is neither an ordinary app nor DeskMind: inside a step
-        of the task's, input to the step's app; else, when the event is `age` seconds old at most KEY_FRESH_S, input
-        to the app that has the keyboard now; else its target is kept (see the module's docstring).
-        The event's own time (`at` - `age`) only decides where a key went, never when it is recorded: recorded at its
-        own time, a key whose callback ran after an action ended fell before the epoch's mark and was never counted
-        (hands#62 re-review) -- the epoch compares with when the input was seen.
-        One rule for what is learned about a key while it is looked into: it can only make the key count, never
-        un-count it (hands#62 external review). The app with the keyboard is taken only if the key is still within
-        KEY_FRESH_S of its own time when the answer comes (a read that took 80 ms could name an app that took the
-        keyboard after the key landed); and the key is recorded when it is known, after the read, never before --
-        an action that moved the epoch's mark while the read was out would otherwise leave the key behind it."""
-        given = at is not None
-        at = at or time.time()
-        if key and not self.is_own(pid) and not (pid and self.is_regular(pid)):
-            step = self.step_at(at - age if age is not None and age >= 0 else at)
-            if step:
-                self.last_external_at = max(self.last_external_at, at)
-                self.last_by_bundle[step] = max(self.last_by_bundle.get(step, 0.0), at)
-                return
-            if age is not None and 0.0 <= age <= KEY_FRESH_S:
-                asked = time.monotonic()
-                front = self.front_now()
-                if front and age + (time.monotonic() - asked) <= KEY_FRESH_S:
-                    pid = front                            # answered while the key was still fresh
-                if not given:
-                    at = max(at, time.time())              # known only now: recorded now
-        if self.is_own(pid):
-            self.last_own_at = max(self.last_own_at, at)
-            return
-        self.last_external_at = max(self.last_external_at, at)
-        bundle = (self._pid_bundle.get(pid) or "").lower() if pid and self.is_regular(pid) else ""
-        if bundle:
-            self.last_by_bundle[bundle] = max(self.last_by_bundle.get(bundle, 0.0), at)
+    def note(self, pid: int | None, at: float | None = None, key: bool = False, age: float | None = None,
+             t0: float | None = None) -> None:
+        """An input event the window server routed to `pid`'s process (None or 0: no target known). `age` is the
+        event's age at `t0` (time.monotonic(), sampled once when the callback began; now when not given). `at`: a
+        fixed record time, for tests.
+
+        Where a key goes, in order:
+        - while the keyboard is lent to a task's app in the background (LENDS), any key not routed to DeskMind goes to
+          that app: the front app then says nothing of where keys go;
+        - a key whose target is neither an ordinary app nor DeskMind goes to the app the fresh front read names, when
+          the callback and the read are within the key's freshness and that app is an ordinary app (or DeskMind);
+        - else, its own time inside a step of the task's: to the step's app (a late or failed read, a front that is
+          no ordinary app -- the flash's edges);
+        - else it keeps its target (unknown: it counts).
+        The step is the fallback, never ahead of a fresh read: a step spans the driver's wait for the user to pause
+        (up to HANDS_FLASH_WAIT_S), and keys the user typed in their terminal then went to the task's app and staled
+        every step (hands#62 re-review).
+
+        In three phases (hands#62 external review, twice): 1. every lookup -- whether a pid is DeskMind's or an
+        ordinary app (each may ask the system on a cache miss), the lend, the step, the app with the keyboard -- with
+        nothing recorded; 2. freshness decided once, after all of them: age + (now - t0) <= KEY_FRESH_S, or what the
+        front read found is not taken; 3. the record, under `lock`, its time taken last, inside the lock (`stamp`) --
+        the lock the executor holds when it stamps the epoch's mark (`mark`).
+        Invariants: nothing learned after a key's freshness window can un-count it (it can only make it count); and a
+        key's record time is never earlier than the moment it becomes visible -- a record written after the mark was
+        set has a later time, so an action that moved the mark while the key was being looked into never hides it."""
+        t0 = time.monotonic() if t0 is None else t0
+        wall0 = time.time()
+
+        def kind(p: int) -> str:
+            if self.is_own(p):
+                return "own"
+            return "regular" if p and self.is_regular(p) else "unknown"
+
+        # -- 1. lookups: nothing shared is written (only the lookups' own caches)
+        target = kind(pid) if pid else "unknown"
+        event_at = (at if at is not None else wall0) - (age if age is not None and age >= 0 else 0.0)
+        lent, lent_kind = 0, "unknown"
+        front, front_kind, step = 0, "unknown", ""
+        if key and target != "own":
+            lent = lent_at(event_at)
+            if lent:
+                lent_kind = kind(lent)
+            elif target != "regular":
+                if age is not None and 0.0 <= age + (time.monotonic() - t0) <= KEY_FRESH_S:
+                    front = self.front_now()               # not even asked for a key already past its freshness
+                    if front:
+                        front_kind = kind(front)
+                step = self.step_at(event_at)
+        # -- 2. freshness, once, after every lookup
+        fresh = age is not None and 0.0 <= age + (time.monotonic() - t0) <= KEY_FRESH_S
+        if lent and lent_kind == "regular":
+            dest, pid = "regular", lent
+        elif front and fresh and front_kind in ("regular", "own"):
+            dest, pid = front_kind, front
+        elif step:
+            dest = "step"                                  # the task's app: it can only make the key count
         else:
-            self.last_unknown_at = max(self.last_unknown_at, at)
+            dest = target
+        bundle = step if dest == "step" else (self._pid_bundle.get(pid) or "").lower() if dest == "regular" else ""
+        # -- 3. the record, its time taken last, under the lock the epoch's mark is stamped under
+        with self.lock:
+            when = at if at is not None else self.stamp()
+            if dest == "own":
+                self.last_own_at = max(self.last_own_at, when)
+                return
+            self.last_external_at = max(self.last_external_at, when)
+            if bundle:
+                self.last_by_bundle[bundle] = max(self.last_by_bundle.get(bundle, 0.0), when)
+            else:
+                self.last_unknown_at = max(self.last_unknown_at, when)
+
+    def stamp(self) -> float:
+        """Now, strictly later than any time stamped before (epoch seconds); called with `lock` held."""
+        t = time.time()
+        if t <= self._last_stamp:
+            t = self._last_stamp + 1e-6
+        self._last_stamp = t
+        return t
+
+    def mark(self) -> float:
+        """A time for the executor's epoch mark: stamped under `lock`, so any input recorded after it is later."""
+        with self.lock:
+            return self.stamp()
 
     # -- the task's steps (told by the executor) -------------------------------------------------------------
     def step_began(self, bundle: str, max_s: float = STEP_MAX_S) -> list:
@@ -460,9 +541,10 @@ class InputWatch:
                     self.note(None)
                 return event
             key = type_ in (Quartz.kCGEventKeyDown, Quartz.kCGEventFlagsChanged)
+            t0 = time.monotonic()                          # sampled once: the key's age is as of t0
             age = self._event_age(Quartz, event) if key else None
             self.note(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0),
-                      key=key, age=age)
+                      key=key, age=age, t0=t0)
         except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side (an unknown target)
             self.note(None)
         return event

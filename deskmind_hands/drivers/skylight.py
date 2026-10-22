@@ -288,6 +288,8 @@ class WindowKey:
     def __init__(self, pid: int, wid: int, previous: int | None, psn, via: str):
         self.pid, self.wid, self.previous, self.psn, self.via = pid, wid, previous, psn, via
         self.closed, self.restored, self.interrupted = False, None, False
+        #: the input watch is told the keyboard is lent to `pid` while this is held (inputwatch.LENDS)
+        self.lend = None
 
     def __enter__(self) -> WindowKey:
         return self
@@ -335,6 +337,16 @@ class WindowKey:
             return bool(self.restored)
         self.closed = True
         prev = self.previous
+        try:
+            return self._give_back(prev)
+        finally:
+            try:
+                from deskmind_hands import inputwatch
+                inputwatch.keyboard_returned(self.lend)   # once the previous key window is back (or not)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _give_back(self, prev) -> bool:
         try:
             front = front_pid()
             if front is None or front == self.pid:
@@ -418,6 +430,7 @@ def enter_window_key(pid: int, wid: int) -> WindowKey:
         raise _refuse("previous", f"the app's key window cannot be read while it has other windows, so it could not "
                                   f"be given back afterwards; nothing was sent")
     via = None
+    lent_from = time.time()
     for attempt in range(2):
         if _stopped() or user_on(pid):
             break
@@ -432,6 +445,13 @@ def enter_window_key(pid: int, wid: int) -> WindowKey:
             and _await_focus(pid, wid, AX_CONFIRM_S):
         via = "ax"
     key = WindowKey(pid, wid, previous, psn, via or "records")
+    try:
+        # from the first record sent: the user's keys may be going to the app's window from there on
+        from deskmind_hands import inputwatch
+        key.lend = inputwatch.keyboard_lent(pid)
+        key.lend[1] = lent_from
+    except Exception:  # noqa: BLE001
+        pass
     # Again right before success (the tries take 0.4-2 s): the user may have come to the app, or the run stopped.
     if user_on(pid):
         key.exit()          # sends nothing: the user is on it

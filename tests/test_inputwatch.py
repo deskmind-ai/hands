@@ -356,13 +356,15 @@ class KeysAtTheFlashsEdge(_KeysCase):
         self.assertGreater(self.ex._last_input_at(), 0.0)   # noqa: SLF001 -- the task is staled
         self.assertEqual(calls, [])                          # the front is not even asked
 
-    def test_a_key_inside_a_step_counts_for_the_steps_app_whoever_is_in_front_later(self):
+    def test_a_late_key_inside_a_step_counts_for_the_steps_app_whoever_is_in_front_later(self):
+        """The step is the fallback: a fresh read names the app (the terminal); a late callback, inside the step,
+        counts for the step's app (the front may have gone back since the flash)."""
         step = self.w.step_began(NE)                       # the executor: a step in NetEase Music begins (a flash)
-        self.front["pid"] = ITERM                          # the front already went back by the time the callback runs
+        self.front["pid"] = ITERM
         self.fields[40] = DOCK
-        self.key()                                         # fresh, during the step
-        self.assertEqual(self.w.last_input_where({NE})[1], NE)
-        self.assertEqual(self.w.last_unknown_at, 0.0)
+        self.key()                                         # fresh, during the step: the read decides
+        self.assertIn("com.googlecode.iterm2", self.w.last_by_bundle)
+        self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001
         self.w.step_ended(step)
         self.w.last_by_bundle.clear()
         self.fields["ts"] = _uptime_ns() - 200_000_000      # typed 0.2 s ago, inside the step; its callback runs late
@@ -430,8 +432,9 @@ class LateKeysAndTheEpoch(_EpochCase):
         real = stub.execute
 
         def during(a):
-            self.fields[40] = DOCK                         # a Command key while the step runs ...
-            self.front["pid"] = ITERM                      # ... whatever is in front when its callback runs
+            self.fields[40] = DOCK                         # a Command key in the flash, its callback late ...
+            self.fields["ts"] = _uptime_ns() - 200_000_000
+            self.front["pid"] = ITERM                      # ... after the front went back: the step's app
             self.key()
             return real(a)
         stub.execute = during
@@ -511,6 +514,134 @@ class WhatTheLookupLearns(_EpochCase):
         self.assertNotIn("com.googlecode.iterm2", self.w.last_by_bundle)
         self.assertGreater(self.w.last_unknown_at, 0.0)    # kept its target: unknown, and it counts
         self.assertEqual(ex.snapshot()["epoch"], e + 1)
+
+class LookupDelaysProperty(_EpochCase):
+    """A property over every way the lookups for a key can be slow (hands#62 external review, at d6a29ed): each
+    lookup -- whether a pid is DeskMind's (own), whether it is an ordinary app (regular), the app with the keyboard
+    (front), the step under way (step) -- alone and in every combination, delayed past the key's freshness window,
+    with an action moving the epoch's mark from another thread in the middle of each delay. Whatever the delays:
+    (1) the key stales the next snapshot, or is provably DeskMind's own (it had the keyboard, known while fresh);
+    (2) no key is put on an app other than the task's once its freshness window has passed.
+    Fails at d6a29ed for the reviewer's two cases among others: a slow first lookup of the front's pid with the task's
+    app in front (recorded behind the mark), and a slow first lookup of the Dock target with iTerm2 in front later
+    (put on iTerm2 after the key's freshness)."""
+
+    LOOKUPS = ("own", "regular", "front", "step")
+
+    def _key_with(self, delayed: frozenset, front_app: int, in_step: bool) -> tuple:
+        import itertools  # noqa: F401
+        from deskmind_hands import inputwatch as iw
+        ex, _, _ = self._task()
+        w = self.w
+        delay = iw.KEY_FRESH_S + 0.02                      # past the freshness window, within the read's deadline
+        bundles, regulars = dict(w._pid_bundle), dict(w._pid_regular)
+        w._pid_bundle, w._pid_regular = {}, {}             # every pid is asked of the "system" the first time
+        advanced = []
+
+        def slow(name, fn):
+            def lookup(*a):
+                if name in delayed:
+                    time.sleep(delay / 2)
+                    t = threading.Thread(target=lambda: (ex._advance(), advanced.append(name)))
+                    t.start()
+                    t.join()                               # an action moved the mark while this lookup was out
+                    time.sleep(delay / 2)
+                return fn(*a)
+            return lookup
+        w._bundle_of = slow("own", lambda pid: bundles.get(pid, ""))
+        w._regular_of = slow("regular", lambda pid: regulars.get(pid, False))
+        w.front_pid = slow("front", lambda: front_app)
+        w.step_at = slow("step", w.step_at)
+        if in_step:
+            w.step_began("com.apple.TextEdit")
+        self.fields[40] = DOCK                             # a key whose target is no ordinary app
+        self.fields.pop("ts", None)                        # fresh when its callback begins
+        self.key()
+        e = ex.epoch
+        stales = ex.snapshot()["epoch"] == e + 1
+        return stales, advanced, w
+
+    def test_whatever_the_lookups_cost_a_key_stales_or_is_provably_deskminds_and_never_moves_away_late(self):
+        import itertools
+        cases = []
+        for n in range(len(self.LOOKUPS) + 1):
+            for delayed in itertools.combinations(self.LOOKUPS, n):
+                for front_app, in_step in ((MUSIC, False), (DESKMIND, False), (ITERM, False), (ITERM, True)):
+                    cases.append((frozenset(delayed), front_app, in_step))
+        for delayed, front_app, in_step in cases:
+            with self.subTest(delayed=sorted(delayed), front={MUSIC: "task", DESKMIND: "deskmind", ITERM: "iterm2"}[front_app],
+                              in_step=in_step):
+                self.setUp()
+                stales, advanced, w = self._key_with(delayed, front_app, in_step)
+                late = bool(advanced)                      # a delay was met: the key is past its freshness window
+                own = w.last_own_at > 0 and w.last_external_at == 0
+                on_other = "com.googlecode.iterm2" in w.last_by_bundle
+                if late:
+                    self.assertFalse(own or on_other, "attributed away from the task's app after its freshness")
+                if front_app == MUSIC or late:
+                    self.assertTrue(stales, "the key did not stale the next snapshot")
+                elif front_app == DESKMIND:
+                    self.assertTrue(own and not stales)    # fresh, DeskMind had the keyboard: the user answering it
+                else:
+                    self.assertTrue(on_other and not stales)   # fresh, the terminal had the keyboard: not the task's
+
+class WaitAndLend(_EpochCase):
+    """A step spans the driver's wait for the user to pause (up to HANDS_FLASH_WAIT_S; 1800 s in the app): the keys
+    the user types in their terminal then are theirs, read off a fresh front, not the step's (hands#62 re-review of
+    7ed10d5/d6a29ed: the rc.13 loop again). While the keyboard is lent to the task's app in the background, the front
+    says nothing of where keys go: they count for the lent app. Each test here fails at d6a29ed."""
+
+    def test_keys_typed_in_the_terminal_while_the_driver_waits_do_not_stale_the_task(self):
+        ex, stub, W12 = self._task()
+        real = stub.execute
+
+        def waits_for_the_user(a):
+            self.front["pid"] = ITERM                      # the user keeps working in the terminal
+            self.fields.pop("ts", None)                    # callbacks fresh
+            self.fields[40] = 0
+            self.key()                                     # a plain key with no target
+            self.fields[40] = DOCK
+            self.key()                                     # a Command chord: the Dock its target
+            return real(a)
+        stub.execute = waits_for_the_user
+        ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        e = ex.epoch
+        self.assertEqual(ex.snapshot()["epoch"], e)        # not staled
+        self.assertIn("com.googlecode.iterm2", self.w.last_by_bundle)
+
+    def test_keys_while_the_keyboard_is_lent_in_the_background_count_for_the_lent_app(self):
+        from deskmind_hands import inputwatch as iw
+        ex, _, _ = self._task()
+        e = ex.epoch
+        self.addCleanup(iw.LENDS.clear)
+        token = iw.keyboard_lent(MUSIC)                    # skylight.enter_window_key: the task's window held key
+        self.front["pid"] = ITERM                          # the user's app keeps the front, not the keys
+        for target in (0, DOCK, ITERM):                    # no target, the Dock, even the terminal's own pid
+            self.fields[40] = target
+            self.key()
+        iw.keyboard_returned(token)
+        self.assertNotIn("com.googlecode.iterm2", self.w.last_by_bundle)
+        s = ex.snapshot()
+        self.assertEqual(s["epoch"], e + 1)
+        self.assertEqual(s["epoch_reason"]["to"], "com.apple.textedit")
+        # given back: the read decides again
+        token[1] -= 10
+        token[2] -= 10
+        self.w.last_by_bundle.clear()
+        self.fields[40] = DOCK
+        self.key()
+        self.assertIn("com.googlecode.iterm2", self.w.last_by_bundle)
+
+    def test_the_window_key_tells_the_watch_while_it_is_held(self):
+        from deskmind_hands import inputwatch as iw
+        from deskmind_hands.drivers import skylight
+        self.addCleanup(iw.LENDS.clear)
+        key = skylight.WindowKey(MUSIC, 1, None, None, "records")
+        key.lend = iw.keyboard_lent(MUSIC)
+        self.assertEqual(iw.lent_at(time.time()), MUSIC)
+        with mock.patch.object(skylight, "front_pid", return_value=None):
+            key.exit()
+        self.assertIsNotNone(key.lend[2])                  # returned when the key window went back (or could not)
 
 class StepsClose(_KeysCase):
     """A step mark that is never closed would put every later key with no app target on that step's app (hands#62

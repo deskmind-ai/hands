@@ -457,9 +457,16 @@ class HandsExecutor:
         if token is not None and w is not None:
             w.step_ended(token)
 
+    def _mark_now(self) -> float:
+        """A time for the epoch's mark. With the input watch: stamped under its lock, so an input it records after
+        the mark is set always has a later time -- one looked into while an action moved the mark is never behind
+        it (hands#62 external review)."""
+        w = getattr(self, "_watch", None)
+        return w.mark() if w is not None and hasattr(w, "mark") else time.time()
+
     def _advance(self, reason: dict | None = None) -> None:
         self.epoch += 1
-        self._epoch_at = time.time()
+        self._epoch_at = self._mark_now()
         #: why the epoch last moved, told in every snapshot: an action of the task's, the user's input to an app the
         #: task operates (which, or "unknown"), or a window list that changed (which app, what appeared, vanished or
         #: was renamed). A stale step upstream can then say what made it stale (rc.9, 10-20).
@@ -958,7 +965,7 @@ class HandsExecutor:
             # own edit of the task's window during the action, and the next step was decided on a view it did not
             # match (hands#62 re-review). Without the tap (the HID idle time) or without keys (a mouse-only tap
             # counts key presses by the idle time), ours and theirs cannot be told apart: moved as before.
-            self._epoch_at = time.time()
+            self._epoch_at = self._mark_now()
         return out
 
     def _input_by_source(self) -> bool:

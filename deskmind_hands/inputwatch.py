@@ -11,6 +11,14 @@ A listen-only tap at the annotated session point (kCGAnnotatedSessionEventTap) s
 server has decided its target process (kCGEventTargetUnixProcessID); input whose target is DeskMind (the app and
 its helper) is left out of `last_external_at`. An event with no target known counts: the safe side.
 
+A key event's target is not always the app it is typed into: a key pressed with Command held (the app switcher's
+Command-Tab) comes with the Dock as its target, which is no ordinary app, and some come with none. While the owner
+worked in a terminal and switched apps, each such key was input to an unknown target and staled the steps of a task
+working in a music app (rc.13, 10-22, run_fd8ab281: 4 stale refusals said "to: unknown"). Keyboard input goes to the
+key window of the app in front, so a key event whose target is not an ordinary app (or DeskMind) is input to the app
+that had the keyboard when it arrived -- read then, not later: during a step's flash the task's app is in front and
+the keys typed then do land in it. Only when that cannot be known either is the target unknown, and it counts.
+
 Key events reach a tap only with Input Monitoring; CGEventTapCreate may drop the key bits of a mask and still
 return a tap, so whether keys are watched is read from the permission itself (CGPreflightListenEventAccess),
 never from the tap having been made. Where no tap can be made, the caller falls back to the HID idle time, where
@@ -126,8 +134,10 @@ class InputWatch:
     whether key events are among what it sees (the Input Monitoring permission), else the caller counts every key
     press by the HID idle time."""
 
-    def __init__(self, own_bundles: set[str] = OWN_BUNDLES):
+    def __init__(self, own_bundles: set[str] = OWN_BUNDLES, front_pid=None):
         self.own_bundles = {b.lower() for b in own_bundles}
+        #: the pid of the app that has the keyboard now (0 or None: not known), read as a key event arrives
+        self.front_pid = front_pid or self._front_pid
         self.last_external_at = 0.0
         self.last_own_at = 0.0
         #: lowercased bundle id -> when input last went to it; input whose target is unknown, apart
@@ -160,9 +170,13 @@ class InputWatch:
             self._pid_bundle[pid] = bundle
         return bundle.lower() in self.own_bundles
 
-    def note(self, pid: int | None, at: float | None = None) -> None:
-        """An input event the window server routed to `pid`'s process (None or 0: no target known) at `at`."""
+    def note(self, pid: int | None, at: float | None = None, key: bool = False) -> None:
+        """An input event the window server routed to `pid`'s process (None or 0: no target known) at `at`. A key
+        event (`key`) whose target is not an ordinary app nor DeskMind went to the app that has the keyboard, read
+        now: the caller notes an event as it arrives."""
         at = at or time.time()
+        if key and not self.is_own(pid) and not (pid and self.is_regular(pid)):
+            pid = self.front_now() or pid
         if self.is_own(pid):
             self.last_own_at = max(self.last_own_at, at)
             return
@@ -172,6 +186,13 @@ class InputWatch:
             self.last_by_bundle[bundle] = max(self.last_by_bundle.get(bundle, 0.0), at)
         else:
             self.last_unknown_at = max(self.last_unknown_at, at)
+
+    def front_now(self) -> int:
+        """The pid of the app that has the keyboard now; 0 when it cannot be known (the key then keeps its target)."""
+        try:
+            return int(self.front_pid() or 0)
+        except Exception:  # noqa: BLE001 -- not known: the safe side
+            return 0
 
     def last_input_for(self, bundles: set[str]) -> float:
         """When input last went to one of `bundles` (lowercased), or anywhere unknown: the safe side."""
@@ -236,6 +257,33 @@ class InputWatch:
             return False
 
     @staticmethod
+    def _front_pid() -> int:
+        """The app that has the keyboard now, asked of the accessibility server (the system-wide element's
+        AXFocusedApplication). Not NSWorkspace's frontmostApplication: in a process whose main thread runs no event
+        loop (this one) it keeps the app that was in front when it was first read, which a probe on 10-22 showed
+        while the keyboard moved between four apps. The accessibility server answers only a process that has spoken to
+        the window server (before that: kAXErrorCannotComplete, every time), so a cheap window list is asked for once
+        first, and again before one retry. 0 when it cannot be read."""
+        try:
+            import ApplicationServices as AS
+            import Quartz
+            sw = getattr(InputWatch, "_system_wide", None)
+            if sw is None:
+                Quartz.CGWindowListCreate(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
+                sw = InputWatch._system_wide = AS.AXUIElementCreateSystemWide()
+                AS.AXUIElementSetMessagingTimeout(sw, 0.25)   # on the tap's thread: never wait long
+            err, app = AS.AXUIElementCopyAttributeValue(sw, "AXFocusedApplication", None)
+            if err != 0 or app is None:
+                Quartz.CGWindowListCreate(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
+                err, app = AS.AXUIElementCopyAttributeValue(sw, "AXFocusedApplication", None)
+            if err != 0 or app is None:
+                return 0
+            err, pid = AS.AXUIElementGetPid(app, None)
+            return int(pid) if err == 0 else 0
+        except Exception:  # noqa: BLE001 -- not macOS, or no accessibility: not known
+            return 0
+
+    @staticmethod
     def _bundle_of(pid: int) -> str:
         try:
             from AppKit import NSRunningApplication
@@ -276,7 +324,8 @@ class InputWatch:
                     self._dragging = False
                     self.note(None)
                 return event
-            self.note(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0))
+            self.note(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0),
+                      key=type_ in (Quartz.kCGEventKeyDown, Quartz.kCGEventFlagsChanged))
         except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side (an unknown target)
             self.note(None)
         return event

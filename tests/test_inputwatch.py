@@ -121,6 +121,7 @@ class Targets(unittest.TestCase):
         for k, v in {"kCGEventTapDisabledByTimeout": -2, "kCGEventTapDisabledByUserInput": -1,
                      "kCGEventLeftMouseDragged": 6, "kCGEventRightMouseDragged": 7, "kCGEventOtherMouseDragged": 27,
                      "kCGEventLeftMouseUp": 2, "kCGEventRightMouseUp": 4, "kCGEventOtherMouseUp": 26,
+                     "kCGEventKeyDown": 10, "kCGEventFlagsChanged": 12,
                      "kCGEventTargetUnixProcessID": 40, "kCGEventSourceUnixProcessID": 41}.items():
             setattr(q, k, v)
         fields = {}
@@ -195,6 +196,131 @@ class Targets(unittest.TestCase):
         w.active = False                                    # no tap: back to the idle time, every input counts
         self.assertNotEqual(ex._last_input_at(), 123.0)
 
+
+
+NE = "com.netease.163music"
+ITERM, MUSIC, DESKMIND, DOCK = 31, 32, 33, 34   # pids of iTerm2, NetEase Music, DeskMind, the Dock in these tests
+
+
+def _quartz(fields: dict):
+    """A stand-in for macOS's Quartz with what the tap's callback reads: event types, and the event's fields."""
+    import types
+    q = types.ModuleType("Quartz")
+    for k, v in {"kCGEventTapDisabledByTimeout": -2, "kCGEventTapDisabledByUserInput": -1,
+                 "kCGEventLeftMouseDown": 1, "kCGEventKeyDown": 10, "kCGEventFlagsChanged": 12,
+                 "kCGEventLeftMouseDragged": 6, "kCGEventRightMouseDragged": 7, "kCGEventOtherMouseDragged": 27,
+                 "kCGEventLeftMouseUp": 2, "kCGEventRightMouseUp": 4, "kCGEventOtherMouseUp": 26,
+                 "kCGEventTargetUnixProcessID": 40, "kCGEventSourceUnixProcessID": 41}.items():
+        setattr(q, k, v)
+    q.CGEventGetIntegerValueField = lambda e, f: fields.get(f, 0)
+    return q
+
+
+class KeysGoToTheAppInFront(unittest.TestCase):
+    """A key event can reach the tap with no target, or with one that is no ordinary app (a Command-key press comes
+    with the Dock as its target); keyboard input goes to the key window of the app in front, so it is input to the
+    app that had the keyboard when it arrived (rc.13, 10-22: the owner working in iTerm2 while a task worked in
+    NetEase Music came out as input to an unknown target and staled 4 steps of run_fd8ab281)."""
+
+    def setUp(self):
+        import sys
+        from deskmind_hands.executor import HandsExecutor
+        self.fields = {}                                   # no target, no source: a hardware key with no target pid
+        patcher = mock.patch.dict(sys.modules, {"Quartz": _quartz(self.fields)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.front = {"pid": ITERM}
+        w = self.w = InputWatch()
+        w.front_pid = lambda: self.front["pid"]            # the app in front, as the system would say
+        w._pid_bundle = {ITERM: "com.googlecode.iterm2", MUSIC: NE, DESKMIND: "ai.deskmind.app", DOCK: "com.apple.dock"}
+        w._pid_regular = {ITERM: True, MUSIC: True, DESKMIND: True, DOCK: False}
+        w.active, w.keys = True, True
+        ex = self.ex = HandsExecutor.__new__(HandsExecutor)
+        ex._watch_tried, ex._watch = True, w
+        ex.drivers, ex.current = {NE: object()}, {}        # the task operates NetEase Music
+
+    def key(self):
+        self.w._callback(None, 10, object(), None)
+
+    def test_keys_with_no_target_while_another_app_is_in_front_do_not_stale_the_task(self):
+        self.front["pid"] = ITERM                          # typing in the terminal
+        self.key()
+        self.w._callback(None, 12, object(), None)        # a modifier, too
+        self.fields[40] = DOCK                             # Command-Tab and the like: the Dock is the key's target
+        self.key()
+        self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001
+        self.assertEqual(self.w.last_unknown_at, 0.0)
+        self.assertIn("com.googlecode.iterm2", self.w.last_by_bundle)
+
+    def test_keys_during_the_flash_with_the_task_app_in_front_stale_it(self):
+        self.front["pid"] = MUSIC                          # DeskMind brought the task's app forward for a step
+        self.key()
+        at = self.ex._last_input_at()                      # noqa: SLF001
+        self.assertEqual(self.w.last_unknown_at, 0.0)
+        self.assertGreater(at, 0.0)
+        self.assertEqual(self.w.last_input_where({NE}), (at, NE))   # what epoch_reason.to says
+        # the front is read when the key arrives, not later: the flash ending does not take the key back
+        self.front["pid"] = ITERM
+        self.assertEqual(self.ex._last_input_at(), at)     # noqa: SLF001
+
+    def test_with_the_front_unknown_too_a_key_with_no_target_counts(self):
+        for target in (0, DOCK):
+            for unknown in (lambda: 0, lambda: None, mock.Mock(side_effect=RuntimeError("no accessibility"))):
+                self.fields[40] = target
+                self.w.front_pid = unknown
+                self.w.last_unknown_at = 0.0
+                self.key()
+                self.assertGreater(self.w.last_unknown_at, 0.0)
+                self.assertEqual(self.w.last_input_where({NE})[1], "unknown")
+                self.assertGreater(self.ex._last_input_at(), 0.0)   # noqa: SLF001
+        # the app with the keyboard is itself no ordinary app (Spotlight's field, say): unknown, it counts
+        self.front["pid"] = DOCK
+        self.w.front_pid = lambda: self.front["pid"]
+        self.w.last_unknown_at = 0.0
+        self.fields[40] = 0
+        self.key()
+        self.assertGreater(self.w.last_unknown_at, 0.0)
+
+    def test_input_to_deskmind_stays_excluded(self):
+        self.front["pid"] = DESKMIND                       # the user answering DeskMind's card from the keyboard
+        self.key()
+        self.fields[40] = DESKMIND                         # ... or a key the window server routed to it
+        self.key()
+        self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001
+        self.assertEqual(self.w.last_external_at, 0.0)
+        self.assertGreater(self.w.last_own_at, 0.0)
+
+    def test_a_key_with_a_target_keeps_it_and_a_mouse_event_never_asks_the_front(self):
+        self.front["pid"] = MUSIC
+        self.fields[40] = ITERM                            # the window server named the key's target: that one
+        self.key()
+        self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001
+        self.fields[40] = 0
+        self.w._callback(None, 1, object(), None)          # a click with no target: unknown, as before
+        self.assertGreater(self.w.last_unknown_at, 0.0)
+        self.assertNotIn(NE, self.w.last_by_bundle)
+
+    def test_the_epoch_reason_names_the_app_the_key_was_resolved_to(self):
+        from test_executor import TE, W12, _executor, _win
+        import time as _t
+        ex, _ = _executor()
+        del ex._last_input_at
+        self.w._pid_bundle[MUSIC] = TE                     # here the task's app is TextEdit
+        ex._watch, ex._watch_tried = self.w, True
+        ex._windows = lambda every=False: [_win("12")]     # noqa: SLF001
+        ex._front = lambda: "文本编辑"                       # noqa: SLF001
+        ex.observe(W12)
+        e0 = ex.snapshot()["epoch"]
+        _t.sleep(0.01)
+        self.front["pid"] = ITERM
+        self.key()
+        self.assertEqual(ex.snapshot()["epoch"], e0)       # typing in the terminal: no change
+        _t.sleep(0.01)
+        self.front["pid"] = MUSIC
+        self.key()
+        s = ex.snapshot()
+        self.assertEqual(s["epoch"], e0 + 1)
+        self.assertEqual((s["epoch_reason"]["by"], s["epoch_reason"]["to"]), ("input", TE.lower()))
 
 if __name__ == "__main__":
     unittest.main()

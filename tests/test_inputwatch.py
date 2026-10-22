@@ -699,6 +699,53 @@ class FlashesTold(_EpochCase):
         self.assertEqual(s["epoch"], e + 1)
         self.assertEqual(s["epoch_reason"]["to"], "com.apple.textedit")
 
+    def test_a_key_put_on_a_flash_counts_for_the_flashed_app_the_steps_app_and_the_read_app(self):
+        """Where there is doubt the key counts everywhere it may have gone: a flash told while the read was out (the
+        read named the music app, fresh), a step of TextEdit's open -- the key is recorded for all three."""
+        self.w._pid_bundle[MUSIC] = NE
+        step = self.w.step_began("com.apple.TextEdit")
+
+        def read_meanwhile():
+            self.iw.front_given_back(self.iw.front_taken("com.apple.finder", time.time() - 0.3))
+            return MUSIC
+        self.w.front_pid = read_meanwhile
+        self.fields[40] = DOCK
+        self.fields.pop("ts", None)
+        self.key()
+        self.w.step_ended(step)
+        self.assertEqual({"com.apple.finder", "com.apple.textedit", NE.lower()} - set(self.w.last_by_bundle), set())
+        self.assertEqual(self.w.last_unknown_at, 0.0)
+
+    def test_the_users_press_is_recorded_as_choosing_the_app_and_the_drivers_own_is_not(self):
+        from deskmind_hands import inputwatch as iw
+        self.addCleanup(setattr, iw, "CURRENT", iw.CURRENT)
+        iw.CURRENT = self.w
+        self.w.active = True
+        t = time.time()
+        self.fields.update({40: MUSIC, 41: os.getpid()})   # the driver's own click into the music app
+        self.w._callback(None, 1, object(), None)
+        self.assertFalse(iw.user_clicked_into(NE, t))
+        self.fields[41] = 0                                # the user's
+        self.w._callback(None, 1, object(), None)
+        self.assertTrue(iw.user_clicked_into(NE, t))
+        self.assertFalse(iw.user_clicked_into(NE, time.time() + 1))   # not since a later time
+        self.w.last_click_by_bundle.clear()
+        self.fields[40] = MUSIC
+        self.key()                                         # a key into it is not choosing it
+        self.assertFalse(iw.user_clicked_into(NE, t))
+        iw.CURRENT = None
+        self.assertIsNone(iw.user_clicked_into(NE, t))     # no watch: not known
+
+    def test_where_the_input_went_is_the_same_in_every_run(self):
+        """A key counted for several apps at once has one time: the epoch's reason names the same app each run --
+        the first in sorted order, a task app ahead of "unknown" (hands#62 re-review at f0520a8)."""
+        self.w.last_unknown_at = 5.0
+        self.w.last_by_bundle = {"com.b": 5.0, "com.a": 5.0}
+        for order in (["com.b", "com.a"], ["com.a", "com.b"]):
+            self.assertEqual(self.w.last_input_where(order), (5.0, "com.a"))
+        self.w.last_by_bundle = {"com.a": 4.0}
+        self.assertEqual(self.w.last_input_where({"com.a"}), (5.0, "unknown"))   # a later unknown still wins
+
     def test_the_drivers_flash_is_told_before_the_front_goes_back_and_ends_after(self):
         """Through the driver's real _flash (the test_receipt_driver fixture): the flash is there while the front
         goes back, from when it was taken, and ends once it has."""

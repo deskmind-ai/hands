@@ -181,6 +181,19 @@ def front_given_back(token: list | None) -> None:
         token[2] = time.time()
 
 
+#: The input watch this process runs, once its tap is on (InputWatch.start); None before, or with none.
+CURRENT = None
+
+
+def user_clicked_into(bundle: str, since: float) -> bool | None:
+    """Whether the user pressed a mouse button in `bundle`'s app since `since` (epoch seconds), by the window server's
+    target of their own presses; None when no watch runs to say (the caller then takes the safe side)."""
+    w = CURRENT
+    if w is None or not getattr(w, "active", False) or not bundle:
+        return None
+    return w.last_click_by_bundle.get(bundle.lower(), 0.0) >= since
+
+
 def flash_at(at: float) -> list[str]:
     """Every app a flash had in front at `at` (to FLASH_MARGIN_S after it ended), newest first; [] for none. All of
     them, not the newest only: a flash told from a step's start for the app found in front at its end (Finder) also
@@ -247,6 +260,9 @@ class InputWatch:
         self.last_own_at = 0.0
         #: lowercased bundle id -> when input last went to it; input whose target is unknown, apart
         self.last_by_bundle: dict[str, float] = {}
+        #: lowercased bundle id -> when the user last pressed a mouse button in it (the window server's target; the
+        #: driver's own clicks are skipped by their source): whether the user chose an app (user_clicked_into)
+        self.last_click_by_bundle: dict[str, float] = {}
         self.last_unknown_at = 0.0
         self.active = False
         self.keys = False
@@ -286,7 +302,7 @@ class InputWatch:
         return bundle.lower() in self.own_bundles
 
     def note(self, pid: int | None, at: float | None = None, key: bool = False, age: float | None = None,
-             t0: float | None = None) -> None:
+             t0: float | None = None, click: bool = False) -> None:
         """An input event the window server routed to `pid`'s process (None or 0: no target known). `age` is the
         event's age at `t0` (time.monotonic(), sampled once when the callback began; now when not given). `at`: a
         fixed record time, for tests.
@@ -365,6 +381,10 @@ class InputWatch:
                 self.last_by_bundle[b] = max(self.last_by_bundle.get(b, 0.0), when)
             if not bundles:
                 self.last_unknown_at = max(self.last_unknown_at, when)
+            if click and dest == "regular":
+                # a press of the user's that the window server routed to an ordinary app: the user chose that app
+                for b in bundles:
+                    self.last_click_by_bundle[b] = max(self.last_click_by_bundle.get(b, 0.0), when)
 
     def stamp(self) -> float:
         """Now, strictly later than any time stamped before (epoch seconds); called with `lock` held."""
@@ -444,12 +464,13 @@ class InputWatch:
 
     def last_input_where(self, bundles: set[str]) -> tuple[float, str]:
         """(when, where) of the latest input to one of `bundles` or to an unknown target: where is the bundle id, or
-        "unknown" (a system surface, a drag, an event that could not be read)."""
+        "unknown" (a system surface, a drag, an event that could not be read). The same in every run: the bundles in
+        sorted order, and at the same time a task app ahead of "unknown" (a key counted for several apps at once)."""
         best = (self.last_unknown_at, "unknown")
-        for b in bundles:
-            t = self.last_by_bundle.get(b.lower(), 0.0)
-            if t > best[0]:
-                best = (t, b.lower())
+        for b in sorted({x.lower() for x in bundles}):
+            t = self.last_by_bundle.get(b, 0.0)
+            if t > best[0] or (t and t == best[0] and best[1] == "unknown"):
+                best = (t, b)
         return best
 
     def posted_by_us(self, source_pid: int | None) -> bool:
@@ -565,10 +586,12 @@ class InputWatch:
                     self.note(None)
                 return event
             key = type_ in (Quartz.kCGEventKeyDown, Quartz.kCGEventFlagsChanged)
+            click = type_ in {getattr(Quartz, n, None) for n in ("kCGEventLeftMouseDown", "kCGEventRightMouseDown",
+                                                                 "kCGEventOtherMouseDown")} - {None}
             t0 = time.monotonic()                          # sampled once: the key's age is as of t0
             age = self._event_age(Quartz, event) if key else None
             self.note(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0),
-                      key=key, age=age, t0=t0)
+                      key=key, age=age, t0=t0, click=click)
         except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side (an unknown target)
             self.note(None)
         return event
@@ -610,6 +633,8 @@ class InputWatch:
             Quartz.CFRunLoopAddSource(loop, src, Quartz.kCFRunLoopCommonModes)
             Quartz.CGEventTapEnable(tap, True)
             self.active = True
+            global CURRENT
+            CURRENT = self                                 # the watch this process runs (user_clicked_into)
             ready.set()
             Quartz.CFRunLoopRun()
 

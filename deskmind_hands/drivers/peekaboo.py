@@ -3929,11 +3929,21 @@ class PeekabooDriver:
         ActionKind.MENU,
     })
 
-    def _untouched_since(self, t0: float) -> bool:
-        """The user has not touched the keyboard, mouse or trackpad since `t0`; False when that cannot be read."""
+    @staticmethod
+    def _user_chose(bundle: str, t0: float) -> bool:
+        """Whether the user chose `bundle`'s app since `t0`: pressed a mouse button in it, by the input watch's own
+        records of where the window server routed the user's presses (the driver's own are skipped by their source).
+        Not the HID idle time: that says only that the user touched something -- typing in their terminal while a
+        step's background click brought Finder forward, they were left typing into Finder, where letters select
+        files and Command-Delete deletes them, and no later step gave the front back (hands#62 re-review at
+        f0520a8). A Command-Tab into the app cannot be told apart cheaply and is taken as not chosen: the front goes
+        back -- being pulled back after a deliberate switch is friction; leaving the task's app under the user's
+        typing risks changes they did not consent to. No watch running (or none that sees presses): not chosen,
+        the front goes back -- what main did for Finder, TextEdit and Safari."""
         try:
-            return self._hid_idle() >= time.time() - t0
-        except Exception:  # noqa: BLE001 -- not known: the user is left where they are
+            from deskmind_hands import inputwatch
+            return bool(inputwatch.user_clicked_into(bundle, t0))
+        except Exception:  # noqa: BLE001
             return False
 
     def _ours(self, name: str, bundle: str = "") -> bool:
@@ -3997,25 +4007,23 @@ class PeekabooDriver:
         after, after_bundle = self._front_app()
         ours_after, ours_before = self._ours(after, after_bundle), self._ours(before, before_bundle)
         if before and after and after != before and ours_after and not ours_before:
-            self._foreground_actions += 1
-            # Two things, kept apart (hands#62 re-review at c0c5a4f). The input watch is told unconditionally: the
-            # app in front and this step's app both, from the step's start (when it came forward is not known) --
-            # counting a key where there is doubt is the safe side. The front goes back only when the user has not
-            # touched anything since the step began: one who clicked into the music app to watch it keeps it --
-            # DeskMind never takes the foreground but on the user's click. An idle time that cannot be read: left.
+            # Two things, kept apart (hands#62 re-reviews). The input watch is told unconditionally: the app in front
+            # and this step's app both, from the step's start (when it came forward is not known) -- counting a key
+            # where there is doubt is the safe side. The front goes back unless the user chose the app (_user_chose).
             tokens = [self._front_taken(b, t0) for b in dict.fromkeys(x for x in (after_bundle, self.app) if x)]
             try:
-                if self._untouched_since(t0):
+                if not self._user_chose(after_bundle, t0):
+                    self._foreground_actions += 1         # a front the task's app took: counted, and given back
                     self._osa(f'tell application "{self._q(before)}" to activate')
                     res = replace(res, detail=f"{res.detail} [took the foreground ({after}); given back to {before}]")
                 else:
-                    res = replace(res, detail=f"{res.detail} [{after} came to the front; left there: the user has "
-                                              f"used the Mac since the step began]")
+                    res = replace(res, detail=f"{res.detail} [{after} came to the front; left there: the user "
+                                              f"clicked into it during the step]")
             finally:
                 for token in tokens:
                     self._front_given_back(token)
         elif (before and after and after != before and not ours_before and not action.foreground
-              and self._untouched_since(t0)):
+              and self._hid_idle() >= time.time() - t0):
             # Something else took the front while the step ran -- a helper app, a notification, an app the click
             # launched -- and the user did not do it (untouched since the step began): the user's app gets it back
             # (cua's focus guard). An intended foreground step, or the user switching apps, is left alone. The app

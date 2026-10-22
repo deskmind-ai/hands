@@ -108,23 +108,58 @@ class FocusGuard(unittest.TestCase):
         self.assertEqual(d.activated, [])
         self.assertNotIn("given back", res.detail)
 
-    def test_a_task_app_the_user_clicked_into_during_the_step_is_left_to_them(self):
-        """The music app (known by its bundle id, no name list) came forward during the step because the user clicked
-        into it to watch: they keep it -- DeskMind never takes the foreground but on the user's click. The input
-        watch is still told (hands#62 re-review at c0c5a4f). An idle time that cannot be read: left as well."""
+    def _task_app_came_forward(self, idle: float, watch: bool, clicked: bool):
+        """A step of the music app's driver (known by its bundle id) after which the music app is in front, the user's
+        terminal before; with an input watch running (or none), the user's press in the music app during the step
+        recorded by it (or not), and the HID idle time `idle`."""
+        import time
         from deskmind_hands import inputwatch as iw
-        self.addCleanup(iw.FLASHES.clear)
+        from deskmind_hands.inputwatch import InputWatch
         ne = "com.netease.163music"
-        for idle in (0.01, RuntimeError("no HID idle")):
-            d, act = self._driver([], idle=0)
-            d.app = ne
-            seq = iter([("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", ne)])
-            d._front_app = lambda: next(seq)
-            d._hid_idle = (lambda i=idle: (_ for _ in ()).throw(i)) if isinstance(idle, Exception) else (lambda i=idle: i)
-            t0 = __import__("time").time()
-            d._execute_outer(act)
-            self.assertEqual(d.activated, [])
-            self.assertIn(ne, iw.flash_at(t0 + 0.1))
+        self.addCleanup(iw.FLASHES.clear)
+        self.addCleanup(setattr, iw, "CURRENT", getattr(iw, "CURRENT", None))
+        w = InputWatch()
+        w.active, w.keys = True, True
+        w._pid_bundle, w._pid_regular = {31: "com.googlecode.iterm2", 32: ne}, {31: True, 32: True}
+        iw.CURRENT = w if watch else None
+        d, act = self._driver([], idle=idle)
+        d.app = ne
+        seq = iter([("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", ne)])
+        d._front_app = lambda: next(seq)
+
+        def step(action):
+            w.note(31)                                     # the user typing in their terminal
+            if clicked:
+                try:
+                    w.note(32, click=True)                 # ... or clicking into the music app to watch it
+                except TypeError:                          # a watch that does not tell presses apart (f0520a8)
+                    w.note(32)
+            time.sleep(0.02)
+            return ExecResult(True, "clicked")
+        d._execute_inner = step
+        t0 = time.time()
+        d._execute_outer(act)
+        self.assertIn(ne, iw.flash_at(t0 + 0.01))          # the watch is told in every case
+        return d
+
+    def test_a_task_app_that_came_forward_while_the_user_typed_elsewhere_is_given_back(self):
+        """Typing in the terminal while a step's background click brought the app forward: the HID idle time says
+        only that the user touched something; left there, their next keys went into the task's app (hands#62
+        re-review at f0520a8)."""
+        d = self._task_app_came_forward(idle=0.01, watch=True, clicked=False)
+        self.assertEqual(d.activated, ['tell application "iTerm2" to activate'])
+        self.assertEqual(d._foreground_actions, 1)
+
+    def test_a_task_app_the_user_clicked_into_during_the_step_is_left_to_them(self):
+        """Their press in the music app, by the watch's own record of where the window server routed it: they chose
+        it, and keep it -- whatever the HID idle time says (it reads 1e9 when it cannot be read)."""
+        d = self._task_app_came_forward(idle=1e9, watch=True, clicked=True)
+        self.assertEqual(d.activated, [])
+        self.assertEqual(d._foreground_actions, 0)         # not counted as the task's front take: the user's
+
+    def test_with_no_watch_running_the_front_is_given_back(self):
+        d = self._task_app_came_forward(idle=0.01, watch=False, clicked=True)
+        self.assertEqual(d.activated, ['tell application "iTerm2" to activate'])
 
     def test_an_intended_foreground_step_is_left_alone(self):
         from deskmind_hands.actions import Action, ActionKind

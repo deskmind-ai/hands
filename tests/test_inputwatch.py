@@ -724,17 +724,17 @@ class FlashesTold(_EpochCase):
         t = time.time()
         self.fields.update({40: MUSIC, 41: os.getpid()})   # the driver's own click into the music app
         self.w._callback(None, 1, object(), None)
-        self.assertFalse(iw.user_clicked_into(NE, t))
+        self.assertFalse(iw.user_chose(NE, t))
         self.fields[41] = 0                                # the user's
         self.w._callback(None, 1, object(), None)
-        self.assertTrue(iw.user_clicked_into(NE, t))
-        self.assertFalse(iw.user_clicked_into(NE, time.time() + 1))   # not since a later time
+        self.assertTrue(iw.user_chose(NE, t))
+        self.assertFalse(iw.user_chose(NE, time.time() + 1))   # not since a later time
         self.w.last_click_by_bundle.clear()
         self.fields[40] = MUSIC
         self.key()                                         # a key into it is not choosing it
-        self.assertFalse(iw.user_clicked_into(NE, t))
+        self.assertFalse(iw.user_chose(NE, t))
         iw.CURRENT = None
-        self.assertIsNone(iw.user_clicked_into(NE, t))     # no watch: not known
+        self.assertIsNone(iw.user_chose(NE, t))     # no watch: not known
 
     def test_where_the_input_went_is_the_same_in_every_run(self):
         """A key counted for several apps at once has one time: the epoch's reason names the same app each run --
@@ -947,6 +947,129 @@ class FlashesTold(_EpochCase):
                 ex._open_window(NE, None)                  # noqa: SLF001
         self.assertIn(NE.lower(), self.flashes(t + 0.001))
 
+
+FINDER, PREVIEW, NOTES = 35, 36, 37
+
+
+class FrontBelongsToTheUsersChoice(_KeysCase):
+    """After a step, the front belongs to the user's latest choice: if it changed, it goes back to the app before
+    unless the user's most recent input since the step began is a press in the app now in front, or input to it after
+    that press -- whatever the app before was, task app or not (driver._settle_front, inputwatch.user_chose; hands#62
+    re-review at a62ecb0). The input events go through the tap's real callback."""
+
+    def setUp(self):
+        super().setUp()
+        from deskmind_hands import inputwatch as iw
+        self.iw = iw
+        self.w._pid_bundle.update({FINDER: "com.apple.finder", PREVIEW: "com.apple.Preview", NOTES: "com.apple.Notes"})
+        self.w._pid_regular.update({FINDER: True, PREVIEW: True, NOTES: True})
+        self.w.active = True
+        self.addCleanup(setattr, iw, "CURRENT", getattr(iw, "CURRENT", None))
+        self.addCleanup(lambda: iw.__dict__.get("FLASHES", []).clear())
+        iw.CURRENT = self.w
+
+    def click(self, pid: int, ours: bool = False):
+        self.fields.update({40: pid, 41: os.getpid() if ours else 0})
+        self.w._callback(None, 1, object(), None)          # a left mouse-down
+        self.fields[41] = 0
+
+    def type_in(self, pid: int):
+        self.fields.update({40: pid, 41: 0})
+        self.fields.pop("ts", None)
+        self.key()
+
+    def step(self, app: str, before: tuple[str, str], after: tuple[str, str], during=lambda: None, idle: float = 60.0):
+        """A step of `app`'s driver: the front `before` it, `after` it, the user's input `during` it."""
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        from deskmind_hands.drivers.base import ExecResult
+        from deskmind_hands.drivers.peekaboo import PeekabooDriver
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        d.app, d._mcp, d._foreground_actions = app, object(), 0
+        fronts = iter([before, after])
+        d._front_app = lambda: next(fronts)
+        d._hid_idle = lambda: idle
+        d._task_windows = lambda: []
+        d.activated = []
+        d._osa = lambda script: d.activated.append(script) or (True, "")
+
+        def inner(a):
+            time.sleep(0.01)
+            during()
+            time.sleep(0.01)
+            return ExecResult(True, "clicked")
+        d._execute_inner = inner
+        d._execute_outer(Action(kind=ActionKind.CLICK, binding=Binding(element_id="B2")))
+        return d.activated
+
+    TERMINAL, MUSIC_APP = ("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", NE)
+
+    def test_clicked_the_music_app_then_back_in_the_terminal_typing_it_is_given_back(self):
+        """B-1: a press in the music app, then a press and typing in the terminal: the latest choice is the terminal."""
+        def during():
+            self.click(MUSIC)
+            self.click(ITERM)
+            self.type_in(ITERM)
+        self.assertEqual(self.step(NE, self.TERMINAL, self.MUSIC_APP, during, idle=0.01),
+                         ['tell application "iTerm2" to activate'])
+
+    def test_clicked_the_music_app_and_still_in_it_it_is_left_with_them(self):
+        def during():
+            self.type_in(ITERM)
+            self.click(MUSIC)
+            self.type_in(MUSIC)                            # typing in it after the press: still choosing it
+        self.assertEqual(self.step(NE, self.TERMINAL, self.MUSIC_APP, during, idle=0.01), [])
+
+    def test_command_tab_back_to_the_terminal_after_clicking_the_task_app_it_is_given_back(self):
+        def during():
+            self.click(MUSIC)
+            self.front["pid"] = ITERM                      # the switch: the keyboard is the terminal's
+            self.fields.update({40: DOCK, 41: 0})          # Command-Tab: the Dock its target
+            self.fields.pop("ts", None)
+            self.key()
+        self.assertEqual(self.step(NE, self.TERMINAL, self.MUSIC_APP, during, idle=0.01),
+                         ['tell application "iTerm2" to activate'])
+
+    def test_preview_opened_by_a_double_click_in_finder_is_given_back_while_the_user_types(self):
+        """B-2: an app the step caused (Preview, from a double-click in Finder), the user typing in the terminal."""
+        self.assertEqual(self.step("com.apple.finder", self.TERMINAL, ("预览", "com.apple.Preview"),
+                                   lambda: self.type_in(ITERM), idle=0.01),
+                         ['tell application "iTerm2" to activate'])
+
+    def test_a_user_in_finder_gets_the_front_back_from_notes(self):
+        """B-3: the user was in Finder (a name-list app) when Notes came forward by a background click."""
+        self.assertEqual(self.step("com.apple.Notes", ("访达", "com.apple.finder"), ("备忘录", "com.apple.Notes"),
+                                   lambda: self.type_in(FINDER), idle=0.01),
+                         ['tell application "访达" to activate'])
+
+    def test_the_drivers_own_click_in_the_task_app_is_not_the_users_choice(self):
+        self.assertEqual(self.step(NE, self.TERMINAL, self.MUSIC_APP, lambda: self.click(MUSIC, ours=True),
+                                   idle=0.01),
+                         ['tell application "iTerm2" to activate'])
+
+    def test_a_started_watch_is_the_one_the_driver_asks(self):
+        """InputWatch.start sets CURRENT once its tap is on: without it the driver could never see a choice."""
+        q = types.ModuleType("Quartz")
+        for k, v in {"kCGEventLeftMouseDown": 1, "kCGEventRightMouseDown": 3, "kCGEventOtherMouseDown": 25,
+                     "kCGEventScrollWheel": 22, "kCGEventKeyDown": 10, "kCGEventFlagsChanged": 12,
+                     "kCGEventLeftMouseDragged": 6, "kCGEventRightMouseDragged": 7, "kCGEventOtherMouseDragged": 27,
+                     "kCGEventLeftMouseUp": 2, "kCGEventRightMouseUp": 4, "kCGEventOtherMouseUp": 26,
+                     "kCGAnnotatedSessionEventTap": 2, "kCGHeadInsertEventTap": 0, "kCGEventTapOptionListenOnly": 1,
+                     "kCFRunLoopCommonModes": "common"}.items():
+            setattr(q, k, v)
+        q.CGEventMaskBit = lambda b: 1 << b
+        q.CGPreflightListenEventAccess = lambda: True
+        q.CGEventTapCreate = lambda *a: object()
+        q.CFMachPortCreateRunLoopSource = lambda *a: object()
+        q.CFRunLoopGetCurrent = lambda: object()
+        q.CFRunLoopAddSource = lambda *a: None
+        q.CGEventTapEnable = lambda *a: None
+        q.CFRunLoopRun = lambda: None
+        self.iw.CURRENT = None
+        w = InputWatch()
+        with mock.patch.dict(sys.modules, {"Quartz": q}), \
+             mock.patch("threading.Thread", lambda target, name, daemon: types.SimpleNamespace(start=target)):
+            self.assertTrue(w.start())
+        self.assertIs(self.iw.CURRENT, w)
 
 class StepsClose(_KeysCase):
     """A step mark that is never closed would put every later key with no app target on that step's app (hands#62

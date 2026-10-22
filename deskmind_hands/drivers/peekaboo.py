@@ -3929,22 +3929,63 @@ class PeekabooDriver:
         ActionKind.MENU,
     })
 
-    @staticmethod
-    def _user_chose(bundle: str, t0: float) -> bool:
-        """Whether the user chose `bundle`'s app since `t0`: pressed a mouse button in it, by the input watch's own
-        records of where the window server routed the user's presses (the driver's own are skipped by their source).
-        Not the HID idle time: that says only that the user touched something -- typing in their terminal while a
-        step's background click brought Finder forward, they were left typing into Finder, where letters select
-        files and Command-Delete deletes them, and no later step gave the front back (hands#62 re-review at
-        f0520a8). A Command-Tab into the app cannot be told apart cheaply and is taken as not chosen: the front goes
-        back -- being pulled back after a deliberate switch is friction; leaving the task's app under the user's
-        typing risks changes they did not consent to. No watch running (or none that sees presses): not chosen,
-        the front goes back -- what main did for Finder, TextEdit and Safari."""
+    def _settle_front(self, before: str, before_bundle: str, after: str, after_bundle: str, t0: float,
+                      action: Action | None, res: ExecResult) -> ExecResult:
+        """Who keeps the front after a step: the front belongs to the user's latest choice (hands#62 re-reviews). One
+        rule, for whatever the front was before -- not only for a user who was outside the task's apps (one in Finder
+        kept Notes in front after a background click) and not only for the task's apps (Preview, opened by a double-
+        click in Finder, stayed under the user's typing).
+
+        If the app in front now is not the one in front before the step, the front goes back to `before`, unless the
+        user's most recent input since the step began is a press in the app now in front, or input to it after such a
+        press (inputwatch.user_chose: newer than all their input elsewhere, to unknown targets and to DeskMind). The
+        driver's own events never count. Accepted friction: a Dock-icon click, Command-Tab, Spotlight, a notification
+        banner or an open/save panel's service into the app is not a press the watch sees there, and the front is
+        given back -- being pulled back is friction; being left with the task's app under one's typing risks changes
+        nobody consented to.
+
+        No input watch running: given back when the app now in front is one of the task's, or the step caused the
+        change (the user has not touched anything since it began -- main's focus guard); otherwise the user may have
+        chosen it and nothing tells: left. A front that cannot be read, before or after: left alone (nothing to give
+        back to, or no change that can be told) -- the step is over by then, nothing more is typed in it. An intended
+        foreground step (action.foreground) is the layer above's choice: left, as before.
+
+        The input watch is told about every change, whoever keeps the front: the app in front from the step's start
+        (and this step's app with it when the app in front is one of the task's) -- counting a key where there is
+        doubt is the safe side."""
+        if not before or not after:
+            return res                                     # not known: left alone
+        if (after_bundle and before_bundle and after_bundle.lower() == before_bundle.lower()) or after == before:
+            return res
+        task_app = self._ours(after, after_bundle)
+        tell = [after_bundle] + ([self.app] if task_app else [])
+        tokens = [self._front_taken(b, t0) for b in dict.fromkeys(x for x in tell if x)]
         try:
-            from deskmind_hands import inputwatch
-            return bool(inputwatch.user_clicked_into(bundle, t0))
-        except Exception:  # noqa: BLE001
-            return False
+            if action is not None and action.foreground:
+                return res
+            try:
+                from deskmind_hands import inputwatch
+                chose = inputwatch.user_chose(after_bundle, t0)
+            except Exception:  # noqa: BLE001
+                chose = None
+            if chose is None:                              # no watch: the task's app, or a change the step caused
+                give = task_app or self._hid_idle() >= time.time() - t0
+            else:
+                give = not chose
+            if not give:
+                why = "the user clicked into it during the step" if chose else "the user may have chosen it"
+                return replace(res, detail=f"{res.detail} [{after} came to the front; left there: {why}]")
+            self._osa(f'tell application "{self._q(before)}" to activate')
+            if task_app:
+                self._foreground_actions += 1             # a front the task's app took: counted, and given back
+                return replace(res, detail=f"{res.detail} [took the foreground ({after}); given back to {before}]")
+            if effect_notes():
+                return replace(res, detail=f"{res.detail} [{after} took the front during the step; given back to "
+                                          f"{before}]")
+            return res
+        finally:
+            for token in tokens:
+                self._front_given_back(token)
 
     def _ours(self, name: str, bundle: str = "") -> bool:
         """Is this front app (its name, and its bundle id when known) one of the apps this task drives? By bundle id:
@@ -4005,37 +4046,7 @@ class PeekabooDriver:
         wins_before = self._task_windows()
         res = self._execute_inner(action)
         after, after_bundle = self._front_app()
-        ours_after, ours_before = self._ours(after, after_bundle), self._ours(before, before_bundle)
-        if before and after and after != before and ours_after and not ours_before:
-            # Two things, kept apart (hands#62 re-reviews). The input watch is told unconditionally: the app in front
-            # and this step's app both, from the step's start (when it came forward is not known) -- counting a key
-            # where there is doubt is the safe side. The front goes back unless the user chose the app (_user_chose).
-            tokens = [self._front_taken(b, t0) for b in dict.fromkeys(x for x in (after_bundle, self.app) if x)]
-            try:
-                if not self._user_chose(after_bundle, t0):
-                    self._foreground_actions += 1         # a front the task's app took: counted, and given back
-                    self._osa(f'tell application "{self._q(before)}" to activate')
-                    res = replace(res, detail=f"{res.detail} [took the foreground ({after}); given back to {before}]")
-                else:
-                    res = replace(res, detail=f"{res.detail} [{after} came to the front; left there: the user "
-                                              f"clicked into it during the step]")
-            finally:
-                for token in tokens:
-                    self._front_given_back(token)
-        elif (before and after and after != before and not ours_before and not action.foreground
-              and self._hid_idle() >= time.time() - t0):
-            # Something else took the front while the step ran -- a helper app, a notification, an app the click
-            # launched -- and the user did not do it (untouched since the step began): the user's app gets it back
-            # (cua's focus guard). An intended foreground step, or the user switching apps, is left alone. The app
-            # that had the front can be one the task operates through another driver: told to the input watch as
-            # well (a key that landed in an app the task does not operate stales nothing).
-            token = self._front_taken(after_bundle, t0) if after_bundle else None
-            try:
-                self._osa(f'tell application "{self._q(before)}" to activate')
-            finally:
-                self._front_given_back(token)
-            if effect_notes():
-                res = replace(res, detail=f"{res.detail} [{after} took the front during the step; given back to {before}]")
+        res = self._settle_front(before, before_bundle, after, after_bundle, t0, action, res)
         note = new_window_note(wins_before, self._task_windows()) if effect_notes() else None
         if note:
             res = replace(res, detail=f"{res.detail} -- {note}")

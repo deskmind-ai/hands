@@ -185,13 +185,23 @@ def front_given_back(token: list | None) -> None:
 CURRENT = None
 
 
-def user_clicked_into(bundle: str, since: float) -> bool | None:
-    """Whether the user pressed a mouse button in `bundle`'s app since `since` (epoch seconds), by the window server's
-    target of their own presses; None when no watch runs to say (the caller then takes the safe side)."""
+def user_chose(bundle: str, since: float) -> bool | None:
+    """Whether the front belongs to `bundle`'s app by the user's latest choice: since `since` (epoch seconds) they
+    pressed a mouse button in it, and nothing they did after that press went anywhere else -- no input to another app,
+    to an unknown target or to DeskMind is newer than it (input to the app itself after the press is still choosing
+    it). By the window server's target of the user's own presses; the driver's own events never reach these records
+    (posted_by_us). None when no watch runs to say."""
     w = CURRENT
-    if w is None or not getattr(w, "active", False) or not bundle:
+    if w is None or not getattr(w, "active", False):
         return None
-    return w.last_click_by_bundle.get(bundle.lower(), 0.0) >= since
+    b = (bundle or "").lower()
+    if not b:
+        return False
+    with w.lock:
+        clicked = w.last_click_by_bundle.get(b, 0.0)
+        elsewhere = max([w.last_unknown_at, w.last_own_at]
+                        + [t for k, t in w.last_by_bundle.items() if k != b])
+    return clicked >= since and clicked > elsewhere
 
 
 def flash_at(at: float) -> list[str]:
@@ -261,7 +271,7 @@ class InputWatch:
         #: lowercased bundle id -> when input last went to it; input whose target is unknown, apart
         self.last_by_bundle: dict[str, float] = {}
         #: lowercased bundle id -> when the user last pressed a mouse button in it (the window server's target; the
-        #: driver's own clicks are skipped by their source): whether the user chose an app (user_clicked_into)
+        #: driver's own clicks are skipped by their source): whether the user chose an app (user_chose)
         self.last_click_by_bundle: dict[str, float] = {}
         self.last_unknown_at = 0.0
         self.active = False
@@ -634,7 +644,7 @@ class InputWatch:
             Quartz.CGEventTapEnable(tap, True)
             self.active = True
             global CURRENT
-            CURRENT = self                                 # the watch this process runs (user_clicked_into)
+            CURRENT = self                                 # the watch this process runs (user_chose)
             ready.set()
             Quartz.CFRunLoopRun()
 

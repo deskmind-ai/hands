@@ -19,11 +19,14 @@ run_fd8ab281: 4 stale refusals said "to: unknown"). Such a key (target neither a
 to the app that had the keyboard then, as plain typing is, under three guards, each on the safe side:
 - during a step of the task's (the executor marks each one, `step_began`/`step_ended`: the step may bring the task's
   app forward, a flash), plus STEP_MARGIN_S around it, the key counts for the task's app, whoever has the keyboard
-  when the callback runs -- it can run late, waiting for the interpreter while the executor works;
+  when the callback runs -- it can run late, waiting for the interpreter while the executor works. A step whose end
+  is never told closes at its own deadline (`max_s`);
 - otherwise the app with the keyboard is read only when the callback runs within KEY_FRESH_S of the event's own
   timestamp; a late callback would read a front that has moved on, so the key keeps its target and counts;
 - when the app with the keyboard cannot be read (no answer within FRONT_DEADLINE_S, accessibility refused), or is
   itself no ordinary app (Spotlight's field), the key keeps its target and counts.
+The event's own time only decides where a key went; every input is recorded when its callback runs, since the epoch's
+mark is compared with when input was seen -- backdated, a key seen after an action ended fell before the mark.
 
 Key events reach a tap only with Input Monitoring; CGEventTapCreate may drop the key bits of a mask and still
 return a tap, so whether keys are watched is read from the permission itself (CGPreflightListenEventAccess),
@@ -143,6 +146,8 @@ STEP_MARGIN_S = 0.5
 #: that failed or did not answer, none is tried for FRONT_BACKOFF_S (each key then keeps its target and counts).
 FRONT_DEADLINE_S = 0.1
 FRONT_BACKOFF_S = 0.5
+#: The longest a step of the task's is taken to last when its end is never told (step_began's default).
+STEP_MAX_S = 180.0
 
 
 def _uptime_ns() -> int:
@@ -235,13 +240,16 @@ class InputWatch:
         return bundle.lower() in self.own_bundles
 
     def note(self, pid: int | None, at: float | None = None, key: bool = False, age: float | None = None) -> None:
-        """An input event the window server routed to `pid`'s process (None or 0: no target known) at `at`. A key
-        event (`key`) whose target is neither an ordinary app nor DeskMind: inside a step of the task's, input to the
-        step's app; else, when the event is `age` seconds old at most KEY_FRESH_S, input to the app that has the
-        keyboard now; else its target is kept (see the module's docstring)."""
+        """An input event the window server routed to `pid`'s process (None or 0: no target known), noted at `at`
+        (the callback's time). A key event (`key`) whose target is neither an ordinary app nor DeskMind: inside a step
+        of the task's, input to the step's app; else, when the event is `age` seconds old at most KEY_FRESH_S, input
+        to the app that has the keyboard now; else its target is kept (see the module's docstring).
+        The event's own time (`at` - `age`) only decides where a key went, never when it is recorded: recorded at its
+        own time, a key whose callback ran after an action ended fell before the epoch's mark and was never counted
+        (hands#62 re-review) -- the epoch compares with when the input was seen."""
         at = at or time.time()
         if key and not self.is_own(pid) and not (pid and self.is_regular(pid)):
-            step = self.step_at(at)
+            step = self.step_at(at - age if age is not None and age >= 0 else at)
             if step:
                 self.last_external_at = max(self.last_external_at, at)
                 self.last_by_bundle[step] = max(self.last_by_bundle.get(step, 0.0), at)
@@ -259,9 +267,11 @@ class InputWatch:
             self.last_unknown_at = max(self.last_unknown_at, at)
 
     # -- the task's steps (told by the executor) -------------------------------------------------------------
-    def step_began(self, bundle: str) -> list:
-        """A step of the task's in `bundle` begins: its app may be brought forward until `step_ended(token)`."""
-        token = [(bundle or "").lower(), time.time(), None]
+    def step_began(self, bundle: str, max_s: float = STEP_MAX_S) -> list:
+        """A step of the task's in `bundle` begins: its app may be brought forward until `step_ended(token)`, and
+        for `max_s` seconds at most -- a step whose end was never told (its caller raised) does not stay open."""
+        now = time.time()
+        token = [(bundle or "").lower(), now, None, now + max_s]
         self._steps = (self._steps + [token])[-32:]
         return token
 
@@ -271,8 +281,9 @@ class InputWatch:
 
     def step_at(self, at: float) -> str:
         """The app of the task's step under way at `at` (within STEP_MARGIN_S of one), or ""."""
-        for bundle, began, ended in reversed(self._steps):
-            if bundle and began - STEP_MARGIN_S <= at <= (ended if ended is not None else time.time()) + STEP_MARGIN_S:
+        for bundle, began, ended, deadline in reversed(self._steps):
+            end = ended if ended is not None else min(time.time(), deadline)
+            if bundle and began - STEP_MARGIN_S <= at <= end + STEP_MARGIN_S:
                 return bundle
         return ""
 
@@ -438,7 +449,7 @@ class InputWatch:
             key = type_ in (Quartz.kCGEventKeyDown, Quartz.kCGEventFlagsChanged)
             age = self._event_age(Quartz, event) if key else None
             self.note(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0),
-                      at=time.time() - age if age is not None and age >= 0 else None, key=key, age=age)
+                      key=key, age=age)
         except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side (an unknown target)
             self.note(None)
         return event

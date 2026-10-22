@@ -355,7 +355,6 @@ class KeysAtTheFlashsEdge(_KeysCase):
         self.assertNotIn("com.googlecode.iterm2", self.w.last_by_bundle)
         self.assertGreater(self.ex._last_input_at(), 0.0)   # noqa: SLF001 -- the task is staled
         self.assertEqual(calls, [])                          # the front is not even asked
-        self.assertLess(time.time() - self.w.last_unknown_at - 0.3, 0.1)   # noted at the key's own time
 
     def test_a_key_inside_a_step_counts_for_the_steps_app_whoever_is_in_front_later(self):
         step = self.w.step_began(NE)                       # the executor: a step in NetEase Music begins (a flash)
@@ -393,6 +392,124 @@ class KeysAtTheFlashsEdge(_KeysCase):
         self.assertEqual(seen, [TE.lower()])
         self.assertIsNotNone(self.w._steps[-1][2])        # and its end
 
+
+class LateKeysAndTheEpoch(_KeysCase):
+    """The epoch's mark is compared with when input was seen. A key is recorded at its callback's time -- its own time
+    only decides where it went -- and the mark an action leaves is not moved past the user's input when the driver's
+    own events are told by their source (hands#62 re-review, at 809aa34). Each test here fails at 809aa34."""
+
+    def _task(self):
+        from test_executor import TE, W12, _executor, _win
+        ex, stub = _executor()
+        del ex._last_input_at                              # the real one, over this watch
+        self.w._pid_bundle[MUSIC] = TE                     # here the task's app is TextEdit (pid MUSIC)
+        ex._watch, ex._watch_tried = self.w, True
+        ex._windows = lambda every=False: [_win("12")]     # noqa: SLF001 -- no desktop
+        ex._front = lambda: "文本编辑"                       # noqa: SLF001
+        ex.observe(W12)
+        ex.snapshot()
+        return ex, stub, W12
+
+    def test_a_key_typed_near_an_actions_end_whose_callback_runs_after_it_stales_the_next_step(self):
+        ex, _, W12 = self._task()
+        ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        e = ex.epoch
+        self.fields[40] = MUSIC                            # typed into the task's own app ...
+        self.fields["ts"] = _uptime_ns() - 200_000_000      # ... 0.2 s ago, before the action ended; seen only now
+        self.key()
+        s = ex.snapshot()
+        self.assertEqual(s["epoch"], e + 1)
+        self.assertEqual(s["epoch_reason"]["by"], "input")
+
+    def test_a_key_moved_onto_the_steps_app_is_not_wiped_by_the_steps_end(self):
+        ex, stub, W12 = self._task()
+        real = stub.execute
+
+        def during(a):
+            self.fields[40] = DOCK                         # a Command key while the step runs ...
+            self.front["pid"] = ITERM                      # ... whatever is in front when its callback runs
+            self.key()
+            return real(a)
+        stub.execute = during
+        ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        e = ex.epoch
+        s = ex.snapshot()
+        self.assertEqual(s["epoch"], e + 1)
+        self.assertEqual(s["epoch_reason"]["to"], "com.apple.textedit")
+
+    def test_the_users_key_during_an_action_stales_the_next_step_and_the_drivers_own_does_not(self):
+        ex, stub, W12 = self._task()
+        real = stub.execute
+
+        def driver_types(a):
+            self.fields.update({40: MUSIC, 41: os.getpid()})   # the driver's own key into the task's app
+            self.key()
+            return real(a)
+        stub.execute = driver_types
+        ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        e = ex.epoch
+        self.assertEqual(ex.snapshot()["epoch"], e)       # ours: no change
+
+        def user_types(a):
+            self.fields.update({40: MUSIC, 41: 0})         # the user edits the task's window mid-action
+            self.key()
+            return real(a)
+        stub.execute = user_types
+        ex.perform({"kind": "click", "window": W12, "target": "B2"})
+        e = ex.epoch
+        s = ex.snapshot()
+        self.assertEqual(s["epoch"], e + 1)
+        self.assertEqual((s["epoch_reason"]["by"], s["epoch_reason"]["to"]), ("input", "com.apple.textedit"))
+
+    def test_without_keys_watched_by_source_the_actions_mark_still_moves(self):
+        """Without Input Monitoring, key presses count by the HID idle time, which cannot tell the driver's own from
+        the user's: the mark an action leaves moves past them, as before."""
+        ex, _, W12 = self._task()
+        self.w.keys = False
+        with mock.patch("deskmind_hands.executor.Quartz") as q:
+            q.CGEventSourceSecondsSinceLastEventType.return_value = 0.0   # the driver's own keys, just now
+            ex.perform({"kind": "click", "window": W12, "target": "B2"})
+            e = ex.epoch
+            q.CGEventSourceSecondsSinceLastEventType.return_value = 0.5
+            self.assertEqual(ex.snapshot()["epoch"], e)
+
+
+class StepsClose(_KeysCase):
+    """A step mark that is never closed would put every later key with no app target on that step's app (hands#62
+    re-review, at 809aa34). Each test here fails at 809aa34."""
+
+    def test_a_launch_that_raises_still_closes_its_step(self):
+        import subprocess
+        from deskmind_hands import executor as exe
+        from test_executor import _executor
+        ex, _ = _executor()
+        ex._watch, ex._watch_tried = self.w, True
+        ex._known_windows = lambda: set()                  # noqa: SLF001
+        ex._front_bundle_id = lambda: "com.googlecode.iterm2"   # noqa: SLF001
+        with mock.patch.object(exe, "resolve_app", return_value=NE), \
+             mock.patch.object(exe, "running_apps", return_value=[]), \
+             mock.patch.object(exe, "installed_apps", return_value=[]), \
+             mock.patch.object(exe.subprocess, "run", side_effect=subprocess.TimeoutExpired("open", 20)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                ex._open_window(NE, None)                  # noqa: SLF001
+        self.assertTrue(self.w._steps)
+        self.assertIsNotNone(self.w._steps[-1][2])        # closed
+        time.sleep(0.01)
+        self.assertEqual(self.w.step_at(time.time() + STEP_MARGIN), "")
+
+    def test_a_step_never_closed_ends_at_its_deadline(self):
+        from deskmind_hands import inputwatch as iw
+        token = self.w.step_began(NE)
+        token[1] -= iw.STEP_MAX_S + 10                     # began long ago (and its deadline with it) ...
+        token[3] -= iw.STEP_MAX_S + 10                     # ... its end never told
+        self.assertEqual(self.w.step_at(time.time()), "")
+        self.fields[40] = DOCK
+        self.key()                                         # a Command key in the terminal now
+        self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001 -- not put on that step's app
+        self.assertIn("com.googlecode.iterm2", self.w.last_by_bundle)
+
+
+STEP_MARGIN = 0.6
 
 class FrontRead(unittest.TestCase):
     """Who has the keyboard is asked of the accessibility server without changing anything process-wide, within a

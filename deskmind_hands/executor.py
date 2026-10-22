@@ -445,12 +445,12 @@ class HandsExecutor:
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
         return time.time() - idle
 
-    def _step_began(self, bundle: str):
+    def _step_began(self, bundle: str, max_s: float = 180.0):
         """Tell the input watch a step of the task's in `bundle` begins: the step may bring the app forward (the
-        driver's flash), and a key that needs an app to be counted against counts for this one until it ends
-        (inputwatch: the tap's callback can run late, after the front has gone back)."""
+        driver's flash), and a key that needs an app to be counted against counts for this one until it ends, or
+        `max_s` at most (inputwatch: the tap's callback can run late, after the front has gone back)."""
         w = getattr(self, "_watch", None)
-        return w.step_began(bundle) if w is not None and hasattr(w, "step_began") else None
+        return w.step_began(bundle, max_s=max_s) if w is not None and hasattr(w, "step_began") else None
 
     def _step_ended(self, token) -> None:
         w = getattr(self, "_watch", None)
@@ -892,7 +892,8 @@ class HandsExecutor:
             have = [b for b in (flash_before or "").split(",") if b.strip()]
             if bundle.lower() not in {b.lower() for b in have}:
                 os.environ["HANDS_FLASH_APPS"] = ",".join(have + [bundle])
-        step = self._step_began(bundle)
+        # the driver may wait for a still Mac before a flash (HANDS_FLASH_WAIT_S), then act
+        step = self._step_began(bundle, max_s=float(os.environ.get("HANDS_FLASH_WAIT_S", "60") or 60) + 120)
         try:
             if getattr(self, "stopped", False) or STOP.is_set():   # read while this step was getting ready: nothing sent
                 return {"status": "error", "why": "stopped by the app"}
@@ -950,8 +951,20 @@ class HandsExecutor:
             out["files"] = []
         if doc1:
             out["document"] = doc1
-        self._epoch_at = time.time()     # the input this action itself sent is not the user's
+        if not self._input_by_source():
+            # The input this action itself sent is not the user's (PR #48, 10-19, before events could be told by
+            # their source). Where they can -- the tap watches keys, and the driver's own events are skipped by
+            # their source process (InputWatch.posted_by_us) -- the mark is not moved: moved, it wiped the user's
+            # own edit of the task's window during the action, and the next step was decided on a view it did not
+            # match (hands#62 re-review). Without the tap (the HID idle time) or without keys (a mouse-only tap
+            # counts key presses by the idle time), ours and theirs cannot be told apart: moved as before.
+            self._epoch_at = time.time()
         return out
+
+    def _input_by_source(self) -> bool:
+        """Whether every input the epoch counts is told by its source, so the driver's own is already left out."""
+        w = getattr(self, "_watch", None)
+        return bool(w is not None and w.active and w.keys)
 
     def _document(self, window: str, wins: list[dict]) -> tuple[str | None, bool | None] | None:
         """(path, modified) of the document the window shows, asked of the app; None when the app does not say or the
@@ -1070,16 +1083,20 @@ class HandsExecutor:
             # LAUNCH_WAIT_S, until a window of it appears.
             before_launch = self._known_windows()
             front_before = self._front_bundle_id()
-            step = self._step_began(bundle)        # some apps take the front on their first launch: see below
-            # in the background (-g): opening an app is no reason to take the front from the user; it comes forward
-            # only for a step, by the flash's rules (the user still, the step allowed) -- `open -b` did take it, and
-            # a music app kept jumping in front of the user's work (rc.10, 10-21)
-            subprocess.run(["open", "-g", "-b", bundle], capture_output=True, timeout=20)
-            launched = self._launch_windows(bundle, before_launch, self.LAUNCH_WAIT_S)
-            if front_before and front_before != bundle and self._front_bundle_id() == bundle:
-                # some apps take the front on their first launch whatever -g says: given back at once
-                self._make_frontmost(front_before)
-            self._step_ended(step)
+            # some apps take the front on their first launch: see below. The whole launch is marked (when the app
+            # took the front is not known), and the mark is closed whatever the launch raised (hands#62 re-review)
+            step = self._step_began(bundle, max_s=20 + self.LAUNCH_WAIT_S + 10)
+            try:
+                # in the background (-g): opening an app is no reason to take the front from the user; it comes
+                # forward only for a step, by the flash's rules (the user still, the step allowed) -- `open -b` did
+                # take it, and a music app kept jumping in front of the user's work (rc.10, 10-21)
+                subprocess.run(["open", "-g", "-b", bundle], capture_output=True, timeout=20)
+                launched = self._launch_windows(bundle, before_launch, self.LAUNCH_WAIT_S)
+                if front_before and front_before != bundle and self._front_bundle_id() == bundle:
+                    # some apps take the front on their first launch whatever -g says: given back at once
+                    self._make_frontmost(front_before)
+            finally:
+                self._step_ended(step)
             self._settled(bundle)
         d = self._driver(bundle)      # started now, so the windows it finds are the ones there before the task's
         before = self._known_windows()

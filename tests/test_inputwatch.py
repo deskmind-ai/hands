@@ -7,6 +7,7 @@ import threading
 import time
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from deskmind_hands.inputwatch import InputWatch
@@ -674,6 +675,26 @@ class FlashesTold(_EpochCase):
         self.assertEqual(s["epoch"], e + 1)
         self.assertEqual(s["epoch_reason"]["to"], "com.apple.textedit")
 
+    def test_a_flash_told_while_the_front_read_is_out_is_found(self):
+        """The callback began before the driver told the flash; the read went out; the driver told the flash and gave
+        the front back; the read answered the terminal, still fresh. The flash check is the last lookup, so the key
+        counts for the flashed app (hands#62 review at 50f176a)."""
+        ex, _, _ = self._task()
+        e = ex.epoch
+
+        def read_meanwhile():
+            token = self.iw.front_taken("com.apple.TextEdit", time.time() - 0.3)   # the driver, during the read
+            self.iw.front_given_back(token)
+            return ITERM                                   # the front given back: the terminal
+        self.w.front_pid = read_meanwhile
+        self.fields[40] = DOCK
+        self.fields.pop("ts", None)                        # fresh
+        self.key()
+        self.assertNotIn("com.googlecode.iterm2", self.w.last_by_bundle)
+        s = ex.snapshot()
+        self.assertEqual(s["epoch"], e + 1)
+        self.assertEqual(s["epoch_reason"]["to"], "com.apple.textedit")
+
     def test_the_drivers_flash_is_told_before_the_front_goes_back_and_ends_after(self):
         """Through the driver's real _flash (the test_receipt_driver fixture): the flash is there while the front
         goes back, from when it was taken, and ends once it has."""
@@ -708,21 +729,104 @@ class FlashesTold(_EpochCase):
         self.assertEqual(self.iw.flash_at(inside[0]), "com.google.chrome")    # afterwards too: the interval
         self.assertEqual(self.iw.flash_at(time.time() + 1.0), "")    # ended
 
-    def test_a_step_whose_app_came_forward_by_itself_is_told_from_the_steps_start(self):
+    def _outer(self, fronts: list[tuple[str, str]], idle: float = 60.0):
+        """A driver for NetEase Music (an app no name list knows) whose step ran while the front went from the first
+        of `fronts` to the second, through the real _ours; the front read by name (_frontmost, as before) and by
+        name and bundle id (_front_app) alike."""
         from deskmind_hands.actions import Action, ActionKind, Binding
         from deskmind_hands.drivers.base import ExecResult
         from deskmind_hands.drivers.peekaboo import PeekabooDriver
         d = PeekabooDriver.__new__(PeekabooDriver)
         d.app, d._mcp, d._foreground_actions = NE, object(), 0
-        fronts = iter(["iTerm2", "网易云音乐"])
-        d._frontmost = lambda: next(fronts)
-        d._ours = lambda name: name == "网易云音乐"
+        apps, names = iter(fronts), iter([n for n, _ in fronts])
+        d._front_app = lambda: next(apps)
+        d._frontmost = lambda: next(names)
+        d._hid_idle = lambda: idle
         d._task_windows = lambda: []
-        d._osa = lambda script: (True, "")
+        d.activated = []
+        d._osa = lambda script: d.activated.append(script) or (True, "")
         t0 = time.time()
         d._execute_inner = lambda a: (time.sleep(0.05), ExecResult(True, "done"))[1]
         d._execute_outer(Action(kind=ActionKind.CLICK, binding=Binding(element_id="B2")))
+        return d, t0
+
+    def test_a_step_whose_app_came_forward_by_itself_is_told_from_the_steps_start(self):
+        """By bundle id, with the real _ours: the music app's name (网易云音乐) never matched its bundle id, so it went
+        down the stranger's branch and no flash was told (hands#62 review at 50f176a)."""
+        d, t0 = self._outer([("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", NE)])
         self.assertEqual(self.iw.flash_at(t0 + 0.02), NE.lower())
+        self.assertEqual(d._foreground_actions, 1)          # counted as the task's own front take
+        self.assertEqual(d.activated, ['tell application "iTerm2" to activate'])
+
+    def test_another_app_that_came_forward_during_a_step_is_told_too(self):
+        """The stranger's branch hands the front back too; the app it took it from may be one the task operates
+        through another driver, so it is told as well."""
+        d, t0 = self._outer([("iTerm2", "com.googlecode.iterm2"), ("音乐", "com.apple.Music")])
+        self.assertEqual(d.activated, ['tell application "iTerm2" to activate'])
+        self.assertEqual(self.iw.flash_at(t0 + 0.02), "com.apple.music")
+
+    def test_the_chat_flash_is_told(self):
+        import os as _os
+        import types
+        from deskmind_hands.drivers import peekaboo as pk
+        chat = "com.example.chat"                           # the chat app is configured per install (apps.py)
+        self.addCleanup(setattr, pk, "CHAT_APP", pk.CHAT_APP)
+        pk.CHAT_APP = chat
+        d = pk.PeekabooDriver.__new__(pk.PeekabooDriver)
+        d.app, d._foreground_actions, d._chat_sends = pk.CHAT_APP, 0, 0
+        d._labels_by_id = {"B1": "打开"}
+        d._rects = {"B1": types.SimpleNamespace(x=10, y=10, w=20, h=10)}
+        d._origin = types.SimpleNamespace(x=0, y=0)
+        d._moved_since_seen = lambda: None
+        d._add_wait = lambda s: None
+        fronts = iter(["com.googlecode.iterm2", pk.CHAT_APP])
+        d._front_bundle = lambda: next(fronts, pk.CHAT_APP)
+        seen = []
+        d._give_front_back = lambda prev, ours=None, late_s=0.0: seen.append(self.iw.flash_at(time.time()))
+        q = types.ModuleType("Quartz")
+        for k in ("kCGEventMouseMoved", "kCGEventLeftMouseDown", "kCGEventLeftMouseUp", "kCGMouseButtonLeft", "kCGHIDEventTap"):
+            setattr(q, k, 0)
+        q.CGEventGetLocation = lambda e: (0, 0)
+        q.CGEventCreate = lambda x: None
+        q.CGEventPost = lambda tap, e: None
+        q.CGEventCreateMouseEvent = lambda *a: None
+        q.CGWarpMouseCursorPosition = lambda p: None
+        q.CGAssociateMouseAndMouseCursorPosition = lambda b: None
+        with mock.patch.dict(_os.environ, {"HANDS_CHAT_FLASH": "1"}), \
+             mock.patch.dict(sys.modules, {"Quartz": q}), \
+             mock.patch.object(pk, "hid_idle_seconds", return_value=60.0), \
+             mock.patch.object(pk.subprocess, "run"), \
+             mock.patch.object(pk.time, "sleep"):
+            res = d._chat_flash_click("B1")
+        self.assertTrue(res.ok, res.detail)
+        self.assertEqual(seen, [chat])       # told before the front went back
+        self.assertIsNotNone(self.iw.FLASHES[-1][2])        # and ended after
+
+    def test_a_front_taken_while_staging_is_told(self):
+        import os as _os
+        import tempfile
+        from deskmind_hands.drivers import peekaboo as pk
+        scratch = Path(tempfile.mkdtemp())
+        (scratch / "ws").mkdir()
+        with mock.patch.dict(_os.environ, {"HANDS_PERMISSIONS_VERIFIED": "1"}):
+            d = pk.PeekabooDriver(app=NE, binary=sys.executable, scratch=scratch)
+        d._mcp = object()
+        fronts = iter([("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", NE)])
+        d._front_app = lambda: next(fronts)
+        d._frontmost = lambda: "iTerm2"
+        d.activated = []
+        seen = []
+        d._osa = lambda script: (d.activated.append(script), seen.append(self.iw.flash_at(time.time())))[0] or (True, "")
+        d._run = lambda key, _extra=None, **fmt: (False, {}, "not here")
+        d.clipboard = lambda: ""
+        d._set_clipboard = lambda value: None
+        with mock.patch.object(pk, "gui_session", return_value="active"):
+            try:
+                d._start(scratch / "ws")
+            except Exception:  # noqa: BLE001 -- what staging does after the give-back is not this test's
+                pass
+        self.assertIn('tell application "iTerm2" to activate', d.activated)
+        self.assertEqual(seen[d.activated.index('tell application "iTerm2" to activate')], NE.lower())
 
     def test_a_cold_launch_that_took_the_front_is_told(self):
         from deskmind_hands import executor as exe

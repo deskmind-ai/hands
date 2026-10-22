@@ -912,7 +912,7 @@ class PeekabooDriver:
         # benchmark run can never cost someone what they had copied.
         self._clipboard_saved = self.clipboard()
         staged_at = time.time()
-        front_before = self._frontmost()
+        front_before, before_bundle = self._front_app()
         for bundle in self.reset_apps:
             self._close_all_windows(bundle)
         if self.app.lower() == "com.apple.finder" or "Finder" in self._stage_apps:
@@ -1073,18 +1073,20 @@ class PeekabooDriver:
         # Staging is not allowed to keep the user's focus. If an app came forward anyway -- a first launch that
         # ignores -g, a sheet -- the user's app is given the front back, and the incident is counted, because a
         # steal that is quietly repaired is still a steal.
-        front_after = self._frontmost()
+        front_after, after_bundle = self._front_app()
         # Only a front taken by one of THIS task's apps is a steal. The first version compared before and after,
         # and when the user had switched apps themselves in between it "gave the front back" -- pulling them away
         # from the app they had just chosen, eight times in one round, and counting each as ours. The user's own
         # switches are not touched and not counted.
         ours = {self.app.lower()} | {app_bundle(n).lower() for n in self._stage_apps}
         ours_names = {"finder", "访达", "textedit", "文本编辑", "safari", "safari浏览器"}
-        taken = front_after and front_after != front_before and (
-            front_after.lower() in ours_names or front_after.lower() in ours)
+        # by bundle id (the task's apps are known by theirs), the hard-coded names kept for a front read without one
+        taken = front_after and (after_bundle, front_after) != (before_bundle, front_before) and (
+            after_bundle.lower() in ours or front_after.lower() in ours_names)
         if taken and front_before and self._mcp is not None:
             self._foreground_actions += 1
-            token = self._front_taken(self.app, staged_at)    # when it came forward while staging is not known
+            # when it came forward while staging is not known: told from staging's start
+            token = self._front_taken(after_bundle or self.app, staged_at)
             try:
                 self._osa(f'tell application "{self._q(front_before)}" to activate')
             finally:
@@ -2179,6 +2181,19 @@ class PeekabooDriver:
     def _frontmost(self) -> str:
         ok, out = self._osa('tell application "System Events" to get name of first process whose frontmost is true')
         return out if ok else ""
+
+    def _front_app(self) -> tuple[str, str]:
+        """(name, bundle id) of the front app, in one System Events read; ("", "") when it cannot be read. The name is
+        what `tell application ... to activate` takes; the bundle id is what the task's apps are known by (self.app,
+        app_bundle) -- a name compared with a bundle id never matched an app outside a hard-coded few (hands#62
+        review: the music app coming forward by itself was never told to the input watch)."""
+        ok, out = self._osa('tell application "System Events"\nset p to first process whose frontmost is true\n'
+                            'return (bundle identifier of p as text) & linefeed & (name of p)\nend tell')
+        if not ok or not out:
+            return "", ""
+        bundle, _, name = out.partition("\n")
+        bundle = "" if bundle.strip() == "missing value" else bundle.strip()
+        return name.strip(), bundle
 
     def _osa(self, script: str) -> tuple[bool, str]:
         try:
@@ -3915,10 +3930,12 @@ class PeekabooDriver:
         ActionKind.MENU,
     })
 
-    def _ours(self, name: str) -> bool:
-        """Is this frontmost-app name one of the apps this task drives?"""
+    def _ours(self, name: str, bundle: str = "") -> bool:
+        """Is this front app (its name, and its bundle id when known) one of the apps this task drives? By bundle id:
+        self.app is one. The names are the staging apps' (Finder, TextEdit, Safari), for a read without a bundle."""
         n = (name or "").lower()
-        return n in {"finder", "访达", "textedit", "文本编辑", "safari", "safari浏览器"} or n == self.app.lower()
+        return (bool(bundle) and bundle.lower() == self.app.lower()) or n == self.app.lower() \
+            or n in {"finder", "访达", "textedit", "文本编辑", "safari", "safari浏览器"}
 
     #: Opt-in (HANDS_CONFIRM_BY_DIFF=1): a click the platform could not confirm is checked by observing once more
     #: and comparing the window with how it was before. SwiftUI buttons answer every background click with "did not
@@ -3967,26 +3984,33 @@ class PeekabooDriver:
         # Checked after every action, not assumed. The same background click on a Finder row left the user's app
         # in front in one test and put Finder in front for 100 seconds in a later run, counted as nothing. Now a
         # front taken by one of this task's apps is counted the moment it happens and handed straight back.
-        before = self._frontmost()
+        before, before_bundle = self._front_app()
         t0 = time.time()
         wins_before = self._task_windows()
         res = self._execute_inner(action)
-        after = self._frontmost()
-        if before and after and after != before and self._ours(after) and not self._ours(before):
+        after, after_bundle = self._front_app()
+        ours_after, ours_before = self._ours(after, after_bundle), self._ours(before, before_bundle)
+        if before and after and after != before and ours_after and not ours_before:
             self._foreground_actions += 1
             # when it came forward during the step is not known: the flash is told from the step's start
-            token = self._front_taken(self.app, t0)
+            token = self._front_taken(after_bundle or self.app, t0)
             try:
                 self._osa(f'tell application "{self._q(before)}" to activate')
             finally:
                 self._front_given_back(token)
             res = replace(res, detail=f"{res.detail} [took the foreground ({after}); given back to {before}]")
-        elif (before and after and after != before and not self._ours(before) and not action.foreground
+        elif (before and after and after != before and not ours_before and not action.foreground
               and self._hid_idle() >= time.time() - t0):
             # Something else took the front while the step ran -- a helper app, a notification, an app the click
             # launched -- and the user did not do it (untouched since the step began): the user's app gets it back
-            # (cua's focus guard). An intended foreground step, or the user switching apps, is left alone.
-            self._osa(f'tell application "{self._q(before)}" to activate')
+            # (cua's focus guard). An intended foreground step, or the user switching apps, is left alone. The app
+            # that had the front can be one the task operates through another driver: told to the input watch as
+            # well (a key that landed in an app the task does not operate stales nothing).
+            token = self._front_taken(after_bundle, t0) if after_bundle else None
+            try:
+                self._osa(f'tell application "{self._q(before)}" to activate')
+            finally:
+                self._front_given_back(token)
             if effect_notes():
                 res = replace(res, detail=f"{res.detail} [{after} took the front during the step; given back to {before}]")
         note = new_window_note(wins_before, self._task_windows()) if effect_notes() else None

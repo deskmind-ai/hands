@@ -75,7 +75,7 @@ class FocusGuard(unittest.TestCase):
         d = PeekabooDriver.__new__(PeekabooDriver)
         d.app, d._mcp, d._foreground_actions = "com.apple.Safari", object(), 0
         seq = iter(fronts)
-        d._frontmost = lambda: next(seq)
+        d._front_app = lambda: (next(seq), "")         # (name, bundle id): names only here
         d._hid_idle = lambda: idle
         d._task_windows = lambda: []
         import time

@@ -289,7 +289,9 @@ class InputWatch:
 
         A key whose target is neither an ordinary app nor DeskMind goes, in order:
         - its own time inside a flash (flash_at): to the flashed app, ahead of the front read -- a read that answered
-          after the front was given back names the user's app for a key that landed in the flashed one;
+          after the front was given back names the user's app for a key that landed in the flashed one. The flash
+          check is the last lookup (it is made first too, to skip the read): a flash told while the read was out is
+          still found;
         - to the app the fresh front read names, when the callback and the read are within the key's freshness and
           that app is an ordinary app (or DeskMind);
         - else, its own time inside a step of the task's: to the step's app (a late or failed read, a front that is
@@ -327,6 +329,9 @@ class InputWatch:
                     if front:
                         front_kind = kind(front)
                 step = self.step_at(event_at)
+                # the flash check is the last lookup: a flash the driver told while the read was out (its give-back
+                # then answered the read) is found here (hands#62 review at 50f176a)
+                flash = self.flash_at(event_at)
         # -- 2. freshness, once, after every lookup
         fresh = age is not None and 0.0 <= age + (time.monotonic() - t0) <= KEY_FRESH_S
         if flash:

@@ -1093,6 +1093,7 @@ class HandsExecutor:
             # some apps take the front on their first launch: see below. The whole launch is marked (when the app
             # took the front is not known), and the mark is closed whatever the launch raised (hands#62 re-review)
             step = self._step_began(bundle, max_s=20 + self.LAUNCH_WAIT_S + 10)
+            launched_at = time.time()
             try:
                 # in the background (-g): opening an app is no reason to take the front from the user; it comes
                 # forward only for a step, by the flash's rules (the user still, the step allowed) -- `open -b` did
@@ -1100,8 +1101,14 @@ class HandsExecutor:
                 subprocess.run(["open", "-g", "-b", bundle], capture_output=True, timeout=20)
                 launched = self._launch_windows(bundle, before_launch, self.LAUNCH_WAIT_S)
                 if front_before and front_before != bundle and self._front_bundle_id() == bundle:
-                    # some apps take the front on their first launch whatever -g says: given back at once
-                    self._make_frontmost(front_before)
+                    # some apps take the front on their first launch whatever -g says: given back at once. The input
+                    # watch is told the app had the front since the launch began (when it came forward is not known)
+                    from .inputwatch import front_given_back, front_taken
+                    taken = front_taken(bundle, launched_at)
+                    try:
+                        self._make_frontmost(front_before)
+                    finally:
+                        front_given_back(taken)
             finally:
                 self._step_ended(step)
             self._settled(bundle)

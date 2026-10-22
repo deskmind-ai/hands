@@ -911,6 +911,7 @@ class PeekabooDriver:
         # The user's clipboard is theirs. Save now, restore in close(), so a
         # benchmark run can never cost someone what they had copied.
         self._clipboard_saved = self.clipboard()
+        staged_at = time.time()
         front_before = self._frontmost()
         for bundle in self.reset_apps:
             self._close_all_windows(bundle)
@@ -1083,7 +1084,11 @@ class PeekabooDriver:
             front_after.lower() in ours_names or front_after.lower() in ours)
         if taken and front_before and self._mcp is not None:
             self._foreground_actions += 1
-            self._osa(f'tell application "{self._q(front_before)}" to activate')
+            token = self._front_taken(self.app, staged_at)    # when it came forward while staging is not known
+            try:
+                self._osa(f'tell application "{self._q(front_before)}" to activate')
+            finally:
+                self._front_given_back(token)
 
     def _stage_url(self, arg: str) -> str:
         """What a browser staging command opens (`"$WS/page.html"`, a URL), as a URL; "" for nothing."""
@@ -2721,7 +2726,11 @@ class PeekabooDriver:
         finally:
             Quartz.CGWarpMouseCursorPosition(cur)
             Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-            self._give_front_back(prev, ours=CHAT_APP, late_s=0.0 if arrived else self.LATE_FRONT_S)
+            token = self._front_taken(CHAT_APP, t0)       # the input watch: the flash, told before the give-back
+            try:
+                self._give_front_back(prev, ours=CHAT_APP, late_s=0.0 if arrived else self.LATE_FRONT_S)
+            finally:
+                self._front_given_back(token)
         self._snapshot = None
         if label.startswith("发送"):
             self._chat_sends += 1
@@ -2847,7 +2856,12 @@ class PeekabooDriver:
                     try:
                         if prev.lower() != bundle.lower():
                             late = self.LATE_FRONT_S if brought and not arrived else 0.0
-                            self._give_front_back(prev, ours=bundle, late_s=late)
+                            # the input watch: the flash, from when the front was taken, told before it goes back
+                            token = self._front_taken(bundle, t0)
+                            try:
+                                self._give_front_back(prev, ours=bundle, late_s=late)
+                            finally:
+                                self._front_given_back(token)
                     except Exception:  # noqa: BLE001
                         pass
                     if restore:
@@ -3407,6 +3421,25 @@ class PeekabooDriver:
     #: How long an app asked forward that had not arrived is still watched for, to give the front back if it comes.
     LATE_FRONT_S = 2.0
 
+    @staticmethod
+    def _front_taken(bundle: str, began: float | None):
+        """Tell the input watch a task's app has had the front since `began` (inputwatch.FLASHES): a key that landed
+        in it then counts for it, whatever the front reads when its callback runs. Told before the front is given
+        back; the token goes to _front_given_back after."""
+        try:
+            from deskmind_hands import inputwatch
+            return inputwatch.front_taken(bundle, began)
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _front_given_back(token) -> None:
+        try:
+            from deskmind_hands import inputwatch
+            inputwatch.front_given_back(token)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _give_front_back(self, prev: str, ours: str | None = None, late_s: float = 0.0) -> None:
         """Give `prev` the front again, through accessibility (AXFrontmost) for every app: `open -b` is a reopen,
         which un-minimises a browser's windows (deskmind#73) and opens a new Finder window on a bare desktop (hands
@@ -3941,7 +3974,12 @@ class PeekabooDriver:
         after = self._frontmost()
         if before and after and after != before and self._ours(after) and not self._ours(before):
             self._foreground_actions += 1
-            self._osa(f'tell application "{self._q(before)}" to activate')
+            # when it came forward during the step is not known: the flash is told from the step's start
+            token = self._front_taken(self.app, t0)
+            try:
+                self._osa(f'tell application "{self._q(before)}" to activate')
+            finally:
+                self._front_given_back(token)
             res = replace(res, detail=f"{res.detail} [took the foreground ({after}); given back to {before}]")
         elif (before and after and after != before and not self._ours(before) and not action.foreground
               and self._hid_idle() >= time.time() - t0):

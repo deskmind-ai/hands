@@ -524,16 +524,18 @@ class LookupDelaysProperty(_EpochCase):
     (2) no key is put on an app other than the task's once its freshness window has passed.
     Fails at d6a29ed for the reviewer's two cases among others: a slow first lookup of the front's pid with the task's
     app in front (recorded behind the mark), and a slow first lookup of the Dock target with iTerm2 in front later
-    (put on iTerm2 after the key's freshness)."""
+    (put on iTerm2 after the key's freshness). With flashes (hands#62 review at cbef166): a key that landed in the
+    flashed app in the flash's last moment, the read answering after the front went back (iTerm2), must stale too --
+    whatever is delayed, the flash lookup (flash) included. Those cases fail at cbef166."""
 
-    LOOKUPS = ("own", "regular", "front", "step")
+    LOOKUPS = ("own", "regular", "front", "step", "flash")
 
-    def _key_with(self, delayed: frozenset, front_app: int, in_step: bool) -> tuple:
+    def _key_with(self, delayed: frozenset, front_app: int, in_step: bool, in_flash: bool = False) -> tuple:
         import itertools  # noqa: F401
         from deskmind_hands import inputwatch as iw
         ex, _, _ = self._task()
         w = self.w
-        delay = iw.KEY_FRESH_S + 0.02                      # past the freshness window, within the read's deadline
+        delay = iw.KEY_FRESH_S + 0.01                      # past the freshness window, within the read's deadline
         bundles, regulars = dict(w._pid_bundle), dict(w._pid_regular)
         w._pid_bundle, w._pid_regular = {}, {}             # every pid is asked of the "system" the first time
         advanced = []
@@ -552,10 +554,21 @@ class LookupDelaysProperty(_EpochCase):
         w._regular_of = slow("regular", lambda pid: regulars.get(pid, False))
         w.front_pid = slow("front", lambda: front_app)
         w.step_at = slow("step", w.step_at)
+        w.flash_at = slow("flash", getattr(w, "flash_at", lambda at: ""))
         if in_step:
             w.step_began("com.apple.TextEdit")
         self.fields[40] = DOCK                             # a key whose target is no ordinary app
         self.fields.pop("ts", None)                        # fresh when its callback begins
+        iw.__dict__.get("FLASHES", []).clear()             # no flash from an earlier case
+        if in_flash:
+            # the driver had TextEdit in front until 10 ms ago; the key landed in it 30 ms ago (fresh), and the
+            # front read now answers the user's app (front_app), the front given back
+            taken = getattr(iw, "front_taken", None)
+            if taken is not None:
+                self.addCleanup(iw.FLASHES.clear)
+                token = taken("com.apple.TextEdit", time.time() - 0.3)
+                token[2] = time.time() - 0.01
+            self.fields["ts"] = _uptime_ns() - 30_000_000
         self.key()
         e = ex.epoch
         stales = ex.snapshot()["epoch"] == e + 1
@@ -566,30 +579,32 @@ class LookupDelaysProperty(_EpochCase):
         cases = []
         for n in range(len(self.LOOKUPS) + 1):
             for delayed in itertools.combinations(self.LOOKUPS, n):
-                for front_app, in_step in ((MUSIC, False), (DESKMIND, False), (ITERM, False), (ITERM, True)):
-                    cases.append((frozenset(delayed), front_app, in_step))
-        for delayed, front_app, in_step in cases:
+                for front_app, in_step, in_flash in ((MUSIC, False, False), (DESKMIND, False, False),
+                                                     (ITERM, False, False), (ITERM, True, False), (ITERM, False, True)):
+                    cases.append((frozenset(delayed), front_app, in_step, in_flash))
+        for delayed, front_app, in_step, in_flash in cases:
             with self.subTest(delayed=sorted(delayed), front={MUSIC: "task", DESKMIND: "deskmind", ITERM: "iterm2"}[front_app],
-                              in_step=in_step):
+                              in_step=in_step, in_flash=in_flash):
                 self.setUp()
-                stales, advanced, w = self._key_with(delayed, front_app, in_step)
+                stales, advanced, w = self._key_with(delayed, front_app, in_step, in_flash)
                 late = bool(advanced)                      # a delay was met: the key is past its freshness window
                 own = w.last_own_at > 0 and w.last_external_at == 0
                 on_other = "com.googlecode.iterm2" in w.last_by_bundle
-                if late:
-                    self.assertFalse(own or on_other, "attributed away from the task's app after its freshness")
-                if front_app == MUSIC or late:
+                if late or in_flash:
+                    self.assertFalse(own or on_other, "attributed away from the task's app")
+                if front_app == MUSIC or late or in_flash:
                     self.assertTrue(stales, "the key did not stale the next snapshot")
                 elif front_app == DESKMIND:
                     self.assertTrue(own and not stales)    # fresh, DeskMind had the keyboard: the user answering it
                 else:
                     self.assertTrue(on_other and not stales)   # fresh, the terminal had the keyboard: not the task's
 
-class WaitAndLend(_EpochCase):
-    """A step spans the driver's wait for the user to pause (up to HANDS_FLASH_WAIT_S; 1800 s in the app): the keys
-    the user types in their terminal then are theirs, read off a fresh front, not the step's (hands#62 re-review of
-    7ed10d5/d6a29ed: the rc.13 loop again). While the keyboard is lent to the task's app in the background, the front
-    says nothing of where keys go: they count for the lent app. Each test here fails at d6a29ed."""
+class WaitAndBackground(_EpochCase):
+    """A step spans the driver's wait for the user to pause (up to HANDS_FLASH_WAIT_S; 1800 s in the app), and the
+    driver's background typing and shortcuts, which do not wait at all: the keys the user types in their terminal then
+    are theirs, read off a fresh front, not the step's (hands#62 re-reviews: the rc.13 loop again). The background key
+    window leaves the user's app both the front and the keyboard (skylight, live test 10-21), so nothing rewrites a key
+    while it is held. The first test fails at d6a29ed, the second at cbef166."""
 
     def test_keys_typed_in_the_terminal_while_the_driver_waits_do_not_stale_the_task(self):
         ex, stub, W12 = self._task()
@@ -609,39 +624,126 @@ class WaitAndLend(_EpochCase):
         self.assertEqual(ex.snapshot()["epoch"], e)        # not staled
         self.assertIn("com.googlecode.iterm2", self.w.last_by_bundle)
 
-    def test_keys_while_the_keyboard_is_lent_in_the_background_count_for_the_lent_app(self):
+    def test_typing_in_the_terminal_while_the_driver_types_in_the_background_does_not_stale_the_task(self):
+        from deskmind_hands.drivers import skylight
+        ex, stub, W12 = self._task()
+        real = stub.execute
+        sl = mock.patch.multiple(skylight, _load=mock.Mock(return_value={"post": object()}),
+                                 user_on=mock.Mock(return_value=False), _stopped=mock.Mock(return_value=False),
+                                 _psn_for=mock.Mock(return_value=object()), focused_window=mock.Mock(return_value=7),
+                                 _send_records=mock.Mock(return_value=[0]), _await_focus=mock.Mock(return_value=True),
+                                 front_pid=mock.Mock(return_value=None))
+
+        def types_in_the_background(a):
+            with sl:
+                with skylight.enter_window_key(MUSIC, 8):  # the task's window held key, the app not activated
+                    self.front["pid"] = ITERM              # the user's app keeps the front and the keyboard
+                    self.fields.pop("ts", None)
+                    for target in (ITERM, 0, DOCK):        # typing, a key with no target, a Command chord
+                        self.fields[40] = target
+                        self.key()
+            return real(a)
+        stub.execute = types_in_the_background
+        ex.perform({"kind": "type", "window": W12, "target": "T1", "text": "x"})
+        e = ex.epoch
+        self.assertEqual(ex.snapshot()["epoch"], e)        # not staled
+        self.assertIn("com.googlecode.iterm2", self.w.last_by_bundle)
+
+
+class FlashesTold(_EpochCase):
+    """The driver tells the watch each flash -- from when it took the front to when it gave it back -- at the points
+    where it brings a task's app forward and gives the user's app the front back, the flash told before the give-back
+    so a key whose callback runs after it finds it (hands#62 review at cbef166). Each test here fails at cbef166."""
+
+    def setUp(self):
+        super().setUp()
         from deskmind_hands import inputwatch as iw
+        self.iw = iw
+        self.addCleanup(lambda: iw.__dict__.get("FLASHES", []).clear())
+
+    def test_a_key_in_the_flashs_last_moment_counts_though_the_read_answers_the_users_app(self):
         ex, _, _ = self._task()
         e = ex.epoch
-        self.addCleanup(iw.LENDS.clear)
-        token = iw.keyboard_lent(MUSIC)                    # skylight.enter_window_key: the task's window held key
-        self.front["pid"] = ITERM                          # the user's app keeps the front, not the keys
-        for target in (0, DOCK, ITERM):                    # no target, the Dock, even the terminal's own pid
-            self.fields[40] = target
-            self.key()
-        iw.keyboard_returned(token)
-        self.assertNotIn("com.googlecode.iterm2", self.w.last_by_bundle)
+        token = self.iw.front_taken("com.apple.TextEdit", time.time() - 0.5)
+        self.front["pid"] = ITERM                          # given back: the read now names the terminal
+        self.fields[40] = DOCK
+        self.fields["ts"] = _uptime_ns() - 5_000_000       # a Command chord 5 ms before the give-back ended
+        self.iw.front_given_back(token)
+        self.key()
         s = ex.snapshot()
         self.assertEqual(s["epoch"], e + 1)
         self.assertEqual(s["epoch_reason"]["to"], "com.apple.textedit")
-        # given back: the read decides again
-        token[1] -= 10
-        token[2] -= 10
-        self.w.last_by_bundle.clear()
-        self.fields[40] = DOCK
-        self.key()
-        self.assertIn("com.googlecode.iterm2", self.w.last_by_bundle)
 
-    def test_the_window_key_tells_the_watch_while_it_is_held(self):
-        from deskmind_hands import inputwatch as iw
-        from deskmind_hands.drivers import skylight
-        self.addCleanup(iw.LENDS.clear)
-        key = skylight.WindowKey(MUSIC, 1, None, None, "records")
-        key.lend = iw.keyboard_lent(MUSIC)
-        self.assertEqual(iw.lent_at(time.time()), MUSIC)
-        with mock.patch.object(skylight, "front_pid", return_value=None):
-            key.exit()
-        self.assertIsNotNone(key.lend[2])                  # returned when the key window went back (or could not)
+    def test_the_drivers_flash_is_told_before_the_front_goes_back_and_ends_after(self):
+        """Through the driver's real _flash (the test_receipt_driver fixture): the flash is there while the front
+        goes back, from when it was taken, and ends once it has."""
+        import os as _os
+        import types
+        from test_receipt_driver import BrowserForeground
+        q = types.ModuleType("Quartz")
+        q.CGEventGetLocation = lambda e: (0, 0)
+        q.CGEventCreate = lambda x: None
+        q.CGWarpMouseCursorPosition = lambda p: None
+        q.CGAssociateMouseAndMouseCursorPosition = lambda b: None
+        d = BrowserForeground._driver(None, True)
+        d._own_window_in_front = lambda bundle: True
+        seen = []
+        stub_back = d._give_front_back
+
+        inside = []
+
+        def give_back(prev, ours=None, late_s=0.0):
+            inside.append(time.time())
+            seen.append(self.iw.flash_at(inside[-1]))      # while the front goes back
+            stub_back(prev, ours, late_s)
+        d._give_front_back = give_back
+        with mock.patch.dict(_os.environ, {"HANDS_FLASH_APPS": "com.google.Chrome"}), \
+             mock.patch.dict(sys.modules, {"Quartz": q}), \
+             mock.patch("deskmind_hands.drivers.peekaboo._ascii_input_source",
+                        return_value=types.SimpleNamespace(restore=lambda: None)), \
+             mock.patch("deskmind_hands.drivers.peekaboo.time.sleep"):
+            ok, _ = d._flash("com.google.Chrome", lambda Q: "typed")
+        self.assertTrue(ok)
+        self.assertEqual(seen, ["com.google.chrome"])
+        self.assertEqual(self.iw.flash_at(inside[0]), "com.google.chrome")    # afterwards too: the interval
+        self.assertEqual(self.iw.flash_at(time.time() + 1.0), "")    # ended
+
+    def test_a_step_whose_app_came_forward_by_itself_is_told_from_the_steps_start(self):
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        from deskmind_hands.drivers.base import ExecResult
+        from deskmind_hands.drivers.peekaboo import PeekabooDriver
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        d.app, d._mcp, d._foreground_actions = NE, object(), 0
+        fronts = iter(["iTerm2", "网易云音乐"])
+        d._frontmost = lambda: next(fronts)
+        d._ours = lambda name: name == "网易云音乐"
+        d._task_windows = lambda: []
+        d._osa = lambda script: (True, "")
+        t0 = time.time()
+        d._execute_inner = lambda a: (time.sleep(0.05), ExecResult(True, "done"))[1]
+        d._execute_outer(Action(kind=ActionKind.CLICK, binding=Binding(element_id="B2")))
+        self.assertEqual(self.iw.flash_at(t0 + 0.02), NE.lower())
+
+    def test_a_cold_launch_that_took_the_front_is_told(self):
+        from deskmind_hands import executor as exe
+        from test_executor import _executor
+        ex, _ = _executor()
+        ex._watch, ex._watch_tried = self.w, True
+        ex._known_windows = lambda: set()                  # noqa: SLF001
+        fronts = iter(["com.googlecode.iterm2", NE] + ["com.googlecode.iterm2"] * 5)
+        ex._front_bundle_id = lambda: next(fronts)         # noqa: SLF001 -- the app took the front on launch
+        ex._make_frontmost = lambda b: True                # noqa: SLF001
+        ex._launch_windows = lambda *a: []                 # noqa: SLF001
+        ex._settled = mock.Mock(side_effect=RuntimeError("stop here"))   # noqa: SLF001
+        t = time.time()
+        with mock.patch.object(exe, "resolve_app", return_value=NE), \
+             mock.patch.object(exe, "running_apps", return_value=[]), \
+             mock.patch.object(exe, "installed_apps", return_value=[]), \
+             mock.patch.object(exe.subprocess, "run"):
+            with self.assertRaises(RuntimeError):
+                ex._open_window(NE, None)                  # noqa: SLF001
+        self.assertEqual(self.iw.flash_at(t + 0.001), NE.lower())
+
 
 class StepsClose(_KeysCase):
     """A step mark that is never closed would put every later key with no app target on that step's app (hands#62

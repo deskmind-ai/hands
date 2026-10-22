@@ -15,12 +15,14 @@ A key event's target is not always an ordinary app: a key pressed with Command h
 target -- it may act on the app switcher (Command-Tab), which changes only which app is in front, no change of
 anything a task looks at -- and some come with none. While the owner worked in a terminal and switched apps, each such
 key was input to an unknown target and staled the steps of a task working in a music app (rc.13, 10-22,
-run_fd8ab281: 4 stale refusals said "to: unknown"). Where a key goes (InputWatch.note), first match:
-- while the driver lends the keyboard to a task's app in the background (LENDS, skylight.enter_window_key), any key
-  not routed to DeskMind counts for that app: the user's app keeps the front then, not the keys;
-- a key whose target is neither an ordinary app nor DeskMind goes to the app with the keyboard (AXFocusedApplication)
-  when the callback runs within KEY_FRESH_S of the event's own timestamp, the read answers within it too, and names
-  an ordinary app (or DeskMind) -- during a flash that is the task's app;
+run_fd8ab281: 4 stale refusals said "to: unknown"). A key whose target is neither an ordinary app nor DeskMind
+goes, first match:
+- its own time inside a flash -- the driver had a task's app in front, from when it took the front to when it gave
+  it back (FLASHES: front_taken/front_given_back, plus FLASH_MARGIN_S after) -- to that app: a key that landed in the
+  flashed app in the flash's last moment, its front read answered after the front went back, would read the user's
+  app (hands#62 review);
+- to the app with the keyboard (AXFocusedApplication) when the callback runs within KEY_FRESH_S of the event's own
+  timestamp, the read answers within it too, and names an ordinary app (or DeskMind);
 - else, the event's time inside a step of the task's (the executor marks each one, `step_began`/`step_ended`, plus
   STEP_MARGIN_S; a step never closed ends at its `max_s`): the step's app -- a late callback or a slow or failed read
   at a flash's edge. Only the fallback: a step spans the driver's wait for the user to pause, and keys typed in the
@@ -152,35 +154,39 @@ FRONT_BACKOFF_S = 0.5
 STEP_MAX_S = 180.0
 
 
-#: The keyboard lent to a task's app in the background (drivers/skylight.enter_window_key: the app's window held key
-#: without activating it), process-wide: [pid, began, ended or None, deadline] (epoch seconds), newest last. While it
-#: is, the user's app keeps the front but not the keys -- what the user types goes to the lent window, or nowhere --
-#: so the app with the keyboard, as the accessibility server names it, says nothing of where a key went.
-LENDS: list[list] = []
-#: The longest a lend is taken to last when its end is never told.
-LEND_MAX_S = 30.0
+#: The driver's flashes, process-wide: [lowercased bundle, took the front at, gave it back at or None, deadline]
+#: (epoch seconds), newest last. Told by the driver at the points where it brings a task's app to the front and where
+#: it gives the user's app the front back (drivers/peekaboo, the executor's launch), including a front an app took by
+#: itself (a launch that ignores -g, a step that came forward): then from when that step began.
+FLASHES: list[list] = []
+#: After a flash's front was given back: the give-back is confirmed by a read that comes a moment after it.
+FLASH_MARGIN_S = 0.1
+#: The longest a flash is taken to last when its end is never told.
+FLASH_MAX_S = 120.0
 
 
-def keyboard_lent(pid: int) -> list:
-    """The driver lends `pid`'s window the keyboard from now (skylight.enter_window_key); a token for keyboard_returned."""
+def front_taken(bundle: str, began: float | None = None) -> list:
+    """A task's app `bundle` has the front since `began` (now when not given); a token for front_given_back. Told
+    before the front is given back, so a key whose callback runs after the give-back finds the flash already there."""
     now = time.time()
-    token = [int(pid or 0), now, None, now + LEND_MAX_S]
-    LENDS[:] = (LENDS + [token])[-32:]
+    began = now if began is None else min(began, now)
+    token = [(bundle or "").lower(), began, None, now + FLASH_MAX_S]
+    FLASHES[:] = (FLASHES + [token])[-32:]
     return token
 
 
-def keyboard_returned(token: list | None) -> None:
+def front_given_back(token: list | None) -> None:
     if token is not None and token[2] is None:
         token[2] = time.time()
 
 
-def lent_at(at: float) -> int:
-    """The pid the keyboard was lent to at `at` (within STEP_MARGIN_S of a lend), or 0."""
-    for pid, began, ended, deadline in reversed(list(LENDS)):
+def flash_at(at: float) -> str:
+    """The app a flash had in front at `at` (to FLASH_MARGIN_S after it ended), or ""."""
+    for bundle, began, ended, deadline in reversed(list(FLASHES)):
         end = ended if ended is not None else min(time.time(), deadline)
-        if pid and began - STEP_MARGIN_S <= at <= end + STEP_MARGIN_S:
-            return pid
-    return 0
+        if bundle and began <= at <= end + FLASH_MARGIN_S:
+            return bundle
+    return ""
 
 
 def _uptime_ns() -> int:
@@ -281,11 +287,11 @@ class InputWatch:
         event's age at `t0` (time.monotonic(), sampled once when the callback began; now when not given). `at`: a
         fixed record time, for tests.
 
-        Where a key goes, in order:
-        - while the keyboard is lent to a task's app in the background (LENDS), any key not routed to DeskMind goes to
-          that app: the front app then says nothing of where keys go;
-        - a key whose target is neither an ordinary app nor DeskMind goes to the app the fresh front read names, when
-          the callback and the read are within the key's freshness and that app is an ordinary app (or DeskMind);
+        A key whose target is neither an ordinary app nor DeskMind goes, in order:
+        - its own time inside a flash (flash_at): to the flashed app, ahead of the front read -- a read that answered
+          after the front was given back names the user's app for a key that landed in the flashed one;
+        - to the app the fresh front read names, when the callback and the read are within the key's freshness and
+          that app is an ordinary app (or DeskMind);
         - else, its own time inside a step of the task's: to the step's app (a late or failed read, a front that is
           no ordinary app -- the flash's edges);
         - else it keeps its target (unknown: it counts).
@@ -294,7 +300,7 @@ class InputWatch:
         every step (hands#62 re-review).
 
         In three phases (hands#62 external review, twice): 1. every lookup -- whether a pid is DeskMind's or an
-        ordinary app (each may ask the system on a cache miss), the lend, the step, the app with the keyboard -- with
+        ordinary app (each may ask the system on a cache miss), the flash, the step, the app with the keyboard -- with
         nothing recorded; 2. freshness decided once, after all of them: age + (now - t0) <= KEY_FRESH_S, or what the
         front read found is not taken; 3. the record, under `lock`, its time taken last, inside the lock (`stamp`) --
         the lock the executor holds when it stamps the epoch's mark (`mark`).
@@ -312,13 +318,10 @@ class InputWatch:
         # -- 1. lookups: nothing shared is written (only the lookups' own caches)
         target = kind(pid) if pid else "unknown"
         event_at = (at if at is not None else wall0) - (age if age is not None and age >= 0 else 0.0)
-        lent, lent_kind = 0, "unknown"
-        front, front_kind, step = 0, "unknown", ""
-        if key and target != "own":
-            lent = lent_at(event_at)
-            if lent:
-                lent_kind = kind(lent)
-            elif target != "regular":
+        flash, front, front_kind, step = "", 0, "unknown", ""
+        if key and target not in ("own", "regular"):
+            flash = self.flash_at(event_at)
+            if not flash:
                 if age is not None and 0.0 <= age + (time.monotonic() - t0) <= KEY_FRESH_S:
                     front = self.front_now()               # not even asked for a key already past its freshness
                     if front:
@@ -326,15 +329,16 @@ class InputWatch:
                 step = self.step_at(event_at)
         # -- 2. freshness, once, after every lookup
         fresh = age is not None and 0.0 <= age + (time.monotonic() - t0) <= KEY_FRESH_S
-        if lent and lent_kind == "regular":
-            dest, pid = "regular", lent
+        if flash:
+            dest = "flash"                                 # the flashed app: it can only make the key count
         elif front and fresh and front_kind in ("regular", "own"):
             dest, pid = front_kind, front
         elif step:
             dest = "step"                                  # the task's app: it can only make the key count
         else:
             dest = target
-        bundle = step if dest == "step" else (self._pid_bundle.get(pid) or "").lower() if dest == "regular" else ""
+        bundle = (flash if dest == "flash" else step if dest == "step"
+                  else (self._pid_bundle.get(pid) or "").lower() if dest == "regular" else "")
         # -- 3. the record, its time taken last, under the lock the epoch's mark is stamped under
         with self.lock:
             when = at if at is not None else self.stamp()
@@ -372,6 +376,11 @@ class InputWatch:
     @staticmethod
     def step_ended(token: list) -> None:
         token[2] = time.time()
+
+    @staticmethod
+    def flash_at(at: float) -> str:
+        """The app a driver's flash had in front at `at` (module flash_at)."""
+        return flash_at(at)
 
     def step_at(self, at: float) -> str:
         """The app of the task's step under way at `at` (within STEP_MARGIN_S of one), or ""."""

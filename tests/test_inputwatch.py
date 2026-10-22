@@ -393,22 +393,26 @@ class KeysAtTheFlashsEdge(_KeysCase):
         self.assertIsNotNone(self.w._steps[-1][2])        # and its end
 
 
-class LateKeysAndTheEpoch(_KeysCase):
-    """The epoch's mark is compared with when input was seen. A key is recorded at its callback's time -- its own time
-    only decides where it went -- and the mark an action leaves is not moved past the user's input when the driver's
-    own events are told by their source (hands#62 re-review, at 809aa34). Each test here fails at 809aa34."""
+class _EpochCase(_KeysCase):
+    """A task operating TextEdit (pid MUSIC here) through the real executor, over the watch."""
 
     def _task(self):
-        from test_executor import TE, W12, _executor, _win
+        from test_executor import W12, _executor, _win
         ex, stub = _executor()
         del ex._last_input_at                              # the real one, over this watch
-        self.w._pid_bundle[MUSIC] = TE                     # here the task's app is TextEdit (pid MUSIC)
+        self.w._pid_bundle[MUSIC] = "com.apple.TextEdit"
         ex._watch, ex._watch_tried = self.w, True
         ex._windows = lambda every=False: [_win("12")]     # noqa: SLF001 -- no desktop
         ex._front = lambda: "文本编辑"                       # noqa: SLF001
         ex.observe(W12)
         ex.snapshot()
         return ex, stub, W12
+
+
+class LateKeysAndTheEpoch(_EpochCase):
+    """The epoch's mark is compared with when input was seen. A key is recorded at its callback's time -- its own time
+    only decides where it went -- and the mark an action leaves is not moved past the user's input when the driver's
+    own events are told by their source (hands#62 re-review, at 809aa34). Each test here fails at 809aa34."""
 
     def test_a_key_typed_near_an_actions_end_whose_callback_runs_after_it_stales_the_next_step(self):
         ex, _, W12 = self._task()
@@ -473,6 +477,40 @@ class LateKeysAndTheEpoch(_KeysCase):
             q.CGEventSourceSecondsSinceLastEventType.return_value = 0.5
             self.assertEqual(ex.snapshot()["epoch"], e)
 
+
+class WhatTheLookupLearns(_EpochCase):
+    """What is learned about a key while the app with the keyboard is looked up can only make it count, never
+    un-count it (hands#62 external review, at 7ed10d5). Each test here fails at 7ed10d5."""
+
+    def test_a_key_is_recorded_after_its_lookup_not_before_an_epoch_that_moved_meanwhile(self):
+        ex, _, _ = self._task()
+
+        def slow_front():
+            ex._advance()                                  # an action moves the epoch's mark while the read is out
+            time.sleep(0.01)
+            return MUSIC                                   # the task's own app had the keyboard
+        self.w.front_pid = slow_front
+        self.fields[40] = DOCK
+        self.key()
+        e = ex.epoch
+        s = ex.snapshot()
+        self.assertEqual(s["epoch"], e + 1)                # the key is behind no mark: it stales the next step
+        self.assertEqual((s["epoch_reason"]["by"], s["epoch_reason"]["to"]), ("input", "com.apple.textedit"))
+
+    def test_an_answer_that_comes_after_the_keys_freshness_is_not_taken(self):
+        from deskmind_hands import inputwatch as iw
+        ex, _, _ = self._task()
+        e = ex.epoch
+
+        def slow_front():
+            time.sleep(iw.KEY_FRESH_S + 0.02)              # within the read's deadline, past the key's freshness
+            return ITERM                                   # the terminal took the keyboard after the key landed
+        self.w.front_pid = slow_front
+        self.fields[40] = DOCK
+        self.key()
+        self.assertNotIn("com.googlecode.iterm2", self.w.last_by_bundle)
+        self.assertGreater(self.w.last_unknown_at, 0.0)    # kept its target: unknown, and it counts
+        self.assertEqual(ex.snapshot()["epoch"], e + 1)
 
 class StepsClose(_KeysCase):
     """A step mark that is never closed would put every later key with no app target on that step's app (hands#62

@@ -22,11 +22,13 @@ to the app that had the keyboard then, as plain typing is, under three guards, e
   when the callback runs -- it can run late, waiting for the interpreter while the executor works. A step whose end
   is never told closes at its own deadline (`max_s`);
 - otherwise the app with the keyboard is read only when the callback runs within KEY_FRESH_S of the event's own
-  timestamp; a late callback would read a front that has moved on, so the key keeps its target and counts;
+  timestamp, and taken only if the answer comes within it too; a late callback or a slow answer could name a front
+  that has moved on, so the key keeps its target and counts;
 - when the app with the keyboard cannot be read (no answer within FRONT_DEADLINE_S, accessibility refused), or is
   itself no ordinary app (Spotlight's field), the key keeps its target and counts.
-The event's own time only decides where a key went; every input is recorded when its callback runs, since the epoch's
-mark is compared with when input was seen -- backdated, a key seen after an action ended fell before the mark.
+The event's own time only decides where a key went; every input is recorded when it is known (after any read),
+since the epoch's mark is compared with when input was seen -- backdated, a key seen after an action ended fell
+before the mark. What is learned about a key after its freshness can only make it count, never un-count it.
 
 Key events reach a tap only with Input Monitoring; CGEventTapCreate may drop the key bits of a mask and still
 return a tap, so whether keys are watched is read from the permission itself (CGPreflightListenEventAccess),
@@ -246,7 +248,13 @@ class InputWatch:
         to the app that has the keyboard now; else its target is kept (see the module's docstring).
         The event's own time (`at` - `age`) only decides where a key went, never when it is recorded: recorded at its
         own time, a key whose callback ran after an action ended fell before the epoch's mark and was never counted
-        (hands#62 re-review) -- the epoch compares with when the input was seen."""
+        (hands#62 re-review) -- the epoch compares with when the input was seen.
+        One rule for what is learned about a key while it is looked into: it can only make the key count, never
+        un-count it (hands#62 external review). The app with the keyboard is taken only if the key is still within
+        KEY_FRESH_S of its own time when the answer comes (a read that took 80 ms could name an app that took the
+        keyboard after the key landed); and the key is recorded when it is known, after the read, never before --
+        an action that moved the epoch's mark while the read was out would otherwise leave the key behind it."""
+        given = at is not None
         at = at or time.time()
         if key and not self.is_own(pid) and not (pid and self.is_regular(pid)):
             step = self.step_at(at - age if age is not None and age >= 0 else at)
@@ -255,7 +263,12 @@ class InputWatch:
                 self.last_by_bundle[step] = max(self.last_by_bundle.get(step, 0.0), at)
                 return
             if age is not None and 0.0 <= age <= KEY_FRESH_S:
-                pid = self.front_now() or pid
+                asked = time.monotonic()
+                front = self.front_now()
+                if front and age + (time.monotonic() - asked) <= KEY_FRESH_S:
+                    pid = front                            # answered while the key was still fresh
+                if not given:
+                    at = max(at, time.time())              # known only now: recorded now
         if self.is_own(pid):
             self.last_own_at = max(self.last_own_at, at)
             return

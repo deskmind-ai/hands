@@ -248,6 +248,11 @@ class _KeysCase(unittest.TestCase):
         ex = self.ex = HandsExecutor.__new__(HandsExecutor)
         ex._watch_tried, ex._watch = True, w
         ex.drivers, ex.current = {NE: object()}, {}        # the task operates NetEase Music
+        # the driver's flashes are process-wide: none from another test (a launch now tells one from its start, and
+        # one ended a moment ago still covers its margin)
+        from deskmind_hands import inputwatch as iw
+        iw.FLASHES.clear()
+        self.addCleanup(iw.FLASHES.clear)
 
     def key(self):
         self.w._callback(None, 10, object(), None)
@@ -857,8 +862,10 @@ class FlashesTold(_EpochCase):
         self.assertIn(chat, seen[0])                        # told before the front went back
         self.assertIsNotNone(self.iw.FLASHES[-1][2])        # and ended after
 
-    def _stage(self, app: str, stage_apps: list[str], fronts: list[tuple[str, str]], mcp: bool = True):
-        """Staging of `app`'s driver while the front went from the first of `fronts` to the second."""
+    def _stage(self, app: str, stage_apps: list[str], fronts: list[tuple[str, str]], mcp: bool = True,
+               during=None):
+        """Staging of `app`'s driver while the front went from the first of `fronts` to the second; `during` runs
+        while staging is under way (as it closes the windows an earlier run left)."""
         import os as _os
         import tempfile
         from deskmind_hands.drivers import peekaboo as pk
@@ -875,6 +882,9 @@ class FlashesTold(_EpochCase):
         d._run = lambda key, _extra=None, **fmt: (False, {}, "not here")
         d.clipboard = lambda: ""
         d._set_clipboard = lambda value: None
+        if during is not None:
+            d.reset_apps = ["com.example.left"]
+            d._close_all_windows = lambda bundle: during() or 0
         t = time.time()
         with mock.patch.object(pk, "gui_session", return_value="active"):
             try:
@@ -917,6 +927,214 @@ class FlashesTold(_EpochCase):
             with self.assertRaises(RuntimeError):
                 ex._open_window(NE, None)                  # noqa: SLF001
         self.assertIn(NE.lower(), self.flashes(t + 0.001))
+
+
+class FlashesToldBeforeTheFront(_EpochCase):
+    """Every place that takes the front, or may (a flash, the chat app's click, staging, a cold launch), tells the
+    input watch before it does, and ends the flash after the front has gone back, on every way out. Told only as the
+    front went back, a key whose callback ran while the app was in front -- perform() still running -- found no flash,
+    and with the front meanwhile in another app the read named that app: the key was put on it, never moved, and the
+    task did not go stale (hands#62 review at af55263: epoch 2 -> 2 through the real _flash). The tests named
+    `..._while_..._counts_for_...` fail at af55263."""
+
+    def setUp(self):
+        super().setUp()
+        from deskmind_hands import inputwatch as iw
+        self.iw = iw
+        iw.FLASHES.clear()
+        self.addCleanup(iw.FLASHES.clear)
+
+    flashes = FlashesTold.flashes
+    _stage = FlashesTold._stage
+
+    def _quartz_for(self, **extra):
+        """The callback's Quartz (the event's fields) with what the driver's path reads besides."""
+        q = _quartz(self.fields)
+        q.CGEventGetLocation = lambda e: (0, 0)
+        q.CGEventCreate = lambda x: None
+        q.CGWarpMouseCursorPosition = lambda p: None
+        q.CGAssociateMouseAndMouseCursorPosition = lambda b: None
+        for k, v in extra.items():
+            setattr(q, k, v)
+        return q
+
+    def _users_key_elsewhere(self):
+        """A Command key the user typed into the app in front (the Dock its target), its callback run now, while the
+        front read already names the terminal: the user has moved there meanwhile."""
+        self.front["pid"] = ITERM
+        self.fields[40] = DOCK
+        self.fields.pop("ts", None)                        # fresh: the read is taken
+        self.key()
+
+    def _flash_driver(self):
+        from test_receipt_driver import BrowserForeground
+        d = BrowserForeground._driver(None, True)          # the user's terminal in front; nothing waits
+        d._own_window_in_front = lambda bundle: True
+        return d
+
+    def _run_flash(self, d, bundle: str, perform):
+        import os as _os
+        from deskmind_hands.drivers import peekaboo as pk
+        with mock.patch.dict(_os.environ, {"HANDS_FLASH_APPS": bundle}), \
+             mock.patch.dict(sys.modules, {"Quartz": self._quartz_for()}), \
+             mock.patch.object(pk, "_ascii_input_source", return_value=types.SimpleNamespace(restore=lambda: None)), \
+             mock.patch.object(pk.time, "sleep"):
+            return d._flash(bundle, perform)
+
+    def test_a_key_while_the_flash_performs_counts_for_the_flashed_app_though_the_front_moved(self):
+        """The review's case, through the real _flash: the key lands in TextEdit while perform() runs, its callback
+        runs then, and the read names the terminal -- the task operating TextEdit goes stale, for TextEdit."""
+        ex, _, _ = self._task()
+        e = ex.epoch
+
+        def perform(Q):
+            self._users_key_elsewhere()
+            return "typed"
+        ok, why = self._run_flash(self._flash_driver(), "com.apple.TextEdit", perform)
+        self.assertTrue(ok, why)
+        s = ex.snapshot()
+        self.assertEqual(s["epoch"], e + 1)
+        self.assertEqual(s["epoch_reason"]["to"], "com.apple.textedit")
+
+    def test_the_flash_is_told_before_the_app_is_brought_forward_and_ended_on_every_way_out(self):
+        """Told before _bring_forward; ended after the give-back whether the step was sent, the app was not raised,
+        did not arrive, or perform() raised."""
+        told = []
+
+        def raises(Q):
+            raise RuntimeError("perform failed")
+        for case in ("sent", "not raised", "not arrived", "raised"):
+            self.iw.FLASHES.clear()
+            d = self._flash_driver()
+            real_bring = d._bring_forward
+
+            def bring(bundle, browser, real_bring=real_bring, case=case):
+                told.append((case, self.flashes(time.time())))
+                if case == "not raised":
+                    return False
+                if case == "not arrived":
+                    return True                                # asked forward; the front stays the terminal's
+                return real_bring(bundle, browser)
+            d._bring_forward = bring
+            if case == "raised":
+                with self.assertRaises(RuntimeError):
+                    self._run_flash(d, NE, raises)
+            else:
+                ok, why = self._run_flash(d, NE, lambda Q: "typed")
+                self.assertEqual(ok, case == "sent", why)
+            self.assertIn(NE.lower(), told[-1][1], case)       # told before the app was asked forward
+            self.assertEqual([f[0] for f in self.iw.FLASHES], [NE.lower()], case)
+            self.assertIsNotNone(self.iw.FLASHES[-1][2], case)  # ended
+
+    def test_a_retried_turn_ends_its_flash_before_the_next_turn_tells_its_own(self):
+        """The user touched the Mac while the app came forward: nothing is sent, the front goes back, the turn is
+        retried -- each turn's flash ended before the next one is told."""
+        d = self._flash_driver()
+        d._takeover = lambda: False
+        idle = iter([100.0, -1.0, 100.0, 100.0])           # still; touched since the check; still again
+        d._hid_idle = lambda: next(idle, 100.0)
+        d._announce_wait = lambda waited, bundle, what: True
+        ok, why = self._run_flash(d, NE, lambda Q: "typed")
+        self.assertTrue(ok, why)
+        turns = [f for f in self.iw.FLASHES if f[0] == NE.lower()]
+        self.assertEqual(len(turns), 2)
+        self.assertIsNotNone(turns[0][2])
+        self.assertLessEqual(turns[0][2], turns[1][1])     # the first ended before the second was told
+        self.assertIsNotNone(turns[1][2])
+
+    def _chat_driver(self):
+        import types as _types
+        from deskmind_hands.drivers import peekaboo as pk
+        chat = "com.example.chat"
+        self.addCleanup(setattr, pk, "CHAT_APP", pk.CHAT_APP)
+        pk.CHAT_APP = chat
+        d = pk.PeekabooDriver.__new__(pk.PeekabooDriver)
+        d.app, d._foreground_actions, d._chat_sends = chat, 0, 0
+        d._labels_by_id = {"B1": "打开"}
+        d._rects = {"B1": _types.SimpleNamespace(x=10, y=10, w=20, h=10)}
+        d._origin = _types.SimpleNamespace(x=0, y=0)
+        d._moved_since_seen = lambda: None
+        d._add_wait = lambda s: None
+        fronts = iter(["com.googlecode.iterm2", chat])
+        d._front_bundle = lambda: next(fronts, chat)
+        d._give_front_back = lambda prev, ours=None, late_s=0.0: None
+        return d, chat
+
+    def _run_chat(self, d, post):
+        import os as _os
+        from deskmind_hands.drivers import peekaboo as pk
+        q = self._quartz_for(CGEventPost=post, CGEventCreateMouseEvent=lambda *a: None)
+        for k in ("kCGEventMouseMoved", "kCGMouseButtonLeft", "kCGHIDEventTap"):
+            setattr(q, k, 0)
+        with mock.patch.dict(_os.environ, {"HANDS_CHAT_FLASH": "1"}), \
+             mock.patch.dict(sys.modules, {"Quartz": q}), \
+             mock.patch.object(pk, "hid_idle_seconds", return_value=60.0), \
+             mock.patch.object(pk.subprocess, "run"), \
+             mock.patch.object(pk.time, "sleep"):
+            return d._chat_flash_click("B1")
+
+    def test_a_key_while_the_chat_app_is_clicked_counts_for_it_though_the_front_moved(self):
+        d, chat = self._chat_driver()
+        keyed = []
+
+        def post(tap, e):
+            if not keyed:
+                keyed.append(1)
+                self._users_key_elsewhere()                # while the chat app is in front for the click
+        res = self._run_chat(d, post)
+        self.assertTrue(res.ok, res.detail)
+        self.assertIn(chat, self.w.last_by_bundle)
+        self.assertEqual(self.w.last_unknown_at, 0.0)
+        self.assertIsNotNone(self.iw.FLASHES[-1][2])       # ended
+
+    def test_the_chat_flash_is_ended_when_the_chat_app_never_came_forward(self):
+        d, chat = self._chat_driver()
+        d._front_bundle = lambda: "com.googlecode.iterm2"  # it never arrives
+        res = self._run_chat(d, lambda tap, e: None)
+        self.assertFalse(res.ok)
+        self.assertEqual([f[0] for f in self.iw.FLASHES], [chat])
+        self.assertIsNotNone(self.iw.FLASHES[-1][2])
+
+    def test_a_key_while_staging_counts_for_the_tasks_app_though_the_front_moved(self):
+        """Staging launched the music app, which took the front; the user's key landed in it while staging went on,
+        then they moved to the terminal, so the front read after staging names the terminal and no front taken is
+        found there."""
+        d, t = self._stage(NE, [], [("iTerm2", "com.googlecode.iterm2"), ("iTerm2", "com.googlecode.iterm2")],
+                           during=self._users_key_elsewhere)
+        self.assertIn(NE.lower(), self.w.last_by_bundle)
+        self.assertEqual(self.w.last_unknown_at, 0.0)
+        self.assertTrue(self.iw.FLASHES and all(f[2] is not None for f in self.iw.FLASHES))   # ended
+        self.assertEqual(d.activated, [])                   # main's give-back: nothing taken, nothing given back
+
+    def test_the_staging_flash_is_ended_when_staging_raises(self):
+        def raises():
+            raise RuntimeError("staging failed")
+        self._stage(NE, [], [("iTerm2", "com.googlecode.iterm2")], during=raises)
+        self.assertIn(NE.lower(), [f[0] for f in self.iw.FLASHES])
+        self.assertTrue(all(f[2] is not None for f in self.iw.FLASHES))
+
+    def test_a_key_while_a_cold_launch_runs_counts_for_the_launched_app_though_the_front_moved(self):
+        from deskmind_hands import executor as exe
+        from test_executor import _executor
+        ex, _ = _executor()
+        ex._watch, ex._watch_tried = self.w, True
+        ex._known_windows = lambda: set()                  # noqa: SLF001
+        ex._front_bundle_id = lambda: "com.googlecode.iterm2"   # noqa: SLF001 -- in front before, and again after
+        ex._make_frontmost = lambda b: True                # noqa: SLF001
+
+        def windows(*a):
+            self._users_key_elsewhere()                    # the app took the front at launch; the user's key in it
+            return []
+        ex._launch_windows = windows                       # noqa: SLF001
+        ex._settled = mock.Mock(side_effect=RuntimeError("stop here"))   # noqa: SLF001
+        with mock.patch.object(exe, "resolve_app", return_value=NE), \
+             mock.patch.object(exe, "running_apps", return_value=[]), \
+             mock.patch.object(exe, "installed_apps", return_value=[]), \
+             mock.patch.object(exe.subprocess, "run"):
+            with self.assertRaises(RuntimeError):
+                ex._open_window(NE, None)                  # noqa: SLF001
+        self.assertIn(NE.lower(), self.w.last_by_bundle)
+        self.assertTrue(all(f[2] is not None for f in self.iw.FLASHES))   # ended
 
 
 class StepsClose(_KeysCase):

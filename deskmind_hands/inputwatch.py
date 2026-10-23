@@ -156,9 +156,11 @@ STEP_MAX_S = 180.0
 
 
 #: The driver's flashes, process-wide: [lowercased bundle, took the front at, gave it back at or None, deadline]
-#: (epoch seconds), newest last. Told by the driver at the points where it brings a task's app to the front and where
-#: it gives the user's app the front back (drivers/peekaboo, the executor's launch), including a front an app took by
-#: itself (a launch that ignores -g, a step that came forward): then from when that step began.
+#: (epoch seconds), newest last. Told by the driver before it brings a task's app to the front, and before anything
+#: that may bring one forward by itself starts (staging, the executor's launch: then for the task's apps, whether or
+#: not one comes), and ended after it gives the user's app the front back (drivers/peekaboo, the executor's launch):
+#: told only as the front went back, a key whose callback ran while the app was in front found no flash (hands#62
+#: review at af55263). A front an app took by itself during a step is told when it is found, from the step's start.
 FLASHES: list[list] = []
 #: After a flash's front was given back: the give-back is confirmed by a read that comes a moment after it.
 FLASH_MARGIN_S = 0.1
@@ -168,7 +170,8 @@ FLASH_MAX_S = 120.0
 
 def front_taken(bundle: str, began: float | None = None) -> list:
     """A task's app `bundle` has the front since `began` (now when not given); a token for front_given_back. Told
-    before the front is given back, so a key whose callback runs after the give-back finds the flash already there."""
+    before the front is taken, so a key whose callback runs while the app is in front finds the flash, and ended after
+    the front is given back, so one whose callback runs after the give-back finds it too."""
     now = time.time()
     began = now if began is None else min(began, now)
     token = [(bundle or "").lower(), began, None, now + FLASH_MAX_S]

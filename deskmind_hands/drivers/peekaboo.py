@@ -912,6 +912,26 @@ class PeekabooDriver:
         # benchmark run can never cost someone what they had copied.
         self._clipboard_saved = self.clipboard()
         staged_at = time.time()
+        # Any of staging's steps may bring one of the task's apps forward (a first launch that ignores -g, a sheet,
+        # an AppleScript `tell` that launches the app), and which one does, and when, is not known. Told to the
+        # input watch only after staging had finished, a key whose callback ran while staging went on found no
+        # flash, and with the front meanwhile in another app it was put on that app for good (hands#62 review at
+        # af55263, the same late telling as _flash's). So the task's apps -- the ones whose front taken during
+        # staging is given back below -- are told from staging's start, before anything is staged, and ended after
+        # the give-back, whatever staging raised. If none of them came forward, the flash was not needed: a key in
+        # another app then counts for the task's apps too, which can only make a step stale, never miss the user's
+        # input to them (the gate: never miss; a stale more is an effect).
+        tokens = [self._front_taken(b, staged_at)
+                  for b in dict.fromkeys(x for x in [self.app] + [app_bundle(n) for n in self._stage_apps] if x)]
+        try:
+            self._stage(staged_at)
+        finally:
+            for token in tokens:
+                self._front_given_back(token)
+
+    def _stage(self, staged_at: float) -> None:
+        """Stage the run's workspace (_start, from `staged_at`): close the windows earlier runs left, open the run's
+        own windows and documents, pin the window it works in, and give the user's app back a front staging took."""
         front_before, before_bundle = self._front_app()
         for bundle in self.reset_apps:
             self._close_all_windows(bundle)
@@ -1084,7 +1104,8 @@ class PeekabooDriver:
             front_after.lower() in ours_names or front_after.lower() in ours)
         # The input watch is told when one of the task's apps -- by bundle id, or by name where app_bundle knows none
         # -- took the front while staging, from staging's start, whatever happens to the front below (the give-back
-        # is main's, unchanged)
+        # is main's, unchanged). The task's own apps are told from the start already (_start); this adds the app
+        # found in front by its bundle id where the task's apps are known by name (a name-list app, Finder).
         tokens = []
         if front_after and (after_bundle, front_after) != (before_bundle, front_before) and (
                 after_bundle.lower() in ours or front_after.lower() in ours or front_after.lower() in ours_names):
@@ -2724,6 +2745,11 @@ class PeekabooDriver:
         t0 = time.time()
         self._foreground_actions += 1
         arrived = False
+        # The input watch is told the flash before the chat app is asked forward, not as the front goes back: a key
+        # whose callback ran during the click found no flash, and with the front meanwhile in another app was put on
+        # that app for good (hands#62 review at af55263, the same late telling as _flash's). Ended after the
+        # give-back, whatever happened.
+        token = self._front_taken(CHAT_APP, t0)
         try:
             subprocess.run(["/usr/bin/open", "-b", CHAT_APP], capture_output=True, timeout=10)
             for _ in range(30):
@@ -2740,10 +2766,9 @@ class PeekabooDriver:
                 time.sleep(0.05)
             time.sleep(0.2)
         finally:
-            Quartz.CGWarpMouseCursorPosition(cur)
-            Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-            token = self._front_taken(CHAT_APP, t0)       # the input watch: the flash, told before the give-back
             try:
+                Quartz.CGWarpMouseCursorPosition(cur)
+                Quartz.CGAssociateMouseAndMouseCursorPosition(True)
                 self._give_front_back(prev, ours=CHAT_APP, late_s=0.0 if arrived else self.LATE_FRONT_S)
             finally:
                 self._front_given_back(token)
@@ -2863,32 +2888,40 @@ class PeekabooDriver:
                 # raised over it is the browser's front window until then)
                 restore = self._browser_front_sid(bundle) if browser else None
 
-                def back(prev=prev, restore=restore):
+                def back(token, prev=prev, restore=restore):
                     # The front goes back only if it is still the app brought forward: the user who clicked another
                     # app meanwhile keeps it (hands #55 review). An app asked forward that had not arrived is watched
                     # for a moment longer, so one that comes late is given back too. The browser's stacking is put
                     # back whoever had the front, the user's own window included when they were in this browser
-                    # (takeover).
+                    # (takeover). The input watch's flash (`token`, told before the front was taken) ends once the
+                    # front has gone back, whatever the give-back did.
                     try:
                         if prev.lower() != bundle.lower():
                             late = self.LATE_FRONT_S if brought and not arrived else 0.0
-                            # the input watch: the flash, from when the front was taken, told before it goes back
-                            token = self._front_taken(bundle, t0)
-                            try:
-                                self._give_front_back(prev, ours=bundle, late_s=late)
-                            finally:
-                                self._front_given_back(token)
+                            self._give_front_back(prev, ours=bundle, late_s=late)
                     except Exception:  # noqa: BLE001
                         pass
+                    finally:
+                        self._front_given_back(token)
                     if restore:
                         try:
                             self._osa(f'tell application id "{self._q(bundle)}" to set index of window id {restore} to 1')
                         except Exception:  # noqa: BLE001
                             pass
                 retry, sent, ime, brought, arrived = False, False, None, False, False
+                token = None
                 # Everything after the app may have come forward is inside the try: a timeout reading the front app
                 # or an input source that throws still gives the front back (hands #55 review)
                 try:
+                    # The input watch is told the flash before the front is taken, not as it goes back: a key the
+                    # user typed into the app while perform() ran, its callback run then, found no flash, and with
+                    # the front meanwhile in another app the read named that app -- the key was put on it and never
+                    # moved, and the task did not go stale (hands#62 review at af55263). Ended in back(), on every
+                    # way out of this try (not raised, not arrived, the user touched the Mac and this turn is
+                    # retried, the app's stop, an error), so a retry's flash is ended before the next turn tells
+                    # its own. Only where the front goes back (the user not already in this app), as before.
+                    if prev.lower() != bundle.lower():
+                        token = self._front_taken(bundle, t0)
                     brought = self._bring_forward(bundle, browser)
                     if not brought:
                         return False, f"the run's own {bundle} window could not be raised; nothing was done"
@@ -2922,10 +2955,13 @@ class PeekabooDriver:
                             ime.restore()
                         except Exception:  # noqa: BLE001
                             pass
-                    if sent:
-                        Quartz.CGWarpMouseCursorPosition(cur)
-                        Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-                    back()
+                    try:
+                        if sent:
+                            Quartz.CGWarpMouseCursorPosition(cur)
+                            Quartz.CGAssociateMouseAndMouseCursorPosition(True)
+                        back(token)
+                    finally:
+                        self._front_given_back(token)   # ended even if the pointer could not be put back
                     if retry:
                         waited = self._announce_wait(waited, bundle, what)
                         still = min(still * 2, 30.0)
@@ -3440,8 +3476,8 @@ class PeekabooDriver:
     @staticmethod
     def _front_taken(bundle: str, began: float | None):
         """Tell the input watch a task's app has had the front since `began` (inputwatch.FLASHES): a key that landed
-        in it then counts for it, whatever the front reads when its callback runs. Told before the front is given
-        back; the token goes to _front_given_back after."""
+        in it then counts for it, whatever the front reads when its callback runs. Told before the front is taken
+        (hands#62 review at af55263); the token goes to _front_given_back after the front has been given back."""
         try:
             from deskmind_hands import inputwatch
             return inputwatch.front_taken(bundle, began)

@@ -322,6 +322,10 @@ class InputWatch:
         self._pid_regular: dict[int, bool] = {}
         #: pid -> its process's start time when it was last looked up (_check_pid)
         self._pid_started: dict[int, float] = {}
+        #: pids looked up while their start time could not be read: not trusted once it can be (_check_pid)
+        self._pid_unsure: set[int] = set()
+        #: a Command-Tab (or Command-`) app switcher open: from its first Tab until Command is let go (_switcher)
+        self._switching = False
         self._dragging = False
         #: this process and its children (Peekaboo, the key-event child): events they post are the driver's own
         #: input, not the user's -- a driver click that reached the tap after the action had ended was taken for the
@@ -347,6 +351,7 @@ class InputWatch:
         self._poll_stop: threading.Event | None = None
         self._poll_thread: threading.Thread | None = None
         self._read_began = 0.0
+        self._loop = None
         #: when a key with no app target was last counted only because nothing proved where it went (note's rule):
         #: counted as main counted it -- an input to an unknown target, wiped by the mark main set at an action's
         #: end (last_input_where's doubt_after)
@@ -356,14 +361,21 @@ class InputWatch:
     def _check_pid(self, pid: int) -> None:
         """Forget what is known of `pid` when it now belongs to another process (its start time changed): the watch
         lives as long as the process (executor.shared_watch), and a pid reused for the task's app kept the old app's
-        bundle (hands#62 delta review at f0f7186). The start time, as posted_by_us tells a reused pid."""
+        bundle (hands#62 delta review at f0f7186). The start time, as posted_by_us tells a reused pid.
+        A pid whose start time cannot be read is asked anew at every look, and what was learnt of it then is not
+        trusted once the start time can be read (hands#62 delta review at 45e67fc: the terminal's pid, cached with no
+        start time, reused by the task's app, kept the terminal's bundle)."""
         info = _proc_info(pid)
         started = info[1] if info else None
         known = self._pid_started.get(pid)
-        if started is not None and known is not None and started != known:
+        if started is None or pid in self._pid_unsure or (known is not None and started != known):
             self._pid_bundle.pop(pid, None)
             self._pid_regular.pop(pid, None)
-        if started is not None:
+            self._pid_started.pop(pid, None)
+        if started is None:
+            self._pid_unsure.add(pid)
+        else:
+            self._pid_unsure.discard(pid)
             self._pid_started[pid] = started
 
     def is_own(self, pid: int | None) -> bool:
@@ -377,7 +389,7 @@ class InputWatch:
         return bundle.lower() in self.own_bundles
 
     def note(self, pid: int | None, at: float | None = None, key: bool = False, age: float | None = None,
-             t0: float | None = None) -> None:
+             t0: float | None = None, switcher: bool = False) -> None:
         """An input event the window server routed to `pid`'s process (None or 0: no target known). `age` is the
         event's age at `t0` (time.monotonic(), sampled once when the callback began; now when not given). `at`: a
         fixed record time, for tests.
@@ -413,7 +425,8 @@ class InputWatch:
             return "regular" if p and self.is_regular(p) else "unknown"
 
         def bundle(p: int) -> str:
-            return (self._pid_bundle.get(p) or "").lower()
+            known = self._pid_bundle.get(p)                # not kept for a pid whose start time is unreadable
+            return (known if known is not None else self._bundle_of(p) or "").lower()
 
         # -- 1. lookups: nothing shared is written (only the lookups' own caches)
         target = kind(pid) if pid else "unknown"
@@ -437,7 +450,9 @@ class InputWatch:
             step = self.step_at(event_at)
             busy = span is None or self.in_flight(*span)
             flashes += [b for b in self.flash_at(event_at) if b not in flashes]    # the last lookup (50f176a)
-            doubt = busy or seen is None or not read
+            # a key in the app switcher (Command-Tab, then Q or H on the app picked) acts on an app the front does not
+            # name: it counts as on main
+            doubt = busy or seen is None or not read or switcher
         # -- 2. the decision
         fresh = age is not None and 0.0 <= age + (time.monotonic() - t0) <= KEY_FRESH_S
         unknown = False
@@ -793,11 +808,38 @@ class InputWatch:
             key = type_ in (Quartz.kCGEventKeyDown, Quartz.kCGEventFlagsChanged)
             t0 = time.monotonic()                          # sampled once: the key's age is as of t0
             age = self._event_age(Quartz, event) if key else None
+            switcher = self._switcher(Quartz, type_, event) if key else False
             self.note(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0),
-                      key=key, age=age, t0=t0)
+                      key=key, age=age, t0=t0, switcher=switcher)
         except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side (an unknown target)
             self.note(None)
         return event
+
+    #: Tab and ` (the key above Tab on a US keyboard): with Command held they open the app switcher
+    SWITCHER_KEYCODES = (48, 50)
+    COMMAND_FLAG = 1 << 20                                 # kCGEventFlagMaskCommand
+
+    def _switcher(self, Quartz, type_, event) -> bool:
+        """Whether this key belongs to an app switcher session: from a Command-Tab, Command-` or Command-Shift-Tab
+        keydown until Command is let go, the release included. In the switcher the user picks an app and acts on it
+        -- Q quits it, H hides it -- while the front stays where it was, and each key comes with the Dock as its
+        target (hands#62 delta review at 45e67fc). Such keys count as on main. Where the event cannot be read, no."""
+        try:
+            flags = int(Quartz.CGEventGetFlags(event) or 0)
+            command = bool(flags & self.COMMAND_FLAG)
+            if type_ == Quartz.kCGEventKeyDown:
+                code = int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode) or 0)
+                if command and code in self.SWITCHER_KEYCODES:
+                    self._switching = True
+                elif not command:
+                    self._switching = False
+                return self._switching
+            if self._switching and not command:            # Command let go: the switcher closes on this one
+                self._switching = False
+                return True
+            return self._switching
+        except Exception:  # noqa: BLE001
+            return self._switching
 
     @staticmethod
     def _event_age(Quartz, event) -> float | None:
@@ -828,12 +870,14 @@ class InputWatch:
         if not tap:
             return False
         self._tap = tap
-        ready = threading.Event()
+        ready, gone = threading.Event(), threading.Event()
 
         def run():
             src = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
-            loop = Quartz.CFRunLoopGetCurrent()
+            loop = self._loop = Quartz.CFRunLoopGetCurrent()
             Quartz.CFRunLoopAddSource(loop, src, Quartz.kCFRunLoopCommonModes)
+            if gone.is_set():                              # given up on before it was running
+                return
             Quartz.CGEventTapEnable(tap, True)
             self.active = True
             ready.set()
@@ -841,7 +885,26 @@ class InputWatch:
 
         self._thread = threading.Thread(target=run, name="input-watch", daemon=True)
         self._thread.start()
-        ready.wait(2.0)
+        if not ready.wait(2.0):
+            # not running in time: given up, and nothing of it left alive -- each executor tries again now, and an
+            # unreferenced live tap and poller were left once per try (hands#62 delta review at 45e67fc)
+            gone.set()
+            self.stop()
+            return False
         if self.active and self.keys:
             self.watch_front()                             # only keys need the front: a click has its target
         return self.active
+
+    def stop(self) -> None:
+        """Stop the poller, disable and invalidate the tap, and stop its run loop: nothing of this watch stays alive."""
+        self.stop_front()
+        self.active = False
+        try:
+            import Quartz
+            if self._tap is not None:
+                Quartz.CGEventTapEnable(self._tap, False)
+                Quartz.CFMachPortInvalidate(self._tap)
+            if self._loop is not None:
+                Quartz.CFRunLoopStop(self._loop)
+        except Exception:  # noqa: BLE001
+            pass

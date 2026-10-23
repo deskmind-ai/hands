@@ -13,8 +13,20 @@ from unittest import mock
 from deskmind_hands.inputwatch import InputWatch
 
 
+def stable_pids(case: unittest.TestCase, *pids: int) -> None:
+    """The made-up `pids` a test injects into a watch's caches: processes whose start time does not change
+    (InputWatch._check_pid forgets a pid whose start time is unreadable or changed); every other pid as the system
+    says."""
+    from deskmind_hands import inputwatch as iw
+    real = iw._proc_info
+    patch = mock.patch.object(iw, "_proc_info", lambda pid: (1, 1.0) if pid in pids else real(pid))
+    patch.start()
+    case.addCleanup(patch.stop)
+
+
 class Targets(unittest.TestCase):
     def test_input_the_window_server_routed_to_deskmind_is_not_the_users_change(self):
+        stable_pids(self, 11, 12, 22)
         w = InputWatch()
         w._pid_bundle = {11: "ai.deskmind.app", 12: "ai.deskmind.hands", 22: "com.apple.TextEdit"}
         w._pid_regular = {11: True, 12: False, 22: True}
@@ -77,6 +89,7 @@ class Targets(unittest.TestCase):
     def test_input_to_a_system_surface_counts_as_an_unknown_target(self):
         """A notification banner, the Dock, Spotlight: not ordinary apps, and a click there can bring another window
         of any app forward -- input to an unknown target (PR #49 review)."""
+        stable_pids(self, 30, 31)
         w = InputWatch()
         w._pid_bundle = {30: "com.apple.notificationcenterui", 31: "com.googlecode.iterm2"}
         w._pid_regular = {30: False, 31: True}
@@ -131,6 +144,7 @@ class Targets(unittest.TestCase):
             setattr(q, k, v)
         fields = {}
         q.CGEventGetIntegerValueField = lambda e, f: fields.get(f, 0)
+        stable_pids(self, 500)
         w._pid_bundle, w._pid_regular = {500: "com.apple.Safari"}, {500: True}
         with mock.patch.dict(sys.modules, {"Quartz": q}):
             fields.update({41: 999222, 40: 500})           # the driver's click into Safari
@@ -215,9 +229,11 @@ def _quartz(fields: dict):
                  "kCGEventLeftMouseDown": 1, "kCGEventKeyDown": 10, "kCGEventFlagsChanged": 12,
                  "kCGEventLeftMouseDragged": 6, "kCGEventRightMouseDragged": 7, "kCGEventOtherMouseDragged": 27,
                  "kCGEventLeftMouseUp": 2, "kCGEventRightMouseUp": 4, "kCGEventOtherMouseUp": 26,
-                 "kCGEventTargetUnixProcessID": 40, "kCGEventSourceUnixProcessID": 41}.items():
+                 "kCGEventTargetUnixProcessID": 40, "kCGEventSourceUnixProcessID": 41,
+                 "kCGKeyboardEventKeycode": 9}.items():
         setattr(q, k, v)
     q.CGEventGetIntegerValueField = lambda e, f: fields.get(f, 0)
+    q.CGEventGetFlags = lambda e: fields.get("flags", 0)   # the modifiers held (Command: 1 << 20)
     # the event's own timestamp (mach_absolute_time's clock, in nanoseconds here): fresh unless a test says otherwise
     q.CGEventGetTimestamp = lambda e: fields.get("ts") or _uptime_ns()
     return q
@@ -251,6 +267,10 @@ class _KeysCase(unittest.TestCase):
         # the driver's flashes are process-wide: none from another test (a launch now tells one from its start, and
         # one ended a moment ago still covers its margin)
         from deskmind_hands import inputwatch as iw
+        # the test's pids are made up: each a process with a start time that does not change (_check_pid)
+        stable = mock.patch.object(iw, "_proc_info", lambda pid: (1, 1.0))
+        stable.start()
+        self.addCleanup(stable.stop)
         iw.FLASHES.clear()
         self.addCleanup(iw.FLASHES.clear)
 
@@ -1217,6 +1237,7 @@ class FrontRead(unittest.TestCase):
             if attr in InputWatch.__dict__:
                 self.addCleanup(setattr, InputWatch, attr, InputWatch.__dict__[attr])
                 delattr(InputWatch, attr)
+        stable_pids(self, ITERM, DOCK)
         w = InputWatch()
         w._pid_bundle = {ITERM: "com.googlecode.iterm2", DOCK: "com.apple.dock"}
         w._pid_regular = {ITERM: True, DOCK: False}
@@ -1270,7 +1291,7 @@ class MainWatch(InputWatch):
     """Main's attribution (deskmind-ai/hands main at b9a8674, InputWatch.note verbatim): an input goes to its target
     when that is an ordinary app, to DeskMind when it is DeskMind, and otherwise to an unknown target, which counts."""
 
-    def note(self, pid, at=None, key=False, age=None, t0=None):   # noqa: ARG002 -- main's signature had pid and at
+    def note(self, pid, at=None, key=False, age=None, t0=None, switcher=False):   # noqa: ARG002 -- main's had pid, at
         at = at or time.time()
         if self.is_own(pid):
             self.last_own_at = max(self.last_own_at, at)
@@ -1324,6 +1345,9 @@ class MainIsTheFloor(_EpochCase):
         ("hung_poller_terminal_typing_between_steps", True, True, False),
         # Codex at f0f7186
         ("slow_read_answers_the_terminal_after_a_switch_and_back", True, True, False),
+        # the delta review at 45e67fc: the app switcher acts on the app it picked, the terminal still in front
+        ("switcher_then_q_on_the_task_app", True, True, False),
+        ("plain_command_chord_in_the_terminal_between_steps", True, False, True),
     ]
 
     # -- the mocked system ---------------------------------------------------------------------------------------
@@ -1585,6 +1609,35 @@ class MainIsTheFloor(_EpochCase):
         threading.Event().wait(0.15)                       # it answers the terminal; reads go on at their pace
         self.cmd_key(at=at)
 
+    def _chord(self, *codes: int):
+        """Command down, the keys `codes` with it (each a keydown, the Dock its target), Command up."""
+        cmd = 1 << 20                                      # kCGEventFlagMaskCommand
+        self.fields.pop("ts", None)
+        self.fields[40] = DOCK
+        self.fields["flags"] = cmd
+        self.w._callback(None, 12, object(), None)         # Command pressed
+        for code in codes:
+            self.fields[9] = code
+            self.key()
+        self.fields["flags"] = 0
+        self.w._callback(None, 12, object(), None)         # Command let go
+        self.fields.pop(9, None)
+
+    def switcher_then_q_on_the_task_app(self, ex, stub):
+        """In the terminal, the user holds Command, presses Tab to pick TextEdit in the switcher and Q to quit it:
+        the front stays the terminal, every key the Dock's."""
+        self._step(ex, stub, lambda d: None)
+        self.focus(ITERM)
+        threading.Event().wait(0.15)
+        self._chord(48, 48, 12)                            # Tab, Tab, Q
+
+    def plain_command_chord_in_the_terminal_between_steps(self, ex, stub):
+        """Command-C in the terminal, no switcher: the rc.13 exception holds."""
+        self._step(ex, stub, lambda d: None)
+        self.focus(ITERM)
+        threading.Event().wait(0.15)
+        self._chord(8)                                     # C
+
     def _hang_poller(self):
         gate = threading.Event()
         self.addCleanup(gate.set)
@@ -1692,7 +1745,8 @@ class MainIsTheFloor(_EpochCase):
                 self.assertEqual(branch, branch_expected, f"branch: {scenario}")
                 if not exception:
                     self.assertTrue(branch or not main, f"main stales and the branch does not: {scenario}")
-        self.assertEqual([s for s, _, _, x in self.TABLE if x], ["terminal_typing_between_steps"])
+        self.assertEqual([s for s, _, _, x in self.TABLE if x],      # the one exception, two ways of typing it
+                         ["terminal_typing_between_steps", "plain_command_chord_in_the_terminal_between_steps"])
 
     def test_review_the_app_that_came_forward_by_itself_during_a_step_stales_it(self):
         """The review's scenario alone (hands#62 review at 9def177): fails there, epoch 2 -> 2."""
@@ -1875,6 +1929,82 @@ class ObservedFront(_KeysCase):
                 self.key()
         self.assertIn(NE, self.w.last_by_bundle)
         self.assertGreater(self.ex._last_input_at(), 0.0)  # noqa: SLF001
+
+    def test_a_pid_whose_start_time_could_not_be_read_is_not_trusted_later(self):
+        """Delta review at 45e67fc: the terminal's pid looked up while its start time could not be read, the terminal
+        gone, the pid reused by the task's app: the key is the task's app's."""
+        from deskmind_hands import inputwatch as iw
+        info = {"v": None}
+        self.w._pid_bundle.pop(ITERM, None)
+        self.w._pid_regular.pop(ITERM, None)
+        with mock.patch.object(iw, "_proc_info", lambda pid: info["v"]), \
+             mock.patch.object(InputWatch, "_regular_of", staticmethod(lambda pid: True)):
+            with mock.patch.object(InputWatch, "_bundle_of", staticmethod(lambda pid: "com.googlecode.iterm2")):
+                self.assertFalse(self.w.is_own(ITERM))     # the terminal, start time unreadable
+                self.assertTrue(self.w.is_regular(ITERM))
+            info["v"] = (1, 300.0)                         # the task's app now has the pid, readable
+            with mock.patch.object(InputWatch, "_bundle_of", staticmethod(lambda pid: NE)):
+                self.fields[40] = ITERM
+                self.key()
+        self.assertIn(NE, self.w.last_by_bundle)
+        self.assertGreater(self.ex._last_input_at(), 0.0)  # noqa: SLF001
+
+    def _chord(self, *codes: int, release: bool = True):
+        cmd = 1 << 20                                      # kCGEventFlagMaskCommand
+        self.fields[40] = DOCK
+        self.fields["flags"] = cmd
+        self.w._callback(None, 12, object(), None)
+        for code in codes:
+            self.fields[9] = code
+            self.key()
+        if release:
+            self.fields["flags"] = 0
+            self.w._callback(None, 12, object(), None)
+
+    def test_keys_in_the_app_switcher_count_and_a_plain_command_chord_does_not(self):
+        """Delta review at 45e67fc: Command-Tab to TextEdit, then Q, the terminal in front all along -- counted as on
+        main; Command-C in the terminal, no switcher -- the rc.13 exception; the switcher closes when Command is let
+        go."""
+        self.front["pid"] = ITERM
+        self.observe_front()
+        self._chord(8)                                     # Command-C
+        self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001
+        for codes in ((48, 12), (50, 4)):                  # Command-Tab then Q; Command-` then H
+            self.w.last_doubt_at = 0.0
+            self._chord(*codes)
+            self.assertGreater(self.ex._last_input_at(), 0.0)  # noqa: SLF001
+        self.w.last_doubt_at = 0.0
+        self._chord(8)                                     # Command let go before: no switcher any more
+        self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001
+
+    def test_a_watch_started_without_keys_is_replaced_once_they_are_permitted(self):
+        """Delta review at 45e67fc: a watch made before Input Monitoring was granted watched no keys for the rest of
+        the process."""
+        from deskmind_hands import executor as exe
+        perm, made, stopped = {"keys": False}, [], []
+
+        class W(InputWatch):
+            @staticmethod
+            def keys_permitted():
+                return perm["keys"]
+
+            def start(self):
+                made.append(self)
+                self.keys, self.active = perm["keys"], True
+                return True
+
+            def stop(self):
+                stopped.append(self)
+        self.addCleanup(exe._SHARED_WATCH.clear)
+        exe._SHARED_WATCH.clear()
+        with mock.patch.object(exe, "InputWatch", W):
+            first = exe.shared_watch()
+            self.assertIs(exe.shared_watch(), first)        # no permission yet: kept
+            perm["keys"] = True
+            second = exe.shared_watch()
+        self.assertIsNot(second, first)
+        self.assertTrue(second.keys)
+        self.assertEqual(stopped, [first])
 
     def test_a_doubt_keeps_the_user_active_after_an_action_ends(self):
         """user_active looks at the last USER_ACTIVE_S, as main did: an action's end does not hide a doubt there."""

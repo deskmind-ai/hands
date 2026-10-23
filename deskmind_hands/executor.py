@@ -1345,6 +1345,12 @@ def shared_watch() -> InputWatch | None:
     as each run tried its own before (hands#62 review at f0f7186). Made under the lock, so two never start at once."""
     with _SHARED_LOCK:
         w = _SHARED_WATCH.get("watch")
+        if w is not None and not w.keys and InputWatch.keys_permitted():
+            # started before Input Monitoring was granted (a mouse-only tap): granted now, so a watch that sees keys
+            # replaces it (hands#62 delta review at 45e67fc)
+            w.stop()
+            _SHARED_WATCH.pop("watch", None)
+            w = None
         if w is None:
             w = InputWatch()
             if not w.start():

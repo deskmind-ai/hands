@@ -257,6 +257,18 @@ class _KeysCase(unittest.TestCase):
     def key(self):
         self.w._callback(None, 10, object(), None)
 
+    def observe_front(self, settle: float = 0.15):
+        """The watch's poller reading the mocked front, run long enough for a key's span to be seen: a key with no
+        app target is left uncounted for the task only on that evidence (InputWatch.note; hands#62 review at
+        e8fa010)."""
+        self.w.watch_front()
+        self.addCleanup(self.w.stop_front)
+        threading.Event().wait(settle)
+
+    def counted_unknown(self) -> bool:
+        """Counted for no app in particular: an unknown target, or a key counted as main counted it (a doubt)."""
+        return max(self.w.last_unknown_at, self.w.last_doubt_at) > 0.0
+
 
 class KeysGoToTheAppInFront(_KeysCase):
     """A key event can reach the tap with no target, or with one that is no ordinary app (a Command-key press comes
@@ -266,6 +278,7 @@ class KeysGoToTheAppInFront(_KeysCase):
 
     def test_keys_with_no_target_while_another_app_is_in_front_do_not_stale_the_task(self):
         self.front["pid"] = ITERM                          # typing in the terminal
+        self.observe_front()                               # the evidence it went there (none: it counts, as on main)
         self.key()
         self.w._callback(None, 12, object(), None)        # a modifier, too
         self.fields[40] = DOCK                             # Command-Tab and the like: the Dock is the key's target
@@ -290,21 +303,26 @@ class KeysGoToTheAppInFront(_KeysCase):
             for unknown in (lambda: 0, lambda: None, mock.Mock(side_effect=RuntimeError("no accessibility"))):
                 self.fields[40] = target
                 self.w.front_pid = unknown
-                self.w.last_unknown_at = self.w._front_backoff_until = 0.0
+                self.w.last_unknown_at = self.w.last_doubt_at = self.w._front_backoff_until = 0.0
                 self.key()
-                self.assertGreater(self.w.last_unknown_at, 0.0)
+                self.assertTrue(self.counted_unknown())
                 self.assertEqual(self.w.last_input_where({NE})[1], "unknown")
                 self.assertGreater(self.ex._last_input_at(), 0.0)   # noqa: SLF001
         # the app with the keyboard is itself no ordinary app (Spotlight's field, say): unknown, it counts
         self.front["pid"] = DOCK
         self.w.front_pid = lambda: self.front["pid"]
-        self.w.last_unknown_at = self.w._front_backoff_until = 0.0
+        self.w.last_unknown_at = self.w.last_doubt_at = self.w._front_backoff_until = 0.0
         self.fields[40] = 0
+        self.key()
+        self.assertTrue(self.counted_unknown())
+        self.w.last_unknown_at = self.w.last_doubt_at = self.w._front_backoff_until = 0.0
+        self.observe_front()                               # seen, too: a front that is no ordinary app counts
         self.key()
         self.assertGreater(self.w.last_unknown_at, 0.0)
 
     def test_input_to_deskmind_stays_excluded(self):
         self.front["pid"] = DESKMIND                       # the user answering DeskMind's card from the keyboard
+        self.observe_front()                               # with no front seen, a key with no target counts (main)
         self.key()
         self.fields[40] = DESKMIND                         # ... or a key the window server routed to it
         self.key()
@@ -333,8 +351,8 @@ class KeysGoToTheAppInFront(_KeysCase):
         ex._front = lambda: "文本编辑"                       # noqa: SLF001
         ex.observe(W12)
         e0 = ex.snapshot()["epoch"]
-        _t.sleep(0.01)
         self.front["pid"] = ITERM
+        self.observe_front()
         self.key()
         self.assertEqual(ex.snapshot()["epoch"], e0)       # typing in the terminal: no change
         _t.sleep(0.01)
@@ -351,16 +369,15 @@ class KeysAtTheFlashsEdge(_KeysCase):
 
     def test_a_late_callback_does_not_read_the_front_for_the_key(self):
         """A key typed in the task's app during a flash, its callback run after the front went back to iTerm2: the
-        key keeps its target and counts, as before the PR, rather than being put on iTerm2."""
-        calls = []
-        self.w.front_pid = lambda: calls.append(1) or ITERM
+        key counts, as before the PR, rather than being put on iTerm2. The front is read at the callback (evidence
+        for the span, since e8fa010's review), but a read past the key's freshness names no app."""
+        self.w.front_pid = lambda: ITERM
         self.fields[40] = DOCK
         self.fields["ts"] = _uptime_ns() - 300_000_000      # the key happened 0.3 s before its callback
         self.key()
-        self.assertGreater(self.w.last_unknown_at, 0.0)
+        self.assertTrue(self.counted_unknown())
         self.assertNotIn("com.googlecode.iterm2", self.w.last_by_bundle)
         self.assertGreater(self.ex._last_input_at(), 0.0)   # noqa: SLF001 -- the task is staled
-        self.assertEqual(calls, [])                          # the front is not even asked
 
     def test_a_late_key_inside_a_step_counts_for_the_steps_app_whoever_is_in_front_later(self):
         """The step is the fallback: a fresh read names the app (the terminal); a late callback, inside the step,
@@ -368,20 +385,24 @@ class KeysAtTheFlashsEdge(_KeysCase):
         step = self.w.step_began(NE)                       # the executor: a step in NetEase Music begins (a flash)
         self.front["pid"] = ITERM
         self.fields[40] = DOCK
-        self.key()                                         # fresh, during the step: the read decides
+        self.key()                                         # fresh, during the step: the read names the terminal ...
         self.assertIn("com.googlecode.iterm2", self.w.last_by_bundle)
-        self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001
+        self.assertGreater(self.ex._last_input_at(), 0.0)  # noqa: SLF001 -- ... but a step is under way: as on main
         self.w.step_ended(step)
+        self.ex._action_end_at = self.w.mark()             # where main moved its mark at the action's end ...
+        self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001 -- ... wiped there, as on main
         self.w.last_by_bundle.clear()
         self.fields["ts"] = _uptime_ns() - 200_000_000      # typed 0.2 s ago, inside the step; its callback runs late
         self.key()
         self.assertIn(NE, self.w.last_by_bundle)
         self.assertGreater(self.ex._last_input_at(), 0.0)   # noqa: SLF001
-        # long after the step (and its margin): the front decides again
-        step[1] -= 10
-        step[2] -= 10
+        # long after the step (and its margin), the front seen: the front decides again
+        for i in (1, 2, 4, 5):
+            step[i] -= 10
         self.w.last_by_bundle.clear()
+        self.w.last_doubt_at = 0.0
         self.fields.pop("ts")
+        self.observe_front()
         self.key()
         self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001
         self.assertIn("com.googlecode.iterm2", self.w.last_by_bundle)
@@ -518,7 +539,7 @@ class WhatTheLookupLearns(_EpochCase):
         self.fields[40] = DOCK
         self.key()
         self.assertNotIn("com.googlecode.iterm2", self.w.last_by_bundle)
-        self.assertGreater(self.w.last_unknown_at, 0.0)    # kept its target: unknown, and it counts
+        self.assertTrue(self.counted_unknown())            # kept its target: unknown, and it counts
         self.assertEqual(ex.snapshot()["epoch"], e + 1)
 
 class LookupDelaysProperty(_EpochCase):
@@ -526,7 +547,8 @@ class LookupDelaysProperty(_EpochCase):
     lookup -- whether a pid is DeskMind's (own), whether it is an ordinary app (regular), the app with the keyboard
     (front), the step under way (step) -- alone and in every combination, delayed past the key's freshness window,
     with an action moving the epoch's mark from another thread in the middle of each delay. Whatever the delays:
-    (1) the key stales the next snapshot, or is provably DeskMind's own (it had the keyboard, known while fresh);
+    (1) the key stales the next snapshot (with no front observed nothing proves it went elsewhere; at d6a29ed this
+    said "or is provably DeskMind's own, known from a fresh read", which the review at e8fa010 took away);
     (2) no key is put on an app other than the task's once its freshness window has passed.
     Fails at d6a29ed for the reviewer's two cases among others: a slow first lookup of the front's pid with the task's
     app in front (recorded behind the mark), and a slow first lookup of the Dock target with iTerm2 in front later
@@ -598,12 +620,9 @@ class LookupDelaysProperty(_EpochCase):
                 on_other = "com.googlecode.iterm2" in w.last_by_bundle
                 if late or in_flash:
                     self.assertFalse(own or on_other, "attributed away from the task's app")
-                if front_app == MUSIC or late or in_flash:
-                    self.assertTrue(stales, "the key did not stale the next snapshot")
-                elif front_app == DESKMIND:
-                    self.assertTrue(own and not stales)    # fresh, DeskMind had the keyboard: the user answering it
-                else:
-                    self.assertTrue(on_other and not stales)   # fresh, the terminal had the keyboard: not the task's
+                # no front observed here: a fresh read alone (DeskMind's, the terminal's) is no proof that the key
+                # went elsewhere since the review at e8fa010 -- it counts, as on main (ObservedFront: with the proof)
+                self.assertTrue(stales, "the key did not stale the next snapshot")
 
 class WaitAndBackground(_EpochCase):
     """A step spans the driver's wait for the user to pause (up to HANDS_FLASH_WAIT_S; 1800 s in the app), and the
@@ -1163,9 +1182,11 @@ class StepsClose(_KeysCase):
     def test_a_step_never_closed_ends_at_its_deadline(self):
         from deskmind_hands import inputwatch as iw
         token = self.w.step_began(NE)
-        token[1] -= iw.STEP_MAX_S + 10                     # began long ago (and its deadline with it) ...
-        token[3] -= iw.STEP_MAX_S + 10                     # ... its end never told
+        for i in (1, 3, 4, 6):
+            token[i] -= iw.STEP_MAX_S + 10                 # began long ago (and its deadline with it), on both clocks
         self.assertEqual(self.w.step_at(time.time()), "")
+        self.assertFalse(self.w.in_flight(time.monotonic() - 1, time.monotonic()))   # its end never told: over
+        self.observe_front()
         self.fields[40] = DOCK
         self.key()                                         # a Command key in the terminal now
         self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001 -- not put on that step's app
@@ -1292,6 +1313,15 @@ class MainIsTheFloor(_EpochCase):
         ("command_key_in_the_task_app_between_steps", True, True, False),
         ("plain_key_into_the_task_app_between_steps", True, True, False),
         ("late_callback_of_a_key_typed_in_the_task_app", True, True, False),
+        # the review at e8fa010
+        ("brief_front_blip_during_a_step", True, True, False),
+        ("routed_after_a_read_past_the_keys_time", True, True, False),
+        ("wall_clock_stepped_back_key_in_the_task_app", True, True, False),
+        ("hung_poller_key_in_the_task_app", True, True, False),
+        ("dead_poller_key_in_the_task_app", True, True, False),
+        ("key_without_a_timestamp_in_the_task_app", True, True, False),
+        ("slow_front_reads_key_in_the_task_app", True, True, False),
+        ("hung_poller_terminal_typing_between_steps", True, True, False),
     ]
 
     # -- the mocked system ---------------------------------------------------------------------------------------
@@ -1486,9 +1516,110 @@ class MainIsTheFloor(_EpochCase):
         self._step(ex, stub, inner)
 
     def terminal_typing_between_steps(self, ex, stub):
+        """The exception: every piece of evidence there -- nothing of the driver's under way over the key's span
+        (the step ended more than FRONT_MARGIN_S before), the front seen throughout, the read at the callback the
+        terminal, no app of the task's seen."""
         self._step(ex, stub, lambda d: None)
         self.focus(ITERM)
+        threading.Event().wait(0.15)
         self.cmd_key()
+
+    def brief_front_blip_during_a_step(self, ex, stub):
+        """TextEdit came forward by itself for ~4 ms during a step, between two reads; a Command key landed in it
+        (hands#62 review at e8fa010, B1a): the record cannot see it, the step under way makes it count."""
+        when = {}
+
+        def inner(d):
+            self.front["pid"] = MUSIC
+            when["at"] = time.time()
+            threading.Event().wait(0.004)
+            self.front["pid"] = ITERM
+        self._step(ex, stub, inner)
+        self.cmd_key(at=when["at"])
+
+    def routed_after_a_read_past_the_keys_time(self, ex, stub):
+        """Stamped at t, a read after it says the terminal, TextEdit came forward 30 ms after t and the key was routed
+        to it: the span runs to the callback's start (B1c)."""
+        self._step(ex, stub, lambda d: None)
+        self.focus(ITERM)
+        threading.Event().wait(0.15)
+        at = time.time()
+        threading.Event().wait(0.03)                       # at least one read of the terminal after the key's time
+        self.focus(MUSIC, settle=False)
+        threading.Event().wait(0.04)
+        self.cmd_key(at=at)
+
+    def wall_clock_stepped_back_key_in_the_task_app(self, ex, stub):
+        """The user in the terminal; the wall clock steps back 0.4 s; they switch to TextEdit and type a Command key
+        (B1d): reads stamped by the stepped clock were dropped as older than the record, and the key's span fell on
+        the terminal's history. The record and the span are on the monotonic clock now."""
+        self._step(ex, stub, lambda d: None)
+        self.focus(ITERM)
+        threading.Event().wait(0.6)
+        real = time.time
+        with mock.patch.object(time, "time", lambda: real() - 0.4):
+            self.focus(MUSIC)
+            self.cmd_key()
+
+    def _hang_poller(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        real = self.w.front_pid
+        self.w.front_pid = lambda: (gate.wait(3), real())[1]
+        threading.Event().wait(0.05)
+
+    def hung_poller_key_in_the_task_app(self, ex, stub):
+        self._step(ex, stub, lambda d: None)
+        self._hang_poller()
+        self.focus(MUSIC, settle=False)
+        at = time.time()
+        self.focus(ITERM, settle=False)
+        self.cmd_key(at=at)
+
+    def hung_poller_terminal_typing_between_steps(self, ex, stub):
+        """Nothing seen, so nothing proves the terminal had it: counted, as on main."""
+        self._step(ex, stub, lambda d: None)
+        self.focus(ITERM)
+        self._hang_poller()
+        threading.Event().wait(0.2)
+        self.cmd_key()
+
+    def dead_poller_key_in_the_task_app(self, ex, stub):
+        self._step(ex, stub, lambda d: None)
+        if hasattr(self.w, "_poll_stop"):
+            self.w.front_pid = lambda: (_ for _ in ()).throw(SystemExit())   # the poller's thread dies
+            threading.Event().wait(0.05)
+            self.w.front_pid = lambda: self.front["pid"]
+        self.focus(MUSIC, settle=False)
+        at = time.time()
+        self.focus(ITERM, settle=False)
+        threading.Event().wait(0.2)
+        self.cmd_key(at=at)
+
+    def key_without_a_timestamp_in_the_task_app(self, ex, stub):
+        self._step(ex, stub, lambda d: None)
+        self.focus(MUSIC)
+        self.focus(ITERM, settle=False)
+        self.fields[40] = DOCK
+        with mock.patch.object(InputWatch, "_event_age", staticmethod(lambda Q, e: None)):
+            self.key()
+
+    def slow_front_reads_key_in_the_task_app(self, ex, stub):
+        """Each read takes ~120 ms: TextEdit in front for ~100 ms between two reads, a Command key into it."""
+        self._step(ex, stub, lambda d: None)
+        real = self.w.front_pid
+
+        def slow():
+            threading.Event().wait(0.12)
+            return real()
+        self.w.front_pid = slow
+        self.focus(ITERM)
+        threading.Event().wait(0.3)
+        self.front["pid"] = MUSIC
+        at = time.time()
+        threading.Event().wait(0.1)
+        self.front["pid"] = ITERM
+        self.cmd_key(at=at)
 
     def command_key_in_the_task_app_between_steps(self, ex, stub):
         self._step(ex, stub, lambda d: None)
@@ -1545,10 +1676,11 @@ class MainIsTheFloor(_EpochCase):
 
 
 class ObservedFront(_KeysCase):
-    """The front as observed (front_seen / fronts_between): runs of reads, each taken to reach back to the read
-    before it and on to the read after it; a gap leaves the span unknown, and the key then goes by the fallbacks."""
+    """The front as observed (front_seen / fronts_between, monotonic seconds): runs of reads, each taken to reach back
+    to the read before it and on to the read after it; time between two reads further apart than FRONT_GAP_S -- from
+    the one's start to the other's answer -- is unseen, and a key over it counts as main counted it."""
 
-    def test_an_app_seen_in_front_over_the_keys_time_is_found_and_a_change_reaches_both_reads(self):
+    def test_an_app_seen_in_front_over_the_span_is_found_and_a_change_reaches_both_reads(self):
         w, t = self.w, 1000.0
         for i in range(5):
             w.front_seen(ITERM, t + i * 0.02)
@@ -1559,53 +1691,216 @@ class ObservedFront(_KeysCase):
         self.assertIsNone(w.fronts_between(t - 1, t + 0.05, wait_s=0))      # nothing read before the span
         self.assertIsNone(w.fronts_between(t + 0.1, t + 0.5, wait_s=0))     # nor after it
 
-    def test_a_gap_in_the_reads_over_the_span_says_nothing(self):
+    def test_time_between_reads_too_far_apart_or_a_slow_read_is_unseen(self):
         from deskmind_hands import inputwatch as iw
         w, t = self.w, 1000.0
         w.front_seen(ITERM, t)
         w.front_seen(ITERM, t + iw.FRONT_GAP_S + 0.05)    # the poller stalled in between
         self.assertIsNone(w.fronts_between(t + 0.01, t + 0.02, wait_s=0))
-        self.assertEqual(w.fronts_between(t + iw.FRONT_GAP_S + 0.05, t + iw.FRONT_GAP_S + 0.05, wait_s=0), [ITERM])
+        g = t + iw.FRONT_GAP_S + 0.05
+        self.assertEqual(w.fronts_between(g, g, wait_s=0), [ITERM])
+        w.front_seen(ITERM, g + 0.02, g + 0.14)            # a read that took 120 ms ...
+        w.front_seen(ITERM, g + 0.16, g + 0.28)            # ... and another: an app in front between is not seen
+        self.assertIsNone(w.fronts_between(g + 0.05, g + 0.1, wait_s=0))
+
+    def test_a_read_older_than_the_last_never_moves_the_record_back(self):
+        w = self.w
+        w.front_seen(ITERM, 1000.0)
+        w.front_seen(MUSIC, 999.0)
+        self.assertEqual(w._front_runs, [[ITERM, 1000.0, 1000.0, False]])
 
     def _seen(self, *runs):
-        """The poller's reads: (pid, seconds) runs, oldest first, the last one read again just after the key."""
+        """The poller's reads: (pid, seconds) runs, oldest first, ending now; the last one read again just after."""
         self.w._front_runs.clear()
-        t = time.time() - sum(s for _, s in runs)
+        t = time.monotonic() - sum(secs for _, secs in runs)
         for pid, secs in runs:
-            for i in range(int(secs / 0.02)):
+            for i in range(int(round(secs / 0.02))):
                 self.w.front_seen(pid, t + i * 0.02)
             t += secs
-        self.w.front_seen(runs[-1][0], time.time() + 0.05)
+        self.w.front_seen(runs[-1][0], time.monotonic() + 0.05)
 
     def test_a_key_counts_for_every_app_seen_and_the_terminal_alone_stales_nothing(self):
+        self.front["pid"] = ITERM
         self._seen((MUSIC, 0.3), (ITERM, 0.02))           # the task's app until a moment ago
         self.fields[40] = DOCK
         self.key()
         self.assertGreater(self.ex._last_input_at(), 0.0)  # noqa: SLF001
         self.w.last_by_bundle.clear()
-        self._seen((ITERM, 0.5))                           # the terminal all along
+        self._seen((ITERM, 0.5))                           # the terminal all along, nothing of the driver's under way
         self.key()
         self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001
         self.assertIn("com.googlecode.iterm2", self.w.last_by_bundle)
 
+    def test_without_every_piece_of_evidence_the_key_counts_as_on_main(self):
+        """The terminal seen all along, yet: a step under way, a flash, the read at the callback failing or naming
+        another app than the record, no timestamp -- each alone makes the key count."""
+        from deskmind_hands import inputwatch as iw
+
+        def case(prepare):
+            self.w.last_by_bundle.clear()
+            self.w.last_unknown_at = self.w.last_doubt_at = self.w._front_backoff_until = 0.0
+            self.front["pid"] = ITERM
+            self.w.front_pid = lambda: self.front["pid"]
+            self._seen((ITERM, 0.5))
+            undo = prepare()
+            self.fields[40] = DOCK
+            self.key()
+            if undo:
+                undo()
+            return self.ex._last_input_at() > 0.0          # noqa: SLF001
+        self.assertFalse(case(lambda: None))               # the exception: all the evidence there
+        step = []
+        self.assertTrue(case(lambda: step.append(self.w.step_began(NE)) or (lambda: self.w.step_ended(step[0]))))
+        tok = []
+        self.assertTrue(case(lambda: tok.append(iw.front_taken("com.example.other")) or
+                             (lambda: iw.front_given_back(tok[0]))))
+        self.assertTrue(case(lambda: setattr(self.w, "front_pid", lambda: 0)))
+        self.assertTrue(case(lambda: setattr(self.w, "front_pid", lambda: MUSIC)))
+        with mock.patch.object(InputWatch, "_event_age", staticmethod(lambda Q, e: None)):
+            self.assertTrue(case(lambda: None))
+
     def test_an_unreadable_front_counts_and_deskmind_alone_is_deskminds(self):
+        self.front["pid"] = 0
         self._seen((0, 0.3))                               # the read failed
         self.fields[40] = DOCK
         self.key()
-        self.assertGreater(self.w.last_unknown_at, 0.0)
-        self.w.last_unknown_at = 0.0
+        self.assertTrue(self.counted_unknown())
+        self.w.last_unknown_at = self.w.last_doubt_at = self.w._front_backoff_until = 0.0
+        self.front["pid"] = DESKMIND
         self._seen((DESKMIND, 0.3))
         self.key()
         self.assertGreater(self.w.last_own_at, 0.0)
-        self.assertEqual(self.w.last_unknown_at, 0.0)
+        self.assertFalse(self.counted_unknown())
+
+    def test_the_wall_clock_stepped_back_moves_nothing(self):
+        self.front["pid"] = ITERM
+        self.observe_front(settle=0.6)                     # the terminal's history
+        real = time.time
+        with mock.patch.object(time, "time", lambda: real() - 0.4):
+            self.front["pid"] = MUSIC                      # the user goes to TextEdit as the clock steps back
+            threading.Event().wait(0.08)
+            self.fields[40] = DOCK
+            self.key()
+        self.assertGreater(self.ex._last_input_at(), 0.0)  # noqa: SLF001
+
+    def test_a_hung_or_dead_poller_does_not_hold_the_taps_thread(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.w.front_pid = lambda: (gate.wait(5), ITERM)[1]
+        self.observe_front(settle=0.2)                     # its first read hangs
+        self.fields[40] = DOCK
+        t = time.monotonic()
+        for _ in range(10):
+            self.key()
+        self.assertLess(time.monotonic() - t, 0.3)         # was ~100 ms a key (hands#62 review at e8fa010)
+        self.assertGreater(self.ex._last_input_at(), 0.0)  # noqa: SLF001 -- nothing seen: it counts
+        gate.set()
+        w2 = InputWatch()
+        w2.front_pid = lambda: (_ for _ in ()).throw(SystemExit())   # the poller's thread dies at its first read
+        w2.watch_front()
+        threading.Event().wait(0.05)
+        t = time.monotonic()
+        self.assertIsNone(w2.fronts_between(time.monotonic() - 0.1, time.monotonic()))
+        self.assertLess(time.monotonic() - t, 0.05)
 
     def test_the_poller_reads_the_front_and_a_stopped_one_is_not_waited_for(self):
-        self.w.watch_front()
-        self.addCleanup(self.w.stop_front)
         self.front["pid"] = MUSIC
-        threading.Event().wait(0.1)
-        self.assertEqual(self.w.fronts_between(time.time() - 0.05, time.time()), [MUSIC])
+        self.observe_front(settle=0.1)
+        self.assertEqual(self.w.fronts_between(time.monotonic() - 0.05, time.monotonic()), [MUSIC])
         self.w.stop_front()
         t = time.monotonic()
-        self.assertIsNone(self.w.fronts_between(time.time() + 1, time.time() + 2))
+        self.assertIsNone(self.w.fronts_between(time.monotonic() + 1, time.monotonic() + 2))
         self.assertLess(time.monotonic() - t, 0.05)
+
+    def test_every_begin_shares_one_watch(self):
+        from deskmind_hands import executor as exe
+        made = []
+
+        class W(InputWatch):
+            def start(self):
+                made.append(self)
+                return True
+        self.addCleanup(exe._SHARED_WATCH.clear)
+        exe._SHARED_WATCH.clear()
+        with mock.patch.object(exe, "InputWatch", W):
+            for _ in range(3):
+                ex = exe.HandsExecutor.__new__(exe.HandsExecutor)
+                ex._watch_tried, ex._watch, ex.drivers, ex.current = False, None, {}, {}
+                ex._last_input_at()                        # noqa: SLF001
+        self.assertEqual(len(made), 1)
+
+
+class EvidenceProperty(_KeysCase):
+    """Random interleavings of front changes (blips shorter than a read included), reads (some slow, some missing),
+    driver actions under way (steps, flashes) and Command keys whose callbacks run at once or late: main counted every
+    one of these keys; the branch counts each, unless the evidence held -- nothing of the driver's under way over the
+    key's span, that span seen without a gap, the read at the callback answered and among the apps seen, and none of
+    them the task's (hands#62 review at e8fa010). The oracle reads the simulated reads directly."""
+
+    def test_the_branch_counts_wherever_main_counts_unless_the_evidence_held(self):
+        import random
+        from deskmind_hands import inputwatch as iw
+        rng = random.Random(62)
+        w = self.w
+        pids = [ITERM, ITERM, MUSIC, DESKMIND, 0]
+        task = "com.apple.textedit"
+        w._pid_bundle[MUSIC] = TE
+        dropped = 0
+        for trial in range(400):
+            w._front_runs.clear(); w._steps = []; iw.FLASHES.clear()
+            w.last_by_bundle.clear(); w.last_unknown_at = w.last_doubt_at = w.last_own_at = 0.0
+            w._front_backoff_until = 0.0
+            now_m, now_w = time.monotonic(), time.time()
+            base = now_m - 4.0
+            segs, t = [], base                              # the truth: who had the keyboard when
+            while t < now_m + 1.0:
+                d = rng.choice([0.003, 0.01, 0.05, 0.2, 0.6])
+                segs.append((t, t + d, rng.choice(pids)))
+                t += d
+
+            def truth(x):
+                for a, b, p in segs:
+                    if a <= x < b:
+                        return p
+                return segs[-1][2]
+            reads, r = [], base
+            while r < now_m + 0.8:
+                dur = 0.12 if rng.random() < 0.05 else 0.0003
+                if rng.random() > 0.03:                     # a read now and then never happens
+                    reads.append((r, r + dur, truth(r + rng.random() * dur)))
+                r += dur + 0.02
+            for a, b, p in reads:
+                w.front_seen(p, a, b)
+            for _ in range(rng.choice([0, 0, 1, 2])):
+                a = base + rng.random() * 3.5
+                b = a + rng.choice([0.05, 0.3, 1.0])
+                tok = (w.step_began(TE) if rng.random() < 0.5 else iw.front_taken(TE))
+                tok[4], tok[5], tok[6] = a, b, b + 100
+                tok[1], tok[2], tok[3] = a - now_m + now_w, b - now_m + now_w, b - now_m + now_w + 100
+            ev = base + 0.5 + rng.random() * 3.0
+            t0 = ev + rng.choice([0.0005, 0.003, 0.03, 0.3])
+            w.front_pid = lambda t0=t0: truth(t0)
+            self.fields[40] = DOCK
+            w.note(DOCK, key=True, age=t0 - ev, t0=t0)
+            counted = w.last_input_for({task}) > 0.0
+
+            # -- the oracle, from the reads themselves
+            a, b = ev - iw.FRONT_MARGIN_S, t0
+            busy = any(tok[4] <= b and (tok[5] + (iw.FLASH_MARGIN_S if tok in iw.FLASHES else 0)) >= a
+                       for tok in list(w._steps) + list(iw.FLASHES))
+            covered = any(x[0] <= a for x in reads) and any(x[0] >= b for x in reads)
+            seen, gap = [], False
+            for i, (ra, rb, p) in enumerate(reads):
+                lo = reads[i - 1][0] if i else ra
+                hi = reads[i + 1][0] if i + 1 < len(reads) else ra
+                if i + 1 < len(reads) and reads[i + 1][1] - ra > iw.FRONT_GAP_S and ra < b and reads[i + 1][0] > a:
+                    gap = True
+                if hi >= a and lo <= b:
+                    seen.append(p)
+            at_callback = truth(t0)
+            evidence = (not busy and covered and not gap and at_callback and at_callback in seen
+                        and MUSIC not in seen and 0 not in seen)
+            with self.subTest(trial=trial):
+                self.assertTrue(counted or evidence, (trial, ev - base, t0 - ev, busy, covered, gap, seen))
+            dropped += not counted
+        self.assertGreater(dropped, 20)                     # the exception does happen: the property is not vacuous

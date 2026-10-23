@@ -245,6 +245,9 @@ class HandsExecutor:
         #: of the Mac. None until the first snapshot; stays None when no tap can be made, and every input then counts.
         self._watch: InputWatch | None = None
         self._watch_tried = False
+        #: Where main moved the epoch's mark at every action's end: a key counted as main counted it (a doubt, see
+        #: InputWatch.note) and recorded before it is wiped as it was on main; every other input is not.
+        self._action_end_at = 0.0
         self.drivers: dict[str, object] = {}
         self.last_obs: dict[str, Observation] = {}       # window id -> last observation (for bindings)
         #: bundle -> the window its driver observed last: the one whose snapshot and element ids the driver holds.
@@ -376,7 +379,7 @@ class HandsExecutor:
         # (PeekabooDriver's foreground route), so a flash never takes keystrokes meant for another app.
         w = getattr(self, "_watch", None)
         if w is not None and w.active and w.keys:
-            return time.time() - w.last_input_for(self._task_bundles()) < self.USER_ACTIVE_S
+            return time.time() - w.last_input_for(self._task_bundles(), self._doubt_after()) < self.USER_ACTIVE_S
         if Quartz is None:
             return False
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
@@ -431,10 +434,9 @@ class HandsExecutor:
         tap: the permission is not there): when the keyboard or mouse was last touched at all."""
         if not self._watch_tried:
             self._watch_tried = True
-            w = InputWatch()
-            self._watch = w if w.start() else None
+            self._watch = shared_watch()
         if self._watch is not None and self._watch.active:
-            at = self._watch.last_input_for(self._task_bundles())
+            at = self._watch.last_input_for(self._task_bundles(), self._doubt_after())
             if self._watch.keys or Quartz is None:
                 return at
             # a mouse-only tap: every key press counts, wherever it went (the safe side)
@@ -584,8 +586,10 @@ class HandsExecutor:
         input_at = self._last_input_at()
         if input_at > self._epoch_at or changed:
             if input_at > self._epoch_at:
-                where = (self._watch.last_input_where(task)[1] if self._watch is not None and self._watch.active
-                         and self._watch.last_input_for(task) >= input_at else "any (no per-app watch)")
+                where = (self._watch.last_input_where(task, self._doubt_after())[1]
+                         if self._watch is not None and self._watch.active
+                         and self._watch.last_input_for(task, self._doubt_after()) >= input_at
+                         else "any (no per-app watch)")
                 reason = {"by": "input", "to": where, "input_at": round(input_at, 3)}
             else:
                 b = changed[0]
@@ -966,7 +970,12 @@ class HandsExecutor:
             # match (hands#62 re-review). Without the tap (the HID idle time) or without keys (a mouse-only tap
             # counts key presses by the idle time), ours and theirs cannot be told apart: moved as before.
             self._epoch_at = self._mark_now()
+        # where main's mark went: a key counted only as main counted it, recorded before this, is wiped as on main
+        self._action_end_at = self._mark_now()
         return out
+
+    def _doubt_after(self) -> float:
+        return getattr(self, "_action_end_at", 0.0)
 
     def _input_by_source(self) -> bool:
         """Whether every input the epoch counts is told by its source, so the driver's own is already left out."""
@@ -1310,6 +1319,21 @@ class HandsExecutor:
                 pass
         self.drivers = {}
         return {"closed": True}
+
+
+#: The process's input watch: one tap and one front poller for every executor `begin` makes (hands#62 review at
+#: e8fa010: each begin started another tap and another 50 Hz poller, and nothing stopped them).
+_SHARED_WATCH: dict = {}
+_SHARED_LOCK = threading.Lock()
+
+
+def shared_watch() -> InputWatch | None:
+    """The process's input watch, started the first time it is asked for; None when no tap can be made."""
+    with _SHARED_LOCK:
+        if "watch" not in _SHARED_WATCH:
+            w = InputWatch()
+            _SHARED_WATCH["watch"] = w if w.start() else None
+        return _SHARED_WATCH["watch"]
 
 
 def main() -> None:

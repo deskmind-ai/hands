@@ -240,6 +240,53 @@ class EveryKindKeepsTheMargin(unittest.TestCase):
         self.assertEqual(d.acted, [])
 
 
+class KindsBoundedByWhatTheyTake(unittest.TestCase):
+    """A wait sleeps at most until the margin; an open_window needs its worst case (OPEN_WINDOW_WORST_S) left, not only
+    the margin; a look is not started a few seconds before its deadline (review of hands#64)."""
+
+    def setUp(self):
+        self.addCleanup(mock.patch.stopall)
+        self.d = FlashDriver(Clock(), busy_s=0.0)
+        self.ex = _executor(self.d)
+
+    def test_a_wait_ends_at_the_margin(self):
+        t0 = time.time()
+        r = self.ex.perform({"kind": "wait", "ms": 20_000}, deadline=time.time() + DEADLINE_MARGIN_S + 0.3)
+        self.assertEqual(r["status"], "ok")
+        self.assertLess(time.time() - t0, 2.0)
+
+    def test_an_open_needs_its_worst_case_left(self):
+        from deskmind_hands.executor import HandsExecutor
+        opened = []
+        self.ex._open_window = lambda app, url: opened.append(app) or {"status": "ok", "files": []}   # noqa: SLF001
+        worst = getattr(HandsExecutor, "OPEN_WINDOW_WORST_S", 40.0)
+        r = self.ex.perform({"kind": "open_window", "app": "网易云音乐"}, deadline=time.time() + worst - 5)
+        self.assertEqual((r["status"], r.get("performed"), opened), ("error", False, []))   # past the margin, short of the worst
+        self.assertEqual(self.ex.perform({"kind": "open_window", "app": "网易云音乐"}, deadline=time.time() + worst + 5)["status"], "ok")
+        self.assertEqual(opened, ["网易云音乐"])
+
+    def test_a_look_is_not_started_seconds_before_its_deadline(self):
+        from deskmind_hands import executor as exe
+        looked = []
+
+        class Fake:
+            def __init__(self, *a, **k):
+                pass
+
+            def snapshot(self):
+                return {"epoch": 1}
+
+            def observe(self, window, screenshot=False, deadline=None):
+                looked.append(window)
+                return {"epoch": 1}
+        lines = [{"id": 1, "op": "begin"}, {"id": 2, "op": "observe", "window": WIN, "deadline_ms": time.time() * 1000 + 3_000}]
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO("".join(json.dumps(m) + "\n" for m in lines))), \
+                mock.patch.object(sys, "stdout", out), mock.patch.object(exe, "HandsExecutor", Fake):
+            exe.main()
+        self.assertEqual(looked, [])
+
+
 class PopupDriver(FlashDriver):
     """A window with three pop-up buttons whose choices are read through accessibility (opening each menu for a
     moment, so only while the Mac is still)."""

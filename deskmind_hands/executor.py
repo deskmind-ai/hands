@@ -30,8 +30,9 @@ One JSON request per line on stdin, one JSON reply per line on stdout (`{"id", "
 request never outlives it. A wait for a still Mac (a step that needs the front, a pop-up's choices) ends
 DEADLINE_MARGIN_S before it, leaving time for the action and the reads after it; a perform that could not act in time
 answers `status: "user_busy"` (the user kept using the Mac) or `"error"`, both with `performed: false` -- nothing was
-sent. An observe's pop-ups share the one deadline and the choices not read are named in `notes`. A request read
-after its deadline is not carried out. Without `deadline_ms`, HANDS_FLASH_WAIT_S alone bounds the waits, as before.
+sent. No kind starts inside the margin; an open_window not with less than OPEN_WINDOW_WORST_S left, and a wait sleeps
+at most until the margin. An observe's pop-ups share the one deadline and the choices not read are named in `notes`;
+a look read within OBSERVE_MARGIN_S of its deadline is not started. Without `deadline_ms`, HANDS_FLASH_WAIT_S alone bounds the waits, as before.
 
 While a request waits for the user, event lines go out beside the replies (they have no `id`):
 `{"event": "user_wait", "req": <request id>, "reason": "user_active", "app", "what"}`, then
@@ -82,6 +83,10 @@ def takeover_until() -> float:
         return float(Path(path).read_text().strip() or 0) if path else 0.0
     except (OSError, ValueError):
         return 0.0
+
+
+#: A look read this close to its deadline is not started: it could not finish (a pop-up's choices, the reply).
+OBSERVE_MARGIN_S = 5.0
 
 
 def allow_flash(bundle: str) -> None:
@@ -868,9 +873,17 @@ class HandsExecutor:
         kind = action.get("kind")
         self._advance({"by": "action", "kind": kind or "", "window": action.get("window") or ""})
         if kind == "wait":
-            time.sleep(min(float(action.get("ms") or 0) / 1000, 30))
+            # at most until the margin before the caller's deadline: a wait that ran past it answered late
+            by = act_by(getattr(self, "_caller_deadline", None))
+            time.sleep(max(0.0, min(float(action.get("ms") or 0) / 1000, 30, *((by - time.time(),) if by is not None else ()))))
             return {"status": "ok", "files": []}
         if kind == "open_window":
+            # an open takes up to OPEN_WINDOW_WORST_S (a launch waited for, the windows settling, a page loading): not
+            # started unless that much time is left before the caller's deadline
+            deadline = getattr(self, "_caller_deadline", None)
+            if deadline is not None and time.time() > min(act_by(deadline), deadline - self.OPEN_WINDOW_WORST_S):
+                return {"status": "error", "performed": False,
+                        "why": "the caller's deadline is too close to open a window in time; nothing was done"}
             return self._open_window(action.get("app") or "", action.get("url"))
         window = action.get("window") or ""
         bundle, wid = self._split(window)
@@ -1350,6 +1363,10 @@ class HandsExecutor:
 
     #: How long a launched app is waited for to show its first window.
     LAUNCH_WAIT_S = 20.0
+    #: The longest an open_window takes, start to reply: the launch waited for (LAUNCH_WAIT_S), the windows settling
+    #: (_settled, 10 s), and the rest (the page's title, the reads after). It does not start with less left.
+    OPEN_WINDOW_WORST_S = LAUNCH_WAIT_S + 20.0
+
 
     def _launch_windows(self, bundle: str, before: set, seconds: float) -> list[dict]:
         """The windows of `bundle` that appeared after its launch: waited for up to `seconds` until the first, then a
@@ -1486,7 +1503,7 @@ def main() -> None:
             write({"id": rid, "ok": True, "result": {"status": "error", "performed": False,
                                                      "why": "read too late for the caller's deadline; nothing was done"}})
             continue
-        if op == "observe" and deadline is not None and time.time() > deadline:
+        if op == "observe" and deadline is not None and time.time() > deadline - OBSERVE_MARGIN_S:
             write({"id": rid, "ok": False, "error": "read after the caller's deadline; not looked at"})
             continue
         extra = {"deadline": deadline} if deadline is not None else {}

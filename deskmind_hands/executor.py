@@ -379,7 +379,9 @@ class HandsExecutor:
         # (PeekabooDriver's foreground route), so a flash never takes keystrokes meant for another app.
         w = getattr(self, "_watch", None)
         if w is not None and w.active and w.keys:
-            return time.time() - w.last_input_for(self._task_bundles(), self._doubt_after()) < self.USER_ACTIVE_S
+            # every input of the last USER_ACTIVE_S, a doubt included whatever mark an action left: main looked at
+            # the time alone (hands#62 delta review at f0f7186)
+            return time.time() - w.last_input_for(self._task_bundles()) < self.USER_ACTIVE_S
         if Quartz is None:
             return False
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
@@ -1086,7 +1088,17 @@ class HandsExecutor:
     def _open_window(self, app: str, url: str | None) -> dict:
         """Open a window of `app` (a bundle id, or a name as the snapshot shows it) and wait for it. No app is named
         in code: the name is resolved to a bundle id generically, and a new document is asked for the way any
-        document-based app answers (its own scripting, by bundle id), then by the keyboard."""
+        document-based app answers (its own scripting, by bundle id), then by the keyboard. The whole of it is a step
+        for the input watch -- under way, so a key with no app target meanwhile counts as on main: `open -g -b` with
+        a URL, `make new document` and the run's own browser window can each bring an app forward (hands#62 delta
+        review at f0f7186: only the launch was marked)."""
+        step = self._step_began((app or "").lower())
+        try:
+            return self._open_window_now(app, url)
+        finally:
+            self._step_ended(step)
+
+    def _open_window_now(self, app: str, url: str | None) -> dict:
         bundle = resolve_app(app, running_apps(), installed_apps())
         if not bundle:
             return {"status": "unsupported", "why": f"no application called {app!r} is running or installed"}
@@ -1328,12 +1340,17 @@ _SHARED_LOCK = threading.Lock()
 
 
 def shared_watch() -> InputWatch | None:
-    """The process's input watch, started the first time it is asked for; None when no tap can be made."""
+    """The process's input watch, started the first time it can be; None when no tap can be made now. Only a watch
+    that started is kept: one that could not (the permission not yet granted) is tried again by the next executor,
+    as each run tried its own before (hands#62 review at f0f7186). Made under the lock, so two never start at once."""
     with _SHARED_LOCK:
-        if "watch" not in _SHARED_WATCH:
+        w = _SHARED_WATCH.get("watch")
+        if w is None:
             w = InputWatch()
-            _SHARED_WATCH["watch"] = w if w.start() else None
-        return _SHARED_WATCH["watch"]
+            if not w.start():
+                return None
+            _SHARED_WATCH["watch"] = w
+        return w
 
 
 def main() -> None:

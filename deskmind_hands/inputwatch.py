@@ -24,9 +24,10 @@ site, then a polled record of it, each missed a case; polling never sees every m
    from FRONT_MARGIN_S before its own time (monotonic: the callback's start less the event's age) to the callback's
    start (the annotated tap sees an event after its target was decided);
 2. the front as observed has no unseen time over that span: the app with the keyboard is read every FRONT_POLL_S on
-   a thread of the watch's own (front_seen, monotonic), and two reads further apart than FRONT_GAP_S, from the one's
-   start to the other's answer, leave the time between unseen (the callback waits for the first read after its
-   start only while that thread is live);
+   a thread of the watch's own (front_seen, monotonic), each read proving its app only at one instant between its
+   start and its answer, and every two consecutive reads from the last answered by the span's start to the first
+   begun after its end are at most FRONT_GAP_S (50 ms) apart from the one's start to the other's answer (the
+   callback waits for that last read only while the thread is live);
 3. a read at the callback answered (front_now) and is among the apps seen;
 4. then the key goes to every app seen, and none is the task's (known where the task's apps are: last_input_for).
 Otherwise the key is a doubt (last_doubt_at): it counts as main counted it -- wiped only by the mark main moved at
@@ -51,6 +52,7 @@ every input counts. Listen-only: nothing is changed or delayed.
 """
 from __future__ import annotations
 
+import collections
 import queue
 import threading
 import time
@@ -164,14 +166,23 @@ FRONT_DEADLINE_S = 0.1
 FRONT_BACKOFF_S = 0.5
 #: The longest a step of the task's is taken to last when its end is never told (step_began's default).
 STEP_MAX_S = 180.0
-#: The front, observed (InputWatch.front_seen, the poller): how often the app with the keyboard is read, the longest
-#: gap between two reads for the time between them to count as seen, and how long before a key's own time an app in
-#: front still counts for it (the event clock against the read's, and the key routed a moment before the front read
-#: changes). A read costs ~0.2 ms (500 reads at 20 ms on 10-23: median 0.2 ms, p99 9.7 ms, ~0.4% of a core).
+#: The front, observed (InputWatch.front_seen, the poller): how often the app with the keyboard is read, and how
+#: long before a key's own time an app in front still counts for it (the event clock against the read's, and the key
+#: routed a moment before the front read changes). A read costs ~0.2 ms (500 reads at 20 ms on 10-23: median 0.2 ms,
+#: p99 9.7 ms, ~0.4% of a core).
 FRONT_POLL_S = 0.02
-FRONT_GAP_S = 0.15
 FRONT_MARGIN_S = 0.1
-FRONT_RUNS = 2048
+#: The widest two consecutive reads may be apart, from the one's start to the other's answer, for nothing between
+#: them to go unseen. A read proves the front only at some instant within [start, answer], so two reads prove nothing
+#: about up to that much time between them. 50 ms is well under what a person needs to bring another app forward, type
+#: into it and go back -- three deliberate acts (a click or Command-Tab, a key, another switch), each a reaction of
+#: ~150 ms or more, and even a fast typist's keys are ~80-100 ms apart -- so no app the user typed into can sit between
+#: two such reads unseen. Normal reads are ~20 ms apart (FRONT_POLL_S plus a read's ~0.2 ms, p99 ~10 ms); a slow read
+#: (hands#62 review at f0f7186: a read begun at 20 ms answered "terminal" at 140 ms, the user in TextEdit at 125-130
+#: ms) makes a wider window, and a key over it counts, as on main.
+FRONT_GAP_S = 0.05
+#: How long the record is kept (reads, at ~50 a second: ~80 s); a key older than that counts, as on main.
+FRONT_READS = 4096
 
 
 #: The driver's flashes, process-wide: [lowercased bundle, took the front at, gave it back at or None, deadline]
@@ -309,6 +320,8 @@ class InputWatch:
         #: so it counts as input to an unknown target (PR #49 review: a Messages banner swapped the conversation an
         #: approved "type and Return" went into).
         self._pid_regular: dict[int, bool] = {}
+        #: pid -> its process's start time when it was last looked up (_check_pid)
+        self._pid_started: dict[int, float] = {}
         self._dragging = False
         #: this process and its children (Peekaboo, the key-event child): events they post are the driver's own
         #: input, not the user's -- a driver click that reached the tap after the action had ended was taken for the
@@ -327,9 +340,9 @@ class InputWatch:
         #: held while an input is recorded and while the executor's epoch mark is stamped (note, mark)
         self.lock = threading.Lock()
         self._last_stamp = 0.0
-        #: the front as observed: runs [pid (0: could not be read), first seen, last seen] (epoch seconds), oldest
-        #: first; a new run starts when the app changes or after a gap of more than FRONT_GAP_S (front_seen)
-        self._front_runs: list[list] = []
+        #: the front as observed: reads (pid (0: could not be read), begun, answered), monotonic seconds, oldest first;
+        #: each proves its pid had the keyboard at some instant between its start and its answer (front_seen)
+        self._front_reads: collections.deque = collections.deque(maxlen=FRONT_READS)
         self._front_seen = threading.Condition()
         self._poll_stop: threading.Event | None = None
         self._poll_thread: threading.Thread | None = None
@@ -340,9 +353,23 @@ class InputWatch:
         self.last_doubt_at = 0.0
 
     # -- classification (pure, testable) ---------------------------------------------------------------------
+    def _check_pid(self, pid: int) -> None:
+        """Forget what is known of `pid` when it now belongs to another process (its start time changed): the watch
+        lives as long as the process (executor.shared_watch), and a pid reused for the task's app kept the old app's
+        bundle (hands#62 delta review at f0f7186). The start time, as posted_by_us tells a reused pid."""
+        info = _proc_info(pid)
+        started = info[1] if info else None
+        known = self._pid_started.get(pid)
+        if started is not None and known is not None and started != known:
+            self._pid_bundle.pop(pid, None)
+            self._pid_regular.pop(pid, None)
+        if started is not None:
+            self._pid_started[pid] = started
+
     def is_own(self, pid: int | None) -> bool:
         if not pid:
             return False
+        self._check_pid(pid)
         bundle = self._pid_bundle.get(pid)
         if bundle is None:
             bundle = self._bundle_of(pid)
@@ -390,6 +417,11 @@ class InputWatch:
 
         # -- 1. lookups: nothing shared is written (only the lookups' own caches)
         target = kind(pid) if pid else "unknown"
+        # the rule's scope: a key with no target, or the Dock's (a Command chord). A key the window server sent to
+        # another process that is no ordinary app -- a launcher's panel, Spotlight -- counts as on main: a system
+        # surface can act on any app (PR #49; hands#62 delta review at f0f7186)
+        if key and target == "unknown" and pid and bundle(pid) != "com.apple.dock":
+            key = False
         known_age = age is not None and age >= 0
         ev_mono = t0 - age if known_age else None
         # the key's own time on the wall clock now (flashes and steps are told in epoch seconds): from t0, so a
@@ -516,59 +548,52 @@ class InputWatch:
     # -- the front, observed ---------------------------------------------------------------------------------
     def front_seen(self, pid: int, began: float | None = None, ended: float | None = None) -> None:
         """A read of the app with the keyboard: `pid` (0: it could not be read), the read begun at `began` and
-        answered at `ended` (monotonic seconds; now when not given). What it answers held at some moment in between.
-        Two reads further apart than FRONT_GAP_S -- from the one's start to the other's answer, so a slow read is a
-        gap too (hands#62 review at e8fa010: reads of ~120 ms missed an app in front ~120 ms) -- leave the time
-        between them unseen."""
+        answered at `ended` (monotonic seconds; now when not given). It proves `pid` had the keyboard at one unknown
+        instant between the two, nothing more: not from its start, not until the next read (hands#62 review at
+        f0f7186: stamped at its start, a slow read that answered "terminal" ended TextEdit's time too early)."""
         began = time.monotonic() if began is None else began
         ended = began if ended is None else max(ended, began)
         with self._front_seen:
-            runs = self._front_runs
-            if runs and began < runs[-1][2]:
+            reads = self._front_reads
+            if reads and began < reads[-1][1]:
                 return                                     # out of order: never moves the record back
-            gapped = bool(runs) and ended - runs[-1][2] > FRONT_GAP_S
-            if runs and runs[-1][0] == pid and not gapped:
-                runs[-1][2] = began
-            else:
-                runs.append([pid, began, began, gapped])
-                if len(runs) > FRONT_RUNS:
-                    del runs[: len(runs) - FRONT_RUNS]
+            reads.append((pid, began, ended))
             self._front_seen.notify_all()
 
     def _poller_live(self) -> bool:
-        """The poller runs and its last read began within FRONT_GAP_S: one that hangs, or a thread that died, is not
-        waited for (hands#62 review at e8fa010: the tap's thread was held 100 ms a key)."""
+        """The poller runs and its last read began within FRONT_DEADLINE_S: one that hangs, or a thread that died, is
+        not waited for (hands#62 review at e8fa010: the tap's thread was held 100 ms a key)."""
         t = self._poll_thread
         return (t is not None and t.is_alive() and self._poll_stop is not None and not self._poll_stop.is_set()
-                and time.monotonic() - self._read_began <= FRONT_GAP_S)
+                and time.monotonic() - self._read_began <= FRONT_DEADLINE_S)
 
     def fronts_between(self, a: float, b: float, wait_s: float | None = None) -> list[int] | None:
-        """Every pid that may have had the keyboard at some point in [a, b] (monotonic seconds), by the observed
-        front; None when the record cannot say -- no read begun by `a`, none begun at or after `b` (waited for,
-        `wait_s`, FRONT_DEADLINE_S by default, only while the poller is live), or time unseen between two reads over
-        the span. A change is seen only at the read after it, so each run is taken to reach back to the read before
-        it and on to the read after it."""
+        """Every pid the reads saw from the last read answered by `a` to the first read begun at or after `b`
+        (monotonic seconds) -- all the apps that can have had the keyboard over [a, b] for longer than FRONT_GAP_S --
+        or None when the reads cannot say that: no read answered by `a`, none begun at or after `b` (waited for,
+        `wait_s`, FRONT_DEADLINE_S by default, only while the poller is live), or two consecutive reads between them
+        further apart than FRONT_GAP_S from the one's start to the other's answer (a slow read, a stalled poller)."""
         wait_s = FRONT_DEADLINE_S if wait_s is None else wait_s
         until = time.monotonic() + wait_s
         with self._front_seen:
-            while (not self._front_runs or self._front_runs[-1][2] < b) and self._poller_live():
+            while (not self._front_reads or self._front_reads[-1][1] < b) and self._poller_live():
                 left = until - time.monotonic()
                 if left <= 0:
                     break
                 self._front_seen.wait(min(left, FRONT_POLL_S))
-            runs = [list(r) for r in self._front_runs]
-        if not runs or runs[0][1] > a or runs[-1][2] < b:
+            reads = list(self._front_reads)
+        first = max((k for k, r in enumerate(reads) if r[2] <= a), default=None)
+        if first is None:
+            return None
+        last = next((k for k in range(first + 1, len(reads)) if reads[k][1] >= b), None)
+        if last is None:
             return None
         out: list[int] = []
-        for i, (pid, first, last, gapped) in enumerate(runs):
-            prev = runs[i - 1] if i else None
-            nxt = runs[i + 1] if i + 1 < len(runs) else None
-            if gapped and prev is not None and prev[2] < b and first > a:
-                return None                                # unseen time over the span
-            lo = prev[2] if prev is not None and not gapped else first
-            hi = nxt[1] if nxt is not None and not nxt[3] else last
-            if hi >= a and lo <= b and pid not in out:
-                out.append(pid)
+        for k in range(first, last + 1):
+            if k > first and reads[k][2] - reads[k - 1][1] > FRONT_GAP_S:
+                return None                                # time over the span no read can vouch for
+            if reads[k][0] not in out:
+                out.append(reads[k][0])
         return out
 
     def polling(self) -> bool:
@@ -686,6 +711,7 @@ class InputWatch:
         return ours
 
     def is_regular(self, pid: int) -> bool:
+        self._check_pid(pid)
         if pid not in self._pid_regular:
             self._pid_regular[pid] = self._regular_of(pid)
         return self._pid_regular[pid]

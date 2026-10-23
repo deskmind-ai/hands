@@ -860,6 +860,11 @@ class HandsExecutor:
     def _perform(self, action: dict) -> dict:
         if getattr(self, "stopped", False) or STOP.is_set():
             return {"status": "error", "why": "stopped by the app"}
+        late = self._too_late_to_start()
+        if late is not None:
+            # every kind, before anything moves (the epoch included): open_window can take ~30 s, and started inside
+            # the margin it answered after the caller had given up (review of hands#64)
+            return late
         kind = action.get("kind")
         self._advance({"by": "action", "kind": kind or "", "window": action.get("window") or ""})
         if kind == "wait":
@@ -950,11 +955,10 @@ class HandsExecutor:
         try:
             if getattr(self, "stopped", False) or STOP.is_set():   # read while this step was getting ready: nothing sent
                 return {"status": "error", "why": "stopped by the app"}
-            by = act_by(deadline)
-            if by is not None and time.time() > by:
+            late = self._too_late_to_start()
+            if late is not None:
                 # the reads before the action took the caller's time: nothing is sent that it would not hear of
-                return {"status": "error", "performed": False, "window": window,
-                        "why": "the caller's deadline came before the step could act; nothing was done"}
+                return {**late, "window": window}
             res: ExecResult = d.execute(a)
         finally:
             d.caller_deadline = None
@@ -1025,6 +1029,16 @@ class HandsExecutor:
         # where main's mark went: a key counted only as main counted it, recorded before this, is wiped as on main
         self._action_end_at = self._mark_now()
         return out
+
+    def _too_late_to_start(self) -> dict | None:
+        """The reply for a step that may no longer start for its caller: past its deadline less DEADLINE_MARGIN_S
+        (base.act_by), the time kept for the action and the reads after it. None when it may start, or no caller set
+        a deadline."""
+        by = act_by(getattr(self, "_caller_deadline", None))
+        if by is None or time.time() <= by:
+            return None
+        return {"status": "error", "performed": False,
+                "why": "the caller's deadline came before the step could act; nothing was done"}
 
     def _doubt_after(self) -> float:
         return getattr(self, "_action_end_at", 0.0)
@@ -1463,16 +1477,17 @@ def main() -> None:
         rid, op = req.get("id"), req.get("op")
         state["rid"] = rid
         ex = state["ex"]
-        # `deadline_ms` (Unix ms, optional): when the caller stops waiting for this reply. A request read after it
-        # (queued behind one that took long) is not carried out: its caller has given up on it.
+        # `deadline_ms` (Unix ms, optional): when the caller stops waiting for this reply. A request read too late
+        # for it (queued behind one that took long) is not carried out: a perform past the deadline less the margin
+        # for acting (base.act_by, as every step's own check), a look past the deadline itself.
         dl = req.get("deadline_ms")
         deadline = float(dl) / 1000 if isinstance(dl, (int, float)) and not isinstance(dl, bool) else None
-        if deadline is not None and time.time() > deadline and op in ("perform", "observe"):
-            if op == "perform":
-                write({"id": rid, "ok": True, "result": {"status": "error", "performed": False,
-                                                         "why": "read after the caller's deadline; nothing was done"}})
-            else:
-                write({"id": rid, "ok": False, "error": "read after the caller's deadline; not looked at"})
+        if op == "perform" and deadline is not None and time.time() > act_by(deadline):
+            write({"id": rid, "ok": True, "result": {"status": "error", "performed": False,
+                                                     "why": "read too late for the caller's deadline; nothing was done"}})
+            continue
+        if op == "observe" and deadline is not None and time.time() > deadline:
+            write({"id": rid, "ok": False, "error": "read after the caller's deadline; not looked at"})
             continue
         extra = {"deadline": deadline} if deadline is not None else {}
         try:

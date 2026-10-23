@@ -214,6 +214,32 @@ class PerformNeverOutlivesTheCaller(unittest.TestCase):
         self.assertGreater(acted[0], 140.0)
 
 
+class EveryKindKeepsTheMargin(unittest.TestCase):
+    """open_window (up to ~30 s), close_window, focus_window and wait returned before the step's deadline check: started
+    inside the margin, an open_window answered after the caller had given up (review of hands#64). Now no kind starts
+    there, and nothing moves (not even the epoch)."""
+
+    def test_no_kind_starts_inside_the_margin(self):
+        self.addCleanup(mock.patch.stopall)
+        d = FlashDriver(Clock(), busy_s=0.0)
+        ex = _executor(d)
+        ex.observe(WIN)
+        ex._open_window = lambda app, url: self.fail("open_window started inside the margin")   # noqa: SLF001
+        ex._pk = lambda args: self.fail("close_window started inside the margin")              # noqa: SLF001
+        e0 = ex.epoch
+        inside = time.time() + DEADLINE_MARGIN_S / 2
+        for action in ({"kind": "open_window", "app": "网易云音乐", "url": "https://music.163.com"},
+                       {"kind": "close_window", "window": WIN}, {"kind": "focus_window", "window": WIN},
+                       {"kind": "wait", "ms": 20_000},
+                       {"kind": "set_value", "window": WIN, "target": "E1", "value": "x", "foreground_ok": True}):
+            t0 = time.time()
+            r = ex.perform(action, deadline=inside)
+            self.assertEqual((r["status"], r.get("performed")), ("error", False), (action, r))
+            self.assertLess(time.time() - t0, 1.0)                     # the wait did not sleep either
+        self.assertEqual(ex.epoch, e0)
+        self.assertEqual(d.acted, [])
+
+
 class PopupDriver(FlashDriver):
     """A window with three pop-up buttons whose choices are read through accessibility (opening each menu for a
     moment, so only while the Mac is still)."""
@@ -300,9 +326,9 @@ class TheExecutorsProtocol(unittest.TestCase):
         now_ms = time.time() * 1000
         out = self._run([{"id": 1, "op": "begin"},
                          {"id": 2, "op": "perform", "action": {"kind": "click"}, "deadline_ms": now_ms + 120_000},
-                         {"id": 3, "op": "perform", "action": {"kind": "click"}, "deadline_ms": now_ms - 1},
+                         {"id": 3, "op": "perform", "action": {"kind": "click"}, "deadline_ms": now_ms + 10_000},
                          {"id": 4, "op": "observe", "window": WIN, "deadline_ms": now_ms - 1}], Fake)
-        self.assertEqual(len(seen), 1)                                       # 3 came after its deadline: not done
+        self.assertEqual(len(seen), 1)                     # 3 came inside the margin before its deadline: not done
         self.assertAlmostEqual(seen[0], (now_ms + 120_000) / 1000, places=2)
         events = [m for m in out if "event" in m]
         self.assertEqual([(e["event"], e["req"]) for e in events], [("user_wait", 2), ("user_resumed", 2)])
@@ -310,7 +336,7 @@ class TheExecutorsProtocol(unittest.TestCase):
         by_id = {m["id"]: m for m in out if "id" in m}
         self.assertEqual(by_id[2]["result"]["status"], "user_busy")
         self.assertEqual(by_id[3]["result"], {"status": "error", "performed": False,
-                                              "why": "read after the caller's deadline; nothing was done"})
+                                              "why": "read too late for the caller's deadline; nothing was done"})
         self.assertFalse(by_id[4]["ok"])
 
 

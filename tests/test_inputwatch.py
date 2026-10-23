@@ -1993,6 +1993,9 @@ class ObservedFront(_KeysCase):
                 self.keys, self.active = perm["keys"], True
                 return True
 
+            def healthy(self):                             # only the permission is in question here
+                return self.keys == perm["keys"]
+
             def stop(self):
                 stopped.append(self)
         self.addCleanup(exe._SHARED_WATCH.clear)
@@ -2027,6 +2030,9 @@ class ObservedFront(_KeysCase):
                 starts.append(self)
                 self.active = len(starts) > 1               # the permission granted after the first try
                 return self.active
+
+            def healthy(self):                             # nothing changes after it started (SharedWatchHealth)
+                return True
         self.addCleanup(exe._SHARED_WATCH.clear)
         exe._SHARED_WATCH.clear()
         with mock.patch.object(exe, "InputWatch", W):
@@ -2043,6 +2049,9 @@ class ObservedFront(_KeysCase):
         class W(InputWatch):
             def start(self):
                 made.append(self)
+                return True
+
+            def healthy(self):                             # nothing changes between the begins
                 return True
         self.addCleanup(exe._SHARED_WATCH.clear)
         exe._SHARED_WATCH.clear()
@@ -2287,3 +2296,88 @@ class StartGivenUp(unittest.TestCase):
         self.assertTrue(invalidated.is_set())
         self.assertNotIn(None, added)
         self.assertFalse(w.active)
+
+
+class SharedWatchHealth(unittest.TestCase):
+    """hands#62 review at 714c989: the shared watch is checked against what holds now at every reuse -- Input
+    Monitoring in both directions, the tap enabled and never disabled by the system, the front's poller alive -- and
+    made anew on any mismatch; without keys the executor counts key presses by the HID idle time, as main did. Each
+    test fails at 714c989."""
+
+    def setUp(self):
+        from deskmind_hands import executor as exe
+        self.exe = exe
+        self.state = {"keys": True, "enabled": True}
+        self.made: list = []
+        state, made = self.state, self.made
+
+        class W(InputWatch):
+            @staticmethod
+            def keys_permitted():
+                return state["keys"]
+
+            def start(self):
+                made.append(self)
+                self.keys, self.active, self._tap = state["keys"], True, "tap"
+                if self.keys:
+                    self.front_pid = lambda: 0
+                    self.watch_front()
+                return True
+        self.W = W
+        q = types.ModuleType("Quartz")
+        q.CGEventTapIsEnabled = lambda tap: state["enabled"]
+        q.CGEventTapEnable = lambda tap, on: None
+        q.CFMachPortInvalidate = lambda tap: None
+        q.CFRunLoopStop = lambda loop: None
+        for patch in (mock.patch.dict(sys.modules, {"Quartz": q}), mock.patch.object(exe, "InputWatch", W)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        exe._SHARED_WATCH.clear()
+        self.addCleanup(lambda: [w.stop_front() for w in made])
+        self.addCleanup(exe._SHARED_WATCH.clear)
+
+    def begin(self):
+        ex = self.exe.HandsExecutor.__new__(self.exe.HandsExecutor)
+        ex._watch_tried, ex._watch, ex.drivers, ex.current = False, None, {}, {}
+        ex._action_end_at = 0.0
+        return ex
+
+    def test_permission_revoked_makes_a_mouse_only_watch_and_keys_count_by_the_idle_time(self):
+        first = self.exe.shared_watch()
+        self.assertTrue(first.keys)
+        self.state["keys"] = False                         # the user revoked Input Monitoring
+        ex = self.begin()
+        hid = types.SimpleNamespace(kCGEventSourceStateHIDSystemState=1, kCGEventKeyDown=10, kCGAnyInputEventType=-1,
+                                    CGEventSourceSecondsSinceLastEventType=lambda state, kind: 0.5)
+        with mock.patch.object(self.exe, "Quartz", hid):
+            at = ex._last_input_at()                       # noqa: SLF001 -- a key pressed 0.5 s ago, anywhere
+        self.assertIsNot(ex._watch, first)
+        self.assertFalse(ex._watch.keys)
+        self.assertGreater(at, time.time() - 1.0)
+
+    def test_a_disabled_tap_on_reuse_is_made_anew(self):
+        first = self.exe.shared_watch()
+        self.state["enabled"] = False
+        self.assertIsNot(self.exe.shared_watch(), first)
+
+    def test_a_dead_poller_on_reuse_is_made_anew(self):
+        first = self.exe.shared_watch()
+        first.stop_front()
+        first._poll_thread.join(1)
+        self.assertIsNot(self.exe.shared_watch(), first)
+        self.assertIs(self.exe.shared_watch(), self.made[-1])   # a healthy one is kept
+
+    def test_a_tap_the_system_disabled_mid_task_is_not_trusted_for_keys(self):
+        w = self.exe.shared_watch()
+        q = _quartz({})
+        q.CGEventTapEnable = lambda tap, on: None
+        with mock.patch.dict(sys.modules, {"Quartz": q}):
+            w._callback(None, -2, object(), None)          # kCGEventTapDisabledByTimeout
+        self.assertFalse(w.keys_trusted)
+        ex = self.begin()
+        ex._watch, ex._watch_tried = w, True
+        hid = types.SimpleNamespace(kCGEventSourceStateHIDSystemState=1, kCGEventKeyDown=10, kCGAnyInputEventType=-1,
+                                    CGEventSourceSecondsSinceLastEventType=lambda state, kind: 0.5)
+        with mock.patch.object(self.exe, "Quartz", hid):
+            self.assertGreater(ex._last_input_at(), time.time() - 1.0)   # noqa: SLF001 -- by the idle time, as main
+        self.assertIsNot(self.exe.shared_watch(), w)       # and the next begin makes a new one

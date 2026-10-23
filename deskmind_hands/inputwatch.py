@@ -352,6 +352,8 @@ class InputWatch:
         self._poll_thread: threading.Thread | None = None
         self._read_began = 0.0
         self._loop = None
+        #: the system disabled the tap at least once (timeout, user input): keys may have gone unseen (_callback)
+        self.keys_lost = False
         #: when a key with no app target was last counted only because nothing proved where it went (note's rule):
         #: counted as main counted it -- an input to an unknown target, wiped by the mark main set at an action's
         #: end (last_input_where's doubt_after)
@@ -786,6 +788,10 @@ class InputWatch:
         try:
             import Quartz
             if type_ in (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput):
+                # the system turned the tap off for a while: the keys pressed then were never seen, so what this
+                # watch says of keys is not trusted from here on -- the executor counts key presses by the HID idle
+                # time, as main did -- and the next begin makes a new watch (healthy); turned back on meanwhile
+                self.keys_lost = True
                 if self._tap is not None:
                     Quartz.CGEventTapEnable(self._tap, True)
                 return event
@@ -848,6 +854,27 @@ class InputWatch:
             return event_age(int(Quartz.CGEventGetTimestamp(event) or 0))
         except Exception:  # noqa: BLE001
             return None
+
+    @property
+    def keys_trusted(self) -> bool:
+        """Keys are watched, and the tap has seen every one since it started (the system never disabled it)."""
+        return bool(self.keys and not self.keys_lost)
+
+    def healthy(self) -> bool:
+        """Whether this watch still sees what it saw when it started: keys watched exactly when Input Monitoring is
+        granted now (in both directions), the tap enabled and never disabled by the system, the front's poller alive
+        where keys are watched. A shared watch that is not is made anew (executor.shared_watch; hands#62 review at
+        714c989: a permission revoked left a watch that saw no keys and still said it did)."""
+        if not self.active or self.keys_lost or self.keys != self.keys_permitted():
+            return False
+        try:
+            import Quartz
+            if self._tap is None or not Quartz.CGEventTapIsEnabled(self._tap):
+                return False
+        except Exception:  # noqa: BLE001 -- cannot be told: made anew
+            return False
+        t = self._poll_thread
+        return not self.keys or (t is not None and t.is_alive() and not (self._poll_stop and self._poll_stop.is_set()))
 
     #: How long start() waits for the tap's thread to be running before it gives up.
     START_WAIT_S = 2.0

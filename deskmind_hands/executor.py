@@ -378,7 +378,7 @@ class HandsExecutor:
         # Bringing an app forward is a separate guard: the driver waits for the Mac to be idle everywhere first
         # (PeekabooDriver's foreground route), so a flash never takes keystrokes meant for another app.
         w = getattr(self, "_watch", None)
-        if w is not None and w.active and w.keys:
+        if w is not None and w.active and w.keys_trusted:
             # every input of the last USER_ACTIVE_S, a doubt included whatever mark an action left: main looked at
             # the time alone (hands#62 delta review at f0f7186)
             return time.time() - w.last_input_for(self._task_bundles()) < self.USER_ACTIVE_S
@@ -439,7 +439,7 @@ class HandsExecutor:
             self._watch = shared_watch()
         if self._watch is not None and self._watch.active:
             at = self._watch.last_input_for(self._task_bundles(), self._doubt_after())
-            if self._watch.keys or Quartz is None:
+            if self._watch.keys_trusted or Quartz is None:
                 return at
             # a mouse-only tap: every key press counts, wherever it went (the safe side)
             idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGEventKeyDown)
@@ -604,7 +604,7 @@ class HandsExecutor:
         # every window this task has been shown: one of them coming back later is not a window an action made
         self.__dict__.setdefault("_listed", set()).update(w["id"] for w in wins)
         return {"epoch": self.epoch, "locked": self.locked(), "front_app": front, "user_active": self.user_active(),
-                "input_watch": ("keys" if self._watch.keys else "mouse") if self._watch is not None and self._watch.active else "",
+                "input_watch": ("keys" if self._watch.keys_trusted else "mouse") if self._watch is not None and self._watch.active else "",
                 **({"epoch_reason": self._epoch_reason} if getattr(self, "_epoch_reason", None) else {}),
                 # the apps whose steps must bring them to the front (read from their pixels, or a step that could not
                 # be delivered in the background): so the plan can say so once, before the run takes the front.
@@ -982,7 +982,7 @@ class HandsExecutor:
     def _input_by_source(self) -> bool:
         """Whether every input the epoch counts is told by its source, so the driver's own is already left out."""
         w = getattr(self, "_watch", None)
-        return bool(w is not None and w.active and w.keys)
+        return bool(w is not None and w.active and w.keys_trusted)
 
     def _document(self, window: str, wins: list[dict]) -> tuple[str | None, bool | None] | None:
         """(path, modified) of the document the window shows, asked of the app; None when the app does not say or the
@@ -1345,9 +1345,11 @@ def shared_watch() -> InputWatch | None:
     as each run tried its own before (hands#62 review at f0f7186). Made under the lock, so two never start at once."""
     with _SHARED_LOCK:
         w = _SHARED_WATCH.get("watch")
-        if w is not None and not w.keys and InputWatch.keys_permitted():
-            # started before Input Monitoring was granted (a mouse-only tap): granted now, so a watch that sees keys
-            # replaces it (hands#62 delta review at 45e67fc)
+        if w is not None and not w.healthy():
+            # checked at every reuse against what holds now: Input Monitoring granted or revoked since it started
+            # (either way the watch says the wrong thing of keys), the tap disabled, the front's poller dead -- made
+            # anew, as main made a watch for each run (hands#62 reviews at 45e67fc and 714c989). Without keys now,
+            # the new one is mouse-only and key presses count by the HID idle time, as on main.
             w.stop()
             _SHARED_WATCH.pop("watch", None)
             w = None

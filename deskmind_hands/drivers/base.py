@@ -9,6 +9,7 @@ support an action it silently drops.
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -207,6 +208,46 @@ class ExecResult:
 
 #: How every driver says a step was left undone because the user was busy.
 USER_BUSY = "the user is active"
+
+#: Seconds kept before a caller's deadline for the action itself and what is read after it (the executor's window and
+#: document reads, the reply): a step that has not started acting by then does nothing. HANDS_DEADLINE_MARGIN_S
+#: overrides it.
+DEADLINE_MARGIN_S = 20.0
+
+
+def act_by(deadline: float | None) -> float | None:
+    """The last moment a step may start acting for a caller that gives up at `deadline` (epoch seconds); None when
+    the caller set no deadline (`hands do`)."""
+    if deadline is None:
+        return None
+    return deadline - float(os.environ.get("HANDS_DEADLINE_MARGIN_S", DEADLINE_MARGIN_S))
+
+
+#: Where a driver's wait for the user is told. None (the CLI, `hands do`): the plain lines on stdout it has always
+#: printed, `HANDS_WAIT {json}` then `HANDS_RESUME`, which the app's runner reads. The executor sets a function
+#: (kind, body) that writes a JSON event line beside its replies, under the same lock: a plain line there was not
+#: JSON, and harness dropped it, so a run waiting for the user never showed "paused".
+_WAIT_SINK = None
+
+
+def set_wait_sink(sink) -> None:
+    """Send the waits for the user to `sink(kind, body)` (kind "user_wait" or "user_resumed"); None: the plain lines."""
+    global _WAIT_SINK
+    _WAIT_SINK = sink
+
+
+def tell_wait(kind: str, body: dict) -> None:
+    """Say that a step waits for the user ("user_wait", with reason, app and what) or that the wait is over
+    ("user_resumed")."""
+    sink = _WAIT_SINK
+    if sink is not None:
+        sink(kind, body)
+        return
+    import json
+    if kind == "user_wait":
+        print("HANDS_WAIT " + json.dumps(body, ensure_ascii=False), flush=True)
+    else:
+        print("HANDS_RESUME", flush=True)
 
 
 EFFECTS = ("confirmed", "partial", "unverifiable", "suspected_noop", "refused")

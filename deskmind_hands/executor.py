@@ -26,6 +26,17 @@ One JSON request per line on stdin, one JSON reply per line on stdout (`{"id", "
     stop      {}                         the app's stop switch: every later perform is refused
     end       {}
 
+`observe` and `perform` take an optional `deadline_ms` (Unix ms): when the caller stops waiting for the reply. The
+request never outlives it. A wait for a still Mac (a step that needs the front, a pop-up's choices) ends
+DEADLINE_MARGIN_S before it, leaving time for the action and the reads after it; a perform that could not act in time
+answers `status: "user_busy"` (the user kept using the Mac) or `"error"`, both with `performed: false` -- nothing was
+sent. An observe's pop-ups share the one deadline and the choices not read are named in `notes`. A request read
+after its deadline is not carried out. Without `deadline_ms`, HANDS_FLASH_WAIT_S alone bounds the waits, as before.
+
+While a request waits for the user, event lines go out beside the replies (they have no `id`):
+`{"event": "user_wait", "req": <request id>, "reason": "user_active", "app", "what"}`, then
+`{"event": "user_resumed", "req": <request id>, "waited_s"}` -- the CLI prints `HANDS_WAIT` / `HANDS_RESUME` instead.
+
 Ownership, consequence classes, consent and the guard live in harness (`src/executor/`); nothing here judges. The
 window inventory comes from Quartz (fast, every app at once); seeing and acting inside a window go through the
 PeekabooDriver, one per application, pinned to the window asked for, so its background input, projections
@@ -46,7 +57,7 @@ from pathlib import Path
 from .actions import Action, ActionKind, Binding
 from .axdocument import _q, document_text, window_document
 from .grounding import STOP
-from .drivers.base import ExecResult, Observation
+from .drivers.base import ExecResult, Observation, act_by, set_wait_sink
 from .audio import playing_apps
 from .browsers import installed_browsers, is_browser
 from .inputwatch import InputWatch, track_children
@@ -640,9 +651,20 @@ class HandsExecutor:
         bundle, _, wid = window.partition("#")
         return bundle, wid
 
-    def observe(self, window: str, screenshot: bool = False) -> dict:
+    def observe(self, window: str, screenshot: bool = False, deadline: float | None = None) -> dict:
+        """One window close up. `deadline` (epoch seconds, from the request's `deadline_ms`): when the caller stops
+        waiting. A wait for a still Mac inside the look (reading a pop-up's choices) ends before it, one deadline
+        for the whole look; what could not be read is said in `notes`."""
         bundle, wid = self._split(window)
         d = self._driver(bundle)
+        d.caller_deadline = deadline
+        d.wait_notes = []
+        try:
+            return self._observe(d, window, bundle, wid, screenshot)
+        finally:
+            d.caller_deadline = None
+
+    def _observe(self, d, window: str, bundle: str, wid: str, screenshot: bool) -> dict:
         d._pinned_window = wid or None
         d._window_id = wid or None
         key = bundle.lower()
@@ -713,6 +735,9 @@ class HandsExecutor:
                                                # rect is local to it, so the app can place a mark on a picture of it
                                                **({"frame": frame} if frame else {})},
                "modal": {"title": "dialog"} if obs.dialog else None, "elements": els, "text": "\n".join(texts)[:4000]}
+        notes = list(getattr(d, "wait_notes", None) or [])
+        if notes:
+            out["notes"] = notes
         if screenshot and obs.screenshot_png:
             import base64
             out["screenshot_png"] = base64.b64encode(obs.screenshot_png).decode()
@@ -738,11 +763,23 @@ class HandsExecutor:
             return None
         return [round(float(v), 1) for v in b]
 
-    def perform(self, action: dict, shot: str | None = None, frames: bool = False) -> dict:
+    def perform(self, action: dict, shot: str | None = None, frames: bool = False, deadline: float | None = None) -> dict:
         """One action. With `frames`, where the window and the element acted on were on screen before acting. With
         `shot` (a file path the layer above chose, in its run folder), a picture of the window after it -- taken on a
         thread of its own while the reply goes out (`shot_pending`): the file appears at that path written whole (a
-        rename), or not at all when the capture fails. Neither asked for: nothing extra, not even a window list."""
+        rename), or not at all when the capture fails. Neither asked for: nothing extra, not even a window list.
+
+        `deadline` (epoch seconds, from the request's `deadline_ms`): when the caller stops waiting for the reply.
+        The step never outlives it: a wait for a still Mac ends before it (status `user_busy`, `performed: false`),
+        and a step that could not start acting in time does nothing (`performed: false`). None (`hands do`): only
+        HANDS_FLASH_WAIT_S bounds a wait, as before."""
+        self._caller_deadline = deadline
+        try:
+            return self._perform_framed(action, shot, frames)
+        finally:
+            self._caller_deadline = None
+
+    def _perform_framed(self, action: dict, shot: str | None, frames: bool) -> dict:
         window = action.get("window") or ""
         where: dict = {}
         if (frames or shot) and window and action.get("kind") not in (None, "wait", "open_window"):
@@ -905,13 +942,22 @@ class HandsExecutor:
             have = [b for b in (flash_before or "").split(",") if b.strip()]
             if bundle.lower() not in {b.lower() for b in have}:
                 os.environ["HANDS_FLASH_APPS"] = ",".join(have + [bundle])
-        # the driver may wait for a still Mac before a flash (HANDS_FLASH_WAIT_S), then act
+        # the driver may wait for a still Mac before a flash (HANDS_FLASH_WAIT_S, and never past the caller's
+        # deadline: caller_deadline), then act
+        deadline = getattr(self, "_caller_deadline", None)
         step = self._step_began(bundle, max_s=float(os.environ.get("HANDS_FLASH_WAIT_S", "60") or 60) + 120)
+        d.caller_deadline = deadline
         try:
             if getattr(self, "stopped", False) or STOP.is_set():   # read while this step was getting ready: nothing sent
                 return {"status": "error", "why": "stopped by the app"}
+            by = act_by(deadline)
+            if by is not None and time.time() > by:
+                # the reads before the action took the caller's time: nothing is sent that it would not hear of
+                return {"status": "error", "performed": False, "window": window,
+                        "why": "the caller's deadline came before the step could act; nothing was done"}
             res: ExecResult = d.execute(a)
         finally:
+            d.caller_deadline = None
             self._step_ended(step)
             if action.get("foreground_ok"):
                 if flash_before is None:
@@ -923,10 +969,14 @@ class HandsExecutor:
             # the load lands before the layer above takes its after-action snapshot -- a title that changed later made
             # the next step stale, eleven times in one search (rc.10, 10-21)
             self._settle_title(window)
-        status = "ok" if res.ok else "unsupported" if res.unsupported else "error"
+        status = "ok" if res.ok else "unsupported" if res.unsupported else "user_busy" if res.deferred else "error"
         if res.ok and res.indeterminate:
             status = "unverified"
         out = {"status": status, "why": res.detail, "window": window}
+        if status == "user_busy":
+            # the driver waited for a still Mac and gave up (its own bound, or the caller's deadline): nothing was
+            # sent. A harness that does not know the status takes it as an error, as it took these before.
+            out["performed"] = False
         # any action can open a window (a "new document" button in an open panel, cmd+N, a browser's pop-up). Two
         # things are told apart (_created): which windows the driver may use and follow (the action's: absent before
         # in any state, the acted app's, no input of the user's meanwhile), and which one the task made -- new_window,
@@ -1402,12 +1452,29 @@ def main() -> None:
         requests.put(None)
 
     threading.Thread(target=read, name="requests", daemon=True).start()
+    # A wait for the user inside a request is told as a JSON event line ({"event": "user_wait" | "user_resumed",
+    # "req": the request's id, ...}), under the reply lock: the plain HANDS_WAIT line the CLI prints was not JSON and
+    # harness dropped it. No "id" key: a harness that does not know events reads no reply into it.
+    set_wait_sink(lambda kind, body: write({"event": kind, "req": state.get("rid"), **body}))
     while True:
         req = requests.get()
         if req is None:
             break
         rid, op = req.get("id"), req.get("op")
+        state["rid"] = rid
         ex = state["ex"]
+        # `deadline_ms` (Unix ms, optional): when the caller stops waiting for this reply. A request read after it
+        # (queued behind one that took long) is not carried out: its caller has given up on it.
+        dl = req.get("deadline_ms")
+        deadline = float(dl) / 1000 if isinstance(dl, (int, float)) and not isinstance(dl, bool) else None
+        if deadline is not None and time.time() > deadline and op in ("perform", "observe"):
+            if op == "perform":
+                write({"id": rid, "ok": True, "result": {"status": "error", "performed": False,
+                                                         "why": "read after the caller's deadline; nothing was done"}})
+            else:
+                write({"id": rid, "ok": False, "error": "read after the caller's deadline; not looked at"})
+            continue
+        extra = {"deadline": deadline} if deadline is not None else {}
         try:
             if op == "begin":
                 ex = state["ex"] = HandsExecutor(Path(req["scratch"]) if req.get("scratch") else None, Path(req["workspace"]) if req.get("workspace") else None)
@@ -1419,10 +1486,10 @@ def main() -> None:
             elif op == "snapshot":
                 res = ex.snapshot()
             elif op == "observe":
-                res = ex.observe(req["window"], bool(req.get("screenshot")))
+                res = ex.observe(req["window"], bool(req.get("screenshot")), **extra)
             elif op == "perform":
-                res = (ex.perform(req["action"], req.get("shot") or None, bool(req.get("frames")))
-                       if req.get("shot") or req.get("frames") else ex.perform(req["action"]))
+                res = (ex.perform(req["action"], req.get("shot") or None, bool(req.get("frames")), **extra)
+                       if req.get("shot") or req.get("frames") or extra else ex.perform(req["action"]))
             elif op == "end":
                 res = ex.end()
             else:
@@ -1430,6 +1497,8 @@ def main() -> None:
             write({"id": rid, "ok": True, "result": res})
         except Exception as e:  # noqa: BLE001 -- every failure is reported to the caller, the process stays up
             write({"id": rid, "ok": False, "error": f"{type(e).__name__}: {e}"})
+        state["rid"] = None
+    set_wait_sink(None)
 
 
 if __name__ == "__main__":

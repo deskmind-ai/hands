@@ -47,7 +47,7 @@ from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, vision_elements
 from . import keys
 from .session import MESSAGES as SESSION_BLOCKED, gui_session, require_usable
 from .base import (USER_BUSY, Driver, DriverUnavailable, Element, ExecResult, Observation, effect_notes,
-                   WindowRef)
+                   act_by, tell_wait, WindowRef)
 
 #: Verified against `peekaboo help <cmd>` for 4.3.1. Collected here so a CLI
 #: change is one edit rather than an archaeology exercise.
@@ -2719,7 +2719,7 @@ class PeekabooDriver:
         import Quartz
         # The user being busy is not the planner's failure: told "not made", the 4B chose 发送 again, then wandered
         # into the message box until the run ended as a loop. The driver waits (up to 60 s) instead.
-        deadline = time.time() + 60
+        deadline = self._wait_until(60.0)
         t_wait = time.time()
         while True:
             if STOP.is_set():
@@ -2731,9 +2731,13 @@ class PeekabooDriver:
                 break
             if time.time() > deadline:
                 self._add_wait(time.time() - t_wait)
-                return ExecResult(False, f"{USER_BUSY} (in the chat app, or typing); the click was not made -- wait")
+                return ExecResult(False, self._too_late(True)
+                                  or f"{USER_BUSY} (in the chat app, or typing); the click was not made -- wait")
             time.sleep(1)
         self._add_wait(time.time() - t_wait)
+        late = self._too_late(time.time() - t_wait > 0.5)
+        if late:
+            return ExecResult(False, late)
         moved = self._moved_since_seen()
         if moved:
             return ExecResult(False, moved, stale=True)
@@ -2795,6 +2799,31 @@ class PeekabooDriver:
         except (OSError, ValueError):
             return False
 
+    def _act_by(self) -> float | None:
+        """The last moment a step may still start acting for its caller, epoch seconds: the caller's deadline
+        (`caller_deadline`, set by the executor from the request's `deadline_ms`) less base.DEADLINE_MARGIN_S. None
+        when no caller set one (`hands do`): then only HANDS_FLASH_WAIT_S bounds a wait, as before."""
+        return act_by(getattr(self, "caller_deadline", None))
+
+    def _wait_until(self, env_s: float) -> float:
+        """When a wait for a still Mac gives up: `env_s` from now, or the caller's _act_by if that comes first. The
+        caller stops listening at its deadline; a wait past it ended in an action nobody was waiting for (rc.14: the
+        caller gave up at 120 s and recorded an error, and the search box was filled 18 s later)."""
+        until = time.time() + env_s
+        by = self._act_by()
+        return until if by is None else min(until, by)
+
+    def _too_late(self, waited: bool) -> str | None:
+        """Why the step must not act now, or None: past the caller's _act_by, nothing is sent. Said as the user's
+        when the step was waiting for them (USER_BUSY: the run treats it as theirs, not a fault), else plainly."""
+        by = self._act_by()
+        if by is None or time.time() <= by:
+            return None
+        if waited:
+            return (f"{USER_BUSY}; the step was not carried out before the caller's deadline (the Mac was not still "
+                    f"in time) -- nothing was done; wait")
+        return "the caller's deadline came before the step could act; nothing was done"
+
     def _flash(self, bundle: str, perform, what: str = "") -> tuple[bool, str]:
         """Bring `bundle` forward for as long as `perform()` takes, then give the user's app the front back.
 
@@ -2804,6 +2833,8 @@ class PeekabooDriver:
         for that -- up to HANDS_FLASH_WAIT_S (60 s by default; the app allows a long wait, since a person at their
         Mac is not a failure) -- and says so on stdout (`HANDS_WAIT`, then `HANDS_RESUME`) so the app can show
         "paused while you use your Mac". While the user has handed the screen over (_takeover) it does not wait.
+        Never past the caller's deadline (`caller_deadline`, less the margin for the action: _act_by): there the
+        wait ends as USER_BUSY with nothing sent, and nothing is brought forward or sent after it.
         If the user touches anything while the app is being brought forward, the step is abandoned before any
         input is sent, the front is given back, and the wait starts again."""
         if self._background_input(bundle):
@@ -2822,6 +2853,10 @@ class PeekabooDriver:
                 if STOP.is_set():
                     skylight.give_focus_back(token)
                     return False, "stopped by the app; nothing was done"
+                late = self._too_late(False)
+                if late:
+                    skylight.give_focus_back(token)
+                    return False, late
                 refused = None
                 try:
                     detail = perform(q)
@@ -2849,7 +2884,7 @@ class PeekabooDriver:
         if STOP.is_set():
             return False, "stopped by the app; nothing was done"
         import Quartz
-        deadline = time.time() + float(os.environ.get("HANDS_FLASH_WAIT_S", "60"))
+        deadline = self._wait_until(float(os.environ.get("HANDS_FLASH_WAIT_S", "60")))
         waited = False
         # How long the user must have been still. It doubles each time they touch something while the app is being
         # brought forward (to 30 s): at a flat 3 s the app jumped forward and back again every few seconds while
@@ -2867,6 +2902,13 @@ class PeekabooDriver:
                 if waited:
                     self._resumed()
                 return False, "stopped by the app; nothing was done"
+            # Past the caller's deadline nothing is brought forward or sent, still Mac or not: the caller has given up
+            # on this step (or is about to), and an effect it never hears of is one it may do again.
+            late = self._too_late(waited)
+            if late:
+                if waited:
+                    self._resumed()
+                return False, late
             prev = self._front_bundle()
             if browser and prev.lower() == bundle.lower() and not self._takeover():
                 # the user is in this browser: raising the run's window there would cover the page they are on
@@ -2875,7 +2917,8 @@ class PeekabooDriver:
                 if time.time() > deadline:
                     if waited:
                         self._resumed()
-                    return False, f"{USER_BUSY} (in {bundle}); the step was not carried out -- wait"
+                    return False, (self._too_late(True)
+                                   or f"{USER_BUSY} (in {bundle}); the step was not carried out -- wait")
                 waited = self._announce_wait(waited, bundle, what)
                 time.sleep(1)
                 continue
@@ -2945,6 +2988,9 @@ class PeekabooDriver:
                         self._resumed()
                     if STOP.is_set():
                         return False, "stopped by the app; nothing was done"
+                    late = self._too_late(waited)     # bringing it forward took the last of the caller's time
+                    if late:
+                        return False, late
                     self._foreground_actions += 1
                     ime = _ascii_input_source()
                     sent = True
@@ -2969,7 +3015,7 @@ class PeekabooDriver:
             if time.time() > deadline:
                 if waited:
                     self._resumed()
-                return False, f"{USER_BUSY}; the step was not carried out -- wait"
+                return False, self._too_late(True) or f"{USER_BUSY}; the step was not carried out -- wait"
             waited = self._announce_wait(waited, bundle, what)
             time.sleep(1)
 
@@ -3072,7 +3118,14 @@ class PeekabooDriver:
                 # stdout): skipped instead, a select stayed optionless for as long as the user kept working, and a
                 # run whose next step was to choose the category could not -- an oracle drive gave up on it as
                 # unreachable (09-30). Only a wait that runs out leaves it for the next look.
-                if self._wait_until_still(self.app, f"read the choices of {e.label!r}") is not None:
+                # With a caller's deadline the pop-ups of one look share it (an absolute time): a wait that ran out
+                # leaves every later pop-up unread at once, never a wait each -- rc.14 found a look could take tens of
+                # minutes at HANDS_FLASH_WAIT_S per pop-up. What was not read is said in the observation.
+                why = self._wait_until_still(self.app, f"read the choices of {e.label!r}")
+                if why is not None:
+                    if getattr(self, "caller_deadline", None) is not None:
+                        self.__dict__.setdefault("wait_notes", []).append(
+                            f"the choices of {e.label!r} were not read: {why}")
                     continue
                 cache[key] = [o for o in axpopup.options(pop["el"]) if not self.POPUP_PROMPT.search(o)]
             if cache[key]:
@@ -3094,12 +3147,12 @@ class PeekabooDriver:
         return self._settle(ok, f"{detail} in {self._labels_by_id.get(eid, eid)!r} (in the background)")
 
     def _wait_until_still(self, bundle: str, what: str = "") -> str | None:
-        """Wait (up to HANDS_FLASH_WAIT_S) until the user has not touched the keyboard or mouse for a moment, saying
-        so on stdout as the flash does; None when it is fine to go on, else why not. No wait while the user has
-        handed the screen over (_takeover)."""
+        """Wait (up to HANDS_FLASH_WAIT_S, and never past the caller's _act_by) until the user has not touched the
+        keyboard or mouse for a moment, saying so as the flash does; None when it is fine to go on, else why not. No
+        wait while the user has handed the screen over (_takeover)."""
         if self._takeover():
-            return None
-        deadline = time.time() + float(os.environ.get("HANDS_FLASH_WAIT_S", "60"))
+            return self._too_late(False)
+        deadline = self._wait_until(float(os.environ.get("HANDS_FLASH_WAIT_S", "60")))
         still = float(os.environ.get("HANDS_BG_STILL_S", "5"))
         waited = False
         while self._hid_idle() < still:
@@ -3110,12 +3163,16 @@ class PeekabooDriver:
             if time.time() > deadline:
                 if waited:
                     self._resumed()
-                return f"{USER_BUSY}; the step was not carried out -- wait"
+                return self._too_late(True) or f"{USER_BUSY}; the step was not carried out -- wait"
             waited = self._announce_wait(waited, bundle, what)
             time.sleep(0.5)
         if waited:
             self._resumed()
-        return "stopped by the app; nothing was done" if STOP.is_set() else None
+        if STOP.is_set():
+            return "stopped by the app; nothing was done"
+        # still now, but after the caller's deadline less the margin (the idle check comes first in the loop): too
+        # late to act for it
+        return self._too_late(waited)
 
     def _background_quartz(self, bundle: str, observed_only: bool = False):
         """A Quartz stand-in that delivers to `bundle`'s window (the pinned one, else its largest -- with
@@ -3399,8 +3456,7 @@ class PeekabooDriver:
         it was about to do read as frozen. The wait is timed from here (see _resumed)."""
         if not already:
             self._wait_t0 = time.time()
-            print("HANDS_WAIT " + json.dumps({"reason": "user_active", "app": bundle, "what": what},
-                                             ensure_ascii=False), flush=True)
+            tell_wait("user_wait", {"reason": "user_active", "app": bundle, "what": what})
         return True
 
     def _add_wait(self, seconds: float) -> None:
@@ -3415,7 +3471,7 @@ class PeekabooDriver:
         t0 = self.__dict__.pop("_wait_t0", None)
         if t0 is not None:
             self._add_wait(time.time() - t0)
-        print("HANDS_RESUME", flush=True)
+        tell_wait("user_resumed", {"waited_s": round(time.time() - t0, 1)} if t0 is not None else {})
 
     def _in_own_browser_window(self, bundle: str) -> bool:
         """Whether the window this step acts in is the run's own browser window (opened by the run, _run_windows)."""

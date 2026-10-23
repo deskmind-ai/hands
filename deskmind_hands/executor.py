@@ -245,6 +245,9 @@ class HandsExecutor:
         #: of the Mac. None until the first snapshot; stays None when no tap can be made, and every input then counts.
         self._watch: InputWatch | None = None
         self._watch_tried = False
+        #: Where main moved the epoch's mark at every action's end: a key counted as main counted it (a doubt, see
+        #: InputWatch.note) and recorded before it is wiped as it was on main; every other input is not.
+        self._action_end_at = 0.0
         self.drivers: dict[str, object] = {}
         self.last_obs: dict[str, Observation] = {}       # window id -> last observation (for bindings)
         #: bundle -> the window its driver observed last: the one whose snapshot and element ids the driver holds.
@@ -375,7 +378,9 @@ class HandsExecutor:
         # Bringing an app forward is a separate guard: the driver waits for the Mac to be idle everywhere first
         # (PeekabooDriver's foreground route), so a flash never takes keystrokes meant for another app.
         w = getattr(self, "_watch", None)
-        if w is not None and w.active and w.keys:
+        if w is not None and w.active and w.keys_trusted:
+            # every input of the last USER_ACTIVE_S, a doubt included whatever mark an action left: main looked at
+            # the time alone (hands#62 delta review at f0f7186)
             return time.time() - w.last_input_for(self._task_bundles()) < self.USER_ACTIVE_S
         if Quartz is None:
             return False
@@ -431,11 +436,10 @@ class HandsExecutor:
         tap: the permission is not there): when the keyboard or mouse was last touched at all."""
         if not self._watch_tried:
             self._watch_tried = True
-            w = InputWatch()
-            self._watch = w if w.start() else None
+            self._watch = shared_watch()
         if self._watch is not None and self._watch.active:
-            at = self._watch.last_input_for(self._task_bundles())
-            if self._watch.keys or Quartz is None:
+            at = self._watch.last_input_for(self._task_bundles(), self._doubt_after())
+            if self._watch.keys_trusted or Quartz is None:
                 return at
             # a mouse-only tap: every key press counts, wherever it went (the safe side)
             idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGEventKeyDown)
@@ -445,9 +449,28 @@ class HandsExecutor:
         idle = Quartz.CGEventSourceSecondsSinceLastEventType(Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType)
         return time.time() - idle
 
+    def _step_began(self, bundle: str, max_s: float = 180.0):
+        """Tell the input watch a step of the task's in `bundle` begins: the step may bring the app forward (the
+        driver's flash), and a key that needs an app to be counted against counts for this one until it ends, or
+        `max_s` at most (inputwatch: the tap's callback can run late, after the front has gone back)."""
+        w = getattr(self, "_watch", None)
+        return w.step_began(bundle, max_s=max_s) if w is not None and hasattr(w, "step_began") else None
+
+    def _step_ended(self, token) -> None:
+        w = getattr(self, "_watch", None)
+        if token is not None and w is not None:
+            w.step_ended(token)
+
+    def _mark_now(self) -> float:
+        """A time for the epoch's mark. With the input watch: stamped under its lock, so an input it records after
+        the mark is set always has a later time -- one looked into while an action moved the mark is never behind
+        it (hands#62 external review)."""
+        w = getattr(self, "_watch", None)
+        return w.mark() if w is not None and hasattr(w, "mark") else time.time()
+
     def _advance(self, reason: dict | None = None) -> None:
         self.epoch += 1
-        self._epoch_at = time.time()
+        self._epoch_at = self._mark_now()
         #: why the epoch last moved, told in every snapshot: an action of the task's, the user's input to an app the
         #: task operates (which, or "unknown"), or a window list that changed (which app, what appeared, vanished or
         #: was renamed). A stale step upstream can then say what made it stale (rc.9, 10-20).
@@ -565,8 +588,10 @@ class HandsExecutor:
         input_at = self._last_input_at()
         if input_at > self._epoch_at or changed:
             if input_at > self._epoch_at:
-                where = (self._watch.last_input_where(task)[1] if self._watch is not None and self._watch.active
-                         and self._watch.last_input_for(task) >= input_at else "any (no per-app watch)")
+                where = (self._watch.last_input_where(task, self._doubt_after())[1]
+                         if self._watch is not None and self._watch.active
+                         and self._watch.last_input_for(task, self._doubt_after()) >= input_at
+                         else "any (no per-app watch)")
                 reason = {"by": "input", "to": where, "input_at": round(input_at, 3)}
             else:
                 b = changed[0]
@@ -579,7 +604,7 @@ class HandsExecutor:
         # every window this task has been shown: one of them coming back later is not a window an action made
         self.__dict__.setdefault("_listed", set()).update(w["id"] for w in wins)
         return {"epoch": self.epoch, "locked": self.locked(), "front_app": front, "user_active": self.user_active(),
-                "input_watch": ("keys" if self._watch.keys else "mouse") if self._watch is not None and self._watch.active else "",
+                "input_watch": ("keys" if self._watch.keys_trusted else "mouse") if self._watch is not None and self._watch.active else "",
                 **({"epoch_reason": self._epoch_reason} if getattr(self, "_epoch_reason", None) else {}),
                 # the apps whose steps must bring them to the front (read from their pixels, or a step that could not
                 # be delivered in the background): so the plan can say so once, before the run takes the front.
@@ -880,11 +905,14 @@ class HandsExecutor:
             have = [b for b in (flash_before or "").split(",") if b.strip()]
             if bundle.lower() not in {b.lower() for b in have}:
                 os.environ["HANDS_FLASH_APPS"] = ",".join(have + [bundle])
+        # the driver may wait for a still Mac before a flash (HANDS_FLASH_WAIT_S), then act
+        step = self._step_began(bundle, max_s=float(os.environ.get("HANDS_FLASH_WAIT_S", "60") or 60) + 120)
         try:
             if getattr(self, "stopped", False) or STOP.is_set():   # read while this step was getting ready: nothing sent
                 return {"status": "error", "why": "stopped by the app"}
             res: ExecResult = d.execute(a)
         finally:
+            self._step_ended(step)
             if action.get("foreground_ok"):
                 if flash_before is None:
                     os.environ.pop("HANDS_FLASH_APPS", None)
@@ -936,8 +964,25 @@ class HandsExecutor:
             out["files"] = []
         if doc1:
             out["document"] = doc1
-        self._epoch_at = time.time()     # the input this action itself sent is not the user's
+        if not self._input_by_source():
+            # The input this action itself sent is not the user's (PR #48, 10-19, before events could be told by
+            # their source). Where they can -- the tap watches keys, and the driver's own events are skipped by
+            # their source process (InputWatch.posted_by_us) -- the mark is not moved: moved, it wiped the user's
+            # own edit of the task's window during the action, and the next step was decided on a view it did not
+            # match (hands#62 re-review). Without the tap (the HID idle time) or without keys (a mouse-only tap
+            # counts key presses by the idle time), ours and theirs cannot be told apart: moved as before.
+            self._epoch_at = self._mark_now()
+        # where main's mark went: a key counted only as main counted it, recorded before this, is wiped as on main
+        self._action_end_at = self._mark_now()
         return out
+
+    def _doubt_after(self) -> float:
+        return getattr(self, "_action_end_at", 0.0)
+
+    def _input_by_source(self) -> bool:
+        """Whether every input the epoch counts is told by its source, so the driver's own is already left out."""
+        w = getattr(self, "_watch", None)
+        return bool(w is not None and w.active and w.keys_trusted)
 
     def _document(self, window: str, wins: list[dict]) -> tuple[str | None, bool | None] | None:
         """(path, modified) of the document the window shows, asked of the app; None when the app does not say or the
@@ -1043,7 +1088,17 @@ class HandsExecutor:
     def _open_window(self, app: str, url: str | None) -> dict:
         """Open a window of `app` (a bundle id, or a name as the snapshot shows it) and wait for it. No app is named
         in code: the name is resolved to a bundle id generically, and a new document is asked for the way any
-        document-based app answers (its own scripting, by bundle id), then by the keyboard."""
+        document-based app answers (its own scripting, by bundle id), then by the keyboard. The whole of it is a step
+        for the input watch -- under way, so a key with no app target meanwhile counts as on main: `open -g -b` with
+        a URL, `make new document` and the run's own browser window can each bring an app forward (hands#62 delta
+        review at f0f7186: only the launch was marked)."""
+        step = self._step_began((app or "").lower())
+        try:
+            return self._open_window_now(app, url)
+        finally:
+            self._step_ended(step)
+
+    def _open_window_now(self, app: str, url: str | None) -> dict:
         bundle = resolve_app(app, running_apps(), installed_apps())
         if not bundle:
             return {"status": "unsupported", "why": f"no application called {app!r} is running or installed"}
@@ -1056,14 +1111,30 @@ class HandsExecutor:
             # LAUNCH_WAIT_S, until a window of it appears.
             before_launch = self._known_windows()
             front_before = self._front_bundle_id()
-            # in the background (-g): opening an app is no reason to take the front from the user; it comes forward
-            # only for a step, by the flash's rules (the user still, the step allowed) -- `open -b` did take it, and
-            # a music app kept jumping in front of the user's work (rc.10, 10-21)
-            subprocess.run(["open", "-g", "-b", bundle], capture_output=True, timeout=20)
-            launched = self._launch_windows(bundle, before_launch, self.LAUNCH_WAIT_S)
-            if front_before and front_before != bundle and self._front_bundle_id() == bundle:
-                # some apps take the front on their first launch whatever -g says: given back at once
-                self._make_frontmost(front_before)
+            # some apps take the front on their first launch: see below. The whole launch is marked (when the app
+            # took the front is not known), and the mark is closed whatever the launch raised (hands#62 re-review)
+            step = self._step_began(bundle, max_s=20 + self.LAUNCH_WAIT_S + 10)
+            launched_at = time.time()
+            # The input watch is told the app may have the front from the launch's start, before it is launched, and
+            # until after the give-back below, whatever the launch raised: told only once the launch had found it in
+            # front, a key whose callback ran during the launch found no flash, and with the front meanwhile in
+            # another app it was put on that app for good (hands#62 review at af55263, the same late telling as the
+            # driver's flash). When the app did not come forward the flash was not needed: a key in another app
+            # then counts for this one too, which can only make a step stale, never miss the user's input to it.
+            from .inputwatch import front_given_back, front_taken
+            taken = front_taken(bundle, launched_at)
+            try:
+                # in the background (-g): opening an app is no reason to take the front from the user; it comes
+                # forward only for a step, by the flash's rules (the user still, the step allowed) -- `open -b` did
+                # take it, and a music app kept jumping in front of the user's work (rc.10, 10-21)
+                subprocess.run(["open", "-g", "-b", bundle], capture_output=True, timeout=20)
+                launched = self._launch_windows(bundle, before_launch, self.LAUNCH_WAIT_S)
+                if front_before and front_before != bundle and self._front_bundle_id() == bundle:
+                    # some apps take the front on their first launch whatever -g says: given back at once
+                    self._make_frontmost(front_before)
+            finally:
+                front_given_back(taken)
+                self._step_ended(step)
             self._settled(bundle)
         d = self._driver(bundle)      # started now, so the windows it finds are the ones there before the task's
         before = self._known_windows()
@@ -1260,6 +1331,34 @@ class HandsExecutor:
                 pass
         self.drivers = {}
         return {"closed": True}
+
+
+#: The process's input watch: one tap and one front poller for every executor `begin` makes (hands#62 review at
+#: e8fa010: each begin started another tap and another 50 Hz poller, and nothing stopped them).
+_SHARED_WATCH: dict = {}
+_SHARED_LOCK = threading.Lock()
+
+
+def shared_watch() -> InputWatch | None:
+    """The process's input watch, started the first time it can be; None when no tap can be made now. Only a watch
+    that started is kept: one that could not (the permission not yet granted) is tried again by the next executor,
+    as each run tried its own before (hands#62 review at f0f7186). Made under the lock, so two never start at once."""
+    with _SHARED_LOCK:
+        w = _SHARED_WATCH.get("watch")
+        if w is not None and not w.healthy():
+            # checked at every reuse against what holds now: Input Monitoring granted or revoked since it started
+            # (either way the watch says the wrong thing of keys), the tap disabled, the front's poller dead -- made
+            # anew, as main made a watch for each run (hands#62 reviews at 45e67fc and 714c989). Without keys now,
+            # the new one is mouse-only and key presses count by the HID idle time, as on main.
+            w.stop()
+            _SHARED_WATCH.pop("watch", None)
+            w = None
+        if w is None:
+            w = InputWatch()
+            if not w.start():
+                return None
+            _SHARED_WATCH["watch"] = w
+        return w
 
 
 def main() -> None:

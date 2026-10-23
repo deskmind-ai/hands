@@ -74,8 +74,11 @@ class FocusGuard(unittest.TestCase):
         from deskmind_hands.drivers.peekaboo import PeekabooDriver
         d = PeekabooDriver.__new__(PeekabooDriver)
         d.app, d._mcp, d._foreground_actions = "com.apple.Safari", object(), 0
-        seq = iter(fronts)
+        # the front read by name (_frontmost, main) and by name and bundle id (_front_app, hands#62) alike, so these
+        # run unchanged on both
+        seq, seq2 = iter(fronts), iter(fronts)
         d._frontmost = lambda: next(seq)
+        d._front_app = lambda: (next(seq2), "")
         d._hid_idle = lambda: idle
         d._task_windows = lambda: []
         import time
@@ -107,6 +110,38 @@ class FocusGuard(unittest.TestCase):
         res = d._execute_outer(act)
         self.assertEqual(d.activated, [])
         self.assertNotIn("given back", res.detail)
+
+    def test_the_give_back_is_mains_whatever_the_step(self):
+        """hands#62 keeps main's give-back exactly (focus give-back is a follow-up): the same branches, the same
+        name-based _ours, the same outcomes -- including foreground=True steps, which the executor sends for every
+        click, type and key. This table passes on origin/main's driver and on this branch's."""
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        ne = "com.netease.163music"
+        given = ['tell application "iTerm2" to activate']
+        # (driver app, front before, front after, HID idle, foreground) -> (activated, counted as a front take)
+        table = [
+            ("com.apple.Safari", ("iTerm2", "com.googlecode.iterm2"), ("Finder", "com.apple.finder"), 60, False, given, 1),
+            ("com.apple.Safari", ("iTerm2", "com.googlecode.iterm2"), ("Finder", "com.apple.finder"), 0.01, True, given, 1),
+            (ne, ("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", ne), 60, False, given, 0),
+            (ne, ("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", ne), 60, True, [], 0),
+            (ne, ("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", ne), 0.01, False, [], 0),
+            ("com.apple.Notes", ("Finder", "com.apple.finder"), ("备忘录", "com.apple.Notes"), 60, False, [], 0),
+            ("com.apple.Safari", ("iTerm2", "com.googlecode.iterm2"), ("Some Updater", "com.example.updater"), 60, False, given, 0),
+            ("com.apple.Safari", ("iTerm2", "com.googlecode.iterm2"), ("Some Updater", "com.example.updater"), 60, True, [], 0),
+            ("com.apple.Safari", ("iTerm2", "com.googlecode.iterm2"), ("Mail", "com.apple.mail"), 0.01, False, [], 0),
+            ("com.apple.Safari", ("iTerm2", "com.googlecode.iterm2"), ("iTerm2", "com.googlecode.iterm2"), 60, False, [], 0),
+            ("com.apple.Safari", ("", ""), ("Finder", "com.apple.finder"), 60, False, [], 0),
+        ]
+        for app, before, after, idle, fg, activated, counted in table:
+            with self.subTest(app=app, before=before[0], after=after[0], idle=idle, foreground=fg):
+                d, _ = self._driver([], idle=idle)
+                d.app = app
+                names, apps = iter([before[0], after[0]]), iter([before, after])
+                d._frontmost = lambda: next(names)
+                d._front_app = lambda: next(apps)
+                d._execute_outer(Action(kind=ActionKind.CLICK, foreground=fg, binding=Binding(element_id="elem_1")))
+                self.assertEqual(d.activated, activated)
+                self.assertEqual(d._foreground_actions, counted)
 
     def test_an_intended_foreground_step_is_left_alone(self):
         from deskmind_hands.actions import Action, ActionKind

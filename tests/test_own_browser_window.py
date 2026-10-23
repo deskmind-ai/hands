@@ -207,6 +207,7 @@ class OwnWindow(unittest.TestCase):
         d.clipboard = lambda: ""
         d._set_clipboard = lambda value: None
         d._frontmost = lambda: "Finder"
+        d._front_app = lambda: ("Finder", "com.apple.finder")   # hands#62: the front by name and bundle id
         d._sparse_tree = lambda data: False
         d._element_cache = lambda data, origin: setattr(d, "_real_read", 1) or []
         d.start(ws or self.scratch / "ws")

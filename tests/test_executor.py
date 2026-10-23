@@ -71,6 +71,16 @@ _exe.app_display_name = lambda bundle: bundle
 _exe.playing_apps = lambda: []
 
 
+
+def _stable_pids(case: unittest.TestCase) -> None:
+    """The watch forgets a pid whose process start time is unreadable or changed (InputWatch._check_pid): the pids a
+    test feeds by hand are made up, so each is given one start time that does not change."""
+    from deskmind_hands import inputwatch as iw
+    patch = mock.patch.object(iw, "_proc_info", lambda pid: (1, 1.0))
+    patch.start()
+    case.addCleanup(patch.stop)
+
+
 def _executor():
     ex = HandsExecutor()
     stub = StubDriver()
@@ -613,6 +623,7 @@ class TaskScope(unittest.TestCase):
         del ex._last_input_at                              # the real one, over a watch fed by hand
         w = InputWatch()
         w.active, w.keys = True, True
+        _stable_pids(self)                                  # the made-up pids keep their start time
         w._pid_bundle = {5: "com.googlecode.iterm2", 6: "com.apple.TextEdit", 7: "ai.deskmind.app"}
         w._pid_regular = {5: True, 6: True, 7: True}
         ex._watch, ex._watch_tried = w, True
@@ -635,6 +646,7 @@ class EpochReason(unittest.TestCase):
         del ex._last_input_at
         w = InputWatch()
         w.active, w.keys = True, True
+        _stable_pids(self)                                  # the made-up pids keep their start time
         w._pid_bundle = {6: "com.apple.TextEdit"}
         w._pid_regular = {6: True}
         ex._watch, ex._watch_tried = w, True
@@ -671,6 +683,7 @@ class UserActive(unittest.TestCase):
         ex, _ = _executor()
         w = InputWatch()
         w.active, w.keys = True, True
+        _stable_pids(self)                                  # the made-up pids keep their start time
         w._pid_bundle = {5: "com.apple.Terminal", 6: "com.apple.TextEdit"}
         w._pid_regular = {5: True, 6: True}
         ex._watch, ex._watch_tried = w, True

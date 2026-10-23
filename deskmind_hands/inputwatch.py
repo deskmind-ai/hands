@@ -849,6 +849,9 @@ class InputWatch:
         except Exception:  # noqa: BLE001
             return None
 
+    #: How long start() waits for the tap's thread to be running before it gives up.
+    START_WAIT_S = 2.0
+
     def start(self) -> bool:
         """Make the tap and run it on its own thread; False when the system refuses, in which case nothing is
         recorded and `active` stays False."""
@@ -870,27 +873,40 @@ class InputWatch:
         if not tap:
             return False
         self._tap = tap
-        ready, gone = threading.Event(), threading.Event()
+        ready, gone, life = threading.Event(), threading.Event(), threading.Lock()
 
         def run():
-            src = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
-            loop = self._loop = Quartz.CFRunLoopGetCurrent()
-            Quartz.CFRunLoopAddSource(loop, src, Quartz.kCFRunLoopCommonModes)
-            if gone.is_set():                              # given up on before it was running
+            # A thread starved past START_WAIT_S finds the start given up and the tap's port invalidated: a run loop
+            # source made from that port is None, and adding None to a run loop crashed the process (hands#62 delta
+            # review at e31a20b, exit 139). So nothing is made once given up, a None source is never added, and the
+            # hand-over -- given up or not, enabled, active, ready -- is one step under `life`, as the give-up is,
+            # so `active` never turns true after stop().
+            if gone.is_set():
                 return
-            Quartz.CGEventTapEnable(tap, True)
-            self.active = True
-            ready.set()
+            src = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+            if src is None:
+                return
+            loop = Quartz.CFRunLoopGetCurrent()
+            with life:
+                if gone.is_set():
+                    return
+                self._loop = loop
+                Quartz.CFRunLoopAddSource(loop, src, Quartz.kCFRunLoopCommonModes)
+                Quartz.CGEventTapEnable(tap, True)
+                self.active = True
+                ready.set()
             Quartz.CFRunLoopRun()
 
         self._thread = threading.Thread(target=run, name="input-watch", daemon=True)
         self._thread.start()
-        if not ready.wait(2.0):
+        if not ready.wait(self.START_WAIT_S):
             # not running in time: given up, and nothing of it left alive -- each executor tries again now, and an
             # unreferenced live tap and poller were left once per try (hands#62 delta review at 45e67fc)
-            gone.set()
-            self.stop()
-            return False
+            with life:
+                if not ready.is_set():                     # it may have got there since the wait gave up
+                    gone.set()
+                    self.stop()
+                    return False
         if self.active and self.keys:
             self.watch_front()                             # only keys need the front: a click has its target
         return self.active

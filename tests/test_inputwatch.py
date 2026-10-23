@@ -2242,3 +2242,48 @@ class InFlightAndTheMark(_EpochCase):
             if truth(ev) == MUSIC and not w.last_input_for({TE.lower()}) > 0:
                 misses.append((trial, round(ev - base, 3)))
         self.assertEqual(misses, [])
+
+
+
+class StartGivenUp(unittest.TestCase):
+    """Delta review at e31a20b: the tap's thread starved past the start's wait; the start gave up and invalidated the
+    port; the thread then made a run loop source from it (None) and added None to its run loop -- a segfault. Fails
+    at e31a20b (the None source is added)."""
+
+    def test_a_thread_that_runs_after_the_start_gave_up_adds_nothing_and_stays_inactive(self):
+        invalidated, added, late = threading.Event(), [], threading.Event()
+
+        class Q:
+            def __getattr__(self, name):
+                if name.startswith("k"):
+                    return 1                               # event types, tap places, run loop modes
+                raise AttributeError(name)
+
+            CGPreflightListenEventAccess = staticmethod(lambda: True)
+            CGEventMaskBit = staticmethod(lambda t: 1)
+            CGEventTapCreate = staticmethod(lambda *a: "tap")
+            CGEventTapEnable = staticmethod(lambda tap, on: None)
+            CFMachPortInvalidate = staticmethod(lambda tap: invalidated.set())
+            CFRunLoopGetCurrent = staticmethod(lambda: "loop")
+            CFRunLoopRun = staticmethod(lambda: None)
+            CFRunLoopStop = staticmethod(lambda loop: None)
+
+            @staticmethod
+            def CFMachPortCreateRunLoopSource(alloc, tap, order):
+                invalidated.wait(5)                        # starved: it gets here after the give-up
+                late.set()
+                return None                                # what an invalidated port gives
+
+            @staticmethod
+            def CFRunLoopAddSource(loop, src, mode):
+                added.append(src)                          # with None: the crash
+
+        w = InputWatch()
+        w.START_WAIT_S = 0.05
+        with mock.patch.dict(sys.modules, {"Quartz": Q()}):
+            self.assertFalse(w.start())
+            late.wait(2)
+            w._thread.join(2)
+        self.assertTrue(invalidated.is_set())
+        self.assertNotIn(None, added)
+        self.assertFalse(w.active)

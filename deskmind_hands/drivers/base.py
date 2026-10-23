@@ -200,14 +200,26 @@ class ExecResult:
     #: it wrote; a driver that cannot tell leaves it empty. A scratch file of the driver's own (the staged 未命名-N
     #: under .hands/) is never one of these.
     files: tuple[tuple[str, str | None], ...] = ()
+    #: Whether any input reached the app: False only where the driver knows none was sent -- a refusal before acting
+    #: (stale, unsupported, waited out for the user, or words marked NothingSent). None: not known, which the layer
+    #: above takes as "may have happened". Never False on a guess: an action that may have gone out stays unknown.
+    performed: bool | None = None
 
     def __post_init__(self):
         if not self.ok and (self.detail or "").lower().startswith(USER_BUSY):
             self.deferred = True
+        if not self.ok and self.performed is None and (self.stale or self.unsupported or self.deferred
+                                                       or isinstance(self.detail, NothingSent)):
+            self.performed = False
 
 
 #: How every driver says a step was left undone because the user was busy.
 USER_BUSY = "the user is active"
+
+
+class NothingSent(str):
+    """A driver's words for a refusal made before any input was sent (ExecResult.performed becomes False). Words built
+    from them by formatting are plain strings again: unknown, the safe side."""
 
 #: Seconds kept before a caller's deadline for the action itself and what is read after it (the executor's window and
 #: document reads, the reply): a step that has not started acting by then does nothing. HANDS_DEADLINE_MARGIN_S

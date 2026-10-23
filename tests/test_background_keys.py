@@ -851,8 +851,11 @@ class NoKeysToTheUsersApp(unittest.TestCase):
                 mock.patch.object(axchrome, "focused_identifier", lambda pid, fr, wid=None: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"):
             res = d._execute_projected(Action(kind=ActionKind.TYPE_TEXT, text="天气",
                                               binding=Binding(observation_id="o", app="Chrome", element_id=WEB_SEARCH)))
-        self.assertFalse(res.ok)
-        self.assertIn(USER_BUSY, res.detail)
+        # the click into the address bar went before the first key was refused: not "busy, nothing done" but
+        # unverified (review of hands#64), and still no key reached the user's app
+        self.assertTrue(res.ok and res.indeterminate, res.detail)
+        self.assertNotIn(USER_BUSY, res.detail)
+        self.assertIsNot(res.performed, False)
         self.assertEqual(self.keys_posted, [])
 
     def test_a_flash_paste_sends_no_key_and_takes_the_original_path(self):

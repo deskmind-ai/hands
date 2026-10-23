@@ -265,6 +265,14 @@ class KindsBoundedByWhatTheyTake(unittest.TestCase):
         self.assertEqual(self.ex.perform({"kind": "open_window", "app": "网易云音乐"}, deadline=time.time() + worst + 5)["status"], "ok")
         self.assertEqual(opened, ["网易云音乐"])
 
+    def test_the_worst_case_is_the_real_paths(self):
+        """A launch (open -g, 20 s), its windows (20 s) settling (10 s), the window asked for (20 s) and looked for
+        (3 s): 73 s, not the 40 s first guessed (review of hands#64). With 60 s left, an open does not start."""
+        opened = []
+        self.ex._open_window = lambda app, url: opened.append(app) or {"status": "ok", "files": []}   # noqa: SLF001
+        r = self.ex.perform({"kind": "open_window", "app": "网易云音乐"}, deadline=time.time() + 60)
+        self.assertEqual((r["status"], opened), ("error", []))
+
     def test_a_look_is_not_started_seconds_before_its_deadline(self):
         from deskmind_hands import executor as exe
         looked = []

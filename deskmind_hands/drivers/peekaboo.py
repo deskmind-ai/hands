@@ -47,7 +47,7 @@ from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, vision_elements
 from . import keys
 from .session import MESSAGES as SESSION_BLOCKED, gui_session, require_usable
 from .base import (USER_BUSY, Driver, DriverUnavailable, Element, ExecResult, Observation, effect_notes,
-                   act_by, tell_wait, WindowRef)
+                   NothingSent, act_by, tell_wait, WindowRef)
 
 #: Verified against `peekaboo help <cmd>` for 4.3.1. Collected here so a CLI
 #: change is one edit rather than an archaeology exercise.
@@ -1628,15 +1628,15 @@ class PeekabooDriver:
         allowed, self._browser_field_allowed = getattr(self, "_browser_field_allowed", None), None
         bar, r = getattr(self, "_address_bar", None), getattr(self, "_address_bar_rect", None)
         if bar is None or r is None:
-            return ExecResult(False, "this window shows no address bar to search from")
+            return ExecResult(False, NothingSent("this window shows no address bar to search from"))
         if allowed != WEB_SEARCH:
-            return ExecResult(False, "not searched from the address bar: what is typed there goes to a website, and "
-                                     "nothing judged that this text belongs there")
+            return ExecResult(False, NothingSent("not searched from the address bar: what is typed there goes to a "
+                                                 "website, and nothing judged that this text belongs there"))
         if not self._background_keys():
             # Not an app list: every step below is checked by reading back (the window proven key, the focus on this
             # window's address bar before the paste and before Return), and a check that fails sends nothing more.
-            return ExecResult(False, "not searched: the address bar is typed into only in the background, and "
-                                     "background input is off or not available on this Mac")
+            return ExecResult(False, NothingSent("not searched: the address bar is typed into only in the background, "
+                                                 "and background input is off or not available on this Mac"))
         moved = self._moved_since_seen()
         if moved:
             return ExecResult(False, moved, stale=True)
@@ -1653,9 +1653,9 @@ class PeekabooDriver:
         bg = self._background_quartz(self.app, observed_only=True)
         if bg is None:
             refused = getattr(self, "_bg_refused", None)
-            return ExecResult(False, f"not searched: {refused}" if refused else
-                              "not searched: the window this run observes was not found, and no other window is "
-                              "typed into")
+            return ExecResult(False, NothingSent(f"not searched: {refused}" if refused else
+                                                 "not searched: the window this run observes was not found, and no "
+                                                 "other window is typed into"))
         q, token = bg
         text = action.text or ""
         x, y = self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2
@@ -1681,8 +1681,12 @@ class PeekabooDriver:
                 res = self._settle(True, f"searched {text!r} from the address bar (in the background)")
         except skylight.WindowKeyRefused as exc:
             # No key reaches the app while the user is on it (or the run's window stopped being its key window):
-            # the user's own field would take them. Deferred, as any step that waits for the user.
-            res = ExecResult(False, f"{USER_BUSY}; not searched: {exc} -- wait")
+            # the user's own field would take them. Not "user busy, nothing done": the click into the address bar,
+            # and cmd+A / cmd+V, may already have gone when a later key was refused -- unverified, looked at before
+            # searching again (review of hands#64).
+            res = ExecResult(True, indeterminate=True,
+                             detail=f"the address bar may have been clicked and {text!r} pasted, but a key was refused "
+                                    f"({exc}), so the search may not have been made -- observe before searching again")
         finally:
             skylight.give_focus_back(token)
         return self._with_key_note(res, token)
@@ -2724,7 +2728,7 @@ class PeekabooDriver:
         while True:
             if STOP.is_set():
                 self._add_wait(time.time() - t_wait)
-                return ExecResult(False, "stopped by the app; nothing was done")
+                return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
             prev = self._front_bundle()
             idle = hid_idle_seconds()
             if prev != CHAT_APP and idle >= 3:
@@ -2742,7 +2746,7 @@ class PeekabooDriver:
         if moved:
             return ExecResult(False, moved, stale=True)
         if STOP.is_set():
-            return ExecResult(False, "stopped by the app; nothing was done")
+            return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
         r = self._rects[eid]
         x, y = self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2
         cur = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
@@ -2820,9 +2824,9 @@ class PeekabooDriver:
         if by is None or time.time() <= by:
             return None
         if waited:
-            return (f"{USER_BUSY}; the step was not carried out before the caller's deadline (the Mac was not still "
-                    f"in time) -- nothing was done; wait")
-        return "the caller's deadline came before the step could act; nothing was done"
+            return NothingSent(f"{USER_BUSY}; the step was not carried out before the caller's deadline (the Mac was "
+                               f"not still in time) -- nothing was done; wait")
+        return NothingSent("the caller's deadline came before the step could act; nothing was done")
 
     def _flash(self, bundle: str, perform, what: str = "") -> tuple[bool, str]:
         """Bring `bundle` forward for as long as `perform()` takes, then give the user's app the front back.
@@ -2844,7 +2848,7 @@ class PeekabooDriver:
             # move the mouse, and it is given back straight after. Kept, it left the user typing into nothing.
             waited = self._wait_until_still(bundle, what)
             if waited is not None:
-                return False, waited
+                return False, NothingSent(waited)
             bg = self._background_quartz(bundle)
             if bg is not None:
                 q, token = bg
@@ -2852,11 +2856,11 @@ class PeekabooDriver:
                 t0 = time.time()
                 if STOP.is_set():
                     skylight.give_focus_back(token)
-                    return False, "stopped by the app; nothing was done"
+                    return False, NothingSent("stopped by the app; nothing was done")
                 late = self._too_late(False)
                 if late:
                     skylight.give_focus_back(token)
-                    return False, late
+                    return False, NothingSent(late)
                 refused = None
                 try:
                     detail = perform(q)
@@ -2877,12 +2881,12 @@ class PeekabooDriver:
             # for this step (foreground_ok), and then by raising that window through the browser's scripting and
             # activating the app without a reopen (_bring_forward), checked before anything is sent (rc.10, 10-21:
             # a field in the run's own Chrome window could not be typed into).
-            return False, (f"not done: {bundle} is brought to the front only for the run's own window, when this "
-                           f"step is allowed to; the step could not be delivered in the background")
+            return False, NothingSent((f"not done: {bundle} is brought to the front only for the run's own window, when this "
+                           f"step is allowed to; the step could not be delivered in the background"))
         if bundle.lower() not in allowed:
-            return False, f"{bundle} only responds in the foreground, which this run is not allowed to use"
+            return False, NothingSent(f"{bundle} only responds in the foreground, which this run is not allowed to use")
         if STOP.is_set():
-            return False, "stopped by the app; nothing was done"
+            return False, NothingSent("stopped by the app; nothing was done")
         import Quartz
         deadline = self._wait_until(float(os.environ.get("HANDS_FLASH_WAIT_S", "60")))
         waited = False
@@ -2901,14 +2905,14 @@ class PeekabooDriver:
             if STOP.is_set():
                 if waited:
                     self._resumed()
-                return False, "stopped by the app; nothing was done"
+                return False, NothingSent("stopped by the app; nothing was done")
             # Past the caller's deadline nothing is brought forward or sent, still Mac or not: the caller has given up
             # on this step (or is about to), and an effect it never hears of is one it may do again.
             late = self._too_late(waited)
             if late:
                 if waited:
                     self._resumed()
-                return False, late
+                return False, NothingSent(late)
             prev = self._front_bundle()
             if browser and prev.lower() == bundle.lower() and not self._takeover():
                 # the user is in this browser: raising the run's window there would cover the page they are on
@@ -2917,8 +2921,8 @@ class PeekabooDriver:
                 if time.time() > deadline:
                     if waited:
                         self._resumed()
-                    return False, (self._too_late(True)
-                                   or f"{USER_BUSY} (in {bundle}); the step was not carried out -- wait")
+                    return False, NothingSent((self._too_late(True)
+                                   or f"{USER_BUSY} (in {bundle}); the step was not carried out -- wait"))
                 waited = self._announce_wait(waited, bundle, what)
                 time.sleep(1)
                 continue
@@ -2967,13 +2971,13 @@ class PeekabooDriver:
                         token = self._front_taken(bundle, t0)
                     brought = self._bring_forward(bundle, browser)
                     if not brought:
-                        return False, f"the run's own {bundle} window could not be raised; nothing was done"
+                        return False, NothingSent(f"the run's own {bundle} window could not be raised; nothing was done")
                     for _ in range(30):
                         if self._front_bundle().lower() == bundle.lower():
                             break
                         time.sleep(0.05)
                     else:
-                        return False, f"{bundle} did not come to the front; nothing was done"
+                        return False, NothingSent(f"{bundle} did not come to the front; nothing was done")
                     arrived = True
                     time.sleep(0.15)
                     # Touched while it came forward -- any input since the idle check, the spectator's too: nothing
@@ -2983,14 +2987,15 @@ class PeekabooDriver:
                         continue
                     if browser and not self._own_window_in_front(bundle):
                         # the run's own window is not the one in front (the user's came up): nothing is sent into it
-                        return False, f"the run's own {bundle} window could not be put in front; nothing was done"
+                        return False, NothingSent(f"the run's own {bundle} window could not be put in front; "
+                                                  f"nothing was done")
                     if waited:
                         self._resumed()
                     if STOP.is_set():
-                        return False, "stopped by the app; nothing was done"
+                        return False, NothingSent("stopped by the app; nothing was done")
                     late = self._too_late(waited)     # bringing it forward took the last of the caller's time
                     if late:
-                        return False, late
+                        return False, NothingSent(late)
                     self._foreground_actions += 1
                     ime = _ascii_input_source()
                     sent = True
@@ -3015,7 +3020,7 @@ class PeekabooDriver:
             if time.time() > deadline:
                 if waited:
                     self._resumed()
-                return False, self._too_late(True) or f"{USER_BUSY}; the step was not carried out -- wait"
+                return False, NothingSent(self._too_late(True) or f"{USER_BUSY}; the step was not carried out -- wait")
             waited = self._announce_wait(waited, bundle, what)
             time.sleep(1)
 
@@ -3159,17 +3164,17 @@ class PeekabooDriver:
             if STOP.is_set():
                 if waited:
                     self._resumed()
-                return "stopped by the app; nothing was done"
+                return NothingSent("stopped by the app; nothing was done")
             if time.time() > deadline:
                 if waited:
                     self._resumed()
-                return self._too_late(True) or f"{USER_BUSY}; the step was not carried out -- wait"
+                return self._too_late(True) or NothingSent(f"{USER_BUSY}; the step was not carried out -- wait")
             waited = self._announce_wait(waited, bundle, what)
             time.sleep(0.5)
         if waited:
             self._resumed()
         if STOP.is_set():
-            return "stopped by the app; nothing was done"
+            return NothingSent("stopped by the app; nothing was done")
         # still now, but after the caller's deadline less the margin (the idle check comes first in the loop): too
         # late to act for it
         return self._too_late(waited)

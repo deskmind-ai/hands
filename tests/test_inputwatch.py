@@ -917,16 +917,16 @@ class FlashesTold(_EpochCase):
         fronts = iter(["com.googlecode.iterm2", NE] + ["com.googlecode.iterm2"] * 5)
         ex._front_bundle_id = lambda: next(fronts)         # noqa: SLF001 -- the app took the front on launch
         ex._make_frontmost = lambda b: True                # noqa: SLF001
-        ex._launch_windows = lambda *a: []                 # noqa: SLF001
+        inside = []
+        ex._launch_windows = lambda *a: inside.append(time.time()) or []   # noqa: SLF001 -- a moment in the launch
         ex._settled = mock.Mock(side_effect=RuntimeError("stop here"))   # noqa: SLF001
-        t = time.time()
         with mock.patch.object(exe, "resolve_app", return_value=NE), \
              mock.patch.object(exe, "running_apps", return_value=[]), \
              mock.patch.object(exe, "installed_apps", return_value=[]), \
              mock.patch.object(exe.subprocess, "run"):
             with self.assertRaises(RuntimeError):
                 ex._open_window(NE, None)                  # noqa: SLF001
-        self.assertIn(NE.lower(), self.flashes(t + 0.001))
+        self.assertIn(NE.lower(), self.flashes(inside[0]))   # not t + 1 ms: a loaded machine starts the launch later
 
 
 class FlashesToldBeforeTheFront(_EpochCase):
@@ -1243,3 +1243,369 @@ class FrontRead(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MainWatch(InputWatch):
+    """Main's attribution (deskmind-ai/hands main at b9a8674, InputWatch.note verbatim): an input goes to its target
+    when that is an ordinary app, to DeskMind when it is DeskMind, and otherwise to an unknown target, which counts."""
+
+    def note(self, pid, at=None, key=False, age=None, t0=None):   # noqa: ARG002 -- main's signature had pid and at
+        at = at or time.time()
+        if self.is_own(pid):
+            self.last_own_at = max(self.last_own_at, at)
+            return
+        self.last_external_at = max(self.last_external_at, at)
+        bundle = (self._pid_bundle.get(pid) or "").lower() if pid and self.is_regular(pid) else ""
+        if bundle:
+            self.last_by_bundle[bundle] = max(self.last_by_bundle.get(bundle, 0.0), at)
+        else:
+            self.last_unknown_at = max(self.last_unknown_at, at)
+
+
+CHAT_PID, NE_PID = 35, 36
+CHAT = "com.example.chat"
+TE = "com.apple.TextEdit"
+APPS = {ITERM: ("iTerm2", "com.googlecode.iterm2"), MUSIC: ("文本编辑", TE), CHAT_PID: ("Chat", CHAT),
+        NE_PID: ("网易云音乐", NE)}
+
+
+class MainIsTheFloor(_EpochCase):
+    """The same scenarios through the real executor -> driver path (HandsExecutor.perform -> PeekabooDriver.execute
+    -> _execute_outer, the real _flash / chat click / staging / launch inside it; the system's calls mocked: the app
+    in front is one value, read by the driver and by the watch's poller alike), once with main's attribution and once
+    with the branch's. Main, for this table: main's InputWatch.note (MainWatch) and main's epoch mark, moved at every
+    action's end (_input_by_source False) -- the executor and driver code is this branch's, which main's attribution
+    ignores apart from those two. Wherever main stales, the branch stales, but for the one exception the hands#62 fix
+    exists for: a key with no app target (a Command chord) typed in the user's own app (the terminal) between steps,
+    when no app of the task's was in front around it (rc.13, 10-22; owner 10-20). Built after the hands#62 review at
+    9def177; `review_*` fails there (the branch did not stale)."""
+
+    #: (scenario, main stales, branch stales, the allowed exception)
+    TABLE = [
+        ("review_textedit_forward_by_itself_during_a_step", True, True, False),
+        ("late_flash_registration_key_during_perform", False, True, False),
+        ("chat_click_key_during_the_click", False, True, False),
+        ("staging_key_while_the_task_app_had_the_front", True, True, False),
+        ("cold_launch_key_while_the_app_had_the_front", True, True, False),
+        ("terminal_typing_while_the_flash_waits_for_idle", False, False, False),
+        ("terminal_typing_between_steps", True, False, True),
+        ("command_key_in_the_task_app_between_steps", True, True, False),
+        ("plain_key_into_the_task_app_between_steps", True, True, False),
+        ("late_callback_of_a_key_typed_in_the_task_app", True, True, False),
+    ]
+
+    # -- the mocked system ---------------------------------------------------------------------------------------
+    def _watch(self, main: bool):
+        w = (MainWatch if main else InputWatch)()
+        w.front_pid = lambda: self.front["pid"]
+        w._pid_bundle = {ITERM: "com.googlecode.iterm2", MUSIC: TE, DESKMIND: "ai.deskmind.app",
+                         DOCK: "com.apple.dock", CHAT_PID: CHAT, NE_PID: NE}
+        w._pid_regular = {ITERM: True, MUSIC: True, DESKMIND: True, DOCK: False, CHAT_PID: True, NE_PID: True}
+        w.active, w.keys = True, True
+        self.w = w
+        if not main:
+            getattr(w, "watch_front", lambda: None)()       # the poller (absent before the observed front)
+            self.addCleanup(getattr(w, "stop_front", lambda: None))
+        return w
+
+    def focus(self, pid: int, settle: bool = True):
+        """The app with the keyboard is now `pid`; with `settle`, it stays so long enough to be read a few times."""
+        self.front["pid"] = pid
+        if settle:
+            threading.Event().wait(0.08)
+
+    def cmd_key(self, at: float | None = None, target: int = DOCK):
+        """The user's key at `at` (now when not given): a Command chord, the Dock its target, unless `target`."""
+        self.fields[40] = target
+        if at is None:
+            self.fields.pop("ts", None)
+        else:
+            self.fields["ts"] = _uptime_ns() - int(max(0.0, time.time() - at) * 1e9)
+        self.key()
+
+    def _driver(self, app: str = TE):
+        from deskmind_hands.drivers import peekaboo as pk
+        d = pk.PeekabooDriver.__new__(pk.PeekabooDriver)
+        d.app, d._mcp, d._foreground_actions, d._chat_sends = app, object(), 0, 0
+        d._front_app = lambda: APPS.get(self.front["pid"], ("", ""))
+        d._front_bundle = lambda: APPS.get(self.front["pid"], ("", ""))[1]
+        d._task_windows = lambda: []
+        d._hid_idle = lambda: 100.0
+        d._osa = lambda script: (True, "")
+        d._takeover = lambda: True
+        d._resumed = lambda: None
+        d._background_input = lambda bundle: False
+        d.BROWSERS = set()
+        d._browser_front_sid = lambda bundle: None
+        d._window_id = None
+        by_bundle = {b.lower(): pid for pid, (_, b) in APPS.items()}
+
+        def bring(bundle, browser):
+            self.front["pid"] = by_bundle[bundle.lower()]
+            return True
+        d._bring_forward = bring
+
+        def give_back(prev, ours=None, late_s=0.0):        # the give-back itself is not what this table tests
+            if APPS.get(self.front["pid"], ("", ""))[1].lower() == (ours or "").lower():
+                self.front["pid"] = by_bundle.get(prev.lower(), self.front["pid"])
+        d._give_front_back = give_back
+        return d
+
+    def _system(self, **quartz):
+        import os as _os
+        from deskmind_hands.drivers import peekaboo as pk
+        q = _quartz(self.fields)
+        for k, v in {"CGEventGetLocation": lambda e: (0, 0), "CGEventCreate": lambda x: None,
+                     "CGWarpMouseCursorPosition": lambda p: None,
+                     "CGAssociateMouseAndMouseCursorPosition": lambda b: None,
+                     "CGEventPost": lambda tap, e: None, "CGEventCreateMouseEvent": lambda *a: None,
+                     "kCGEventMouseMoved": 0, "kCGMouseButtonLeft": 0, "kCGHIDEventTap": 0, **quartz}.items():
+            setattr(q, k, v)
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(mock.patch.dict(sys.modules, {"Quartz": q}))
+        stack.enter_context(mock.patch.dict(_os.environ, {"HANDS_FLASH_APPS": f"{TE},{NE}", "HANDS_CHAT_FLASH": "1"}))
+        stack.enter_context(mock.patch.object(pk, "require_usable", return_value="active"))
+        stack.enter_context(mock.patch.object(pk, "_ascii_input_source",
+                                              return_value=types.SimpleNamespace(restore=lambda: None)))
+        stack.enter_context(mock.patch.object(pk, "hid_idle_seconds", return_value=60.0))
+        by_bundle = {b.lower(): pid for pid, (_, b) in APPS.items()}
+
+        def run(args, *a, **k):                            # `open -b X` brings X forward; nothing else is run
+            if list(args[:2]) == ["/usr/bin/open", "-b"] and str(args[2]).lower() in by_bundle:
+                self.front["pid"] = by_bundle[str(args[2]).lower()]
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        stack.enter_context(mock.patch.object(pk.subprocess, "run", side_effect=run))
+        return stack
+
+    def _step(self, ex, stub, inner, app: str = TE, **quartz):
+        """One action of the task's through executor.perform and the real driver.execute, `inner` as the step."""
+        from deskmind_hands.drivers.base import ExecResult
+        d = self._driver(app)
+        d._execute_inner = lambda a: inner(d) or ExecResult(True, "done")
+        stub.execute = d.execute
+        with self._system(**quartz):
+            return ex.perform({"kind": "click", "window": "com.apple.TextEdit#12", "target": "B2"})
+
+    # -- the scenarios: each leaves the executor right after the user's input; the verdict is the next snapshot -------
+    def review_textedit_forward_by_itself_during_a_step(self, ex, stub):
+        """A background action brought TextEdit forward by itself; the user typed a Command key into it and
+        Command-Tabbed back to the terminal; before and after the step the terminal is in front. The key's callback
+        runs after the step, within its freshness, the front read naming the terminal (hands#62 review at 9def177)."""
+        when = {}
+
+        def inner(d):
+            self.focus(MUSIC)                              # TextEdit came forward by itself
+            when["key"] = time.time() - 0.005              # the Command key into it ...
+            self.focus(ITERM, settle=False)                # ... and the switch back to the terminal
+        self._step(ex, stub, inner)
+        self.cmd_key(at=when["key"])
+
+    def late_flash_registration_key_during_perform(self, ex, stub):
+        """The earlier P1: a key into the flashed app while perform() runs, its callback then, the front meanwhile
+        in the terminal (hands#62 review at af55263)."""
+        def perform(Q):
+            self.focus(ITERM, settle=False)
+            self.cmd_key()
+            return "typed"
+        self._step(ex, stub, lambda d: d._flash(TE, perform)[1] and None)
+
+    def chat_click_key_during_the_click(self, ex, stub):
+        import types as _types
+        from deskmind_hands.drivers import peekaboo as pk
+        self.addCleanup(setattr, pk, "CHAT_APP", pk.CHAT_APP)
+        pk.CHAT_APP = CHAT
+        ex.current[CHAT] = f"{CHAT}#5"                     # the task operates the chat app too
+        keyed = []
+
+        def post(tap, e):
+            if not keyed:
+                keyed.append(1)
+                self.focus(ITERM, settle=False)
+                self.cmd_key()
+
+        def inner(d):
+            d._labels_by_id = {"B1": "打开"}
+            d._rects = {"B1": _types.SimpleNamespace(x=10, y=10, w=20, h=10)}
+            d._origin = _types.SimpleNamespace(x=0, y=0)
+            d._moved_since_seen = lambda: None
+            d._add_wait = lambda s: None
+            d._chat_flash_click("B1")
+            self.focus(ITERM, settle=False)
+        self._step(ex, stub, inner, app=CHAT, CGEventPost=post)
+
+    def staging_key_while_the_task_app_had_the_front(self, ex, stub):
+        """Staging (a driver started for TextEdit) brought it forward; a key in it, the user then in the terminal:
+        the front read after staging names the terminal."""
+        def during():
+            self.focus(MUSIC, settle=False)
+            self.focus(ITERM, settle=False)
+            self.cmd_key()
+        fronts = [("iTerm2", "com.googlecode.iterm2"), ("iTerm2", "com.googlecode.iterm2")]
+        self._stage(TE, [], fronts, during=during)
+
+    _stage = FlashesTold._stage
+
+    def cold_launch_key_while_the_app_had_the_front(self, ex, stub):
+        from deskmind_hands import executor as exe
+        ex.current[NE] = f"{NE}#7"                         # the task goes on to operate the launched app
+        ex._known_windows = lambda: set()                  # noqa: SLF001
+        ex._front_bundle_id = lambda: "com.googlecode.iterm2"   # noqa: SLF001
+        ex._make_frontmost = lambda b: True                # noqa: SLF001
+
+        def windows(*a):
+            self.focus(NE_PID, settle=False)               # it took the front at launch ...
+            self.focus(ITERM, settle=False)                # ... and the user went back to the terminal
+            self.cmd_key()
+            return []
+        ex._launch_windows = windows                       # noqa: SLF001
+        ex._settled = mock.Mock(side_effect=RuntimeError("stop here"))   # noqa: SLF001
+        with mock.patch.object(exe, "resolve_app", return_value=NE), \
+             mock.patch.object(exe, "running_apps", return_value=[]), \
+             mock.patch.object(exe, "installed_apps", return_value=[]), \
+             mock.patch.object(exe.subprocess, "run"):
+            try:
+                ex._open_window(NE, None)                  # noqa: SLF001
+            except RuntimeError:
+                pass
+
+    def terminal_typing_while_the_flash_waits_for_idle(self, ex, stub):
+        """The user works in the terminal while the driver waits for a still Mac before it brings TextEdit forward:
+        their Command keys went to the terminal, before any app of the task's had the front."""
+        def inner(d):
+            d._takeover = lambda: False
+            idle = iter([0.0, 100.0, 100.0, 100.0])        # busy, then still
+            d._hid_idle = lambda: next(idle, 100.0)
+
+            def wait(waited, bundle, what):
+                self.cmd_key()                             # typing in the terminal meanwhile
+                return True
+            d._announce_wait = wait
+            d._flash(TE, lambda Q: "typed")
+        self.focus(ITERM)
+        self._step(ex, stub, inner)
+
+    def terminal_typing_between_steps(self, ex, stub):
+        self._step(ex, stub, lambda d: None)
+        self.focus(ITERM)
+        self.cmd_key()
+
+    def command_key_in_the_task_app_between_steps(self, ex, stub):
+        self._step(ex, stub, lambda d: None)
+        self.focus(MUSIC)                                  # the user in TextEdit themselves
+        self.cmd_key()
+        self.focus(ITERM, settle=False)
+
+    def plain_key_into_the_task_app_between_steps(self, ex, stub):
+        self._step(ex, stub, lambda d: None)
+        self.focus(MUSIC)
+        self.cmd_key(target=MUSIC)
+
+    def late_callback_of_a_key_typed_in_the_task_app(self, ex, stub):
+        self._step(ex, stub, lambda d: None)
+        self.focus(MUSIC)
+        at = time.time()
+        self.focus(ITERM)                                  # the callback runs once the user is back in the terminal
+        self.focus(ITERM)
+        self.cmd_key(at=at)
+
+    # -- the table --------------------------------------------------------------------------------------------------
+    def stales(self, scenario: str, main: bool) -> bool:
+        from deskmind_hands.drivers import peekaboo as pk
+        from deskmind_hands.grounding import STOP
+        STOP.clear()
+        self.iw = __import__("deskmind_hands.inputwatch", fromlist=["FLASHES"])
+        self.iw.FLASHES.clear()
+        self._watch(main)
+        self.focus(ITERM)                                  # the user in the terminal, read for a while already
+        ex, stub, _ = self._task()
+        if main:
+            ex._input_by_source = lambda: False            # noqa: SLF001 -- main moved the mark at every action's end
+        with mock.patch.object(pk.time, "sleep"):
+            getattr(self, scenario)(ex, stub)
+        e = ex.epoch
+        s = ex.snapshot()
+        return s["epoch"] == e + 1 and s["epoch_reason"].get("by") == "input"
+
+    def test_wherever_main_stales_the_branch_stales_but_for_the_listed_exception(self):
+        got = []
+        for scenario, main_expected, branch_expected, exception in self.TABLE:
+            with self.subTest(scenario=scenario):
+                main, branch = self.stales(scenario, True), self.stales(scenario, False)
+                got.append((scenario, main, branch))
+                self.assertEqual(main, main_expected, f"main: {scenario}")
+                self.assertEqual(branch, branch_expected, f"branch: {scenario}")
+                if not exception:
+                    self.assertTrue(branch or not main, f"main stales and the branch does not: {scenario}")
+        self.assertEqual([s for s, _, _, x in self.TABLE if x], ["terminal_typing_between_steps"])
+
+    def test_review_the_app_that_came_forward_by_itself_during_a_step_stales_it(self):
+        """The review's scenario alone (hands#62 review at 9def177): fails there, epoch 2 -> 2."""
+        self.assertTrue(self.stales("review_textedit_forward_by_itself_during_a_step", False))
+
+
+class ObservedFront(_KeysCase):
+    """The front as observed (front_seen / fronts_between): runs of reads, each taken to reach back to the read
+    before it and on to the read after it; a gap leaves the span unknown, and the key then goes by the fallbacks."""
+
+    def test_an_app_seen_in_front_over_the_keys_time_is_found_and_a_change_reaches_both_reads(self):
+        w, t = self.w, 1000.0
+        for i in range(5):
+            w.front_seen(ITERM, t + i * 0.02)
+        for i in range(5, 10):
+            w.front_seen(MUSIC, t + i * 0.02)              # TextEdit from somewhere between 0.08 and 0.10
+        self.assertEqual(w.fronts_between(t + 0.081, t + 0.085, wait_s=0), [ITERM, MUSIC])   # either, then
+        self.assertEqual(w.fronts_between(t + 0.15, t + 0.16, wait_s=0), [MUSIC])
+        self.assertIsNone(w.fronts_between(t - 1, t + 0.05, wait_s=0))      # nothing read before the span
+        self.assertIsNone(w.fronts_between(t + 0.1, t + 0.5, wait_s=0))     # nor after it
+
+    def test_a_gap_in_the_reads_over_the_span_says_nothing(self):
+        from deskmind_hands import inputwatch as iw
+        w, t = self.w, 1000.0
+        w.front_seen(ITERM, t)
+        w.front_seen(ITERM, t + iw.FRONT_GAP_S + 0.05)    # the poller stalled in between
+        self.assertIsNone(w.fronts_between(t + 0.01, t + 0.02, wait_s=0))
+        self.assertEqual(w.fronts_between(t + iw.FRONT_GAP_S + 0.05, t + iw.FRONT_GAP_S + 0.05, wait_s=0), [ITERM])
+
+    def _seen(self, *runs):
+        """The poller's reads: (pid, seconds) runs, oldest first, the last one read again just after the key."""
+        self.w._front_runs.clear()
+        t = time.time() - sum(s for _, s in runs)
+        for pid, secs in runs:
+            for i in range(int(secs / 0.02)):
+                self.w.front_seen(pid, t + i * 0.02)
+            t += secs
+        self.w.front_seen(runs[-1][0], time.time() + 0.05)
+
+    def test_a_key_counts_for_every_app_seen_and_the_terminal_alone_stales_nothing(self):
+        self._seen((MUSIC, 0.3), (ITERM, 0.02))           # the task's app until a moment ago
+        self.fields[40] = DOCK
+        self.key()
+        self.assertGreater(self.ex._last_input_at(), 0.0)  # noqa: SLF001
+        self.w.last_by_bundle.clear()
+        self._seen((ITERM, 0.5))                           # the terminal all along
+        self.key()
+        self.assertEqual(self.ex._last_input_at(), 0.0)    # noqa: SLF001
+        self.assertIn("com.googlecode.iterm2", self.w.last_by_bundle)
+
+    def test_an_unreadable_front_counts_and_deskmind_alone_is_deskminds(self):
+        self._seen((0, 0.3))                               # the read failed
+        self.fields[40] = DOCK
+        self.key()
+        self.assertGreater(self.w.last_unknown_at, 0.0)
+        self.w.last_unknown_at = 0.0
+        self._seen((DESKMIND, 0.3))
+        self.key()
+        self.assertGreater(self.w.last_own_at, 0.0)
+        self.assertEqual(self.w.last_unknown_at, 0.0)
+
+    def test_the_poller_reads_the_front_and_a_stopped_one_is_not_waited_for(self):
+        self.w.watch_front()
+        self.addCleanup(self.w.stop_front)
+        self.front["pid"] = MUSIC
+        threading.Event().wait(0.1)
+        self.assertEqual(self.w.fronts_between(time.time() - 0.05, time.time()), [MUSIC])
+        self.w.stop_front()
+        t = time.monotonic()
+        self.assertIsNone(self.w.fronts_between(time.time() + 1, time.time() + 2))
+        self.assertLess(time.monotonic() - t, 0.05)

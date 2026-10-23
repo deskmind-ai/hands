@@ -16,7 +16,14 @@ target -- it may act on the app switcher (Command-Tab), which changes only which
 anything a task looks at -- and some come with none. While the owner worked in a terminal and switched apps, each such
 key was input to an unknown target and staled the steps of a task working in a music app (rc.13, 10-22,
 run_fd8ab281: 4 stale refusals said "to: unknown"). A key whose target is neither an ordinary app nor DeskMind
-goes, first match:
+goes, first, by the front as it was observed: the app with the keyboard is read every FRONT_POLL_S on a thread of the
+watch's own (`front_seen`: runs of the same app, with when it was first and last seen), and a key counts for every
+app that was in front at any point from FRONT_MARGIN_S before its own time to its own time -- plus every app a flash
+had in front then -- whichever code path raised it and whenever the callback runs (hands#62 review at 9def177: the
+front inferred, site by site, from what the driver had told or from reads before and after a step, missed an app
+that came forward by itself during a step and was left again before its end). The callback waits (FRONT_DEADLINE_S at
+most) for the first read after the key's time, so the front a moment after it is seen too. Only where that record
+has no gap over the key's time (the poller stalled or not running: no read for FRONT_GAP_S) does it go, first match:
 - its own time inside a flash -- the driver had a task's app in front, from when it took the front to when it gave
   it back (FLASHES: front_taken/front_given_back, plus FLASH_MARGIN_S after) -- to every app a flash had in front
   then, and to the step's app: a key that landed in the flashed app in the flash's last moment, its front read
@@ -153,6 +160,14 @@ FRONT_DEADLINE_S = 0.1
 FRONT_BACKOFF_S = 0.5
 #: The longest a step of the task's is taken to last when its end is never told (step_began's default).
 STEP_MAX_S = 180.0
+#: The front, observed (InputWatch.front_seen, the poller): how often the app with the keyboard is read, the longest
+#: gap between two reads for the time between them to count as seen, and how long before a key's own time an app in
+#: front still counts for it (the event clock against the read's, and the key routed a moment before the front read
+#: changes). A read costs ~0.2 ms (500 reads at 20 ms on 10-23: median 0.2 ms, p99 9.7 ms, ~0.4% of a core).
+FRONT_POLL_S = 0.02
+FRONT_GAP_S = 0.15
+FRONT_MARGIN_S = 0.1
+FRONT_RUNS = 2048
 
 
 #: The driver's flashes, process-wide: [lowercased bundle, took the front at, gave it back at or None, deadline]
@@ -277,6 +292,11 @@ class InputWatch:
         #: held while an input is recorded and while the executor's epoch mark is stamped (note, mark)
         self.lock = threading.Lock()
         self._last_stamp = 0.0
+        #: the front as observed: runs [pid (0: could not be read), first seen, last seen] (epoch seconds), oldest
+        #: first; a new run starts when the app changes or after a gap of more than FRONT_GAP_S (front_seen)
+        self._front_runs: list[list] = []
+        self._front_seen = threading.Condition()
+        self._poll_stop: threading.Event | None = None
 
     # -- classification (pure, testable) ---------------------------------------------------------------------
     def is_own(self, pid: int | None) -> bool:
@@ -294,7 +314,11 @@ class InputWatch:
         event's age at `t0` (time.monotonic(), sampled once when the callback began; now when not given). `at`: a
         fixed record time, for tests.
 
-        A key whose target is neither an ordinary app nor DeskMind goes, in order:
+        A key whose target is neither an ordinary app nor DeskMind goes to every app the observed front had at any
+        point from FRONT_MARGIN_S before its own time to its own time (fronts_between, the first read after it
+        waited for), and to every app a flash had in front then -- an unreadable or system front is unknown and
+        counts; DeskMind alone in front is DeskMind's. Only where that record has a gap over the key's time (or the
+        key has no timestamp), in order:
         - its own time inside a flash (flash_at): to the flashed app, ahead of the front read -- a read that answered
           after the front was given back names the user's app for a key that landed in the flashed one. The flash
           check is the last lookup (it is made first too, to skip the read): a flash told while the read was out is
@@ -327,20 +351,37 @@ class InputWatch:
         # -- 1. lookups: nothing shared is written (only the lookups' own caches)
         target = kind(pid) if pid else "unknown"
         event_at = (at if at is not None else wall0) - (age if age is not None and age >= 0 else 0.0)
-        flashes, front, front_kind, step = [], 0, "unknown", ""
+        flashes, front, front_kind, step, seen = [], 0, "unknown", "", None
         if key and target not in ("own", "regular"):
             flashes = list(self.flash_at(event_at))
+            # the front as observed over the key's own time; None when that record has a gap there. Only an event
+            # whose own time is known: a key with no timestamp is placed at its callback, which may be late
+            seen = self.fronts_between(event_at - FRONT_MARGIN_S, event_at) if age is not None and age >= 0 else None
+            if seen is not None:
+                seen = [kind(p) if p else "unknown" for p in seen], seen
+        if key and target not in ("own", "regular") and seen is None:
             if not flashes and age is not None and 0.0 <= age + (time.monotonic() - t0) <= KEY_FRESH_S:
                 front = self.front_now()                   # not even asked for a key already past its freshness
                 if front:
                     front_kind = kind(front)
             step = self.step_at(event_at)
+        if key and target not in ("own", "regular"):
             # the flash check is the last lookup: a flash the driver told while the read was out (its give-back
             # then answered the read) is found here (hands#62 review at 50f176a)
             flashes += [b for b in self.flash_at(event_at) if b not in flashes]
         # -- 2. freshness, once, after every lookup
         fresh = age is not None and 0.0 <= age + (time.monotonic() - t0) <= KEY_FRESH_S
-        if flashes:
+        unknown = False
+        if seen is not None:
+            # every app seen in front then, and every flashed app: an app the task does not operate stales nothing,
+            # a front that could not be read or is no ordinary app (a system surface) is unknown and counts, and only
+            # DeskMind in front all along is the user answering DeskMind. The step is not added: it spans the
+            # driver's wait for a still Mac, and keys typed in the terminal then are the user's (hands#62 re-review)
+            kinds, pids = seen
+            regular = [(self._pid_bundle.get(p) or "").lower() for k, p in zip(kinds, pids) if k == "regular"]
+            unknown = "unknown" in kinds
+            dest = "seen" if (flashes or regular or unknown) else "own"
+        elif flashes:
             dest = "flash"                                 # the flashed apps: it can only make the key count
         elif front and fresh and front_kind in ("regular", "own"):
             dest, pid = front_kind, front
@@ -353,7 +394,8 @@ class InputWatch:
         # are the task's; a key recorded for an app the task does not operate stales nothing)
         read = ([(self._pid_bundle.get(front) or "").lower()]
                 if front and fresh and front_kind == "regular" else [])     # what a fresh read named, kept too
-        bundles = (list(dict.fromkeys(flashes + ([step] if step else []) + read)) if dest == "flash"
+        bundles = (list(dict.fromkeys(flashes + regular)) if dest == "seen"
+                   else list(dict.fromkeys(flashes + ([step] if step else []) + read)) if dest == "flash"
                    else [step] if dest == "step"
                    else [(self._pid_bundle.get(pid) or "").lower()] if dest == "regular" else [])
         bundles = [b for b in bundles if b]
@@ -366,7 +408,7 @@ class InputWatch:
             self.last_external_at = max(self.last_external_at, when)
             for b in bundles:
                 self.last_by_bundle[b] = max(self.last_by_bundle.get(b, 0.0), when)
-            if not bundles:
+            if not bundles or unknown:
                 self.last_unknown_at = max(self.last_unknown_at, when)
 
     def stamp(self) -> float:
@@ -407,6 +449,79 @@ class InputWatch:
             if bundle and began - STEP_MARGIN_S <= at <= end + STEP_MARGIN_S:
                 return bundle
         return ""
+
+    # -- the front, observed ---------------------------------------------------------------------------------
+    def front_seen(self, pid: int, at: float | None = None) -> None:
+        """The app with the keyboard read at `at` (now when not given): `pid`, 0 when it could not be read."""
+        at = time.time() if at is None else at
+        with self._front_seen:
+            runs = self._front_runs
+            if runs and runs[-1][0] == pid and 0.0 <= at - runs[-1][2] <= FRONT_GAP_S:
+                runs[-1][2] = at
+            elif not runs or at >= runs[-1][2]:
+                runs.append([pid, at, at])
+                if len(runs) > FRONT_RUNS:
+                    del runs[: len(runs) - FRONT_RUNS]
+            self._front_seen.notify_all()
+
+    def fronts_between(self, a: float, b: float, wait_s: float | None = None) -> list[int] | None:
+        """Every pid that may have had the keyboard at some point in [a, b], by the observed front; None when the
+        record cannot say -- no read before `a`, none after `b` (waited for, `wait_s`, FRONT_DEADLINE_S by default,
+        while the poller runs), or a gap of more than FRONT_GAP_S between two reads over the span. A change is seen
+        only at the read after it, so each run is taken to reach back to the read before it and on to the read after
+        it: an app is never left out for having changed hands between two reads."""
+        wait_s = FRONT_DEADLINE_S if wait_s is None else wait_s
+        until = time.monotonic() + wait_s
+        with self._front_seen:
+            while (not self._front_runs or self._front_runs[-1][2] < b) and self.polling():
+                left = until - time.monotonic()
+                if left <= 0:
+                    break
+                self._front_seen.wait(left)
+            runs = [list(r) for r in self._front_runs]
+        if not runs or runs[0][1] > a or runs[-1][2] < b:
+            return None
+        out: list[int] = []
+        for i, (pid, first, last) in enumerate(runs):
+            nxt = runs[i + 1] if i + 1 < len(runs) else None
+            prev = runs[i - 1] if i else None
+            if nxt is not None and nxt[1] - last > FRONT_GAP_S and last < b and nxt[1] > a:
+                return None                                # nothing was read over part of the span
+            lo = prev[2] if prev is not None and first - prev[2] <= FRONT_GAP_S else first
+            hi = nxt[1] if nxt is not None and nxt[1] - last <= FRONT_GAP_S else last
+            if hi >= a and lo <= b and pid not in out:
+                out.append(pid)
+        return out
+
+    def polling(self) -> bool:
+        return self._poll_stop is not None and not self._poll_stop.is_set()
+
+    def watch_front(self) -> None:
+        """Read the app with the keyboard every FRONT_POLL_S on a thread of its own, into front_seen, until
+        stop_front(). A read that hangs leaves a gap, and a key over a gap goes by the fallbacks (note)."""
+        if self.polling():
+            return
+        stop = self._poll_stop = threading.Event()
+
+        def poll():
+            while not stop.is_set():
+                # stamped when the read began: what it answers held at some moment after that, so an app that came
+                # forward while a slow read was out is never placed later than it came (the margin before a key's
+                # time covers the other side)
+                began = time.time()
+                try:
+                    pid = int(self.front_pid() or 0)
+                except Exception:  # noqa: BLE001 -- not known: recorded as such, and it counts
+                    pid = 0
+                self.front_seen(pid, began)
+                stop.wait(FRONT_POLL_S)
+        threading.Thread(target=poll, name="input-watch-front-poll", daemon=True).start()
+
+    def stop_front(self) -> None:
+        if self._poll_stop is not None:
+            self._poll_stop.set()
+        with self._front_seen:
+            self._front_seen.notify_all()
 
     # -- the app with the keyboard ---------------------------------------------------------------------------
     def front_now(self) -> int:
@@ -620,4 +735,6 @@ class InputWatch:
         self._thread = threading.Thread(target=run, name="input-watch", daemon=True)
         self._thread.start()
         ready.wait(2.0)
+        if self.active and self.keys:
+            self.watch_front()                             # only keys need the front: a click has its target
         return self.active

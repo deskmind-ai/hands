@@ -350,8 +350,14 @@ class FakeQ:
     def CGEventPost(self, tap, ev):   # noqa: N802
         if ev["down"] and "text" in ev:
             self.d.log.append(("keys", ev["text"]))
-            if self.d.keys_land:
+            if not self.field.focused:                                  # the keyboard focus is elsewhere: there
+                self.field.other += ev["text"]
+            elif self.d.keys_land:
                 self.field.value += ev["text"].capitalize() if not self.field.value.endswith(" ") else ev["text"]
+        elif ev["down"]:                                                # a key built beforehand (_key_pair)
+            self.d.log.append(("key", ev["code"], ev.get("flags", 0)))
+            if ev.get("flags"):                                         # cmd+A: the next keys replace it all
+                self.field.value = ""
 
 
 def driver():
@@ -379,14 +385,17 @@ class Field:
     def __init__(self, value, takes_insertion, role="AXTextArea", names=("正文",), web=False):
         self.value, self.takes, self.role, self.names, self.web = value, takes_insertion, role, list(names), web
         self.focused = True
+        self.other = ""                     # another field of the window, where keys go when this one lost the focus
 
 
 class TypeText(unittest.TestCase):
     def run_type(self, field, keys_land=True, enter=None, text="hello 你好", clear=False, selects=True,
-                 all_selected=True, d=None, settle=None, value=None, insert=None, extra=(), user_on=False):
+                 all_selected=True, d=None, settle=None, value=None, insert=None, extra=(), user_on=False,
+                 key_event=None, real_keycode=False):
         d = d or driver()
         d.keys_land = keys_land
-        d._keycode = lambda q, letter: {"a": 0}[letter]
+        if not real_keycode:
+            d._keycode = lambda q, letter: {"a": 0}[letter]
 
         def post_key(q, code, flags=0):                                 # cmd+A selects all: the next keys replace it
             d.log.append(("key", code, flags))
@@ -417,13 +426,14 @@ class TypeText(unittest.TestCase):
                    mock.patch.object(axfield, "names", lambda el: field.names),
                    mock.patch.object(axfield, "in_web_area", lambda el: field.web),
                    mock.patch.object(axfield, "is_focused", lambda el: field.focused),
-                   mock.patch.object(axfield, "focus", lambda el: d.log.append("focus") or True),
+                   mock.patch.object(axfield, "focus",
+                                     lambda el: d.log.append("focus") or setattr(field, "focused", True) or True),
                    mock.patch.object(axfield, "select", lambda el, replace_all: d.log.append("select") or selects),
                    mock.patch.object(axfield, "all_selected", lambda el, wait=0.5: all_selected),
                    mock.patch.object(skylight, "user_on", lambda pid: user_on),
                    mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin, key=None: FakeQ(d, field)),
                    mock.patch.object(PeekabooDriver, "_key_event",
-                                     classmethod(lambda cls, Q, code, down: {"down": down, "code": code})),
+                                     key_event or classmethod(lambda cls, Q, code, down: {"down": down, "code": code})),
                    mock.patch.object(skylight, "enter_window_key",
                                      enter or (lambda pid, wid: d.log.append(("key window", pid, wid)) or Key(d.log)))]
         for p in patches:
@@ -501,6 +511,58 @@ class TypeText(unittest.TestCase):
         d, res = self.run_type(Field("start", takes_insertion="ignored"), d=d, text="again")
         self.assertEqual(d.log, [("ax insert", "again")])
         self.assertFalse(hasattr(d, "_ax_noop_windows"))
+
+    def test_focus_moved_while_preparing_the_keys_lands_nothing_elsewhere(self):
+        """hands#66's focus family: a key event made after the focus check (on a cold cache, a child process reading
+        the layout, up to 20 s) let the focus move first, and the next chunk went into another field. Prepared before
+        the check now. Every preparing call -- the layout read on a cold cache, each key event, the chunks -- moves
+        the focus away; nothing lands elsewhere, and the field is focused again before the first key."""
+        from deskmind_hands.drivers import peekaboo as P
+        field = Field("start", takes_insertion=False)
+
+        def steal(*_a, **_k):
+            field.focused = False
+            field.other_moves = getattr(field, "other_moves", 0) + 1
+
+        def child(*a, **k):                                       # the layout read: a child process, when cold
+            steal()
+            return types.SimpleNamespace(stdout='{"events": {}, "table": {}}', returncode=0)
+
+        def key_event(cls, Q, code, down):
+            cls._load_keys()                                      # cold: the child process
+            steal()
+            return {"down": down, "code": code}
+        chunks = skylight.text_chunks
+        cold = [mock.patch.object(PeekabooDriver, name, value)
+                for name, value in (("_key_blobs", {}), ("_letter_codes", {}), ("_letters_read_at", 0.0))]
+        d, res = self.run_type(field, text="hello world", real_keycode=True, key_event=classmethod(key_event),
+                               extra=[*cold, mock.patch.object(P.subprocess, "run", child),
+                                      mock.patch.object(skylight, "text_chunks",
+                                                        lambda t, *a: steal() or chunks(t, *a))])
+        self.assertGreater(field.other_moves, 0)                  # the preparing calls did move it
+        self.assertEqual(field.other, "", d.log)
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+        self.assertIn("Hello world", field.value)
+
+    def test_focus_moved_while_a_key_event_is_made_on_a_cold_cache_lands_nothing_elsewhere(self):
+        """Codex's case on #66 @3f82851, here: only the key event's making moves the focus (a child process on a cold
+        cache). It was made after the check, and the chunk went into the other field."""
+        from deskmind_hands.drivers import peekaboo as P
+        field = Field("start", takes_insertion=False)
+
+        def child(*a, **k):
+            field.focused = False                                 # the user clicked another field meanwhile
+            return types.SimpleNamespace(stdout='{"events": {}, "table": {}}', returncode=0)
+
+        def key_event(cls, Q, code, down):
+            cls._load_keys()
+            return {"down": down, "code": code}
+        cold = [mock.patch.object(PeekabooDriver, name, value)
+                for name, value in (("_key_blobs", {}), ("_letter_codes", {}), ("_letters_read_at", 0.0))]
+        d, res = self.run_type(field, text="hello world", real_keycode=True, key_event=classmethod(key_event),
+                               extra=[*cold, mock.patch.object(P.subprocess, "run", child)])
+        self.assertEqual(field.other, "", d.log)
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
 
     def test_the_window_changing_midway_stops_the_typing(self):
         """2000 chars into the task's window, which closes midway: the app makes the user's window key, and the rest

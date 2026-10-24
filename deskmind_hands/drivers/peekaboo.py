@@ -3733,11 +3733,18 @@ class PeekabooDriver:
             return None
         if not self._ascii_input():
             return None             # an input method would take the keys (a candidate window): no background route
+        # prepare, before the focus is checked: everything that can block or wait -- the layout and key events (a
+        # child process on a cold or stale cache, up to 20 s), cmd+A and every chunk's events, the event source.
+        # Between a check and its press there is then nothing but the press (_press_checked; hands#66, the focus
+        # family: a key event made after the check let the focus move first).
+        select_code = self._keycode(None, "a")
+        chunks = skylight.text_chunks(text)
+        sent, why = 0, None
         try:
             with skylight.enter_window_key(pid, wid) as key:
-                if not axfield.focus(field):
-                    return None
                 q = skylight.BackgroundQuartz(pid, wid, (self._origin.x, self._origin.y), key=key)
+                pairs = [self._unicode_pair(q, c) for c in chunks]
+                select_key = self._key_pair(q, select_code, q.kCGEventFlagMaskCommand) if clear_first else None
 
                 def lost() -> str | None:
                     if STOP.is_set():
@@ -3747,18 +3754,29 @@ class PeekabooDriver:
                         return why
                     return None if axfield.is_focused(field) else "the field no longer has the focus in its window"
 
+                # send: the focus, the selection (each may wait), then each press checked right before it
+                if not axfield.focus(field):
+                    return None
                 if not axfield.select(field, clear_first):
                     # Chrome did not take a whole-text selection through accessibility (live, 10-21); cmd+A to the
                     # window does it, read back the same way. A caret that cannot be put at the end: not this route.
                     if not clear_first or lost():
                         return None
                     try:
-                        self._post_key(q, self._keycode(q, "a"), q.kCGEventFlagMaskCommand)
+                        if self._press_checked(q, *select_key, lost):
+                            return None
                     except skylight.WindowKeyRefused:
                         return None         # refused before it was sent: nothing typed
                     if not axfield.all_selected(field):
                         return None
-                sent, why = self._post_unicode(q, text, stop=lost)
+                for chunk, pair in zip(chunks, pairs):
+                    try:
+                        why = self._press_checked(q, *pair, lost)
+                    except skylight.WindowKeyRefused as exc:   # the window refused the key: not sent
+                        why = str(exc)
+                    if why:
+                        break
+                    sent += len(chunk)
         except skylight.WindowKeyRefused as exc:
             if exc.kind == "stopped":
                 return ExecResult(False, "stopped by the app; nothing was done")

@@ -765,12 +765,14 @@ class Gate:
     its two constructors; a background gate is bound to its BackgroundQuartz's WindowKey, and only such a gate lets
     a key go without the window being asked again in the post (BackgroundQuartz.post_checked)."""
 
-    __slots__ = ("field", "window_key", "front_pid")
+    __slots__ = ("field", "window_key", "front_pid", "away")
 
-    def __init__(self, field, window_key, front_pid, _token):
+    def __init__(self, field, window_key, front_pid, _token, away=None):
         if _token is not Gate._MADE:
             raise TypeError("a Gate is made by Gate.background or Gate.foreground")
         self.field, self.window_key, self.front_pid = field, window_key, front_pid
+        #: the target app must stay out of the front (background), or be it (foreground)
+        self.away = (window_key is not None) if away is None else away
 
     _MADE = object()
 
@@ -784,6 +786,12 @@ class Gate:
     @classmethod
     def foreground(cls, pid: int, field) -> "Gate":
         return cls(field, None, int(pid), cls._MADE)
+
+    @classmethod
+    def untouched(cls, pid: int, field) -> "Gate":
+        """An app left in the background with no window held (the accessibility insertion, T1): the target app must
+        stay out of the front; no window to read, and the element's focus is not needed (the write names it)."""
+        return cls(field, None, int(pid), cls._MADE, away=True)
 
     # The order is the gate's, once, here: the checks that can wait first, the instant ones last, so nothing that
     # can wait sits between the last check and the send (Codex on #66 @79cd02d: STOP was asked, then the focus read
@@ -820,9 +828,9 @@ class Gate:
         front = _front_app_pid()
         if front is None:
             return "the front app could not be read"
-        if self.window_key is None and front != self.front_pid:
+        if not self.away and front != self.front_pid:
             return "the app is no longer the front app (the user went elsewhere)"
-        if self.window_key is not None and front == self.front_pid:
+        if self.away and front == self.front_pid:
             return "the user brought the app forward"
         return None
 
@@ -3809,11 +3817,13 @@ class PeekabooDriver:
         return f"typed {len(text)} chars with keys to window {wid} in the background"
 
     def _type_in_background(self, eid: str, text: str, clear_first: bool) -> ExecResult | None:
-        """Type `text` into the observed window's field `eid` without bringing anything forward: first the
-        accessibility insertion (a native field only: in a web page it can show without being the page's own value);
-        if the field reads back unchanged, keys (Unicode payloads) to the window, made its app's key window and proven
-        so (skylight.enter_window_key), the field given the focus inside it, the window and the focus checked before
-        every chunk. Verified by reading the field back, and "unverified" when that read-back does not show the text.
+        """Type `text` into the observed window's field `eid` without bringing anything forward, one way chosen before
+        the text is sent: a native field, the accessibility insertion; a web page's field (where the insertion can
+        show without being the page's own value), keys (Unicode payloads) to the window, made its app's key window and
+        proven so (skylight.enter_window_key), the field given the focus inside it, the window and the focus checked
+        before every chunk. Keys after an insertion only when it was refused before reaching the app -- never after
+        one that went (a late write plus keys typed it twice). Verified by reading the field back, and "unverified"
+        when that read-back does not show the text.
 
         None -- the caller's route then, with its own gates (waiting for the user, the flash rules) -- whenever this
         route does not apply or cannot start: no field to read back by, not the observed element, the window moved,
@@ -3847,8 +3857,24 @@ class PeekabooDriver:
             return None
         if web and clear_first and self._background_input(self.app):
             return None             # a web field's replace: the click and paste route, ahead of this one as before
+        # T1, read before its gate (accessibility reads that can wait): the selection range to write, and whether the
+        # field's selection can be read back at all -- the insertion writes its text only after the selection reads
+        # back as written, so a field whose selection cannot be read goes to keys, decided here, before a send
+        # (review of #67 @7926924)
+        try:
+            insert_at = None if web else axfield.wanted(field, clear_first)
+            readable = axfield.selection_readable(field)
+        except Exception:   # noqa: BLE001 -- unread: not this route
+            insert_at, readable = None, False
+        if not readable:
+            # Both ways in here are confirmed by the field's selection -- the insertion's selection, the keys' caret
+            # or select-all read back -- so a field whose selection cannot be read is not typed into here at all:
+            # the caller's route, before anything is sent (review of #67 @8e08b5e)
+            return None
+        insertable = not web
+        t1 = Gate.untouched(pid, field)
         if STOP.is_set():
-            return ExecResult(False, "stopped by the app; nothing was done")
+            return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
 
         def result(after: str | None, how: str, note: str = "") -> ExecResult:
             tail = f"; {note}" if note else ""
@@ -3861,21 +3887,42 @@ class PeekabooDriver:
                               detail=f"typed {len(text)} chars into {label!r} in the background ({how}), unverified: "
                                      f"the field reads {(after or '')[-120:]!r} -- observe before typing again{tail}")
 
-        # Windows of this run where the insertion was accepted and changed nothing after the whole wait (Chrome):
-        # by window, never by app, and only for this run. Typing there again goes straight to keys.
-        noop = self.__dict__.setdefault("_ax_noop_windows", set())
-        if not web and str(wid) not in noop:
+        # The way in is chosen before the text is sent, and kept: a native field gets the accessibility insertion,
+        # a web page's field keys (in_web_area: the insertion can show there without being the page's own value).
+        # Once an insertion went out, no keys follow it -- read back after the wait, it is verified or unverified: a
+        # write that lands after the wait plus keys typed the text twice ("ls -lals -la", hands#66 review). Keys only
+        # when the insertion was refused before anything reached the app (nothing counted as sent: base.ax_counted).
+        # No window is remembered as "the insertion does nothing here" either -- that was decided from a failed write.
+        if insertable:
+            sent_before = sends_so_far()
+            # T1: the gate (STOP, the target app not in front) right before each of the insertion's two writes --
+            # the selection, then, once it reads back as written, the text
             try:
-                written = axfield.insert(field, text, clear_first)
-            except Exception:   # noqa: BLE001 -- refused or failed: the read-back below says whether anything changed
-                written = True
-            # Long enough for a slow app to show it: keys after an insertion that only showed late typed it twice.
-            # Nothing written (the selection was refused), nothing to wait for.
-            after = axfield.settled_value(field, before, wait=self.AX_INSERT_WAIT_S if written else 0)
-            if after != before:
-                return result(after, "accessibility insertion")
-            if written:
-                noop.add(str(wid))
+                went, why = axfield.insert(field, text, clear_first, check=t1.before_focus_write, want=insert_at)
+            except Exception as exc:   # noqa: BLE001 -- failed part way: what went is told by the count
+                if sends_so_far() > sent_before:
+                    self._snapshot = None
+                    return ExecResult(False, MaybeSent(f"the insertion into {label!r} failed part way ({exc}): the "
+                                                       f"selection or the text may have gone -- observe before typing "
+                                                       f"again"))
+                return None             # nothing went: the caller's route
+            reached = sends_so_far() > sent_before
+            if went in (axfield.TEXT, axfield.TEXT_MAYBE):
+                # Long enough for a slow app to show it. A write answered with an error that may still have arrived:
+                # read back like any other -- verified if the text is there, else unverified, "may have been written"
+                after = axfield.settled_value(field, before, wait=self.AX_INSERT_WAIT_S)
+                return result(after, "accessibility insertion" if went == axfield.TEXT
+                              else f"accessibility insertion; {why}")
+            if reached:
+                # the selection went and no text was written: said so, unverified -- no keys after a send
+                self._snapshot = None
+                return ExecResult(False, MaybeSent(f"the selection in {label!r} was set but no text was written "
+                                                   f"({why}) -- observe before typing again"))
+            if went == axfield.NOTHING:                 # the gate refused before the first write
+                if STOP.is_set():
+                    return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
+                return None         # the user came to the app: nothing went, the caller's route (its own gates)
+            # the selection refused before it reached the app (nothing counted): the keys below, chosen before a send
         multiline = axfield.role(field) == "AXTextArea"
         if "\n" in text or (not multiline and "\t" in text):
             # A newline is never a bare Return key (hands#66: in a chat box Return sends, "one\ntwo" sent "one"): text
@@ -3884,36 +3931,64 @@ class PeekabooDriver:
             return None
         if not self._ascii_input():
             return None             # an input method would take the keys (a candidate window): no background route
-        late = axfield.value(field)
-        if late != before:
-            # Read once more right before the keys: an insertion that landed after the wait is not typed again.
-            return result(late, "accessibility insertion, shown late")
+        # prepare, before the focus is checked: everything that can block or wait -- the layout and key events (a
+        # child process on a cold or stale cache, up to 20 s), cmd+A and every chunk's events, the event source.
+        # Between a check and its press there is then nothing but the press (_press_checked; hands#66, the focus
+        # family: a key event made after the check let the focus move first).
+        select_code = self._keycode(None, "a")
+        chunks = skylight.text_chunks(text)
+        sent, why = 0, None
         try:
             with skylight.enter_window_key(pid, wid) as key:
-                if not axfield.focus(field):
-                    return None
                 q = skylight.BackgroundQuartz(pid, wid, (self._origin.x, self._origin.y), key=key)
+                pairs = [self._unicode_pair(q, c) for c in chunks]
+                select_key = self._key_pair(q, select_code, q.kCGEventFlagMaskCommand) if clear_first else None
 
-                def lost() -> str | None:
+                # send: the route's one gate (hands#66) asked before every send -- the focus write (STOP, the
+                # window), the selection, cmd+A and every chunk (STOP, the window, the field's focus, last)
+                gate = Gate.background(q, field)
+                route_before = sends_so_far()
+
+                def stop(why: str) -> ExecResult | None:
+                    """Refused at a send: told as it is -- part went (unverified), the app's stop (nothing sent),
+                    else None, nothing of this route went: the caller's route."""
+                    if sends_so_far() > route_before:
+                        return ExecResult(False, MaybeSent(f"typing into {label!r} stopped part way: {why} -- it may "
+                                                           f"have taken effect; observe before typing again"))
                     if STOP.is_set():
-                        return "stopped by the app"
-                    why = key.lost()
-                    if why:
-                        return why
-                    return None if axfield.is_focused(field) else "the field no longer has the focus in its window"
+                        return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
+                    return None
 
-                if not axfield.select(field, clear_first):
+                why = gate.before_focus_write()
+                if why:
+                    return stop(why)
+                if not axfield.focus(field):
+                    return stop("the field did not take the keyboard focus")
+                want = axfield.wanted(field, clear_first)    # the length read before the gate, not after it
+                why = gate.before_send()
+                if why:
+                    return stop(why)
+                if not axfield.select_range(field, want):
                     # Chrome did not take a whole-text selection through accessibility (live, 10-21); cmd+A to the
                     # window does it, read back the same way. A caret that cannot be put at the end: not this route.
-                    if not clear_first or lost():
-                        return None
+                    if not clear_first:
+                        return stop("the caret could not be put at the end of the field")
                     try:
-                        self._post_key(q, self._keycode(q, "a"), q.kCGEventFlagMaskCommand)
-                    except skylight.WindowKeyRefused:
-                        return None         # refused before it was sent: nothing typed
+                        why = self._press_checked(q, *select_key, gate)
+                    except skylight.WindowKeyRefused as exc:
+                        why = str(exc)
+                    if why:
+                        return stop(why)
                     if not axfield.all_selected(field):
-                        return None
-                sent, why = self._post_unicode(q, text, stop=lost)
+                        return stop("the field's text could not be selected")
+                for chunk, pair in zip(chunks, pairs):
+                    try:
+                        why = self._press_checked(q, *pair, gate)
+                    except skylight.WindowKeyRefused as exc:   # the window refused the key: not sent
+                        why = str(exc)
+                    if why:
+                        break
+                    sent += len(chunk)
         except skylight.WindowKeyRefused as exc:
             if exc.kind == "stopped":
                 return ExecResult(False, "stopped by the app; nothing was done")

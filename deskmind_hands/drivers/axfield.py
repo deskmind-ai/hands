@@ -20,12 +20,17 @@ def _get(el, attr):
     return v if err == 0 else None
 
 
-def _set(el, attr, value) -> bool:
+def _set_answer(el, attr, value) -> int:
     """Every accessibility write of this module (focus, selection, inserted text): counted as sent before it is made,
-    and taken back only on an answer that it never reached the app (base.ax_counted). True when accepted."""
+    and taken back only on an answer that it never reached the app (base.ax_counted). The AXError code it answered."""
     from ApplicationServices import AXUIElementSetAttributeValue
     from .base import ax_counted
-    return ax_counted(lambda: AXUIElementSetAttributeValue(el, attr, value)) == 0
+    return ax_counted(lambda: AXUIElementSetAttributeValue(el, attr, value))
+
+
+def _set(el, attr, value) -> bool:
+    """_set_answer, True when accepted."""
+    return _set_answer(el, attr, value) == 0
 
 
 def _range(loc: int, length: int):
@@ -123,11 +128,38 @@ def _selection(el) -> tuple[int, int] | None:
     return (int(r[0]), int(r[1])) if isinstance(r, tuple) else (int(r.location), int(r.length))
 
 
-def insert(el, text: str, replace_all: bool) -> bool:
-    """`text` in place of the whole text (replace_all) or at the end, by the accessibility insertion
-    (AXSelectedText); True when the write was sent and accepted -- which is not proof it changed anything. False:
-    nothing was written (the selection was refused, or the write)."""
-    return select(el, replace_all) and _set(el, "AXSelectedText", text)
+NOTHING, SELECTION, TEXT, TEXT_MAYBE = "nothing", "selection", "text", "text, maybe"
+
+
+def insert(el, text: str, replace_all: bool, check=None, want=None) -> tuple[str, str | None]:
+    """`text` in place of the whole text (replace_all) or at the end, by the accessibility insertion: the selection
+    written (`want`, read beforehand: wanted), then -- only once it reads back as written -- the text (AXSelectedText).
+    `check()` right before each write: a reason to stop, or None. (how far it went: NOTHING, SELECTION, TEXT -- the
+    text write sent and accepted, which is not proof it changed anything -- or TEXT_MAYBE -- sent, answered with an
+    error that does not say it never arrived (base.ax_not_delivered) -- and why it stopped there, or None)."""
+    at = want if want is not None else wanted(el, replace_all)
+    why = check() if check is not None else None
+    if why:
+        return NOTHING, why
+    if not select_range(el, at):
+        return SELECTION, "the selection did not read back as written"
+    why = check() if check is not None else None
+    if why:
+        return SELECTION, why
+    from .base import ax_not_delivered
+    err = _set_answer(el, "AXSelectedText", text)
+    if err == 0:
+        return TEXT, None
+    if ax_not_delivered(err):
+        return SELECTION, f"the text write was refused ({err})"
+    # a timeout, kAXErrorCannotComplete, kAXErrorFailure: it may have been written -- the field is read back
+    # (review of #67 @9310989: the text applied, then -25204, was reported as never written)
+    return TEXT_MAYBE, f"the text write answered {err}: it may have been written"
+
+
+def selection_readable(el) -> bool:
+    """Whether the field's selection can be read (AXSelectedTextRange): the insertion is confirmed by it."""
+    return _selection(el) is not None
 
 
 def focus(el, wait: float = 0.5) -> bool:

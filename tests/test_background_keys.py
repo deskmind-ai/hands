@@ -11,7 +11,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from deskmind_hands.drivers import axfield, keys, skylight   # noqa: E402
+from deskmind_hands.drivers import axfield, base, keys, skylight   # noqa: E402
+from deskmind_hands.drivers import peekaboo as P_DRIVER   # noqa: E402
 from deskmind_hands.drivers.peekaboo import PeekabooDriver   # noqa: E402
 from deskmind_hands.geometry import Point, Rect   # noqa: E402
 from deskmind_hands.grounding import STOP   # noqa: E402
@@ -313,8 +314,8 @@ class TextAndChords(unittest.TestCase):
         self.assertFalse(axfield.typed_in("old", "old new", "new", True))         # not in place of what was there
 
 
-class Key:
-    """A WindowKey stand-in: records its use; `lose_after` chunks typed, it reads as lost."""
+class Key(skylight.WindowKey):
+    """A WindowKey (the type a background Gate holds), made without a window: records its use; `lost()` as told."""
 
     def __init__(self, log, via="records", lost=None, note=""):
         self.log, self.via, self._lost, self._note = log, via, lost, note
@@ -334,12 +335,17 @@ class Key:
         return self._note
 
 
-class FakeQ:
-    """Quartz as _post_unicode uses it: each Unicode key-down goes into `field` (as an app would type it)."""
+class FakeQ(skylight.BackgroundQuartz):
+    """A BackgroundQuartz (the type a background Gate holds), made without Quartz: each Unicode key-down goes into
+    `field` (as an app would type it), or into another field when it has lost the focus."""
     kCGHIDEventTap, kCGEventFlagMaskCommand = 0, 1 << 20
+    _q = None
 
-    def __init__(self, d, field):
-        self.d, self.field = d, field
+    def __init__(self, d, field, key=None, pid=None):
+        self.d, self.field, self.key, self.pid = d, field, key, pid if pid is not None else PID
+
+    def post_checked(self, event, gate):
+        self.CGEventPost(0, event)
 
     def CGEventKeyboardSetUnicodeString(self, ev, n, s):   # noqa: N802
         ev["text"] = s
@@ -348,10 +354,18 @@ class FakeQ:
         ev["flags"] = f
 
     def CGEventPost(self, tap, ev):   # noqa: N802
+        if ev["down"] and getattr(self.d, "count_sends", False):
+            base.counted(lambda: None)
         if ev["down"] and "text" in ev:
             self.d.log.append(("keys", ev["text"]))
-            if self.d.keys_land:
+            if not self.field.focused:                                  # the keyboard focus is elsewhere: there
+                self.field.other += ev["text"]
+            elif self.d.keys_land:
                 self.field.value += ev["text"].capitalize() if not self.field.value.endswith(" ") else ev["text"]
+        elif ev["down"]:                                                # a key built beforehand (_key_pair)
+            self.d.log.append(("key", ev["code"], ev.get("flags", 0)))
+            if ev.get("flags"):                                         # cmd+A: the next keys replace it all
+                self.field.value = ""
 
 
 def driver():
@@ -379,14 +393,22 @@ class Field:
     def __init__(self, value, takes_insertion, role="AXTextArea", names=("正文",), web=False):
         self.value, self.takes, self.role, self.names, self.web = value, takes_insertion, role, list(names), web
         self.focused = True
+        self.other = ""                     # another field of the window, where keys go when this one lost the focus
 
 
-class TypeText(unittest.TestCase):
+class _TypeHarness(unittest.TestCase):
     def run_type(self, field, keys_land=True, enter=None, text="hello 你好", clear=False, selects=True,
-                 all_selected=True, d=None, settle=None, value=None, insert=None, extra=(), user_on=False):
+                 all_selected=True, d=None, settle=None, value=None, insert=None, extra=(), user_on=False,
+                 key_event=None, real_keycode=False, count_sends=False):
         d = d or driver()
         d.keys_land = keys_land
-        d._keycode = lambda q, letter: {"a": 0}[letter]
+        d.count_sends = count_sends                     # the fake focus, selection and keys counted as sends
+
+        def sends():
+            if count_sends:
+                base.ax_counted(lambda: 0)
+        if not real_keycode:
+            d._keycode = lambda q, letter: {"a": 0}[letter]
 
         def post_key(q, code, flags=0):                                 # cmd+A selects all: the next keys replace it
             d.log.append(("key", code, flags))
@@ -394,11 +416,20 @@ class TypeText(unittest.TestCase):
                 field.value = ""
         d._post_key = post_key
 
-        def ax_insert(el, t, replace_all):
+        def ax_insert(el, t, replace_all, check=None, want=None):
+            # takes_insertion: True, it shows; "ignored", it reaches the app and nothing shows (accepted, a no-op);
+            # False, refused before it reached the app (nothing counted as sent). The gate (`check`) as the real one
+            # asks it, before the first write.
+            why = check() if check is not None else None
+            if why:
+                return axfield.NOTHING, why
             d.log.append(("ax insert", t))
-            if field.takes:
+            if not field.takes:
+                return axfield.SELECTION, "the selection was refused"
+            base.counted(lambda: None)
+            if field.takes is True:
                 field.value = t if replace_all else field.value + t
-            return True
+            return axfield.TEXT, None
         d.settle_waits = []
 
         def default_settle(el, before, wait=0.6):
@@ -411,20 +442,38 @@ class TypeText(unittest.TestCase):
                    mock.patch.object(axfield, "role", lambda el: field.role),
                    mock.patch.object(axfield, "names", lambda el: field.names),
                    mock.patch.object(axfield, "in_web_area", lambda el: field.web),
-                   mock.patch.object(axfield, "is_focused", lambda el: field.focused),
-                   mock.patch.object(axfield, "focus", lambda el: d.log.append("focus") or True),
-                   mock.patch.object(axfield, "select", lambda el, replace_all: d.log.append("select") or selects),
-                   mock.patch.object(axfield, "all_selected", lambda el, wait=0.5: all_selected),
+                   mock.patch.object(axfield, "is_focused",                       # a read that can wait: a test
+                                     lambda el: getattr(d, "on_focus_read", lambda: None)() or field.focused),
+                   mock.patch.object(axfield, "focus", lambda el: d.log.append("focus") or sends()
+                                     or setattr(field, "focused", True) or True),
+                   mock.patch.object(axfield, "select", lambda el, replace_all: d.log.append("select") or sends()
+                                     or selects),
+                   # the selection's range read (it can wait), apart from its write: a test may act there
+                   mock.patch.object(axfield, "wanted", lambda el, all_: getattr(d, "on_length_read", lambda: None)()
+                                     or (0, 0), create=True),
+                   # a selection that cannot be read cannot be read back as set either (consistent with it)
+                   mock.patch.object(axfield, "select_range", lambda el, want, wait=0.3: d.log.append("select")
+                                     or sends() or getattr(d, "on_select", lambda: None)()
+                                     or (selects and getattr(d, "selection_readable", True)), create=True),
+                   mock.patch.object(axfield, "selection_readable", lambda el: getattr(d, "selection_readable", True),
+                                     create=True),
+                   mock.patch.object(axfield, "all_selected",
+                                     lambda el, wait=0.5: all_selected and getattr(d, "selection_readable", True)),
                    mock.patch.object(skylight, "user_on", lambda pid: user_on),
-                   mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin, key=None: FakeQ(d, field)),
+                   mock.patch.object(skylight, "BackgroundQuartz",
+                                     type("HeldWindow", (FakeQ,), {"__init__": lambda self_, pid, wid, origin, key=None:
+                                                                   FakeQ.__init__(self_, d, field, key, pid)})),
+                   # the front app, as the gate's instant check reads it: another app, the user's, by default
+                   mock.patch.object(P_DRIVER, "_front_app_pid", lambda: getattr(d, "front_app", 1)),
                    mock.patch.object(PeekabooDriver, "_key_event",
-                                     classmethod(lambda cls, Q, code, down: {"down": down, "code": code})),
+                                     key_event or classmethod(lambda cls, Q, code, down: {"down": down, "code": code})),
                    mock.patch.object(skylight, "enter_window_key",
                                      enter or (lambda pid, wid: d.log.append(("key window", pid, wid)) or Key(d.log)))]
         for p in patches:
             p.start()
         try:
-            return d, d._type_in_background("t1", text, clear)
+            with base.input_scope(None):                                  # one step, its sends counted
+                return d, d._type_in_background("t1", text, clear)
         finally:
             for p in patches:
                 p.stop()
@@ -432,13 +481,16 @@ class TypeText(unittest.TestCase):
     def keys_sent(self, d):
         return [e for e in d.log if isinstance(e, tuple) and e[0] == "keys"]
 
+
+class TypeText(_TypeHarness):
+
     def test_the_accessibility_insertion_first(self):
         d, res = self.run_type(Field("start\n", takes_insertion=True))
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
         self.assertIn("accessibility insertion", res.detail)
         self.assertEqual(d.log, [("ax insert", "hello 你好")])          # no window made key, no key sent
 
-    def test_keys_when_the_insertion_changes_nothing(self):
+    def test_keys_when_the_insertion_is_refused_before_reaching_the_app(self):
         d, res = self.run_type(Field("start", takes_insertion=False))
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
         self.assertIn("keys to window 200", res.detail)
@@ -446,9 +498,9 @@ class TypeText(unittest.TestCase):
                                  ("keys", "hello 你好"), "exit"])
 
     def test_nothing_written_no_wait(self):
-        d, res = self.run_type(Field("start", takes_insertion=False), insert=lambda el, t, r: False)
-        self.assertEqual(d.settle_waits[0], 0)
-        self.assertNotIn("200", d.__dict__.get("_ax_noop_windows", set()))   # refused, not a no-op: tried again
+        d, res = self.run_type(Field("start", takes_insertion=False),
+                               insert=lambda el, t, r, check=None, want=None: (axfield.SELECTION, "refused"))
+        self.assertNotIn(PeekabooDriver.AX_INSERT_WAIT_S, d.settle_waits)   # nothing went: no wait for it to show
 
     def test_an_insertion_shown_late_is_not_typed_again(self):
         """The value shows the insertion only after ~1 s: the wait (1.5 s) sees it, and no key is sent."""
@@ -460,9 +512,10 @@ class TypeText(unittest.TestCase):
                 field.value += pending.pop()
             return field.value
 
-        def insert(el, t, replace_all):
+        def insert(el, t, replace_all, check=None, want=None):
             pending.append(t)
-            return True
+            base.counted(lambda: None)
+            return axfield.TEXT, None
         fake_time = types.SimpleNamespace(monotonic=lambda: clock[0],
                                           sleep=lambda dt: clock.__setitem__(0, clock[0] + dt))
         d, res = self.run_type(field, settle=real_settle, value=value, insert=insert,
@@ -470,39 +523,84 @@ class TypeText(unittest.TestCase):
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
         self.assertGreaterEqual(clock[0], 1.0)
         self.assertEqual(d.log, [])                                       # no window made key, no key sent
-        self.assertNotIn("200", d.__dict__.get("_ax_noop_windows", set()))
 
-    def test_an_insertion_shown_just_before_the_keys_is_not_typed_again(self):
-        field = Field("start", takes_insertion=False)
-        reads = []
+    def test_an_insertion_that_went_and_shows_nothing_is_unverified_and_no_key_follows(self):
+        """Chosen before sending, kept: an insertion that reached the app is never followed by keys (hands#66 review:
+        a late write plus the keys typed the text twice). Unverified, said so."""
+        d, res = self.run_type(Field("start", takes_insertion="ignored"))
+        self.assertTrue(res.indeterminate, res.detail)
+        self.assertIn("unverified", res.detail)
+        self.assertEqual(d.log, [("ax insert", "hello 你好")])          # no window made key, no key sent
 
-        def value(el):                       # the read right before the keys is the first to show it
-            reads.append(1)
-            if len(reads) == 2:
-                field.value = "start" + "hello 你好"
-            return field.value
-        d, res = self.run_type(field, value=value, settle=lambda el, before, wait=0.6: before)
-        self.assertTrue(res.ok and not res.indeterminate, res.detail)
-        self.assertIn("shown late", res.detail)
+    def test_a_write_that_lands_after_the_wait_is_one_copy_and_unverified(self):
+        field = Field("start", takes_insertion="ignored")
+        d, res = self.run_type(field)
+        field.value += "hello 你好"                                      # the write lands after the read-back
+        self.assertTrue(res.indeterminate, res.detail)
         self.assertEqual(self.keys_sent(d), [])
+        self.assertEqual(field.value.count("hello 你好"), 1)
 
-    def test_a_window_where_the_insertion_did_nothing_goes_straight_to_keys(self):
-        """Chrome: accepted and nothing changed after the whole wait -- remembered for that window, not the app."""
+    def test_no_window_is_remembered_from_a_failed_write(self):
+        """The way in is decided from the element, not from what an earlier write did: the next text in the same
+        window is inserted again, and again no key follows."""
         d = driver()
-        d, res = self.run_type(Field("start", takes_insertion=False), d=d)
-        self.assertTrue(res.ok, res.detail)
-        self.assertEqual(d._ax_noop_windows, {"200"})
+        d, res = self.run_type(Field("start", takes_insertion="ignored"), d=d)
         d.log.clear()
-        d, res = self.run_type(Field("start", takes_insertion=False), d=d, text="again")
-        self.assertTrue(res.ok, res.detail)
-        self.assertNotIn("ax insert", [e[0] for e in d.log if isinstance(e, tuple)])
-        self.assertIn(("keys", "again"), d.log)
-        d.log.clear()
-        d._window_id = d._pinned_window = "201"                         # another window of the same app
-        d._element_window = {"t1": "201"}
-        d._observed_windows.add("201")
-        d, res = self.run_type(Field("start", takes_insertion=False), d=d, text="third")
-        self.assertIn(("ax insert", "third"), d.log)
+        d, res = self.run_type(Field("start", takes_insertion="ignored"), d=d, text="again")
+        self.assertEqual(d.log, [("ax insert", "again")])
+        self.assertFalse(hasattr(d, "_ax_noop_windows"))
+
+    def test_focus_moved_while_preparing_the_keys_lands_nothing_elsewhere(self):
+        """hands#66's focus family: a key event made after the focus check (on a cold cache, a child process reading
+        the layout, up to 20 s) let the focus move first, and the next chunk went into another field. Prepared before
+        the check now. Every preparing call -- the layout read on a cold cache, each key event, the chunks -- moves
+        the focus away; nothing lands elsewhere, and the field is focused again before the first key."""
+        from deskmind_hands.drivers import peekaboo as P
+        field = Field("start", takes_insertion=False)
+
+        def steal(*_a, **_k):
+            field.focused = False
+            field.other_moves = getattr(field, "other_moves", 0) + 1
+
+        def child(*a, **k):                                       # the layout read: a child process, when cold
+            steal()
+            return types.SimpleNamespace(stdout='{"events": {}, "table": {}}', returncode=0)
+
+        def key_event(cls, Q, code, down):
+            cls._load_keys()                                      # cold: the child process
+            steal()
+            return {"down": down, "code": code}
+        chunks = skylight.text_chunks
+        cold = [mock.patch.object(PeekabooDriver, name, value)
+                for name, value in (("_key_blobs", {}), ("_letter_codes", {}), ("_letters_read_at", 0.0))]
+        d, res = self.run_type(field, text="hello world", real_keycode=True, key_event=classmethod(key_event),
+                               extra=[*cold, mock.patch.object(P.subprocess, "run", child),
+                                      mock.patch.object(skylight, "text_chunks",
+                                                        lambda t, *a: steal() or chunks(t, *a))])
+        self.assertGreater(field.other_moves, 0)                  # the preparing calls did move it
+        self.assertEqual(field.other, "", d.log)
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+        self.assertIn("Hello world", field.value)
+
+    def test_focus_moved_while_a_key_event_is_made_on_a_cold_cache_lands_nothing_elsewhere(self):
+        """Codex's case on #66 @3f82851, here: only the key event's making moves the focus (a child process on a cold
+        cache). It was made after the check, and the chunk went into the other field."""
+        from deskmind_hands.drivers import peekaboo as P
+        field = Field("start", takes_insertion=False)
+
+        def child(*a, **k):
+            field.focused = False                                 # the user clicked another field meanwhile
+            return types.SimpleNamespace(stdout='{"events": {}, "table": {}}', returncode=0)
+
+        def key_event(cls, Q, code, down):
+            cls._load_keys()
+            return {"down": down, "code": code}
+        cold = [mock.patch.object(PeekabooDriver, name, value)
+                for name, value in (("_key_blobs", {}), ("_letter_codes", {}), ("_letters_read_at", 0.0))]
+        d, res = self.run_type(field, text="hello world", real_keycode=True, key_event=classmethod(key_event),
+                               extra=[*cold, mock.patch.object(P.subprocess, "run", child)])
+        self.assertEqual(field.other, "", d.log)
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
 
     def test_the_window_changing_midway_stops_the_typing(self):
         """2000 chars into the task's window, which closes midway: the app makes the user's window key, and the rest
@@ -512,7 +610,8 @@ class TypeText(unittest.TestCase):
 
         def lost():
             chunks[0] += 1
-            return "window 200 is no longer the app's key window (now 100)" if chunks[0] > 3 else None
+            # asked by the gate before the focus write and the selection, then before each chunk: lost after three
+            return "window 200 is no longer the app's key window (now 100)" if chunks[0] > 5 else None
         d, res = self.run_type(Field("start", takes_insertion=False), d=d, text="x" * 2000,
                                enter=lambda pid, wid: Key(d.log, lost=lost))
         self.assertFalse(res.ok)
@@ -531,7 +630,7 @@ class TypeText(unittest.TestCase):
             field.focused = False                                        # e.g. a Tab moved it, or a dialog took it
         with mock.patch.object(FakeQ, "CGEventPost", post):
             d, res = self.run_type(field, d=d, text="y" * 40)
-        self.assertIn("no longer has the focus", res.detail)
+        self.assertIn("lost the keyboard focus", res.detail)
         self.assertEqual(len(self.keys_sent(d)), 1)
 
     def test_no_cmd_a_when_the_window_is_lost(self):
@@ -936,3 +1035,287 @@ class FrontApp(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GateAtEverySendSiteInTheBackground(_TypeHarness):
+    """hands#66's one-gate rule in _type_in_background's key route (review of #66 @8086268, the third of the "check
+    before send" family): every send site -- the focus write (T2), the selection (T3), cmd+A (T4), each chunk (T5)
+    -- x {STOP, the window lost, the focus lost}, the condition arising right before that site: nothing is sent
+    there, and the result is honest -- nothing sent when nothing went before (or, the window lost before anything
+    went, None: the caller's route), else unverified. T1, the insertion: STOP between its selection and its text."""
+
+    SITE_CALL = {"focus write": 1, "select": 2, "cmd+A": 3, "chunk": 4}   # which ask of the window precedes it
+
+    def row(self, site, what):
+        from deskmind_hands.grounding import STOP
+        STOP.clear()
+        self.addCleanup(STOP.clear)
+        field = Field("start", takes_insertion=False)            # the insertion refused: the key route
+        d = driver()
+        calls = [0]
+        at = self.SITE_CALL[site]
+
+        def flip():
+            if what == "stop":
+                STOP.set()
+            elif what == "focus":
+                field.focused = False
+
+        def lost():
+            # the gate reads this (it can wait), then the focus, then asks STOP: whatever arises during the site's
+            # own read -- the window gone, a STOP (Codex on #66 @79cd02d: one during this read went unseen), the
+            # focus moved -- is seen by that same gate
+            calls[0] += 1
+            if calls[0] == at and what == "window":
+                return "window 200 is no longer the app's key window (now 100)"
+            if calls[0] == at:
+                flip()
+            return None
+        prepare_flip = False
+        text = "x" * 40
+        clear = site in ("select", "cmd+A")
+
+        def run():
+            return self.run_type(field, d=d, text=text, clear=clear, selects=site != "cmd+A", count_sends=True,
+                                 enter=lambda pid, wid: Key(d.log, lost=lost),
+                                 extra=[mock.patch.object(skylight, "text_chunks",
+                                                          lambda t, *a: (flip() if prepare_flip else None) or
+                                                          _chunks(t, *a))])
+        return run()
+
+    def sent_at(self, d, site):
+        if site == "focus write":
+            return "focus" in d.log
+        if site == "select":
+            return "select" in d.log
+        if site == "cmd+A":
+            return ("key", 0, 1 << 20) in d.log
+        return len(self.keys_sent(d)) > 1
+
+    def test_every_site_under_every_condition(self):
+        for site in ("focus write", "select", "cmd+A", "chunk"):
+            for what in ("stop", "window", "focus"):
+                if site == "focus write" and what == "focus":
+                    continue                                     # the focus is what that write sets
+                with self.subTest(site=site, condition=what):
+                    d, res = self.row(site, what)
+                    self.assertFalse(self.sent_at(d, site), (getattr(res, "detail", res), d.log))
+                    if site == "focus write":                    # nothing of this route went before it
+                        if what == "stop":
+                            self.assertIs(res.performed, False, res.detail)
+                        else:
+                            self.assertIsNone(res)               # the caller's route, chosen before a send
+                    else:
+                        self.assertIsNot(res.performed, False, res.detail)
+                        self.assertTrue(res.indeterminate, res.detail)
+
+    def test_the_control_every_site_is_reached_when_nothing_happens(self):
+        for site in ("focus write", "select", "cmd+A", "chunk"):
+            with self.subTest(site=site):
+                d, res = self.row(site, None)
+                self.assertTrue(self.sent_at(d, site), d.log)
+
+    def test_the_user_coming_to_the_app_during_a_read_sends_nothing_there(self):
+        """hands#66's instant checks (Codex @0838225), here: the user comes to the target app during the window read
+        right before the focus write (T2), or during the field's focus read right before the first chunk (T5)."""
+        for at in ("window read before the focus write", "focus read before the first chunk"):
+            with self.subTest(at=at):
+                field = Field("start", takes_insertion=False)
+                d = driver()
+
+                def lost():
+                    if at.startswith("window"):
+                        d.front_app = PID                        # the user brought the target app forward
+                    return None
+                reads = []
+
+                def on_focus_read():
+                    reads.append(1)
+                    if at.startswith("focus") and len(reads) == 2:   # the select's gate, then the first chunk's
+                        d.front_app = PID
+                d.on_focus_read = on_focus_read
+                d, res = self.run_type(field, d=d, text="x" * 40, count_sends=True,
+                                       enter=lambda pid, wid: Key(d.log, lost=lost))
+                self.assertEqual(self.keys_sent(d), [])
+                if at.startswith("window"):
+                    self.assertNotIn("focus", d.log)
+
+    def test_t3_the_length_read_moving_the_focus_writes_no_selection(self):
+        """Review of #66 @24fbf21: the selection's length read (it can wait) sat between the gate and the write."""
+        field = Field("start", takes_insertion=False)
+        d = driver()
+        reads = []
+
+        def on_length_read():
+            reads.append(1)
+            if len(reads) == 2:                                   # T3's read (the first is T1's, the insertion's)
+                field.focused = False
+        d.on_length_read = on_length_read
+        d, res = self.run_type(field, d=d, text="x" * 40, count_sends=True,
+                               enter=lambda pid, wid: Key(d.log, lost=lambda: None))
+        self.assertNotIn("select", d.log)
+        self.assertIsNot(res.performed, False)                   # the focus write went before it: unverified
+        self.assertTrue(res.indeterminate, res.detail)
+
+    def test_t1_a_stop_during_the_length_read_writes_nothing(self):
+        from deskmind_hands.grounding import STOP
+        self.addCleanup(STOP.clear)
+        field = Field("start", takes_insertion=True)
+        d = driver()
+        d.on_length_read = STOP.set
+        writes = []
+        d, res = self.run_type(field, d=d, insert=lambda el, t, r, check=None, want=None: (check and check()) and (axfield.NOTHING, check())
+                               or (writes.append(t), (axfield.TEXT, None))[1])
+        self.assertEqual(writes, [])
+        self.assertIs(res.performed, False)
+
+    def test_t1_a_stop_between_the_insertions_selection_and_its_text_writes_no_text(self):
+        from deskmind_hands.grounding import STOP
+        self.addCleanup(STOP.clear)
+        writes = []
+        with mock.patch.object(axfield, "select_range", lambda el, want, wait=0.3: writes.append("selection") or
+                               STOP.set() or True), \
+                mock.patch.object(axfield, "_length", lambda el: 4), \
+                mock.patch.object(axfield, "_set", lambda el, attr, v: writes.append(attr) or True):
+            went, why = axfield.insert("FIELD", "text", False,
+                                       check=lambda: "stopped by the app" if STOP.is_set() else None)
+        self.assertEqual((went, why), (axfield.SELECTION, "stopped by the app"))
+        self.assertEqual(writes, ["selection"])                 # no AXSelectedText after the stop
+
+
+class TheInsertionBehindItsGate(_TypeHarness):
+    """Review of #67 @7926924, T1 (the accessibility insertion): (1) a send of the selection alone was reported as
+    "typed N chars"; the text is now written only after the selection reads back as written, and a selection that
+    went with no text after it says so (unverified, no keys after a send); (2) T1 asked STOP only, after reads that
+    can wait -- the user came to the app during the range read and the insertion went. T1 has a gate now (STOP, the
+    target app not in front), asked right before each of its two writes. Driven through _type_in_background and the
+    real axfield.insert."""
+
+    def run_t1(self, d, field, text_answer=0, applies=False, **kw):
+        texts = []
+
+        def answer(el, attr, v):                                  # the text write, as the OS answers it
+            texts.append((attr, v))
+            if text_answer == 0 or text_answer not in base.AX_NOT_DELIVERED:
+                base.counted(lambda: None)
+            if applies:
+                field.value += v
+            return text_answer
+        extra = [mock.patch.object(axfield, "_set", lambda el, attr, v: answer(el, attr, v) == 0),
+                 mock.patch.object(axfield, "_set_answer", answer, create=True)]
+        d, res = self.run_type(field, d=d, insert=REAL_INSERT, count_sends=True, extra=extra,
+                               enter=lambda pid, wid: Key(d.log, lost=lambda: None), **kw)
+        return d, res, texts
+
+    def test_a_selection_that_went_and_did_not_read_back_writes_no_text_and_says_so(self):
+        d = driver()
+        d, res, texts = self.run_t1(d, Field("start", takes_insertion=True), selects=False)
+        self.assertEqual(texts, [])                                  # no AXSelectedText
+        self.assertEqual(self.keys_sent(d), [])                      # no keys after a send
+        self.assertIsNot(res.performed, False)
+        self.assertTrue(res.indeterminate, res.detail)
+        self.assertIn("no text was written", res.detail)
+        self.assertNotIn("typed", res.detail)
+
+    def test_a_stop_after_the_selection_writes_no_text_and_says_so(self):
+        from deskmind_hands.grounding import STOP
+        self.addCleanup(STOP.clear)
+        d = driver()
+        d.on_select = STOP.set
+        d, res, texts = self.run_t1(d, Field("start", takes_insertion=True))
+        self.assertEqual(texts, [])
+        self.assertTrue(res.indeterminate, res.detail)
+        self.assertIn("no text was written", res.detail)
+
+    def test_the_gate_before_each_write(self):
+        """A front-app row and a STOP row for each of T1's two writes: arising during the read before it (the range
+        read before the selection; the selection's read-back before the text) -- that write is not made."""
+        from deskmind_hands.grounding import STOP
+        for write in ("selection", "text"):
+            for what in ("front", "stop"):
+                with self.subTest(write=write, condition=what):
+                    STOP.clear()
+                    self.addCleanup(STOP.clear)
+                    d = driver()
+
+                    def arise(d=d, what=what):
+                        if what == "stop":
+                            STOP.set()
+                        else:
+                            d.front_app = PID                         # the user brought the target app forward
+                    if write == "selection":
+                        d.on_length_read = arise
+                    else:
+                        d.on_select = arise
+                    d, res, texts = self.run_t1(d, Field("start", takes_insertion=True))
+                    self.assertEqual(texts, [])
+                    if write == "selection":
+                        self.assertNotIn("select", d.log)
+                        if what == "stop":
+                            self.assertIs(res.performed, False)
+                        else:
+                            self.assertIsNone(res)                   # nothing went: the caller's route
+                    else:
+                        self.assertIn("select", d.log)
+                        self.assertTrue(res.indeterminate, res.detail)
+                        self.assertIn("no text was written", res.detail)
+
+    def test_a_text_write_that_times_out_after_applying_is_read_back_and_verified(self):
+        """Codex on #67 @9310989: the OS applied the text, then answered kAXErrorCannotComplete (-25204) -- which
+        may have been delivered (base.ax_not_delivered) -- and the result said no text was written."""
+        d = driver()
+        d, res, texts = self.run_t1(d, Field("start", takes_insertion=True), text_answer=-25204, applies=True)
+        self.assertEqual(texts, [("AXSelectedText", "hello 你好")])
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)    # read back: there
+        self.assertEqual(self.keys_sent(d), [])
+
+    def test_a_text_write_that_times_out_and_shows_nothing_may_have_been_written(self):
+        d = driver()
+        d, res, texts = self.run_t1(d, Field("start", takes_insertion=True), text_answer=-25204)
+        self.assertTrue(res.indeterminate, res.detail)
+        self.assertIn("may have been written", res.detail)
+        self.assertEqual(self.keys_sent(d), [])
+
+    def test_a_text_write_refused_for_certain_is_the_selection_only(self):
+        d = driver()
+        d, res, texts = self.run_t1(d, Field("start", takes_insertion=True), text_answer=-25205)
+        self.assertTrue(res.indeterminate, res.detail)                  # the selection went
+        self.assertIn("no text was written", res.detail)
+        self.assertEqual(self.keys_sent(d), [])
+
+    def test_a_field_whose_selection_cannot_be_read_is_handed_back_before_any_send(self):
+        """Review of #67 @8e08b5e (A1): the keys' caret and select-all are read back by the same selection, so the
+        key route failed after its sends too. Unreadable: neither way here, the caller's route, nothing sent."""
+        for clear in (False, True):
+            with self.subTest(replace=clear):
+                d = driver()
+                d.selection_readable = False
+                d, res, texts = self.run_t1(d, Field("start", takes_insertion=True), clear=clear)
+                self.assertIsNone(res)
+                self.assertEqual(texts, [])
+                self.assertEqual([e for e in d.log if e in ("focus", "select") or isinstance(e, tuple)
+                                  and e[0] in ("keys", "key", "ax insert")], [])
+
+    def test_an_insertion_that_raises_says_what_went(self):
+        """Review of #67 @8e08b5e (A2): an exception was taken for a text write. Told by the count now."""
+        for counted in (True, False):
+            with self.subTest(counted=counted):
+                def boom(el, t, r, check=None, want=None, counted=counted):
+                    if counted:
+                        base.counted(lambda: None)                   # the selection went
+                    raise RuntimeError("the accessibility call failed")
+                d = driver()
+                d, res = self.run_type(Field("start", takes_insertion=True), d=d, insert=boom, count_sends=True,
+                                       enter=lambda pid, wid: Key(d.log, lost=lambda: None))
+                if counted:
+                    self.assertIsNot(res.performed, False)
+                    self.assertTrue(res.indeterminate, res.detail)
+                    self.assertIn("failed part way", res.detail)
+                else:
+                    self.assertIsNone(res)
+                self.assertEqual(self.keys_sent(d), [])
+
+
+REAL_INSERT = axfield.insert
+_chunks = skylight.text_chunks
+

@@ -725,17 +725,19 @@ class _NotReady(Exception):
     """Raised inside a flash before anything is typed: the element could not be made ready (focus) for keys."""
 
 
-def _post(Q, tap, event, press=None, release=None) -> None:
+def _post(Q, tap, event, press=None, release=None, checked=False) -> None:
     """Every event this driver posts (see the rest below). `press`: (key, let_go) -- a down whose up must follow,
     remembered until it does (base.release_all lets it go whatever ends the step). `release`: the key of an up -- the
-    completion of input already started, never refused by the deadline (base.releasing)."""
+    completion of input already started, never refused by the deadline (base.releasing). `checked`: a down whose
+    window and focus the caller checked right before (_press_checked) -- a BackgroundQuartz posts it without asking
+    the window again (post_checked)."""
     if release is not None:
         with releasing():
-            _post_one(Q, tap, event)
+            _post_one(Q, tap, event, checked)
         note_released(release)
         return
     if press is None:
-        _post_one(Q, tap, event)
+        _post_one(Q, tap, event, checked)
         return
     # Remembered BEFORE the first OS call that could deliver the down: a route with two transports (BackgroundQuartz
     # sends a mouse down by SkyLight, then by CGEventPostToPid) may have delivered it by the first when the deadline
@@ -744,7 +746,7 @@ def _post(Q, tap, event, press=None, release=None) -> None:
     note_pressed(*press)
     before = sends_so_far()
     try:
-        _post_one(Q, tap, event)
+        _post_one(Q, tap, event, checked)
     except BaseException:
         if sends_so_far() == before:
             note_released(press[0])
@@ -766,11 +768,15 @@ def _mouse_up(Q, make, at, button) -> callable:
     return let_go
 
 
-def _post_one(Q, tap, event) -> None:
+def _post_one(Q, tap, event, checked=False) -> None:
     """Every event this driver posts: counted as sent before it goes (base.counted) -- a BackgroundQuartz counts its
-    own, after its key check, so a key it refuses before posting is not counted."""
+    own, after its key check, so a key it refuses before posting is not counted (`checked`: the caller's check
+    stands for it, BackgroundQuartz.post_checked)."""
     if getattr(Q, "counts_own_posts", False):
-        Q.CGEventPost(tap, event)
+        if checked and hasattr(Q, "post_checked"):
+            Q.post_checked(event)
+        else:
+            Q.CGEventPost(tap, event)
     else:
         counted(lambda: Q.CGEventPost(tap, event))
 
@@ -3600,8 +3606,8 @@ class PeekabooDriver:
         why = check()
         if why:
             return why
-        _post(Q, Q.kCGHIDEventTap, down, press=(key, lambda in_place=False: _post(Q, Q.kCGHIDEventTap, up,
-                                                                                 release=key)))
+        _post(Q, Q.kCGHIDEventTap, down, checked=True,            # the check above stands: not asked again in the post
+              press=(key, lambda in_place=False: _post(Q, Q.kCGHIDEventTap, up, release=key)))
         time.sleep(0.02)
         _post(Q, Q.kCGHIDEventTap, up, release=key)
         time.sleep(0.02)
@@ -3633,7 +3639,7 @@ class PeekabooDriver:
                 select_key = self._key_pair(q, select_code, q.kCGEventFlagMaskCommand) if clear_first else None
 
                 def check() -> str | None:
-                    return key.lost() or still_focused()
+                    return key.lost() or still_focused()     # the window first, the element's focus last
                 why = ready()
                 if why:
                     return f"stopped:{why}"

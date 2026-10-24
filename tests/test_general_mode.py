@@ -1138,7 +1138,9 @@ class _KeysFixture(unittest.TestCase):
                          "is_focused": lambda f: el["focused"],
                          "can_set": lambda f, attr: el["can_focus"],
                          "focus": focus,
-                         "select": select}.items():
+                         "select": select,
+                         "wanted": lambda f, all_: after("length read") or (0, 4),     # the length: a read
+                         "select_range": lambda f, want, wait=0.3: select(f, True)}.items():
             p = mock.patch.object(axfield, name, fn, create=True)     # can_set: new here
             p.start()
             self.addCleanup(p.stop)
@@ -1239,6 +1241,12 @@ class _KeysFixture(unittest.TestCase):
         appkit.NSPasteboard = SimpleNamespace(generalPasteboard=lambda: PB())
         appkit.NSPasteboardItem = Item
         appkit.NSPasteboardTypeString = "public.utf8-plain-text"
+        self.workspace_front = None                             # NSWorkspace's frontmost app: not told by default
+        appkit.NSWorkspace = SimpleNamespace(sharedWorkspace=lambda: SimpleNamespace(
+            frontmostApplication=lambda: None if self.workspace_front is None else SimpleNamespace(
+                processIdentifier=lambda: self.workspace_front)))
+        appkit.NSRunningApplication = SimpleNamespace(
+            runningApplicationsWithBundleIdentifier_=lambda b: getattr(self, "bundle_apps", []))
         p = mock.patch.dict(sys.modules, {"AppKit": appkit})
         p.start()
         self.addCleanup(p.stop)
@@ -1390,6 +1398,29 @@ class TypingWhereNoValueIsTaken(_KeysFixture):
         self.assertIn("may have taken effect", res.detail)
         self.assertIsNot(res.performed, False)
         self.assertTrue(res.indeterminate, res.detail)
+
+    def test_a_webkit_app_the_user_is_in_goes_on_to_the_foreground_route(self):
+        """Review of #66 @24fbf21: in the WebKit app the user is in, _background_quartz holds no window; the paste
+        refused with a type _flash does not know and the step ended there. The same refusal as before
+        (WindowKeyRefused): _flash goes on to its foreground route -- here, its rule that the app is not allowed in
+        front."""
+        from deskmind_hands.drivers import skylight
+        d = self._driver(settable=False)
+        del d._flash                                                          # the real one
+        d._background_input = lambda bundle: True
+        d._wait_until_still = lambda bundle, what: None
+        d._too_late = lambda waited: None
+        bq = skylight.BackgroundQuartz.__new__(skylight.BackgroundQuartz)
+        bq._q, bq.pid, bq.wid = types.SimpleNamespace(kCGEventFlagMaskCommand=1 << 20, kCGHIDEventTap=0), 4242, 200
+        bq.key = skylight.NoWindowKey.__new__(skylight.NoWindowKey)          # the user's front app: no key held
+        d._background_quartz = lambda bundle: (bq, bq.key)
+        self.el["focused"] = True
+        with mock.patch.object(skylight, "give_focus_back", lambda t: None), \
+                mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": ""}):
+            res = self._type(d, text="one\ntwo")
+        self.assertIn("only responds in the foreground", res.detail)
+        self.assertIs(res.performed, False, res.detail)
+        self.assertEqual(self.pastes(), [])
 
     # -- the rest
     def test_a_button_is_not_a_keyboard_target(self):
@@ -1567,6 +1598,8 @@ class GateAtEverySendSite(_KeysFixture):
 
     CMD = 1 << 20
 
+    prepare_hook = staticmethod(lambda: None)                   # a row sets what happens while preparing
+
     def route(self, kind):
         from deskmind_hands.drivers import skylight
         d = self._driver(settable=False)
@@ -1693,6 +1726,53 @@ class GateAtEverySendSite(_KeysFixture):
                 self.setUp()
                 self.run_row(kind, site, None)
                 self.assertTrue(self.sent_at(site), self.log)
+
+    # -- review of #66 @24fbf21
+    def test_the_length_read_before_the_select_all_is_before_the_gate(self):
+        """axfield.select read the text's length (it can wait) between the gate and the write: the focus moved
+        there, and the selection was still written. The length is read first; the gate right before the write."""
+        for kind in ("foreground", "webkit", "background"):
+            with self.subTest(route=kind):
+                self.setUp()
+                self.el["focused"] = True
+                self.hooks["length read"] = self.condition(kind, "focus")
+                d = self.route(kind)
+                res = self._type(d, text="x" * 40 if kind == "background" else "ls -la", clear=True)
+                self.assertNotIn(("select", True), self.log)
+                self.assertIs(res.performed, False, res.detail)
+
+    def test_an_app_with_no_window_is_refused_cleanly_or_found_by_its_bundle(self):
+        self.el["focused"] = True
+        d = self.route("foreground")
+        d._pid_of = lambda bundle, all_wins=None: None          # no layer-0 window
+        res = self._type(d)                                     # nor a process of the bundle
+        self.assertIs(res.performed, False, res.detail)
+        self.assertIn("could not be found", res.detail)
+        self.assertEqual(self.pastes(), [])
+        self.setUp()
+        self.el["focused"] = True
+        self.bundle_apps = [types.SimpleNamespace(processIdentifier=lambda: 4242)]
+        d = self.route("foreground")
+        d._pid_of = lambda bundle, all_wins=None: None
+        res = self._type(d)                                     # its process by bundle id: typed
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_the_front_app_without_the_window_server_falls_back_to_nsworkspace(self):
+        from deskmind_hands.drivers import skylight
+        self.el["focused"] = True
+        with mock.patch.object(skylight, "front_pid", lambda: None):    # the window server does not tell
+            d = self.route("foreground")
+            self.workspace_front = 4242                                    # NSWorkspace does
+            res = self._type(d)
+            self.assertTrue(res.ok and not res.indeterminate, res.detail)
+        self.setUp()
+        self.el["focused"] = True
+        with mock.patch.object(skylight, "front_pid", lambda: None):
+            d = self.route("foreground")
+            self.workspace_front = None                                    # neither tells: refused
+            res = self._type(d)
+        self.assertIs(res.performed, False, res.detail)
+        self.assertEqual(self.pastes(), [])
 
     def test_codex_the_webkit_paste_after_the_user_came_back_is_not_sent(self):
         res = self.run_row("webkit", "cmd+V", "window")

@@ -758,8 +758,9 @@ class Gate:
     before send" family: each site chose its own checks, and one left the window out).
 
     background (a window held as its app's key window, BackgroundQuartz): the window (WindowKey.lost), the
-    element's focus, then STOP. foreground (the app brought to the front): the element's focus, then STOP and the
-    app still the front one (_front_app_pid: no accessibility wait). What can wait first, the instant last (below).
+    element's focus, then STOP and the target app not the front one. foreground (the app brought to the front): the
+    element's focus, then STOP and the target app the front one (_front_app_pid: no accessibility wait). What can
+    wait first, the instant last (below); `front_pid` is the target app's pid on both routes.
     before_focus_write leaves the focus out (it is what the write sets); before_send asks all of it. Built only by
     its two constructors; a background gate is bound to its BackgroundQuartz's WindowKey, and only such a gate lets
     a key go without the window being asked again in the post (BackgroundQuartz.post_checked)."""
@@ -778,7 +779,7 @@ class Gate:
         from deskmind_hands.drivers import skylight
         if not isinstance(q, skylight.BackgroundQuartz) or not isinstance(q.key, skylight.WindowKey):
             raise TypeError("a background gate needs a BackgroundQuartz holding a WindowKey")
-        return cls(field, q.key, None, cls._MADE)
+        return cls(field, q.key, int(q.pid), cls._MADE)          # the target app: it must not come to the front
 
     @classmethod
     def foreground(cls, pid: int, field) -> "Gate":
@@ -803,16 +804,26 @@ class Gate:
             return "the element lost the keyboard focus"
         return None
 
+    # Every condition of a route, and its form (Codex on #66 @0838225: "the user came back to the app" was asked only
+    # inside WindowKey.lost, an accessibility read -- the user came back during the focus read after it, and the
+    # paste went). Each condition with an instant form is asked again in _instant, after every read:
+    #   background: STOP (a flag: instant); the target app not the front one (the window server / NSWorkspace:
+    #     instant; also inside WindowKey.lost); the window still the app's key window (AXFocusedWindow: a read
+    #     only); the element's focus (AXFocused: a read only).
+    #   foreground: STOP (instant); the target app the front one (instant); the element's focus (a read only).
+
     def _instant(self) -> str | None:
-        """The instant checks, asked last: STOP, then (foreground) the app still the front one."""
+        """The instant checks, asked last, on either route: STOP, then the front app -- the target app must be it in
+        the foreground, and must not be (the user came to it) in the background."""
         if STOP.is_set():
             return "stopped by the app"
-        if self.window_key is None:
-            front = _front_app_pid()
-            if front is None:
-                return "the front app could not be read"
-            if front != self.front_pid:
-                return "the app is no longer the front app (the user went elsewhere)"
+        front = _front_app_pid()
+        if front is None:
+            return "the front app could not be read"
+        if self.window_key is None and front != self.front_pid:
+            return "the app is no longer the front app (the user went elsewhere)"
+        if self.window_key is not None and front == self.front_pid:
+            return "the user brought the app forward"
         return None
 
     def before_focus_write(self) -> str | None:

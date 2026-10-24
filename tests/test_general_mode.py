@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deskmind_hands.adapters.systemone import SystemOneAdapter, ambiguity_question, answer_candidates, top_operations
 from deskmind_hands.cli import task_apps
-from deskmind_hands.drivers.base import Element, ExecResult
+from deskmind_hands.drivers.base import Element, ExecResult, NothingSent
 from deskmind_hands.drivers.peekaboo import PeekabooDriver, fresh_windows, parse_textedit_windows, window_key
 from deskmind_hands.geometry import Rect
 from deskmind_hands.runtime.loop import is_cycling
@@ -1091,30 +1091,39 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
     ("set_value ... without valid canonical result semantics") was accepted and never showed, and each uncertain step
     put every later action to the user. The way in is chosen from the element, once, before anything is sent, never
     by app: a settable value is written (unconfirmed: unverified, no keys after); a text element that takes no value
-    gets keys (the focus by accessibility, never a click; a newline is Return only where it is a new line); anything
-    else is refused with nothing sent. Read back once after. Codex's four cases on hands#66 @29714a4 first."""
+    gets keys, only while it holds the keyboard focus at the moment they are sent; a newline is never a bare Return
+    key -- pasted as text into a multi-line element, refused for a one-line one; anything else is refused with nothing
+    sent. Read back once after. Two tables (focus; newline x field kind), then the rest."""
 
     def setUp(self):
-        from deskmind_hands.drivers import axfield
+        from deskmind_hands.drivers import axfield, base
         self.shown = {"value": "~ % "}
-        self.el = {"role": "AXTextArea", "focused": False, "can_focus": True, "caret": True}
+        self.el = {"role": "AXTextArea", "focused": False, "can_focus": True, "focus_takes": True,
+                   "lose_during_wait": False}
         self.log = []
         el = self.el
+
+        def focus(f, wait=0.5):
+            self.log.append("focus")
+            base.ax_counted(lambda: 0)                  # an accessibility write: counted as sent
+            if el["focus_takes"]:
+                el["focused"] = True
+            return el["focus_takes"]
         for name, fn in {"value": lambda f: self.shown["value"],
                          "role": lambda f: el["role"],
                          "is_focused": lambda f: el["focused"],
                          "can_set": lambda f, attr: el["can_focus"],
-                         "shows_caret": lambda f: el["caret"],
-                         "focus": lambda f, wait=0.5: self.log.append("focus") or el.update(focused=True) or True,
+                         "focus": focus,
                          "select": lambda f, all_, wait=0.3: self.log.append(("select", all_)) or True}.items():
-            p = mock.patch.object(axfield, name, fn, create=True)     # can_set, shows_caret: new here
+            p = mock.patch.object(axfield, name, fn, create=True)     # can_set: new here
             p.start()
             self.addCleanup(p.stop)
         p = mock.patch.object(PeekabooDriver, "AX_INSERT_WAIT_S", 0.0)
         p.start()
         self.addCleanup(p.stop)
 
-    def _driver(self, settable, reflects=False, keys_land=True, field=True, late_write=False):
+    def _driver(self, settable, reflects=False, keys_land=True, field=True, late_write=False, foreground=True,
+                fail_paste=False):
         from types import SimpleNamespace
         from deskmind_hands.geometry import Point, Rect
         from deskmind_hands.drivers import peekaboo as P
@@ -1140,11 +1149,13 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
             return True, {"effect": "accepted"}, "", ""
         d._mcp = SimpleNamespace(tool=tool)
         q = SimpleNamespace(kCGEventFlagMaskCommand=1 << 20)
-        board = {"text": ""}
+        self.board = board = {"text": "", "items": [{"public.utf8-plain-text": "the user's own"}]}
         d._post_click = lambda Q, x, y, count=1: self.log.append("click")
 
         def post_key(Q, code, flags=0):
             self.log.append(("key", code, flags))
+            if fail_paste and code == 9:
+                raise RuntimeError("the paste could not be posted")
             if keys_land and code == 9 and flags:
                 self.shown["value"] += board["text"]
             elif keys_land and code == P.keys.RETURN:
@@ -1152,19 +1163,43 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
         d._post_key = post_key
         d._keycode = lambda Q, ch: {"a": 0, "v": 9}[ch]
 
+        class Item:
+            def __init__(self, data=None):
+                self.data = dict(data or {})
+
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def init(self):
+                return self
+
+            def types(self):
+                return list(self.data)
+
+            def dataForType_(self, t):
+                return self.data[t]
+
+            def setData_forType_(self, data, t):
+                self.data[t] = data
+
         class PB:
             def pasteboardItems(self):
-                return []
+                return [Item(i) for i in board["items"]]
 
             def clearContents(self):
-                board["text"] = ""
+                board["text"], board["items"] = "", []
 
             def setString_forType_(self, s, t):
                 board["text"] = s
+                board["items"] = [{t: s}]
+
+            def writeObjects_(self, items):
+                board["items"] = [dict(i.data) for i in items]
         appkit = types.ModuleType("AppKit")
         appkit.NSPasteboard = SimpleNamespace(generalPasteboard=lambda: PB())
-        appkit.NSPasteboardItem = object
-        appkit.NSPasteboardTypeString = "str"
+        appkit.NSPasteboardItem = Item
+        appkit.NSPasteboardTypeString = "public.utf8-plain-text"
         p = mock.patch.dict(sys.modules, {"AppKit": appkit})
         p.start()
         self.addCleanup(p.stop)
@@ -1173,8 +1208,13 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
         self.addCleanup(p.stop)
 
         def flash(app, perform, what=""):
+            if not foreground:
+                return False, NothingSent("com.example.term only responds in the foreground, which this run is not "
+                                          "allowed to use")
             if "value" in pending:                              # the write lands while the app comes forward
                 self.shown["value"] = pending.pop("value")
+            if self.el["lose_during_wait"]:
+                self.el["focused"] = False                       # the user clicked another field meanwhile
             return True, perform(q)
         d._flash = flash
         d._settle = lambda ok, detail: ExecResult(ok, detail)
@@ -1190,27 +1230,99 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
     def sent(self):
         return [x for x in self.log if x not in ("ax insertion route",)]
 
-    # -- Codex on hands#66 @29714a4
-    def test_codex_a_newline_in_a_one_line_field_is_refused_not_submitted(self):
+    def pastes(self):
+        return [x for x in self.log if isinstance(x, tuple) and x[0] == "key"]
+
+    # -- table 1: focus at the check -> during the wait -> right before the keys
+    def test_focus_kept_throughout_is_left_alone_and_the_caret_kept(self):
+        self.el["focused"] = True
+        res = self._type(self._driver(settable=False))
+        self.assertNotIn("click", self.log)
+        self.assertNotIn("focus", self.log)
+        self.assertFalse([x for x in self.log if isinstance(x, tuple) and x[0] == "select"])
+        self.assertTrue(res.ok and not res.indeterminate)
+
+    def test_focus_lost_during_the_wait_is_given_back_before_the_keys(self):
+        """Codex P1 @5fb2651: the focus read before the wait was trusted at the send, and the paste went into the
+        field the user had moved to."""
+        self.el.update(focused=True, lose_during_wait=True)
+        res = self._type(self._driver(settable=False))
+        self.assertEqual(self.sent(), ["focus", ("key", 9, 1 << 20)])         # focused again, then pasted
+        self.assertTrue(res.ok and not res.indeterminate)
+
+    def test_focus_lost_during_the_wait_and_not_settable_is_refused_before_the_keys(self):
+        self.el.update(focused=True, lose_during_wait=True, can_focus=False)
+        res = self._type(self._driver(settable=False))
+        self.assertIs(res.performed, False)
+        self.assertEqual(self.pastes(), [])
+
+    def test_not_focused_is_focused_by_accessibility_then_typed(self):
+        res = self._type(self._driver(settable=False))
+        self.assertEqual(self.sent(), ["focus", ("key", 9, 1 << 20)])
+        self.assertTrue(res.ok and not res.indeterminate)
+
+    def test_a_focus_write_that_does_not_read_back_is_unverified_not_nothing_sent(self):
+        """The accessibility focus write is a send (base.ax_counted): refused after it, the step is unverified."""
+        self.el["focus_takes"] = False
+        res = self._type(self._driver(settable=False))
+        self.assertEqual(self.pastes(), [])
+        self.assertIsNone(res.performed)
+        self.assertTrue(res.indeterminate)
+
+    def test_not_focused_and_not_settable_is_refused_before_the_wait(self):
+        self.el["can_focus"] = False
+        res = self._type(self._driver(settable=False))
+        self.assertIs(res.performed, False)
+        self.assertEqual(self.sent(), [])
+
+    # -- table 2: newline x field kind
+    def test_no_newline_in_a_multi_line_element_is_one_paste(self):
+        from deskmind_hands.drivers import peekaboo as P
+        res = self._type(self._driver(settable=False))
+        self.assertEqual(self.pastes(), [("key", 9, 1 << 20)])
+        self.assertNotIn(("key", P.keys.RETURN, 0), self.log)
+        self.assertTrue(res.ok and not res.indeterminate)
+
+    def test_a_newline_in_a_multi_line_element_is_pasted_as_text_never_the_return_key(self):
+        """Codex P1 @5fb2651: in a chat box Return sends -- "one\ntwo" sent "one". The newline goes in as text."""
+        from deskmind_hands.drivers import peekaboo as P
+        d = self._driver(settable=False)
+        bg = []
+        d._keys_in_background = lambda field, text, ready, select_all: bg.append(text)
+        res = self._type(d, text="one\ntwo")
+        self.assertEqual(bg, [])                                               # not the background keys
+        self.assertEqual(self.pastes(), [("key", 9, 1 << 20)])                 # one paste, no Return key
+        self.assertNotIn(("key", P.keys.RETURN, 0), self.log)
+        self.assertTrue(self.shown["value"].endswith("one\ntwo"))
+        self.assertTrue(res.ok and not res.indeterminate)
+
+    def test_a_newline_where_the_foreground_cannot_be_used_is_refused(self):
+        res = self._type(self._driver(settable=False, foreground=False), text="one\ntwo")
+        self.assertIs(res.performed, False)
+        self.assertIn("only pasted", res.detail)
+        self.assertEqual(self.sent(), [])
+
+    def test_a_newline_in_a_one_line_field_is_refused_not_submitted(self):
         self.el["role"] = "AXTextField"
         res = self._type(self._driver(settable=False), text="one\ntwo")
         self.assertIs(res.performed, False)
         self.assertIn("press Return as its own step", res.detail)
         self.assertEqual(self.sent(), [])
 
-    def test_codex_a_button_is_not_a_keyboard_target(self):
-        self.el.update(role="AXButton", caret=False)
+    # -- the rest
+    def test_a_button_is_not_a_keyboard_target(self):
+        self.el["role"] = "AXButton"
         res = self._type(self._driver(settable=False))
         self.assertIs(res.performed, False)
         self.assertIn("not a text target", res.detail)
         self.assertEqual(self.sent(), [])
 
-    def test_codex_no_element_found_is_refused(self):
+    def test_no_text_element_found_is_refused(self):
         res = self._type(self._driver(settable=False, field=False))
         self.assertIs(res.performed, False)
         self.assertEqual(self.sent(), [])
 
-    def test_codex_a_late_write_is_unverified_and_typed_once(self):
+    def test_a_late_write_is_unverified_and_typed_once(self):
         d = self._driver(settable=True, late_write=True)
         res = self._type(d)
         self.assertTrue(res.indeterminate)
@@ -1219,33 +1331,9 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
         d._flash("x", lambda q: "")                                               # the write lands later
         self.assertEqual(self.shown["value"].count("ls -la"), 1)
 
-    def test_codex_an_already_focused_field_is_not_clicked_and_keeps_its_caret(self):
-        self.el["focused"] = True
-        res = self._type(self._driver(settable=False))
-        self.assertNotIn("click", self.log)
-        self.assertNotIn("focus", self.log)
-        self.assertFalse([x for x in self.log if isinstance(x, tuple) and x[0] == "select"])
-        self.assertTrue(res.ok and not res.indeterminate)
-
-    # -- the rest of the table
-    def test_a_terminal_view_is_focused_by_accessibility_and_typed_with_return_between_lines(self):
-        from deskmind_hands.drivers import peekaboo as P
-        res = self._type(self._driver(settable=False), text="ls -la\nwhoami")
-        self.assertEqual(self.sent(), ["focus", ("key", 9, 1 << 20), ("key", P.keys.RETURN, 0), ("key", 9, 1 << 20)])
-        self.assertNotIn("set_value", [x[0] for x in self.sent() if isinstance(x, tuple)])
-        self.assertTrue(res.ok and not res.indeterminate)
-        self.assertIn("verified by read-back", res.detail)
-
     def test_replacing_selects_all_then_types(self):
-        res = self._type(self._driver(settable=False), clear=True)
+        self._type(self._driver(settable=False), clear=True)
         self.assertEqual(self.sent()[:2], ["focus", ("select", True)])
-        self.assertIsNotNone(res)
-
-    def test_an_element_that_cannot_take_the_focus_without_a_click_is_refused(self):
-        self.el["can_focus"] = False
-        res = self._type(self._driver(settable=False))
-        self.assertIs(res.performed, False)
-        self.assertEqual(self.sent(), [])
 
     def test_keys_that_do_not_show_are_unverified_and_nothing_more_is_sent(self):
         res = self._type(self._driver(settable=False, keys_land=False))
@@ -1256,3 +1344,65 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
         res = self._type(self._driver(settable=True, reflects=True))
         self.assertEqual([x for x in self.sent() if isinstance(x, tuple)], [("set_value", "~ % ls -la")])
         self.assertTrue(res.ok and not res.indeterminate)
+
+    def test_the_users_clipboard_is_put_back_after_the_paste_and_after_a_failure_in_it(self):
+        self._type(self._driver(settable=False))
+        self.assertEqual(self.board["items"], [{"public.utf8-plain-text": "the user's own"}])
+        self.el["focused"] = False
+        with self.assertRaises(RuntimeError):
+            self._type(self._driver(settable=False, fail_paste=True))
+        self.assertEqual(self.board["items"], [{"public.utf8-plain-text": "the user's own"}])
+
+
+class TextTargetFoundByItsRole(unittest.TestCase):
+    """Codex P2 @5fb2651: "it shows a caret" could never be reached -- the element is found by a text role at its
+    place (axfield.field_at) before any caret is asked about -- and the tests stubbed that finding. Through the real
+    _field_now: an AXGroup with a selected text range is no text target; an AXTextArea is."""
+
+    def _driver(self):
+        from deskmind_hands.geometry import Point, Rect
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        d.app = "com.example.term"
+        d._rects, d._element_role = {"elem_3": Rect(0, 30, 580, 350)}, {"elem_3": "textArea"}
+        d._labels_by_id, d._role_labels = {"elem_3": "Shell"}, set()
+        d._origin, d._snapshot = Point(100, 100), "s1"
+        d._background_input = lambda bundle: False
+        d._key_target = lambda: (4242, 200)
+        return d
+
+    def _tree(self, role):
+        from deskmind_hands.drivers import axchrome, axfield
+        el = {"AXRole": role, "AXSelectedTextRange": (0, 0), "AXChildren": [], "frame": (100, 130, 580, 350),
+              "AXTitle": "Shell"}
+        win = {"AXRole": "AXWindow", "AXChildren": [el], "frame": (100, 100, 600, 400)}
+        return [mock.patch.object(axfield, "window", lambda pid, wid: win),
+                mock.patch.object(axfield, "_get", lambda e, attr: e.get(attr)),
+                mock.patch.object(axchrome, "_frame", lambda e: e.get("frame"))], el
+
+    def _type(self, d):
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        from deskmind_hands.drivers.base import input_scope
+        d._element_settable = {"elem_3": False}
+        d._element_value = {"elem_3": ""}
+        d._mcp = SimpleNamespace(tool=lambda name, args: self.fail("no accessibility write here"))
+        d._type_in_background = lambda eid, text, clear: None
+        with input_scope(None):
+            return d._execute_inner(Action(kind=ActionKind.TYPE_TEXT, text="ls", binding=Binding(element_id="elem_3")))
+
+    def test_a_group_with_a_selected_text_range_is_no_text_target(self):
+        patches, _ = self._tree("AXGroup")
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        d = self._driver()
+        self.assertIsNone(d._field_now("elem_3"))
+        res = self._type(d)
+        self.assertIs(res.performed, False)
+        self.assertIn("not a text element", res.detail)
+
+    def test_a_text_area_is_found_as_the_text_target(self):
+        patches, el = self._tree("AXTextArea")
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.assertIs(self._driver()._field_now("elem_3"), el)

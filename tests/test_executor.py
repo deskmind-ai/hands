@@ -1667,6 +1667,25 @@ class ClicksOnDeskMindThatMove(unittest.TestCase):
                    pids=[self.DESKMIND, 0, self.DESKMIND])
         self.assertEqual(self.ex.snapshot()["epoch"], e1 + 1)
 
+    def test_codex_a_missed_down_does_not_make_a_later_drag_deskminds(self):
+        """Codex on #65 @b9eb9dc: click DeskMind and let go; the tap is turned off and misses the next down (in a
+        task window); a drag near the old point, routed to the task's app, into its window. The press was kept, and
+        the drag was DeskMind's."""
+        self.click([(800, 500), (800, 500)], pid=self.DESKMIND)
+        self.assertEqual(self.ex.snapshot()["epoch"], self.e0)
+        self.event(-2, 0, (0, 0))                                               # kCGEventTapDisabledByTimeout
+        self.event(6, self.DESKMIND, (801, 500))                                # the down was never seen
+        self.event(2, self.DESKMIND, (802, 501))
+        s = self.ex.snapshot()
+        self.assertEqual(s["epoch"], self.e0 + 1)
+        self.assertEqual(s["epoch_reason"]["to"], "unknown")
+
+    def test_a_drag_after_a_release_with_no_new_down_is_unknown(self):
+        self.click([(800, 500), (800, 500)], pid=self.DESKMIND)                 # pressed and let go
+        self.event(6, self.DESKMIND, (801, 500))                                # a drag with no down of its own
+        self.event(2, self.DESKMIND, (801, 500))
+        self.assertEqual(self.ex.snapshot()["epoch"], self.e0 + 1)
+
     def test_a_plain_click_or_key_to_deskmind_leaves_the_epoch_and_an_unknown_one_moves_it(self):
         self.click([(800, 500), (800, 500)], pid=self.DESKMIND)
         self.event(10, self.DESKMIND, (0, 0))                                   # a key to DeskMind

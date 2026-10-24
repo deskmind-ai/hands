@@ -800,6 +800,10 @@ class InputWatch:
                 # watch says of keys is not trusted from here on -- the executor counts key presses by the HID idle
                 # time, as main did -- and the next begin makes a new watch (healthy); turned back on meanwhile
                 self.keys_lost = True
+                # events were missed: a press seen before is not the start of whatever comes next (a down unseen, a
+                # drag from there into a task window) -- the DeskMind exemption is for one press, drag and release
+                # seen whole (_own_click_moved)
+                self._press = None
                 if self._tap is not None:
                     Quartz.CGEventTapEnable(self._tap, True)
                 return event
@@ -807,6 +811,8 @@ class InputWatch:
             # task's window), and the press is the source's: a drag, and its release, is input to an unknown target
             # (PR #49 review) -- unless it is a click on DeskMind that moved a little (_own_click_moved)
             if self.posted_by_us(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUnixProcessID) or 0)):
+                if type_ not in (getattr(Quartz, "kCGEventKeyDown", None), getattr(Quartz, "kCGEventFlagsChanged", None)):
+                    self._press = None                    # a mouse event of the driver's breaks the user's sequence
                 return event                              # the driver's own click or key, not the user's
             drags = (Quartz.kCGEventLeftMouseDragged, Quartz.kCGEventRightMouseDragged, Quartz.kCGEventOtherMouseDragged)
             ups = (Quartz.kCGEventLeftMouseUp, Quartz.kCGEventRightMouseUp, Quartz.kCGEventOtherMouseUp)
@@ -820,6 +826,7 @@ class InputWatch:
                 self.note(own)                            # DeskMind's (its pid), else None: an unknown target
                 return event
             if type_ in ups:
+                self._press = None                        # the press is over: a drag after it has a down of its own
                 return event
             if type_ in downs:
                 self._press = self._own_press(Quartz, event)
@@ -830,6 +837,7 @@ class InputWatch:
             self.note(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0),
                       key=key, age=age, t0=t0, switcher=switcher)
         except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side (an unknown target)
+            self._press = None
             self.note(None)
         return event
 
@@ -854,7 +862,11 @@ class InputWatch:
         got the press; what is not known is only where a drop lands -- under the pointer when it is let go. So a drag
         is DeskMind's while the press went to DeskMind, each of its events too, and the pointer has stayed within
         OWN_CLICK_SLOP_PT of the press (a drag-and-drop does not start inside that, and nothing else is under the
-        pointer there); once any of that fails, the rest of the drag is an unknown target, as before."""
+        pointer there); once any of that fails, the rest of the drag is an unknown target, as before. Only for one
+        press, drag and release seen whole: the press is forgotten at every release, whenever the tap was turned off
+        (events missed), at a mouse event of the driver's and at an event that could not be read -- a drag with no
+        press seen since is an unknown target (Codex on hands#65 @b9eb9dc: a press kept across a missed down made a
+        later drag near it DeskMind's, into a task window)."""
         press = self._press
         if press is None:
             return None

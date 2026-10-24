@@ -13,12 +13,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deskmind_hands.adapters.systemone import SystemOneAdapter, ambiguity_question, answer_candidates, top_operations
 from deskmind_hands.cli import task_apps
-from deskmind_hands.drivers.base import Element
+from deskmind_hands.drivers.base import Element, ExecResult
 from deskmind_hands.drivers.peekaboo import PeekabooDriver, fresh_windows, parse_textedit_windows, window_key
 from deskmind_hands.geometry import Rect
 from deskmind_hands.runtime.loop import is_cycling
@@ -1082,3 +1083,109 @@ class GymSplit(unittest.TestCase):
         for name in ("music", "mail", "settings", "mailmusic", "expense"):
             fam = self.family(name)
             self.assertEqual(fam.make_task(30123, 2), fam.make_task(30123, 2))
+
+
+class TypingWhereNoValueIsTaken(unittest.TestCase):
+    """rc.15 (10-24): typing into a terminal's text view ended "unverified" every time -- the accessibility write
+    ("set_value ... without valid canonical result semantics") was accepted and never showed, and each uncertain step
+    put every later action to the user. Decided from the element, never by app: a value that is not settable is not
+    written through accessibility, and a write that does not show in the element falls back to key typing; each read
+    back from the element. Fail on 76e3bfd."""
+
+    def _driver(self, settable, reflects, keys_land=True):
+        from types import SimpleNamespace
+        from deskmind_hands.geometry import Point, Rect
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        d.app = "com.example.term"
+        d._rects, d._element_role = {"elem_3": Rect(0, 30, 580, 350)}, {"elem_3": "textArea"}
+        d._element_value, d._labels_by_id = {"elem_3": "~ % "}, {"elem_3": "Shell"}
+        d._element_settable = {"elem_3": settable}
+        d._origin, d._snapshot, d.calls = Point(100, 100), "s1", []
+        d._background_input = lambda bundle: False
+        d._type_in_background = lambda eid, text, clear: d.calls.append("background keys") and None
+        d._moved_since_seen = lambda: None
+        self.shown = {"value": "~ % "}
+        d._field_now = lambda eid: "FIELD"
+
+        def tool(name, args):
+            d.calls.append((name, args.get("value")))
+            if reflects:
+                self.shown["value"] = args.get("value")
+            return True, {"effect": "accepted"}, "", ""
+        d._mcp = SimpleNamespace(tool=tool)
+
+        def flash(app, perform, what=""):
+            d.calls.append(("keys", what))
+            if keys_land:
+                self.shown["value"] += "ls -la"
+            return True, "typed 6 chars into 'Shell' with keys"
+        d._flash = flash
+        d._settle = lambda ok, detail: ExecResult(ok, detail)
+        return d
+
+    def _type(self, d, text="ls -la"):
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        from deskmind_hands.drivers import axfield
+        with mock.patch.object(axfield, "value", lambda f: self.shown["value"]), \
+                mock.patch.object(PeekabooDriver, "AX_INSERT_WAIT_S", 0.0):
+            return d._execute_inner(Action(kind=ActionKind.TYPE_TEXT, text=text, clear_first=False,
+                                           binding=Binding(element_id="elem_3")))
+
+    def test_a_write_accepted_and_not_shown_falls_back_to_keys(self):
+        d = self._driver(settable=True, reflects=False)
+        res = self._type(d)
+        self.assertEqual(d.calls, ["background keys", ("set_value", "~ % ls -la"),        # background keys: once
+                                   ("keys", "type 'ls -la' into 'Shell'")])
+        self.assertTrue(res.ok)
+        self.assertFalse(res.indeterminate)
+        self.assertIn("verified by read-back", res.detail)
+
+    def test_a_value_that_is_not_settable_is_never_written_through_accessibility(self):
+        d = self._driver(settable=False, reflects=False)
+        res = self._type(d)
+        self.assertNotIn("set_value", [c[0] for c in d.calls if isinstance(c, tuple)])
+        self.assertEqual(d.calls[-1], ("keys", "type 'ls -la' into 'Shell'"))
+        self.assertTrue(res.ok and not res.indeterminate)
+
+    def test_a_write_that_shows_is_verified_and_no_key_is_sent(self):
+        d = self._driver(settable=True, reflects=True)
+        res = self._type(d)
+        self.assertEqual([c for c in d.calls if isinstance(c, tuple)], [("set_value", "~ % ls -la")])
+        self.assertTrue(res.ok and not res.indeterminate)
+
+    def test_keys_that_do_not_show_either_are_reported_unverified(self):
+        d = self._driver(settable=False, reflects=False, keys_land=False)
+        res = self._type(d)
+        self.assertTrue(res.indeterminate)
+        self.assertIn("unverified", res.detail)
+
+    def test_a_newline_is_pressed_as_return_between_pasted_lines(self):
+        """In a shell a pasted newline is not Return (bracketed paste): each line is pasted, Return pressed between."""
+        import types as _t
+        from deskmind_hands.drivers import peekaboo as P
+        d = self._driver(settable=False, reflects=False)
+        posted = []
+        q = _t.SimpleNamespace(kCGEventFlagMaskCommand=1 << 20)
+        d._post_click = lambda Q, x, y: posted.append("click")
+        d._post_key = lambda Q, code, flags=0: posted.append(("key", code, flags))
+        d._keycode = lambda Q, ch: {"a": 0, "v": 9}[ch]
+        board = {"items": []}
+
+        class PB:
+            def pasteboardItems(self):
+                return []
+
+            def clearContents(self):
+                board["items"] = []
+
+            def setString_forType_(self, s, t):
+                posted.append(("clipboard", s))
+        appkit = _t.ModuleType("AppKit")
+        appkit.NSPasteboard = _t.SimpleNamespace(generalPasteboard=lambda: PB())
+        appkit.NSPasteboardItem = object
+        appkit.NSPasteboardTypeString = "str"
+        d._flash = lambda app, perform, what="": (True, perform(q))
+        with mock.patch.dict(sys.modules, {"AppKit": appkit}), mock.patch.object(P.time, "sleep", lambda s: None):
+            self._type(d, text="ls -la\nwhoami")
+        self.assertEqual(posted, ["click", ("clipboard", "ls -la"), ("key", 9, 1 << 20), ("key", P.keys.RETURN, 0),
+                                  ("clipboard", "whoami"), ("key", 9, 1 << 20)])

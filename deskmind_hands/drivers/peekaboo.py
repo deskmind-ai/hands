@@ -725,6 +725,33 @@ class _NotReady(Exception):
     """Raised inside a flash before anything is typed: the element could not be made ready (focus) for keys."""
 
 
+def _pid_by_bundle(bundle: str) -> int | None:
+    """The newest running process of `bundle`, by bundle id (NSRunningApplication); None when there is none."""
+    try:
+        from AppKit import NSRunningApplication
+        apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle) or []
+        pids = [int(a.processIdentifier()) for a in apps if a.processIdentifier() > 0]
+        return max(pids) if pids else None
+    except Exception:  # noqa: BLE001 -- not known
+        return None
+
+
+def _front_app_pid() -> int | None:
+    """The front app's pid without an accessibility wait: the window server (skylight.front_pid), else -- its symbols
+    missing on some macOS -- NSWorkspace's frontmost application (review of #66 @24fbf21: with the window server's
+    answer alone, every foreground paste refused there). None only when neither tells."""
+    from deskmind_hands.drivers import skylight
+    front = skylight.front_pid()
+    if front is not None:
+        return front
+    try:
+        from AppKit import NSWorkspace
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        return int(app.processIdentifier()) if app is not None else None
+    except Exception:  # noqa: BLE001 -- not known
+        return None
+
+
 class Gate:
     """The one check of a typing route, built once while it is prepared and asked before every send of that route:
     the accessibility focus write, the select-all, cmd+A, cmd+V and every chunk (hands#66, the third of the "check
@@ -764,7 +791,7 @@ class Gate:
             return "stopped by the app"
         if self.window_key is not None:
             return self.window_key.lost()
-        front = skylight.front_pid()
+        front = _front_app_pid()
         if front is None:
             return "the front app could not be read"
         return None if front == self.front_pid else "the app is no longer the front app (the user went elsewhere)"
@@ -3556,19 +3583,23 @@ class PeekabooDriver:
             return None
 
         def select_all(gate: Gate) -> str | None | bool:
-            """The accessibility select-all when replacing, its gate asked right before: True when it took, False when
-            it did not (cmd+A then), a reason when the gate refused."""
+            """The accessibility select-all when replacing, its gate asked right before the write -- the text's length
+            read before the gate (an accessibility read that can wait: review of #66 @24fbf21): True when it took,
+            False when it did not (cmd+A then), a reason when the gate refused."""
+            want = axfield.wanted(field, True)
             why = gate.before_send()
             if why:
                 return why
-            return axfield.select(field, True)
+            return axfield.select_range(field, want)
 
         # prepare, before any check: everything that can block or wait -- the keyboard layout and key events (a child
         # process on a cold or stale cache, up to 20 s: Codex on #66 @3f82851, the focus moved meanwhile and cmd+V
         # pasted into another field), the clipboard. Between a check and its press there is then nothing but the
         # press (_press_checked).
         codes = {c: self._keycode(None, c) for c in "av"}     # loads (or refreshes) the layout and key events
-        pid = self._pid_of(self.app)                          # the app the foreground gate asks to be in front
+        # the app the foreground gate asks to be in front: its process with a window, else any process of the bundle
+        # (review of #66 @24fbf21: no layer-0 window and the gate was built of None); unknown, refused before a send
+        pid = self._pid_of(self.app) or _pid_by_bundle(self.app)
         sent_before = sends_so_far()
 
         def stopped(why: str) -> ExecResult:
@@ -3591,9 +3622,14 @@ class PeekabooDriver:
                 # brought to the front
                 if isinstance(Q, skylight.BackgroundQuartz):
                     if not isinstance(Q.key, skylight.WindowKey):
-                        raise _NotReady("the app is the user's front app: a key would land in its key window")
+                        # the refusal _flash's background branch knows: nothing went, on to the foreground route
+                        # (review of #66 @24fbf21: another type ended the step there)
+                        raise skylight._refuse("front", "the app is the user's front app: a key would land in its "
+                                                        "key window, the user's; none was sent")
                     gate = Gate.background(Q, field)
                 else:
+                    if not pid:
+                        raise _NotReady(f"the process of {self.app} could not be found")
                     gate = Gate.foreground(pid, field)
                 pb = NSPasteboard.generalPasteboard()
                 saved = [{t: it.dataForType_(t) for t in it.types()} for it in (pb.pasteboardItems() or [])]

@@ -757,9 +757,9 @@ class Gate:
     the accessibility focus write, the select-all, cmd+A, cmd+V and every chunk (hands#66, the third of the "check
     before send" family: each site chose its own checks, and one left the window out).
 
-    background (a window held as its app's key window, BackgroundQuartz): STOP, then the window (WindowKey.lost),
-    then the element's focus, last. foreground (the app brought to the front): STOP, then the app still the front
-    one (skylight.front_pid: the window server, no accessibility wait), then the element's focus, last.
+    background (a window held as its app's key window, BackgroundQuartz): the window (WindowKey.lost), the
+    element's focus, then STOP. foreground (the app brought to the front): the element's focus, then STOP and the
+    app still the front one (_front_app_pid: no accessibility wait). What can wait first, the instant last (below).
     before_focus_write leaves the focus out (it is what the write sets); before_send asks all of it. Built only by
     its two constructors; a background gate is bound to its BackgroundQuartz's WindowKey, and only such a gate lets
     a key go without the window being asked again in the post (BackgroundQuartz.post_checked)."""
@@ -784,23 +784,44 @@ class Gate:
     def foreground(cls, pid: int, field) -> "Gate":
         return cls(field, None, int(pid), cls._MADE)
 
-    def before_focus_write(self) -> str | None:
-        """STOP, then the window (background) or the app still in front (foreground); why not."""
-        from deskmind_hands.drivers import skylight
+    # The order is the gate's, once, here: the checks that can wait first, the instant ones last, so nothing that
+    # can wait sits between the last check and the send (Codex on #66 @79cd02d: STOP was asked, then the focus read
+    # waited; the user stopped the task or went to another app meanwhile, the read still said yes, and cmd+V went).
+    # Can wait: WindowKey.lost (the app's focused window, an accessibility read) and the element's focus
+    # (AXFocused). Instant: STOP (a flag) and the front app (_front_app_pid: the window server, else NSWorkspace --
+    # no accessibility wait).
+
+    def _reads(self, focus: bool) -> str | None:
+        """The checks that can wait: the held window (background), then -- unless it is what is about to be
+        written -- the element's focus."""
+        from deskmind_hands.drivers import axfield
+        if self.window_key is not None:
+            why = self.window_key.lost()
+            if why:
+                return why
+        if focus and not axfield.is_focused(self.field):
+            return "the element lost the keyboard focus"
+        return None
+
+    def _instant(self) -> str | None:
+        """The instant checks, asked last: STOP, then (foreground) the app still the front one."""
         if STOP.is_set():
             return "stopped by the app"
-        if self.window_key is not None:
-            return self.window_key.lost()
-        front = _front_app_pid()
-        if front is None:
-            return "the front app could not be read"
-        return None if front == self.front_pid else "the app is no longer the front app (the user went elsewhere)"
+        if self.window_key is None:
+            front = _front_app_pid()
+            if front is None:
+                return "the front app could not be read"
+            if front != self.front_pid:
+                return "the app is no longer the front app (the user went elsewhere)"
+        return None
+
+    def before_focus_write(self) -> str | None:
+        """Before the accessibility focus write: the window (background), then STOP and the front app; why not."""
+        return self._reads(focus=False) or self._instant()
 
     def before_send(self) -> str | None:
-        """All of it: before_focus_write, then the element's focus, last; why not."""
-        from deskmind_hands.drivers import axfield
-        return self.before_focus_write() or (None if axfield.is_focused(self.field)
-                                             else "the element lost the keyboard focus")
+        """Before every other send: the window and the element's focus, then STOP and the front app; why not."""
+        return self._reads(focus=True) or self._instant()
 
 
 def _post(Q, tap, event, press=None, release=None, gate=None) -> None:

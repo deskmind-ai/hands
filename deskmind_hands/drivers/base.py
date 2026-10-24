@@ -221,7 +221,12 @@ USER_BUSY = "the user is active"
 
 class NothingSent(str):
     """A driver's words for a refusal made before any input was sent (ExecResult.performed becomes False). Words built
-    from them by formatting are plain strings again: unknown, the safe side."""
+    from them by formatting are plain strings again: unknown, the safe side.
+
+    What "nothing was sent" means (the coordinator's decision, review of hands#64 round 6): nothing went to the app
+    that could change its content or lasting state -- no click, key, paste, typing, accessibility write, and no
+    accessibility focus moved into a field. Bringing the app to the front, or making a window its key window, and
+    giving that back, does not count: a refusal after only those is still "nothing was sent"."""
 
 
 class MaybeSent(str):

@@ -3363,6 +3363,9 @@ class PeekabooDriver:
                 return result(after, "accessibility insertion")
             if written:
                 noop.add(str(wid))
+                # an accessibility write the app accepted went to it, shown or not (it can show late): if this route
+                # hands the step on, a later refusal of the step is no "nothing done" (execute: _went)
+                self._input_went = True
         multiline = axfield.role(field) == "AXTextArea"
         if not multiline and ("\n" in text or "\t" in text):
             return None             # Return would submit a one-line field, Tab move its focus: not typed as keys
@@ -3384,6 +3387,7 @@ class PeekabooDriver:
             with skylight.enter_window_key(pid, wid) as key:
                 if not axfield.focus(field):
                     return None
+                self._input_went = True     # the field took the focus in its window: the app's state changed
                 q = skylight.BackgroundQuartz(pid, wid, (self._origin.x, self._origin.y), key=key)
 
                 def lost() -> str | None:

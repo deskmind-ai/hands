@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from deskmind_hands.drivers import axfield, keys, skylight   # noqa: E402
+from deskmind_hands.drivers import axfield, base, keys, skylight   # noqa: E402
 from deskmind_hands.drivers.peekaboo import PeekabooDriver   # noqa: E402
 from deskmind_hands.geometry import Point, Rect   # noqa: E402
 from deskmind_hands.grounding import STOP   # noqa: E402
@@ -395,8 +395,13 @@ class TypeText(unittest.TestCase):
         d._post_key = post_key
 
         def ax_insert(el, t, replace_all):
+            # takes_insertion: True, it shows; "ignored", it reaches the app and nothing shows (accepted, a no-op);
+            # False, refused before it reached the app (nothing counted as sent)
             d.log.append(("ax insert", t))
-            if field.takes:
+            if not field.takes:
+                return False
+            base.counted(lambda: None)
+            if field.takes is True:
                 field.value = t if replace_all else field.value + t
             return True
         d.settle_waits = []
@@ -424,7 +429,8 @@ class TypeText(unittest.TestCase):
         for p in patches:
             p.start()
         try:
-            return d, d._type_in_background("t1", text, clear)
+            with base.input_scope(None):                                  # one step, its sends counted
+                return d, d._type_in_background("t1", text, clear)
         finally:
             for p in patches:
                 p.stop()
@@ -438,7 +444,7 @@ class TypeText(unittest.TestCase):
         self.assertIn("accessibility insertion", res.detail)
         self.assertEqual(d.log, [("ax insert", "hello 你好")])          # no window made key, no key sent
 
-    def test_keys_when_the_insertion_changes_nothing(self):
+    def test_keys_when_the_insertion_is_refused_before_reaching_the_app(self):
         d, res = self.run_type(Field("start", takes_insertion=False))
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
         self.assertIn("keys to window 200", res.detail)
@@ -448,7 +454,6 @@ class TypeText(unittest.TestCase):
     def test_nothing_written_no_wait(self):
         d, res = self.run_type(Field("start", takes_insertion=False), insert=lambda el, t, r: False)
         self.assertEqual(d.settle_waits[0], 0)
-        self.assertNotIn("200", d.__dict__.get("_ax_noop_windows", set()))   # refused, not a no-op: tried again
 
     def test_an_insertion_shown_late_is_not_typed_again(self):
         """The value shows the insertion only after ~1 s: the wait (1.5 s) sees it, and no key is sent."""
@@ -470,39 +475,32 @@ class TypeText(unittest.TestCase):
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
         self.assertGreaterEqual(clock[0], 1.0)
         self.assertEqual(d.log, [])                                       # no window made key, no key sent
-        self.assertNotIn("200", d.__dict__.get("_ax_noop_windows", set()))
 
-    def test_an_insertion_shown_just_before_the_keys_is_not_typed_again(self):
-        field = Field("start", takes_insertion=False)
-        reads = []
+    def test_an_insertion_that_went_and_shows_nothing_is_unverified_and_no_key_follows(self):
+        """Chosen before sending, kept: an insertion that reached the app is never followed by keys (hands#66 review:
+        a late write plus the keys typed the text twice). Unverified, said so."""
+        d, res = self.run_type(Field("start", takes_insertion="ignored"))
+        self.assertTrue(res.indeterminate, res.detail)
+        self.assertIn("unverified", res.detail)
+        self.assertEqual(d.log, [("ax insert", "hello 你好")])          # no window made key, no key sent
 
-        def value(el):                       # the read right before the keys is the first to show it
-            reads.append(1)
-            if len(reads) == 2:
-                field.value = "start" + "hello 你好"
-            return field.value
-        d, res = self.run_type(field, value=value, settle=lambda el, before, wait=0.6: before)
-        self.assertTrue(res.ok and not res.indeterminate, res.detail)
-        self.assertIn("shown late", res.detail)
+    def test_a_write_that_lands_after_the_wait_is_one_copy_and_unverified(self):
+        field = Field("start", takes_insertion="ignored")
+        d, res = self.run_type(field)
+        field.value += "hello 你好"                                      # the write lands after the read-back
+        self.assertTrue(res.indeterminate, res.detail)
         self.assertEqual(self.keys_sent(d), [])
+        self.assertEqual(field.value.count("hello 你好"), 1)
 
-    def test_a_window_where_the_insertion_did_nothing_goes_straight_to_keys(self):
-        """Chrome: accepted and nothing changed after the whole wait -- remembered for that window, not the app."""
+    def test_no_window_is_remembered_from_a_failed_write(self):
+        """The way in is decided from the element, not from what an earlier write did: the next text in the same
+        window is inserted again, and again no key follows."""
         d = driver()
-        d, res = self.run_type(Field("start", takes_insertion=False), d=d)
-        self.assertTrue(res.ok, res.detail)
-        self.assertEqual(d._ax_noop_windows, {"200"})
+        d, res = self.run_type(Field("start", takes_insertion="ignored"), d=d)
         d.log.clear()
-        d, res = self.run_type(Field("start", takes_insertion=False), d=d, text="again")
-        self.assertTrue(res.ok, res.detail)
-        self.assertNotIn("ax insert", [e[0] for e in d.log if isinstance(e, tuple)])
-        self.assertIn(("keys", "again"), d.log)
-        d.log.clear()
-        d._window_id = d._pinned_window = "201"                         # another window of the same app
-        d._element_window = {"t1": "201"}
-        d._observed_windows.add("201")
-        d, res = self.run_type(Field("start", takes_insertion=False), d=d, text="third")
-        self.assertIn(("ax insert", "third"), d.log)
+        d, res = self.run_type(Field("start", takes_insertion="ignored"), d=d, text="again")
+        self.assertEqual(d.log, [("ax insert", "again")])
+        self.assertFalse(hasattr(d, "_ax_noop_windows"))
 
     def test_the_window_changing_midway_stops_the_typing(self):
         """2000 chars into the task's window, which closes midway: the app makes the user's window key, and the rest

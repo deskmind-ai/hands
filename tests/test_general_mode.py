@@ -1761,20 +1761,22 @@ class GateAtEverySendSite(_KeysFixture):
         res = self._type(d)                                     # its process by bundle id: typed
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
 
-    def test_the_front_app_without_the_window_server_falls_back_to_nsworkspace(self):
+    def test_the_front_app_unknown_without_the_window_server_is_refused(self):
+        """hands#69: the front app comes only from the window server's front process; without it the front is unknown
+        and the gate refuses -- not inferred from window order, not NSWorkspace's stale frontmostApplication."""
         from deskmind_hands.drivers import skylight
         self.el["focused"] = True
-        with mock.patch.object(skylight, "front_pid", lambda: None):    # the window server does not tell
-            d = self.route("foreground")
-            self.workspace_front = 4242                                    # NSWorkspace does
-            res = self._type(d)
-            self.assertTrue(res.ok and not res.indeterminate, res.detail)
-        self.setUp()
-        self.el["focused"] = True
-        with mock.patch.object(skylight, "front_pid", lambda: None):
-            d = self.route("foreground")
-            self.workspace_front = None                                    # neither tells: refused
-            res = self._type(d)
+        quartz = types.ModuleType("Quartz")
+        quartz.kCGWindowListOptionOnScreenOnly, quartz.kCGWindowListExcludeDesktopElements = 1, 16
+        quartz.CGWindowListCopyWindowInfo = lambda o, w: [{"kCGWindowLayer": 0, "kCGWindowOwnerPID": 4242}]
+        # started before the route's own patches of sys.modules, so stopped after them: nothing leaks
+        for p in (mock.patch.dict(sys.modules, {"Quartz": quartz}),
+                  mock.patch.object(skylight, "front_pid", lambda: None)):
+            p.start()
+            self.addCleanup(p.stop)
+        d = self.route("foreground")
+        self.workspace_front = 4242                                       # NSWorkspace, stale: not asked
+        res = self._type(d)
         self.assertIs(res.performed, False, res.detail)
         self.assertEqual(self.pastes(), [])
 

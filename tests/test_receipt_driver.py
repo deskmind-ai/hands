@@ -212,7 +212,7 @@ class BrowserForeground(unittest.TestCase):
         d._own_window_in_front = lambda bundle: True
         del d._give_front_back                         # the real one
         made = []
-        d._make_frontmost = lambda b: made.append(b) or True
+        d._restore_front = lambda b, name="": made.append(b) or True
 
         def step(Q):
             d.front[0] = "com.tinyspeck.slackmacgap"   # the user clicked Slack
@@ -271,7 +271,7 @@ class BrowserForeground(unittest.TestCase):
         made = []
         fronts = iter(["com.google.Chrome", "com.apple.finder"])
         d._front_bundle = lambda: next(fronts, "com.apple.finder")
-        d._make_frontmost = lambda b: made.append(b) or True
+        d._restore_front = lambda b, name="": made.append(b) or True
         with mock.patch("deskmind_hands.drivers.peekaboo.subprocess.run") as run, \
              mock.patch("deskmind_hands.drivers.peekaboo.time.sleep"):
             d._give_front_back("com.apple.finder", ours="com.google.Chrome")
@@ -286,7 +286,7 @@ class BrowserForeground(unittest.TestCase):
         made = []
         fronts = iter(["", "com.google.Chrome", "com.apple.finder"])
         d._front_bundle = lambda: next(fronts, "com.apple.finder")
-        d._make_frontmost = lambda b: made.append(b) or True
+        d._restore_front = lambda b, name="": made.append(b) or True
         with mock.patch("deskmind_hands.drivers.peekaboo.time.sleep"):
             d._give_front_back("com.apple.finder", ours="com.google.Chrome")
         self.assertEqual(made, ["com.apple.finder"])
@@ -309,7 +309,7 @@ class BrowserForeground(unittest.TestCase):
             made.append(b)
             d.front[0] = b
             return True
-        d._make_frontmost = make
+        d._restore_front = lambda b, name="": make(b)
         reads = [0]
 
         def front():
@@ -357,7 +357,7 @@ class BrowserForeground(unittest.TestCase):
         d = PeekabooDriver.__new__(PeekabooDriver)
         d.BROWSERS = {"com.google.chrome"}
         made = []
-        d._make_frontmost = lambda b: made.append(b) or True
+        d._restore_front = lambda b, name="": made.append(b) or True
         fronts = iter(["x", "com.google.Chrome"])
         d._front_bundle = lambda: next(fronts, "com.google.Chrome")
         with mock.patch("deskmind_hands.drivers.peekaboo.subprocess.run") as run, \

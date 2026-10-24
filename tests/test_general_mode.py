@@ -1996,3 +1996,447 @@ class TextTargetFoundByItsRole(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         self.assertIs(self._driver()._field_now("elem_3"), el)
+
+
+class NewlinesGoInAsText(unittest.TestCase):
+    """hands#66's newline rule on the command-line channel: a newline in the text is never a bare Return key. Peekaboo's
+    `type` presses Return for each one (AXorcist Element.typeText), _type_multiline pressed it between lines, and the
+    type_fg fallback typed it the same way. Text with a newline goes in as text, the way chosen before the first send:
+    the element's value written (then verified or unverified, never a paste after), else a paste where the step may
+    use the foreground, else nothing; a one-line field refuses it. Fail on 10d5b71."""
+
+    def setUp(self):
+        from deskmind_hands.drivers import axfield
+        self.shown = {"value": "old"}
+        for name, fn in (("value", lambda f: self.shown["value"]),
+                         ("settled_value", lambda f, before, wait=0.6: self.shown["value"])):
+            p = mock.patch.object(axfield, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def driver(self, role="textArea", settable=True, foreground=False, takes=True, paste="ok", ax_role="AXTextArea"):
+        self.selected_all = False
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        d._element_ax_role = {"e1": ax_role}
+        d._pid_of = lambda bundle, all_wins=None: 4242
+        d.app, d._mcp, d._snapshot = "com.example.notes", None, "s1"
+        d._pinned_window, d._element_window, d._window_id = None, {"e1": ""}, "200"
+        d._element_role, d._element_settable = {"e1": role}, {"e1": settable}
+        d._element_value, d._labels_by_id = {"e1": "old"}, {"e1": "Body"}
+        d.allow_foreground, d._blind_write = foreground, None
+        d._foreground_actions = d._escalations = 0
+        d._field_now = lambda eid: "FIELD"
+        d._foreground_refusal = lambda: None
+        d._browser_field_refusal = lambda vid: None
+        # the field as the next observation reads it (the foreground route's read-back)
+        d.observe = lambda: SimpleNamespace(elements=[SimpleNamespace(settable=True, value=self.shown["value"])])
+        d._settle = lambda ok, detail: ExecResult(ok, detail)
+        d.AX_INSERT_WAIT_S = 0.0
+        self.sent = []
+
+        def run(key, _extra=None, **fmt):
+            self.sent.append((key, fmt.get("text"), fmt.get("chord")))
+            if key == "set_value" and takes == "fails":
+                return False, {}, "ERROR: the value could not be set"
+            if key == "set_value" and takes:
+                self.shown["value"] = fmt["text"]
+            if key == "paste_fg":
+                if paste == "unknown":
+                    return False, {}, "UNKNOWN: the outcome is unknown"
+                # a paste replaces the selection, else goes in at the caret (the end)
+                self.shown["value"] = (fmt["text"] if self.selected_all else self.shown["value"] + fmt["text"])
+            return True, {}, ""
+        d._run = run
+        return d
+
+    def type_(self, d, text, clear=False, foreground=False):
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        from deskmind_hands.drivers.base import input_scope
+        with input_scope(None):
+            return d._execute_inner(Action(kind=ActionKind.TYPE_TEXT, text=text, clear_first=clear,
+                                           foreground=foreground, binding=Binding(element_id="e1")))
+
+    def no_return(self):
+        self.assertFalse([s for s in self.sent if s[0].startswith("press") and s[2] == "return"], self.sent)
+        self.assertFalse([s for s in self.sent if s[0] in ("type", "type_clear", "type_fg") and "\n" in (s[1] or "")],
+                         self.sent)
+
+    def test_appended_text_with_a_newline_is_inserted_at_the_end(self):
+        self.replace_fakes()
+        self.insert_fakes()
+        res = self.type_(self.driver(), "a\nb")
+        self.assertEqual((self.sent, self.inserted), ([], ["a\nb"]))      # no value written over it
+        self.assertEqual(self.shown["value"], "olda\nb")
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_codex_an_append_keeps_what_loaded_after_the_observation(self):
+        """Review of #68 @98654dd: cached + text was written as the value, deleting what loaded after the
+        observation, and read as verified."""
+        self.replace_fakes()
+        self.insert_fakes()
+        d = self.driver()
+        self.shown["value"] = "old + loaded since"                       # the cache still says "old"
+        res = self.type_(d, "a\nb")
+        self.assertEqual(self.shown["value"], "old + loaded sincea\nb")
+        self.assertFalse([x for x in self.sent if x[0] == "set_value"], self.sent)
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    # -- review of #68 @870f1df
+    def test_an_append_to_a_web_page_field_is_never_an_accessibility_insertion(self):
+        """In a web page (a chat box in Chrome or Electron) the insertion reads back and the page's own state stays
+        old: a later submit sends the old content. Pasted in the foreground instead, or refused without it."""
+        self.replace_fakes()
+        self.insert_fakes()
+        self.web = True
+        d = self.replace_driver()
+        res = self.type_(d, "a\nb", foreground=True)
+        self.assertEqual(self.inserted, [])
+        self.assertEqual([x[0] for x in self.sent], ["paste_fg"])
+        self.setUp()
+        self.replace_fakes()
+        self.insert_fakes()
+        self.web = True
+        res = self.type_(self.driver(settable=False), "a\nb")             # no foreground: refused
+        self.assertEqual((self.inserted, self.sent), ([], []))
+        self.assertIs(res.performed, False, res.detail)
+
+    def test_the_paste_goes_at_the_real_end_when_the_field_grew_while_the_app_came_forward(self):
+        self.replace_fakes(focused=False)
+        self.insert_fakes(front=4242)
+        self.web = True                                                    # a web page's field: the paste route
+        d = self.replace_driver()
+        raise_app = d._raise_app
+
+        def raise_and_grow(bundle):
+            self.shown["value"] += " + more"                               # loaded while the app came forward
+            return raise_app(bundle)
+        d._raise_app = raise_and_grow
+        res = self.type_(d, "a\nb", foreground=True)
+        self.assertEqual(self.select_wants, [(len("old + more"), 0)])      # the caret at the real end
+        self.assertEqual(self.shown["value"], "old + morea\nb")
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def real_field(self, d, ax_role="AXTextArea", tree_role="AXTextArea", label="Body"):
+        """The real _field_now / _field_is_observed over an accessibility tree, the element as the CLI reports it."""
+        from deskmind_hands.drivers import axchrome, axfield
+        from deskmind_hands.geometry import Point, Rect
+        del d._field_now
+        el = {"AXRole": tree_role, "AXTitle": label, "AXChildren": [], "frame": (100, 130, 580, 350)}
+        win = {"AXRole": "AXWindow", "AXChildren": [el], "frame": (100, 100, 600, 400)}
+        d._rects, d._origin, d._role_labels = {"e1": Rect(0, 30, 580, 350)}, Point(100, 100), set()
+        d._key_target = lambda: (4242, 200)
+        d._element_role, d._element_ax_role = {"e1": "textField"}, {"e1": ax_role}   # Peekaboo's role: textField
+        for target, name, fn in ((axfield, "window", lambda pid, wid: win),
+                                 (axfield, "_get", lambda e, attr: e.get(attr) if isinstance(e, dict) else None),
+                                 (axchrome, "_frame", lambda e: e.get("frame"))):
+            p = mock.patch.object(target, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+        return el
+
+    def test_codex_a_text_area_found_by_the_real_lookup_is_appended_to(self):
+        """Codex on #68 @4dbe852: the field lookup still went by Peekaboo's role (textField), which never matches an
+        AXTextArea -- the multi-line append was refused. Through the real _field_now, CLI-shaped data."""
+        self.replace_fakes()
+        self.insert_fakes()
+        d = self.driver(role="textField")
+        el = self.real_field(d)
+        self.assertIs(d._field_now("e1"), el)
+        res = self.type_(d, "a\nb")
+        self.assertEqual(self.inserted, ["a\nb"])
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_a_text_area_found_by_the_real_lookup_is_replaced_and_read_back(self):
+        d = self.driver(role="textField")
+        self.real_field(d)
+        res = self.type_(d, "a\nb", clear=True)
+        self.assertEqual(self.sent, [("set_value", "a\nb", None)])
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_a_one_line_field_by_its_raw_role_is_refused_and_an_unknown_kind_is_looked_up(self):
+        d = self.driver(role="textField")
+        self.real_field(d, ax_role="AXTextField", tree_role="AXTextField")
+        res = self.type_(d, "a\nb")
+        self.assertIn("one-line", res.detail)
+        self.setUp()
+        self.replace_fakes()
+        self.insert_fakes()
+        d = self.driver(role="textField")
+        el = self.real_field(d, ax_role="")                              # the raw role not reported
+        self.assertIs(d._field_now("e1"), el)                            # Peekaboo's textField: either kind
+
+    def test_codex_a_text_area_peekaboo_calls_textfield_is_typed(self):
+        """Review of #68 @98654dd: Peekaboo's role is textField for AXTextArea too; TextEdit's body was refused."""
+        self.replace_fakes()
+        self.insert_fakes()
+        res = self.type_(self.driver(role="textField", ax_role="AXTextArea"), "a\nb")
+        self.assertEqual(self.inserted, ["a\nb"])
+        self.assertTrue(res.ok, res.detail)
+        for ax_role, refused in (("AXTextField", True), ("", False)):
+            with self.subTest(ax_role=ax_role):
+                self.setUp()
+                self.replace_fakes()
+                self.insert_fakes()
+                res = self.type_(self.driver(role="textField", ax_role=ax_role), "a\nb")
+                self.assertEqual(res.performed is False and "one-line" in res.detail, refused, res.detail)
+
+    def test_replacing_with_lines_is_written_whole_and_not_shown_is_unverified_with_no_paste_after(self):
+        res = self.type_(self.driver(takes=False, foreground=True), "a\nb", clear=True, foreground=True)
+        self.assertEqual(self.sent, [("set_value", "a\nb", None)])             # no paste after the write
+        self.no_return()
+        self.assertTrue(res.indeterminate, res.detail)
+
+    def test_a_one_line_field_refuses_a_newline(self):
+        res = self.type_(self.driver(role="textField"), "a\nb")
+        self.assertEqual(self.sent, [])
+        self.assertIs(res.performed, False, res.detail)
+        self.assertIn("press Return as its own step", res.detail)
+
+    def test_no_value_to_write_pastes_in_the_foreground_and_never_types_it(self):
+        self.replace_fakes()
+        self.insert_fakes(front=4242)
+        self.web = True                                           # a web page's field: pasted, never the insertion
+        d = self.driver(settable=False, foreground=True, paste="unknown")
+        d._raise_app = lambda bundle: True
+        d._front_bundle = lambda: d.app
+        res = self.type_(d, "a\nb", foreground=True)
+        self.assertEqual([s[0] for s in self.sent], ["paste_fg"])               # no type_fg after it
+        self.no_return()
+        self.assertIsNotNone(res)
+
+    def test_no_value_and_no_foreground_sends_nothing(self):
+        res = self.type_(self.driver(settable=False), "a\nb")
+        self.assertEqual(self.sent, [])
+        self.assertIs(res.performed, False, res.detail)
+
+    def test_text_without_a_newline_is_typed_as_before(self):
+        self.type_(self.driver(), "ab")
+        self.assertEqual([s[0] for s in self.sent][:1], ["type"])
+
+    # -- review of #68 @1194dde
+    def test_a_lone_carriage_return_is_a_newline_before_any_route(self):
+        """B1: a lone "\r" reached Peekaboo's `type`."""
+        self.type_(self.driver(), "a\rb", clear=True)
+        self.assertEqual(self.sent, [("set_value", "a\nb", None)])
+        self.replace_fakes()
+        self.insert_fakes()
+        self.web = True                                           # a web page's field: the paste route
+        d = self.driver(settable=False, foreground=True)
+        d._raise_app, d._front_bundle = (lambda bundle: True), (lambda: d.app)
+        self.front = 4242
+        self.type_(d, "a\rb", foreground=True)
+        self.assertFalse([x for x in self.sent if "\r" in (x[1] or "")], self.sent)
+        self.assertEqual(self.sent, [("paste_fg", "a\nb", None)])
+
+    def test_text_with_a_newline_into_the_focused_field_is_refused(self):
+        """B2 (pasted, then committed with Return -- a chat message sent), then Codex on #68 @4dbe852 (an unbound
+        replace pasted at the caret: "old" became "olda\nb"): with no field named, multi-line text is refused."""
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        from deskmind_hands.drivers.base import input_scope
+        for clear in (False, True):
+            with self.subTest(replace=clear):
+                d = self.driver(settable=False, foreground=True)
+                with input_scope(None):
+                    res = d._execute_inner(Action(kind=ActionKind.TYPE_TEXT, text="one\ntwo", foreground=True,
+                                                  clear_first=clear, binding=Binding()))
+                self.assertEqual(self.sent, [])
+                self.assertIs(res.performed, False, res.detail)
+                self.assertIn("needs a target field", res.detail)
+                self.assertEqual(self.shown["value"], "old")
+
+    def replace_fakes(self, readable=True, selects=True, focused=True):
+        from deskmind_hands.drivers import axfield, peekaboo as P
+        self.writes, self.focused, self.front, self.reads = [], focused, 4242, []
+        self.on_read = {}                                         # the n-th focus read: what happens during it
+
+        from deskmind_hands.drivers import base
+
+        def select_range(el, want, wait=0.3):
+            self.writes.append("select all")
+            self.select_wants = getattr(self, "select_wants", []) + [want]
+            base.ax_counted(lambda: 0)                            # an accessibility write: counted as sent
+            self.selected_all = selects and want[1] > 0            # a range selected; (n, 0) is a caret
+            return selects
+
+        def is_focused(el):                                       # a read that can wait
+            self.reads.append(1)
+            self.on_read.get(len(self.reads), lambda: None)()
+            return self.focused
+
+        def focus(el, wait=0.5):
+            self.writes.append("focus")
+            base.ax_counted(lambda: 0)
+            self.focused = True
+            return True
+        for name, fn in (("wanted", lambda el, all_: (0, len(self.shown["value"])) if all_
+                          else (len(self.shown["value"]), 0)),
+                         ("_selection", lambda el: (0, 0) if readable else None),
+                         ("is_focused", is_focused), ("focus", focus), ("select_range", select_range)):
+            p = mock.patch.object(axfield, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(P, "_front_app_pid", lambda: self.front)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def insert_fakes(self, front=1111):
+        """The accessibility insertion at the end (axfield.insert), its gate asked first as the real one does."""
+        from deskmind_hands.drivers import axfield, base
+        self.inserted = []
+        self.front = front                                        # the user's app in front: the target is not
+
+        def insert(el, text, replace_all, check=None, want=None):
+            why = check() if check is not None else None
+            if why:
+                return axfield.NOTHING, why
+            base.ax_counted(lambda: 0)
+            self.inserted.append(text)
+            self.shown["value"] += text                           # at the end: what is there stays
+            return axfield.TEXT, None
+        self.web = False
+        for name, fn in (("insert", insert), ("selection_readable", lambda el: True),
+                         ("in_web_area", lambda el: self.web)):
+            p = mock.patch.object(axfield, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def replace_driver(self, arrives_after=0):
+        """The app's process is 4242; `arrives_after` reads of the front after the raise, it is in front."""
+        d = self.driver(settable=False, foreground=True)
+        reads = {"left": None}
+
+        def raise_app(bundle):
+            self.writes.append("raise")
+            reads["left"] = arrives_after
+            return True
+
+        def front_bundle():
+            if reads["left"] is not None:
+                if reads["left"] <= 0:
+                    self.front = 4242
+                reads["left"] -= 1
+            return d.app if self.front == 4242 else "com.example.other"
+        d._raise_app, d._front_bundle = raise_app, front_bundle
+        d._pid_of = lambda bundle, all_wins=None: 4242
+        return d
+
+    def test_replacing_with_lines_by_a_paste_selects_all_first_and_verifies_by_equality(self):
+        """B3: a replace on the paste route did not clear -- "old" became "olda\nb" and read as verified."""
+        self.replace_fakes()
+        res = self.type_(self.replace_driver(), "a\nb", clear=True, foreground=True)
+        self.assertEqual(self.writes, ["raise", "select all"])
+        self.assertEqual([x[0] for x in self.sent], ["paste_fg"])
+        self.assertEqual(self.shown["value"], "a\nb")
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_codex_the_replace_reads_back_its_own_field_not_any_field(self):
+        """Review of #68 @98654dd: the replace's read-back scanned every settable field -- another holding the text
+        made a failed paste "verified"."""
+        self.replace_fakes()
+        d = self.replace_driver()
+        real_run = d._run
+
+        def run(key, _extra=None, **fmt):
+            if key == "paste_fg":
+                return False, {}, "the paste did not go"                 # the target unchanged
+            return real_run(key, _extra, **fmt)
+        d._run = run
+        d.observe = lambda: SimpleNamespace(elements=[SimpleNamespace(settable=True, value="a\nb")])  # another field
+        res = self.type_(d, "a\nb", clear=True, foreground=True)
+        self.assertTrue(res.indeterminate, res.detail)
+        self.assertNotIn("verified by read", res.detail)
+
+    def test_a_replace_that_only_contains_the_text_is_not_verified(self):
+        self.replace_fakes(selects=True)
+        d = self.replace_driver()
+        real_run = d._run
+
+        def run(key, _extra=None, **fmt):                              # the paste lands after the old text anyway
+            if key == "paste_fg":
+                self.selected_all = False
+            return real_run(key, _extra, **fmt)
+        d._run = run
+        res = self.type_(d, "a\nb", clear=True, foreground=True)
+        self.assertEqual(self.shown["value"], "olda\nb")
+        self.assertTrue(res.indeterminate, res.detail)                  # contains it, does not equal it
+
+    def test_a_replace_whose_selection_cannot_be_read_is_refused_before_a_send(self):
+        self.replace_fakes(readable=False)
+        res = self.type_(self.replace_driver(), "a\nb", clear=True, foreground=True)
+        self.assertEqual((self.sent, self.writes), ([], []))
+        self.assertIs(res.performed, False, res.detail)
+
+    def test_the_replace_gate_before_each_write(self):
+        """#68 B3 behind the foreground Gate: the app brought forward, then the gate before the focus write, the
+        select-all and the paste -- the focus read first, STOP and the front app last. A STOP or another app coming
+        forward during the read before a write: that write and none after it is made."""
+        from deskmind_hands.grounding import STOP
+        order = ("focus write", "select all", "paste")
+        for n, write in enumerate(order, start=1):              # the n-th focus read precedes that write
+            for what in ("front", "stop"):
+                with self.subTest(write=write, condition=what):
+                    STOP.clear()
+                    self.addCleanup(STOP.clear)
+                    self.replace_fakes(focused=False)
+                    d = self.replace_driver()
+
+                    def arise(what=what):
+                        if what == "stop":
+                            STOP.set()
+                        else:
+                            self.front = 9999                      # the user brought another app forward
+                    self.on_read[n] = arise
+                    res = self.type_(d, "a\nb", clear=True, foreground=True)
+                    made = [w for w in self.writes if w != "raise"] + [x[0] for x in self.sent]
+                    expected = {"focus write": [], "select all": ["focus"], "paste": ["focus", "select all"]}[write]
+                    self.assertEqual(made, expected)
+                    if write == "focus write":
+                        self.assertIs(res.performed, False, res.detail)
+                    else:
+                        self.assertTrue(res.indeterminate, res.detail)
+
+    # -- review of #68 @1fb0766
+    def test_the_replace_waits_for_the_app_to_come_forward(self):
+        """Bringing the app forward is asynchronous: the gate read the old front and refused almost every time."""
+        from deskmind_hands.drivers import peekaboo as P
+        self.replace_fakes()
+        self.front = 1111                                         # the user's app in front
+        with mock.patch.object(P.time, "sleep", lambda s: None):
+            res = self.type_(self.replace_driver(arrives_after=3), "a\nb", clear=True, foreground=True)
+        self.assertEqual([x[0] for x in self.sent], ["paste_fg"])
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_the_replace_whose_app_never_comes_forward_sends_nothing(self):
+        from deskmind_hands.drivers import peekaboo as P
+        self.replace_fakes()
+        self.front = 1111
+        with mock.patch.object(P.time, "sleep", lambda s: None):
+            res = self.type_(self.replace_driver(arrives_after=999), "a\nb", clear=True, foreground=True)
+        self.assertEqual([w for w in self.writes if w != "raise"] + [x[0] for x in self.sent], [])
+        self.assertIs(res.performed, False, res.detail)
+        self.assertIn("did not come to the front", res.detail)
+
+    def test_a_browser_replace_is_refused_before_anything_is_raised(self):
+        """The browser refusal came inside the paste, after the raise, the focus write and the select-all."""
+        self.replace_fakes()
+        d = self.replace_driver()
+        d.app = "com.google.Chrome"
+        del d._foreground_refusal                                 # the real one: a browser is never pasted into
+        res = self.type_(d, "a\nb", clear=True, foreground=True)
+        self.assertEqual((self.writes, self.sent), ([], []))
+        self.assertIs(res.performed, False, res.detail)
+
+    def test_a_failed_value_write_says_so(self):
+        res = self.type_(self.driver(takes="fails"), "a\nb", clear=True)
+        self.assertFalse(res.ok)
+        self.assertTrue(res.indeterminate, res.detail)
+        self.assertIn("failed", res.detail)
+
+    def test_no_key_route_sends_a_newline_as_return(self):
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        posted = []
+        d._post_key = lambda Q, code, flags=0: posted.append(code)
+        for nl in ("\n", "\r"):
+            with self.assertRaises(ValueError):
+                d._post_chunk(None, nl)
+        self.assertEqual(posted, [])

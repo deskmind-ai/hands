@@ -614,11 +614,19 @@ class TypeText(unittest.TestCase):
         d2, res = self.run_type(Field("start", takes_insertion=True), d=d2)   # a native field takes the insertion
         self.assertTrue(res.ok and "accessibility insertion" in res.detail, res.detail)
 
-    def test_carriage_returns_are_newlines(self):
-        d, res = self.run_type(Field("a", takes_insertion=False), text="b\r\nc\rd")
-        self.assertEqual([e for e in d.log if isinstance(e, tuple) and e[0] in ("keys", "key")],
-                         [("keys", "b"), ("key", keys.RETURN, 0), ("keys", "c"), ("key", keys.RETURN, 0),
-                          ("keys", "d")])
+    def test_a_newline_is_never_the_return_key_here(self):
+        """hands#66's newline rule: no key route turns a newline (or a carriage return) into Return -- in a chat box
+        Return sends. Text with one goes in as text: the insertion where it is taken, else not by keys here (None:
+        the caller's route, a value written or a paste)."""
+        for text in ("b\nc", "b\r\nc\rd"):
+            d, res = self.run_type(Field("a", takes_insertion=False), text=text)          # insertion refused
+            self.assertIsNone(res, text)
+            self.assertEqual([e for e in d.log if isinstance(e, tuple) and e[0] in ("keys", "key")], [], text)
+        field = Field("a", takes_insertion=True)
+        d, res = self.run_type(field, text="b\r\nc")                                    # inserted as text
+        self.assertEqual(field.value, "ab\nc")
+        self.assertNotIn(("key", keys.RETURN, 0), d.log)
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
 
     def test_a_one_line_field_takes_no_newline_or_tab_as_keys(self):
         for text in ("a\tb", "a\nb", "a\r\nb", "a\rb"):

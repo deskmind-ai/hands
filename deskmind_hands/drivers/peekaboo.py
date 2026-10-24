@@ -3653,8 +3653,11 @@ class PeekabooDriver:
             if reached or after != before:
                 return result(after, "accessibility insertion")
         multiline = axfield.role(field) == "AXTextArea"
-        if not multiline and ("\n" in text or "\t" in text):
-            return None             # Return would submit a one-line field, Tab move its focus: not typed as keys
+        if "\n" in text or (not multiline and "\t" in text):
+            # A newline is never a bare Return key (hands#66: in a chat box Return sends, "one\ntwo" sent "one"): text
+            # with one goes in as text -- the insertion above, a value written, or a paste -- never as keys here. A
+            # Tab in a one-line field would move its focus.
+            return None
         if not self._ascii_input():
             return None             # an input method would take the keys (a candidate window): no background route
         try:

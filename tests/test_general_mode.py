@@ -2143,9 +2143,23 @@ class NewlinesGoInAsText(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def replace_driver(self):
+    def replace_driver(self, arrives_after=0):
+        """The app's process is 4242; `arrives_after` reads of the front after the raise, it is in front."""
         d = self.driver(settable=False, foreground=True)
-        d._raise_app = lambda bundle: self.writes.append("raise") or True
+        reads = {"left": None}
+
+        def raise_app(bundle):
+            self.writes.append("raise")
+            reads["left"] = arrives_after
+            return True
+
+        def front_bundle():
+            if reads["left"] is not None:
+                if reads["left"] <= 0:
+                    self.front = 4242
+                reads["left"] -= 1
+            return d.app if self.front == 4242 else "com.example.other"
+        d._raise_app, d._front_bundle = raise_app, front_bundle
         d._pid_of = lambda bundle, all_wins=None: 4242
         return d
 
@@ -2206,6 +2220,37 @@ class NewlinesGoInAsText(unittest.TestCase):
                         self.assertIs(res.performed, False, res.detail)
                     else:
                         self.assertTrue(res.indeterminate, res.detail)
+
+    # -- review of #68 @1fb0766
+    def test_the_replace_waits_for_the_app_to_come_forward(self):
+        """Bringing the app forward is asynchronous: the gate read the old front and refused almost every time."""
+        from deskmind_hands.drivers import peekaboo as P
+        self.replace_fakes()
+        self.front = 1111                                         # the user's app in front
+        with mock.patch.object(P.time, "sleep", lambda s: None):
+            res = self.type_(self.replace_driver(arrives_after=3), "a\nb", clear=True, foreground=True)
+        self.assertEqual([x[0] for x in self.sent], ["paste_fg"])
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_the_replace_whose_app_never_comes_forward_sends_nothing(self):
+        from deskmind_hands.drivers import peekaboo as P
+        self.replace_fakes()
+        self.front = 1111
+        with mock.patch.object(P.time, "sleep", lambda s: None):
+            res = self.type_(self.replace_driver(arrives_after=999), "a\nb", clear=True, foreground=True)
+        self.assertEqual([w for w in self.writes if w != "raise"] + [x[0] for x in self.sent], [])
+        self.assertIs(res.performed, False, res.detail)
+        self.assertIn("did not come to the front", res.detail)
+
+    def test_a_browser_replace_is_refused_before_anything_is_raised(self):
+        """The browser refusal came inside the paste, after the raise, the focus write and the select-all."""
+        self.replace_fakes()
+        d = self.replace_driver()
+        d.app = "com.google.Chrome"
+        del d._foreground_refusal                                 # the real one: a browser is never pasted into
+        res = self.type_(d, "a\nb", clear=True, foreground=True)
+        self.assertEqual((self.writes, self.sent), ([], []))
+        self.assertIs(res.performed, False, res.detail)
 
     def test_a_failed_value_write_says_so(self):
         res = self.type_(self.driver(takes="fails"), "a\nb")

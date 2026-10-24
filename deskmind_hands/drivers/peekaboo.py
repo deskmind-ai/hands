@@ -3210,16 +3210,9 @@ class PeekabooDriver:
                     brought = self._bring_forward(bundle, browser)
                     if not brought:
                         return False, NothingSent(f"the run's own {bundle} window could not be raised; nothing was done")
-                    for _ in range(30):
-                        if self._front_bundle().lower() == bundle.lower():
-                            break
-                        left = time_left()
-                        if left is not None and left <= 0:   # the wait ends in time; nothing is sent late
-                            return False, NothingSent(f"the caller's deadline came while {bundle} was coming forward; "
-                                                      f"nothing was done")
-                        time.sleep(0.05)
-                    else:
-                        return False, NothingSent(f"{bundle} did not come to the front; nothing was done")
+                    late = self._wait_front(bundle)
+                    if late:
+                        return False, NothingSent(f"{late}; nothing was done")
                     arrived = True
                     time.sleep(0.15)
                     # Touched while it came forward -- any input since the idle check, the spectator's too: nothing
@@ -5424,6 +5417,19 @@ class PeekabooDriver:
                                              f"nothing was typed. Type it without the newline, and press Return as "
                                              f"its own step if you mean to submit"))
 
+    def _wait_front(self, bundle: str) -> str | None:
+        """Wait for `bundle`, asked forward, to be the front app (bringing an app forward is asynchronous): None once
+        it is, else why not -- the caller's deadline came (the wait ends in time; nothing is sent late), or it did
+        not come within the wait (30 reads, 50 ms apart). The one wait, for _flash and _replace_by_paste."""
+        for _ in range(30):
+            if self._front_bundle().lower() == bundle.lower():
+                return None
+            left = time_left()
+            if left is not None and left <= 0:
+                return f"the caller's deadline came while {bundle} was coming forward"
+            time.sleep(0.05)
+        return f"{bundle} did not come to the front"
+
     def _replace_by_paste(self, eid: str, label: str, text: str) -> ExecResult:
         """Replace the field's text with `text` (it has a newline) by a paste: a paste inserts at the caret, so the
         field's text is selected first (review of #68 @1194dde: without the selection "old" became "olda\nb" and
@@ -5435,6 +5441,11 @@ class PeekabooDriver:
         selected (before_send), the paste (before_send). Refused before anything is sent when the field is not found,
         its selection cannot be read or its app not found; a refusal after a write went is unverified."""
         from deskmind_hands.drivers import axfield
+        browser_window = self._foreground_refusal()
+        if browser_window:
+            # the paste would be refused there (a browser window that is not the run's): before anything is raised,
+            # focused or selected (review of #68 @1fb0766)
+            return ExecResult(False, NothingSent(browser_window))
         field = self._field_now(eid) if eid else None
         refused = (f"replacing {label!r} with text that has a newline needs its text selected first, and "
                    f"{{why}}: nothing was typed")
@@ -5462,6 +5473,9 @@ class PeekabooDriver:
             return stop("stopped by the app")
         if not self._raise_app(self.app):
             return stop(f"{self.app} could not be brought forward")
+        late = self._wait_front(self.app)           # bringing it forward is asynchronous (review of #68 @1fb0766)
+        if late:
+            return stop(late)                        # nothing sent, or unverified when the raise was a counted reopen
         gate = Gate.foreground(pid, field)
         if gate.before_send() is not None:                      # not holding the focus (or the gate says no)
             why = gate.before_focus_write()

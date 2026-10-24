@@ -1086,14 +1086,8 @@ class GymSplit(unittest.TestCase):
             self.assertEqual(fam.make_task(30123, 2), fam.make_task(30123, 2))
 
 
-class TypingWhereNoValueIsTaken(unittest.TestCase):
-    """rc.15 (10-24): typing into a terminal's text view ended "unverified" every time -- the accessibility write
-    ("set_value ... without valid canonical result semantics") was accepted and never showed, and each uncertain step
-    put every later action to the user. The way in is chosen from the element, once, before anything is sent, never
-    by app: a settable value is written (unconfirmed: unverified, no keys after); a text element that takes no value
-    gets keys, only while it holds the keyboard focus at the moment they are sent; a newline is never a bare Return
-    key -- pasted as text into a multi-line element, refused for a one-line one; anything else is refused with nothing
-    sent. Read back once after. Two tables (focus; newline x field kind), then the rest."""
+class _KeysFixture(unittest.TestCase):
+    """A text element whose value is not settable, its focus, a clipboard and the key posts, all faked."""
 
     def setUp(self):
         from deskmind_hands.drivers import axfield, base
@@ -1135,7 +1129,7 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
         d._origin, d._snapshot = Point(100, 100), "s1"
         d._background_input = lambda bundle: False
         d._type_in_background = lambda eid, text, clear: self.log.append("ax insertion route") and None
-        d._keys_in_background = lambda field, text, ready, select_all: None      # this Mac: foreground keys
+        d._keys_in_background = lambda *a: None                                  # this Mac: foreground keys
         d._moved_since_seen = lambda: None
         d._field_now = lambda eid: "FIELD" if field else None
         pending = {}
@@ -1148,7 +1142,7 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
                 pending["value"] = args.get("value")            # lands later, after the read-back
             return True, {"effect": "accepted"}, "", ""
         d._mcp = SimpleNamespace(tool=tool)
-        q = SimpleNamespace(kCGEventFlagMaskCommand=1 << 20)
+        q = SimpleNamespace(kCGEventFlagMaskCommand=1 << 20, kCGHIDEventTap=0)
         self.board = board = {"text": "", "items": [{"public.utf8-plain-text": "the user's own"}]}
         d._post_click = lambda Q, x, y, count=1: self.log.append("click")
 
@@ -1162,6 +1156,15 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
                 self.shown["value"] += "\n"
         d._post_key = post_key
         d._keycode = lambda Q, ch: {"a": 0, "v": 9}[ch]
+        # the press primitives: events built beforehand are ("down"|"up", code, flags); a down is the key, as typed
+        d._key_pair = lambda Q, code, flags=0: (("down", code, flags), ("up", code, flags), ("key", code))
+
+        def post(Q, tap, ev, press=None, release=None):
+            if ev[0] == "down":
+                post_key(Q, ev[1], ev[2])
+        p = mock.patch.object(P, "_post", post)
+        p.start()
+        self.addCleanup(p.stop)
 
         class Item:
             def __init__(self, data=None):
@@ -1233,6 +1236,16 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
     def pastes(self):
         return [x for x in self.log if isinstance(x, tuple) and x[0] == "key"]
 
+
+class TypingWhereNoValueIsTaken(_KeysFixture):
+    """rc.15 (10-24): typing into a terminal's text view ended "unverified" every time -- the accessibility write
+    ("set_value ... without valid canonical result semantics") was accepted and never showed, and each uncertain step
+    put every later action to the user. The way in is chosen from the element, once, before anything is sent, never
+    by app: a settable value is written (unconfirmed: unverified, no keys after); a text element that takes no value
+    gets keys, only while it holds the keyboard focus at the moment they are sent; a newline is never a bare Return
+    key -- pasted as text into a multi-line element, refused for a one-line one; anything else is refused with nothing
+    sent. Read back once after. Two tables (focus; newline x field kind), then the rest."""
+
     # -- table 1: focus at the check -> during the wait -> right before the keys
     def test_focus_kept_throughout_is_left_alone_and_the_caret_kept(self):
         self.el["focused"] = True
@@ -1288,7 +1301,7 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
         from deskmind_hands.drivers import peekaboo as P
         d = self._driver(settable=False)
         bg = []
-        d._keys_in_background = lambda field, text, ready, select_all: bg.append(text)
+        d._keys_in_background = lambda field, text, *a: bg.append(text)
         res = self._type(d, text="one\ntwo")
         self.assertEqual(bg, [])                                               # not the background keys
         self.assertEqual(self.pastes(), [("key", 9, 1 << 20)])                 # one paste, no Return key
@@ -1320,15 +1333,17 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
         d._wait_until_still = lambda bundle, what: None
         d._too_late = lambda waited: None
         token = types.SimpleNamespace(note=lambda: "")
-        d._background_quartz = lambda bundle: (types.SimpleNamespace(kCGEventFlagMaskCommand=1 << 20), token)
-        posts = []
+        d._background_quartz = lambda bundle: (types.SimpleNamespace(kCGEventFlagMaskCommand=1 << 20,
+                                                                     kCGHIDEventTap=0), token)
+        from deskmind_hands.drivers import peekaboo as P
 
-        def post_key(Q, code, flags=0):
-            posts.append((code, flags))
-            if code == 9:
+        def post(Q, tap, ev, press=None, release=None):
+            if ev[:2] == ("down", 9):
                 base.counted(lambda: None)                                   # the paste went
                 raise skylight.WindowKeyRefused("the user came back to the app")
-        d._post_key = post_key
+        p = mock.patch.object(P, "_post", post)
+        p.start()
+        self.addCleanup(p.stop)
         from deskmind_hands.actions import Action, ActionKind, Binding
         d._require_session = lambda: None
         d.CONFIRM_BY_DIFF = False
@@ -1383,6 +1398,124 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self._type(self._driver(settable=False, fail_paste=True))
         self.assertEqual(self.board["items"], [{"public.utf8-plain-text": "the user's own"}])
+
+
+class FocusMovesWhilePreparing(_KeysFixture):
+    """Codex on #66 @3f82851 (the second of the focus family): the key code for cmd+V was looked up after the focus
+    check, and on a cold cache that is a child process (up to 20 s); the focus moved meanwhile and the text went into
+    another field. Split by structure: everything slow is prepared before the first check, and between a check and
+    its press there is nothing that can wait. Here every preparing call -- the layout read on a cold cache, the
+    clipboard saved, each key event built, the window's event source, the text cut in chunks -- moves the focus to
+    another field: nothing may land there, and the result is a refocus (then typed) or nothing sent."""
+
+    def steal(self, *_a, **_k):
+        self.el["focused"] = False                        # the user clicked into another field
+        self.log.append("focus moved")
+
+    def cold_cache(self):
+        from deskmind_hands.drivers import peekaboo as P
+        for name, value in (("_key_blobs", {}), ("_letter_codes", {}), ("_letters_read_at", 0.0)):
+            p = mock.patch.object(PeekabooDriver, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+        def child(*a, **k):                               # the layout read: a child process, on a cold cache
+            self.steal()
+            return types.SimpleNamespace(stdout='{"events": {}, "table": {}}', returncode=0)
+        p = mock.patch.object(P.subprocess, "run", child)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def driver(self, background=False, can_focus=True):
+        from deskmind_hands.drivers import peekaboo as P, skylight
+        self.el.update(focused=True, can_focus=can_focus)
+        self.other = {"value": ""}
+        d = self._driver(settable=False)
+        del d._keycode                                    # the real one: a cold cache reads the layout
+        self.cold_cache()
+        pair = d._key_pair
+
+        def stealing_pair(Q, code, flags=0):
+            self.steal()
+            return pair(Q, code, flags)
+        d._key_pair = stealing_pair
+        d._unicode_pair = lambda Q, chunk: self.steal() or (("down", "u", chunk), ("up", "u", chunk), ("key", 0))
+
+        def post(Q, tap, ev, press=None, release=None):
+            if not (isinstance(ev, tuple) and ev[0] == "down"):
+                return
+            into = self.shown if self.el["focused"] else self.other
+            self.log.append(("key", ev[1], ev[2]))
+            if ev[1] == 9:
+                into["value"] += self.board["text"]       # the paste
+            elif ev[1] in ("u", 0):
+                into["value"] += ev[2] if isinstance(ev[2], str) else "?"
+        p = mock.patch.object(P, "_post", post)
+        p.start()
+        self.addCleanup(p.stop)
+        d._post_key = lambda Q, code, flags=0: post(Q, 0, ("down", code, flags))  # a key pressed whole: the same
+        if background:
+            del d._keys_in_background                      # the real background route
+            d._background_keys = lambda: True
+            d._ascii_input = lambda: True
+            d._key_target = lambda: (4242, 200)
+            key = types.SimpleNamespace(lost=lambda: None, note=lambda: "")
+
+            class Enter:
+                def __enter__(self_):
+                    return key
+
+                def __exit__(self_, *a):
+                    return False
+
+            def make_q(*a, **k):
+                self.steal()
+                return types.SimpleNamespace(
+                    kCGEventFlagMaskCommand=1 << 20, kCGHIDEventTap=0,
+                    CGEventCreateKeyboardEvent=lambda src, code, down: ("down" if down else "up", code, 0),
+                    CGEventSetFlags=lambda ev, f: None, CGEventKeyboardSetUnicodeString=lambda ev, n, t: None)
+            chunks = skylight.text_chunks
+            for name, fn in (("user_on", lambda pid: False), ("enter_window_key", lambda pid, wid: Enter()),
+                             ("BackgroundQuartz", make_q),
+                             ("text_chunks", lambda t, *a: self.steal() or chunks(t, *a))):
+                p = mock.patch.object(skylight, name, fn)
+                p.start()
+                self.addCleanup(p.stop)
+        return d
+
+    def assert_nothing_in_the_other_field(self, res):
+        self.assertEqual(self.other["value"], "", self.log)
+        self.assertIn("focus moved", self.log)            # the preparing calls did move it
+        self.assertFalse(res.ok and res.indeterminate, res.detail)   # never typed elsewhere then "unverified"
+
+    def test_foreground_paste_refocuses_after_preparing(self):
+        res = self._type(self.driver())
+        self.assert_nothing_in_the_other_field(res)
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+        self.assertTrue(self.shown["value"].endswith("ls -la"))
+
+    def test_foreground_paste_with_no_way_to_refocus_sends_nothing(self):
+        res = self._type(self.driver(can_focus=False))
+        self.assert_nothing_in_the_other_field(res)
+        self.assertIs(res.performed, False)
+        self.assertEqual(self.pastes(), [])
+
+    def test_foreground_replace_refocuses_after_preparing(self):
+        d = self.driver()
+        self.shown["value"] = ""                          # replacing: what the selection held is gone (the fake)
+        res = self._type(d, clear=True)
+        self.assert_nothing_in_the_other_field(res)
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_background_keys_refocus_after_preparing(self):
+        res = self._type(self.driver(background=True))
+        self.assert_nothing_in_the_other_field(res)
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_background_keys_with_no_way_to_refocus_send_nothing(self):
+        res = self._type(self.driver(background=True, can_focus=False))
+        self.assert_nothing_in_the_other_field(res)
+        self.assertIs(res.performed, False)
 
 
 class TextTargetFoundByItsRole(unittest.TestCase):

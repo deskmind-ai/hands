@@ -3479,8 +3479,8 @@ class PeekabooDriver:
         before = self._read_field(field)
 
         def ready() -> str | None:
-            """Right before the keys: the element holds the keyboard focus (left alone when it does, the caret kept;
-            else given through accessibility and read back); why not."""
+            """The first check, right before anything is sent: the element holds the keyboard focus (left alone when
+            it does, the caret kept; else given through accessibility and read back); why not."""
             if axfield.is_focused(field):
                 return None
             if not axfield.can_set(field, "AXFocused"):
@@ -3489,27 +3489,50 @@ class PeekabooDriver:
                 return "it did not take the keyboard focus"
             return None
 
-        def select_all(q) -> None:
-            if action.clear_first and not axfield.select(field, True):
-                self._post_key(q, self._keycode(q, "a"), q.kCGEventFlagMaskCommand)
+        def still_focused() -> str | None:
+            """The check before every later press (and after any wait): no focus given back once input went."""
+            if STOP.is_set():
+                return "stopped by the app"
+            return None if axfield.is_focused(field) else "the element lost the keyboard focus"
+
+        # prepare, before any check: everything that can block or wait -- the keyboard layout and key events (a child
+        # process on a cold or stale cache, up to 20 s: Codex on #66 @3f82851, the focus moved meanwhile and cmd+V
+        # pasted into another field), the clipboard. Between a check and its press there is then nothing but the
+        # press (_press_checked).
+        codes = {c: self._keycode(None, c) for c in "av"}     # loads (or refreshes) the layout and key events
+        sent_before = sends_so_far()
+
+        def stopped(why: str) -> ExecResult:
+            if sends_so_far() > sent_before:
+                return ExecResult(False, MaybeSent(f"typing into {label!r} stopped part way: {why} -- it may have "
+                                                   f"taken effect; observe before typing again"))
+            return ExecResult(False, NothingSent(f"{label!r}: {why}; nothing was typed"))
 
         # a newline goes in as text, pasted whole: never the background keys, which make it the Return key
-        res = None if newline else self._keys_in_background(field, text, ready, select_all)
+        res = None if newline else self._keys_in_background(field, text, ready, still_focused,
+                                                            action.clear_first, codes["a"])
         if res is None:
             def perform(Q):
                 from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
-                why = ready()
-                if why:
-                    raise _NotReady(why)
+                cmd = Q.kCGEventFlagMaskCommand
+                select_key = self._key_pair(Q, codes["a"], cmd) if action.clear_first else None
+                paste_key = self._key_pair(Q, codes["v"], cmd)
                 pb = NSPasteboard.generalPasteboard()
                 saved = [{t: it.dataForType_(t) for t in it.types()} for it in (pb.pasteboardItems() or [])]
                 try:
-                    select_all(Q)
-                    if STOP.is_set():
-                        return "stopped by the app before the text was pasted"
                     pb.clearContents()
                     pb.setString_forType_(text, NSPasteboardTypeString)
-                    self._post_key(Q, self._keycode(Q, "v"), Q.kCGEventFlagMaskCommand)
+                    # send: the first check, then each press checked right before it
+                    why = ready()
+                    if why:
+                        raise _NotReady(why)
+                    if action.clear_first and not axfield.select(field, True):
+                        why = self._press_checked(Q, *select_key, still_focused)       # cmd+A
+                        if why:
+                            raise _NotReady(why)
+                    why = self._press_checked(Q, *paste_key, still_focused)            # cmd+V
+                    if why:
+                        raise _NotReady(why)
                     time.sleep(0.4)                 # the paste read before the clipboard is put back
                 finally:
                     release_all()   # what this step still holds down is let go first, before anything is given back
@@ -3527,7 +3550,7 @@ class PeekabooDriver:
             try:
                 ok, detail = self._flash(self.app, perform, what=f"type {text!r} into {label!r}")
             except _NotReady as exc:
-                return ExecResult(False, NothingSent(f"{label!r}: {exc}; nothing was typed"))
+                return stopped(str(exc))
             if not ok:
                 if newline and isinstance(detail, NothingSent):
                     # Said more, as nothing sent only when it was: a MaybeSent (a focus write, cmd+A or the paste
@@ -3537,6 +3560,8 @@ class PeekabooDriver:
                                                          f"the foreground"))
                 return ExecResult(False, detail)
             res = detail
+        elif isinstance(res, str) and res.startswith("stopped:"):
+            return stopped(res[len("stopped:"):])
         if isinstance(res, ExecResult):
             return res
         self._snapshot = None
@@ -3546,11 +3571,49 @@ class PeekabooDriver:
         shown = "it cannot be read back" if after is None else f"it reads {after[-120:]!r}"
         return ExecResult(True, indeterminate=True, detail=f"{res}, unverified: {shown} -- observe before typing again")
 
-    def _keys_in_background(self, field, text: str, ready, select_all):
+    @classmethod
+    def _key_pair(cls, Q, keycode: int, flags: int = 0) -> tuple:
+        """(down, up, key) of one key with `flags`, built now -- the prepare side of a press (_press_checked)."""
+        down, up = cls._key_event(Q, keycode, True), cls._key_event(Q, keycode, False)
+        Q.CGEventSetFlags(down, flags)
+        Q.CGEventSetFlags(up, flags)
+        return down, up, ("key", keycode)
+
+    def _unicode_pair(self, Q, chunk: str) -> tuple:
+        """(down, up, key) of one run of text as a Unicode payload on key code 0 (a tab: the Tab key), built now."""
+        if chunk == "\t":
+            return self._key_pair(Q, keys.TAB)
+        units = len(chunk.encode("utf-16-le")) // 2
+        pair = []
+        for down in (True, False):
+            ev = self._key_event(Q, 0, down)
+            Q.CGEventKeyboardSetUnicodeString(ev, units, chunk)
+            Q.CGEventSetFlags(ev, 0)
+            pair.append(ev)
+        return pair[0], pair[1], ("key", 0)
+
+    @staticmethod
+    def _press_checked(Q, down, up, key, check) -> str | None:
+        """One press of events built beforehand: `check()` right before the down -- nothing that can block or wait
+        between them -- and the up after it, never checked (the completion of input already started). Why it was not
+        pressed, or None."""
+        why = check()
+        if why:
+            return why
+        _post(Q, Q.kCGHIDEventTap, down, press=(key, lambda in_place=False: _post(Q, Q.kCGHIDEventTap, up,
+                                                                                 release=key)))
+        time.sleep(0.02)
+        _post(Q, Q.kCGHIDEventTap, up, release=key)
+        time.sleep(0.02)
+        return None
+
+    def _keys_in_background(self, field, text: str, ready, still_focused, clear_first: bool, select_code: int):
         """`text` as keys to the observed window without bringing anything forward (the window made its app's key
-        window, proven so; Unicode payloads, a newline as Return): a detail string when typed, an ExecResult when it
-        stopped, None when this route does not apply -- decided before anything is sent (no background keys on this
-        Mac, an input method on, not the run's window, the user's front app, the window could not be made key)."""
+        window, proven so; Unicode payloads): a detail string when typed, "stopped:<why>" when stopped, an
+        ExecResult when the window refused a key part way, None when this route does not apply -- decided before
+        anything is sent (no background keys on this Mac, an input method on, not the run's window, the user's front
+        app, the window could not be made key). Prepared first (the key events, every chunk's); then the first focus
+        check, the selection when replacing, and each press checked right before it (the window and the focus)."""
         from deskmind_hands.drivers import axfield, skylight
         if not self._background_keys() or not self._ascii_input():
             return None
@@ -3561,26 +3624,33 @@ class PeekabooDriver:
         if skylight.user_on(pid):
             return None
         sent_before = sends_so_far()
+        typed = 0
         try:
             with skylight.enter_window_key(pid, wid) as key:
+                q = skylight.BackgroundQuartz(pid, wid, (self._origin.x, self._origin.y), key=key)
+                chunks = skylight.text_chunks(text)
+                pairs = [self._unicode_pair(q, c) for c in chunks]
+                select_key = self._key_pair(q, select_code, q.kCGEventFlagMaskCommand) if clear_first else None
+
+                def check() -> str | None:
+                    return key.lost() or still_focused()
                 why = ready()
                 if why:
-                    return ExecResult(False, NothingSent(f"{why}; nothing was typed"))
-                q = skylight.BackgroundQuartz(pid, wid, (self._origin.x, self._origin.y), key=key)
-
-                def lost() -> str | None:
-                    if STOP.is_set():
-                        return "stopped by the app"
-                    return key.lost() or (None if axfield.is_focused(field) else "the element lost the focus")
-                select_all(q)
-                sent, why = self._post_unicode(q, text, stop=lost)
+                    return f"stopped:{why}"
+                if clear_first and not axfield.select(field, True):
+                    why = self._press_checked(q, *select_key, check)
+                    if why:
+                        return f"stopped:{why}"
+                for chunk, pair in zip(chunks, pairs):
+                    why = self._press_checked(q, *pair, check)
+                    if why:
+                        return f"stopped:{why} (after {typed} of {len(text)} chars)"
+                    typed += len(chunk)
         except skylight.WindowKeyRefused as exc:
             if sends_so_far() == sent_before:
                 return None             # refused before anything went: the foreground route, chosen before a send
-            return ExecResult(False, indeterminate=True, detail=f"typing stopped part way: {exc}")
-        if sent < len(text):
             return ExecResult(False, indeterminate=True,
-                              detail=f"typing stopped after {sent} of {len(text)} chars: {why}")
+                              detail=f"typing stopped after {typed} of {len(text)} chars: {exc}")
         return f"typed {len(text)} chars with keys to window {wid} in the background"
 
     def _type_in_background(self, eid: str, text: str, clear_first: bool) -> ExecResult | None:

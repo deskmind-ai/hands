@@ -212,11 +212,96 @@ class ExecResult:
             self.indeterminate = True
         if not self.ok and self.performed is None and not self.indeterminate and (
                 self.stale or self.unsupported or self.deferred or isinstance(self.detail, NothingSent)):
-            self.performed = False
+            # the one place a refusal becomes "nothing done": only while this step sent nothing. A route that claims
+            # it after something went (a fall-through, a refusal after a focus write) gets unverified instead
+            if sent_in_step():
+                self.indeterminate = True
+            else:
+                self.performed = False
 
 
 #: How every driver says a step was left undone because the user was busy.
 USER_BUSY = "the user is active"
+
+
+# -- What a step sent to the user's apps, counted where it is sent (review of hands#64 round 7) -------------------------
+#
+# Every primitive that can reach an app counts itself BEFORE it calls the OS: an event post, an accessibility attribute
+# write or action, a scripted command that tells the app to do something. Counting at the hand-on points of each route
+# missed one send after another (the background route, the accessibility insertion, the focus write); counted here,
+# no route can forget. The one thing that takes a count back is an OS answer that definitely means "not delivered"
+# (AX_NOT_DELIVERED); anything else -- success, a timeout, kAXErrorCannotComplete, an exception -- stays counted.
+# Bringing an app forward and making a window its key window are not counted (the definition at NothingSent).
+#
+# The count belongs to one step: Driver.execute runs inside input_scope(), and only there does a NothingSent refusal
+# (or a stale / unsupported / user-busy one) become performed:false -- and only while nothing was counted in it
+# (ExecResult.__post_init__, the one place).
+
+#: Accessibility errors that mean the write or action never reached the app: an invalid argument or element, an
+#: attribute or action the element does not have, not implemented, the accessibility API disabled. Nothing else --
+#: kAXErrorFailure, kAXErrorCannotComplete (a timeout) and any unknown code may have been delivered.
+AX_NOT_DELIVERED = frozenset({
+    -25201,   # kAXErrorIllegalArgument
+    -25202,   # kAXErrorInvalidUIElement
+    -25205,   # kAXErrorAttributeUnsupported (includes not settable)
+    -25206,   # kAXErrorActionUnsupported
+    -25208,   # kAXErrorNotImplemented
+    -25211,   # kAXErrorAPIDisabled
+})
+
+_SENDS = {"n": 0, "scopes": 0, "quiet": 0}
+
+
+def counted(call, refused=None):
+    """Count a send, then make it: `call()`. `refused(result)` True only for an answer that definitely means it was
+    not delivered (then the count is taken back). An exception leaves it counted. Inside uncounted(): not counted."""
+    if _SENDS["quiet"]:
+        return call()
+    _SENDS["n"] += 1
+    result = call()
+    if refused is not None and refused(result):
+        _SENDS["n"] -= 1
+    return result
+
+
+class uncounted:
+    """What runs inside is no send: a read, or bringing an app or a window forward (NothingSent's definition)."""
+
+    def __enter__(self):
+        _SENDS["quiet"] += 1
+        return self
+
+    def __exit__(self, *exc):
+        _SENDS["quiet"] -= 1
+        return False
+
+
+def ax_counted(call):
+    """An accessibility write or action (returns an AXError code): counted unless the code is in AX_NOT_DELIVERED."""
+    return counted(call, refused=lambda err: err in AX_NOT_DELIVERED)
+
+
+def sends_so_far() -> int:
+    """The process's running count of sends (for a route that compares before and after its own sending)."""
+    return _SENDS["n"]
+
+
+class input_scope:
+    """One step's count of sends: entered by Driver.execute. Outside one, nothing counts as sent (sent_in_step 0)."""
+
+    def __enter__(self):
+        self._saved = (_SENDS["n"], _SENDS["scopes"])
+        _SENDS["n"], _SENDS["scopes"] = 0, _SENDS["scopes"] + 1
+        return self
+
+    def __exit__(self, *exc):
+        _SENDS["n"], _SENDS["scopes"] = self._saved
+        return False
+
+
+def sent_in_step() -> int:
+    """How many sends the step in progress made (0 outside a step)."""
+    return _SENDS["n"] if _SENDS["scopes"] else 0
 
 
 class NothingSent(str):

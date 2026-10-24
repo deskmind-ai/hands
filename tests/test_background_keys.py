@@ -875,13 +875,13 @@ class NoKeysToTheUsersApp(unittest.TestCase):
             PeekabooDriver._post_key(Q, 0, Q.kCGEventFlagMaskCommand)     # cmd+A: the user's mail body
             PeekabooDriver._post_key(Q, 9, Q.kCGEventFlagMaskCommand)
             return "entered"
-        with mock.patch.object(skylight, "_load", lambda: None):
+        from deskmind_hands.drivers.base import ExecResult, input_scope, sent_in_step
+        with mock.patch.object(skylight, "_load", lambda: None), input_scope():
             ok, detail = d._flash("com.apple.Safari", perform, what="type")
+            self.assertGreater(sent_in_step(), 0)                       # the click (its mouse events), counted
         self.assertFalse(ok)
         self.assertIn("may have taken effect", detail)
-        from deskmind_hands.drivers.base import ExecResult
         self.assertTrue(ExecResult(ok, detail).indeterminate)
-        self.assertGreater(q.sent, 0)                                   # the click (its mouse events)
         self.assertEqual(self.keys_posted, [])
 
     def test_flash_reports_a_key_window_not_given_back(self):

@@ -21,8 +21,11 @@ def _get(el, attr):
 
 
 def _set(el, attr, value) -> bool:
+    """Every accessibility write of this module (focus, selection, inserted text): counted as sent before it is made,
+    and taken back only on an answer that it never reached the app (base.ax_counted). True when accepted."""
     from ApplicationServices import AXUIElementSetAttributeValue
-    return AXUIElementSetAttributeValue(el, attr, value) == 0
+    from .base import ax_counted
+    return ax_counted(lambda: AXUIElementSetAttributeValue(el, attr, value)) == 0
 
 
 def _range(loc: int, length: int):

@@ -515,15 +515,16 @@ def post_key_event(pid: int, event, auth: bool = True) -> str:
     """One key event to `pid`: SLEventPostToPid with an authentication message (macOS 15+; `auth`), else
     CGEventPostToPid when SkyLight's post is missing. The route taken, for the trace."""
     import Quartz
+    from .base import counted
     fns = _load()
     if not fns or fns.get("post") is None:
-        Quartz.CGEventPostToPid(pid, event)
+        counted(lambda: Quartz.CGEventPostToPid(pid, event))
         return "cgevent"
     p = _ptr(event)
     fns["set_int"](p, F_PID, pid)
     fns["set_int"](p, F_SOURCE_STATE, HID_SYSTEM_STATE)
     signed = auth and _authenticate(fns, p, pid)
-    fns["post"](pid, p)
+    counted(lambda: fns["post"](pid, p))
     return "skylight+auth" if signed else "skylight"
 
 
@@ -557,6 +558,9 @@ class BackgroundQuartz:
     the user's pointer is not touched. Keys reach the window only while it is the app's key window (enter_window_key).
     """
 
+    #: Counts its own posts (base.counted), after its key check: a key it refuses was never sent.
+    counts_own_posts = True
+
     def __init__(self, pid: int, window_id: int, origin: tuple[float, float], key=None):
         import Quartz
         self._q, self.pid, self.wid, self.origin = Quartz, pid, window_id, origin
@@ -565,9 +569,6 @@ class BackgroundQuartz:
         self.key_auth = True
         #: What holds the window key (WindowKey), or NoWindowKey (the app is the user's front app: no key at all).
         self.key = key
-        #: How many events went to the app through this stand-in: a refusal after the first one is no "nothing
-        #: was done" (review of hands#64 round 5: a click and a paste went, then Return was refused).
-        self.sent = 0
 
     def _key_allowed(self) -> None:
         """Raise WindowKeyRefused unless a key-down may go now: never without a WindowKey (to the user's front app
@@ -595,12 +596,11 @@ class BackgroundQuartz:
         if kind in (q.kCGEventKeyDown, q.kCGEventKeyUp, q.kCGEventFlagsChanged):
             if kind != q.kCGEventKeyUp:
                 self._key_allowed()     # a key-up always goes: a key-down already sent is never left held
-            self.sent += 1              # counted before the post: one that throws half way may have gone
-            post_key_event(self.pid, event, auth=self.key_auth)
+            post_key_event(self.pid, event, auth=self.key_auth)     # counted there (base.counted)
             return
-        self.sent += 1
+        from .base import counted
         if not fns:
-            q.CGEventPostToPid(self.pid, event)
+            counted(lambda: q.CGEventPostToPid(self.pid, event))
             return
         p = _ptr(event)
         loc = q.CGEventGetLocation(event)
@@ -613,5 +613,5 @@ class BackgroundQuartz:
                              (F_HANDLER, self.wid), (F_PID, self.pid)):
             fns["set_int"](p, field, value)
         if fns.get("post") is not None:
-            fns["post"](self.pid, p)
-        q.CGEventPostToPid(self.pid, event)   # both transports, as cua sends a click
+            counted(lambda: fns["post"](self.pid, p))
+        counted(lambda: q.CGEventPostToPid(self.pid, event))   # both transports, as cua sends a click

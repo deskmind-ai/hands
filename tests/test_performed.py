@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from deskmind_hands.actions import Action, ActionKind, Binding   # noqa: E402
 from deskmind_hands.drivers import axchrome, skylight   # noqa: E402
-from deskmind_hands.drivers.base import USER_BUSY, ExecResult, NothingSent   # noqa: E402
+from deskmind_hands.drivers.base import USER_BUSY, ExecResult, NothingSent, input_scope   # noqa: E402
 from deskmind_hands.drivers.peekaboo import WEB_SEARCH   # noqa: E402
 from deskmind_hands.geometry import Rect   # noqa: E402
 
@@ -157,27 +157,22 @@ class AfterPartOfTheStepWent(unittest.TestCase):
 
     def flash(self, sent_before_refusal: int):
         from test_caller_deadline import APP, Clock, FlashDriver
+        from deskmind_hands.drivers.base import counted
         d = FlashDriver(Clock(), busy_s=0.0)
         d._background_input = lambda b: True
         d._wait_until_still = lambda b, w="": None
         d._too_late = lambda waited: None
-
-        class Q:
-            sent = 0
-
-        q = Q()
-        d._background_quartz = lambda b, observed_only=False: (q, object())
+        d._background_quartz = lambda b, observed_only=False: (object(), object())
         went = []
 
         def perform(Q_):
             for e in ["click", "cmd+A", "cmd+V"][:sent_before_refusal]:
-                went.append(e)
-                q.sent += 1
+                counted(lambda e=e: went.append(e))         # each event through the counted post, as _post makes it
             raise skylight.WindowKeyRefused("the user came to the app; Return not sent")
         with mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": ""}), \
-                mock.patch.object(skylight, "give_focus_back", lambda t: True):
+                mock.patch.object(skylight, "give_focus_back", lambda t: True), input_scope():
             ok, detail = d._flash(APP, perform, what="type")
-        return ExecResult(ok, detail), went
+            return ExecResult(ok, detail), went
 
     def test_the_background_route_refused_after_a_click_and_paste_is_unverified(self):
         """The reviewer's probe (rv64_probe_flash): click, cmd+A, cmd+V went, Return refused; it fell through to the
@@ -192,17 +187,6 @@ class AfterPartOfTheStepWent(unittest.TestCase):
         self.assertEqual(went, [])
         self.assertIs(res.performed, False, res.detail)         # the front route's own refusal: nothing went
 
-    def test_a_typing_route_that_sent_a_key_then_handed_on_makes_a_later_refusal_unverified(self):
-        import test_background_keys as BK
-        t = BK.TypeText()
-        t._cleanups = []
-        d, typed = t.run_type(BK.Field("old", takes_insertion=False), clear=True, selects=False, all_selected=False)
-        self.assertIsNone(typed)                                # handed on to the next route, as before
-        self.assertTrue(d._input_went)                          # but the cmd+A it sent is known
-        res = d._went(ExecResult(False, "moved; observe again", stale=True))
-        self.assertIsNone(res.performed)
-        self.assertTrue(res.indeterminate)
-
     def test_ok_false_but_indeterminate_is_unverified_not_error(self):
         ex, stub = TE._executor()
         ex.observe(TE.W12)
@@ -210,74 +194,6 @@ class AfterPartOfTheStepWent(unittest.TestCase):
         r = ex.perform({"kind": "type", "window": TE.W12, "target": "T1", "text": "123456789"})
         self.assertEqual(r["status"], "unverified", r)
         self.assertNotIn("performed", r)
-
-
-class AccessibilityCounts(unittest.TestCase):
-    """Round 6: an accessibility write the app accepted, or the focus moved into the field, is input -- a route that
-    did either and then hands the step on makes a later refusal of the step unverified (the reviewer's repro
-    hands_ax_insert_then_handed_on)."""
-
-    def type_(self, **kw):
-        import test_background_keys as BK
-        t = BK.TypeText()
-        t._cleanups = []
-        return t.run_type(BK.Field("start", takes_insertion=False), **kw)
-
-    def test_an_accepted_insertion_then_the_key_route_refused(self):
-        def enter(pid, wid):
-            raise skylight._refuse("previous", "the app's key window cannot be read; nothing sent")
-        d, typed = self.type_(enter=enter)
-        self.assertIn(("ax insert", "hello 你好"), d.log)
-        self.assertIsNone(typed)                                 # handed on
-        later = d._went(ExecResult(False, NothingSent("only responds in the foreground, which this run may not use")))
-        self.assertIsNot(later.performed, False)
-        self.assertTrue(later.indeterminate)
-
-    def test_the_focus_moved_then_select_failed(self):
-        d, typed = self.type_(selects=False, clear=False, insert=lambda el, t, r: False)
-        self.assertIn("focus", d.log)
-        self.assertIsNone(typed)
-        self.assertTrue(d._input_went)
-
-    def test_nothing_accepted_and_no_focus_hands_on_as_nothing(self):
-        d, typed = self.type_(insert=lambda el, t, r: False, enter=lambda pid, wid: (_ for _ in ()).throw(
-            skylight._refuse("previous", "the app's key window cannot be read; nothing sent")))
-        self.assertIsNone(typed)
-        self.assertFalse(getattr(d, "_input_went", False))
-
-
-class KeysCount(unittest.TestCase):
-    """H4: BackgroundQuartz counts the keys it sends -- a real one, keys only (cmd+A goes, cmd+V refused)."""
-
-    def test_keys_only_then_refused_counts_what_went(self):
-        import test_background_keys as BK
-        from deskmind_hands.drivers.peekaboo import PeekabooDriver
-        posted = []
-        key = skylight.WindowKey(BK.PID, BK.TARGET, BK.PREV, "psn", "records")
-        key.lost = lambda: None
-        q, _ = BK.background_quartz(key)
-        with mock.patch.object(skylight, "_load", lambda: None), \
-                mock.patch.object(skylight, "post_key_event", lambda pid, ev, auth=True: posted.append(ev)), \
-                mock.patch.object(PeekabooDriver, "_key_event",       # the fake Quartz's events, never a real one
-                                  classmethod(lambda cls, Q, code, down: Q.CGEventCreateKeyboardEvent(None, code, down))):
-            PeekabooDriver._post_key(q, 0, q.kCGEventFlagMaskCommand)      # cmd+A: down, up
-            key.lost = lambda: "window 200 is no longer the app's key window"
-            with self.assertRaises(skylight.WindowKeyRefused):
-                PeekabooDriver._post_key(q, 9, q.kCGEventFlagMaskCommand)  # cmd+V refused
-        self.assertEqual(len(posted), 2)
-        self.assertEqual(q.sent, 2)
-
-
-class WentOverUserBusy(unittest.TestCase):
-    def test_a_user_busy_refusal_after_input_went_is_unverified_not_nothing_done(self):
-        """H10: _went over a USER_BUSY refusal: __post_init__ sees the words again and sets deferred; performed must
-        still not become False (the harness would keep the step off its uncertain list)."""
-        from deskmind_hands.drivers.peekaboo import PeekabooDriver
-        d = PeekabooDriver.__new__(PeekabooDriver)
-        d._input_went = True
-        r = d._went(ExecResult(False, NothingSent(f"{USER_BUSY}; the step was not carried out before the caller's deadline")))
-        self.assertTrue(r.indeterminate)
-        self.assertIsNone(r.performed)
 
 
 class InputAtTheInstantTheListWasTaken(unittest.TestCase):

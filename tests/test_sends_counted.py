@@ -151,10 +151,13 @@ class PrimitiveTable(unittest.TestCase):
         with input_scope():
             field = BK.Field("start", takes_insertion=False)
             field.focused = False                                       # never reads back focused in time
-            d, typed = t.run_type(field, enter=enter, insert=lambda el, txt, r: False)
+            d, typed = t.run_type(field, enter=enter, insert=lambda el, txt, r, check=None, want=None: (axfield.SELECTION, "refused"))
             later = ExecResult(False, NothingSent("only responds in the foreground, which this run may not use"))
         self.assertIn(("set", "AXFocused", True), calls[0])
-        self.assertIsNone(typed)                                         # handed on
+        # hands#66's rule since: after a send no other route -- the focus write went, so this route says so itself
+        # (unverified) instead of handing the step on
+        self.assertIsNot(typed.performed, False)
+        self.assertTrue(typed.indeterminate, typed.detail)
         self.assertIsNot(later.performed, False)
         self.assertTrue(later.indeterminate)
 
@@ -422,7 +425,7 @@ class NoSendBypassesTheCount(unittest.TestCase):
     SUBPROCESS = {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
     #: (module, qualified function, what): why it may be made there
     EXEMPT = {
-        ("deskmind_hands.drivers.axfield", "_set", "AXUIElementSetAttributeValue"): "the counted wrapper (ax_counted)",
+        ("deskmind_hands.drivers.axfield", "_set_answer", "AXUIElementSetAttributeValue"): "the counted wrapper (ax_counted)",
         ("deskmind_hands.drivers.axpopup", "_act", "AXUIElementPerformAction"): "the counted wrapper (ax_counted)",
         ("deskmind_hands.drivers.skylight", "BackgroundQuartz.post_checked", "CGEventPost"):
             "any event other than a key: BackgroundQuartz's own CGEventPost, which counts its posts (counts_own_posts)",

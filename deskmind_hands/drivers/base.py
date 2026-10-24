@@ -304,9 +304,16 @@ def counted(call, refused=None):
     return result
 
 
+def ax_not_delivered(err) -> bool:
+    """Whether an accessibility answer means the write or action never reached the app (AX_NOT_DELIVERED). The one
+    classification: success is delivered, and so may be anything else (kAXErrorFailure, kAXErrorCannotComplete, an
+    unknown code)."""
+    return err in AX_NOT_DELIVERED
+
+
 def ax_counted(call):
-    """An accessibility write or action (returns an AXError code): counted unless the code is in AX_NOT_DELIVERED."""
-    return counted(call, refused=lambda err: err in AX_NOT_DELIVERED)
+    """An accessibility write or action (returns an AXError code): counted unless it was not delivered."""
+    return counted(call, refused=ax_not_delivered)
 
 
 class releasing:

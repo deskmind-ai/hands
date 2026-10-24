@@ -58,7 +58,7 @@ from pathlib import Path
 from .actions import Action, ActionKind, Binding
 from .axdocument import _q, document_text, window_document
 from .grounding import STOP
-from .drivers.base import ExecResult, Observation, act_by, set_wait_sink
+from .drivers.base import ExecResult, Observation, act_by, input_scope, set_wait_sink
 from .audio import playing_apps
 from .browsers import installed_browsers, is_browser
 from .inputwatch import InputWatch, track_children
@@ -975,7 +975,9 @@ class HandsExecutor:
                 # the reads before the action took the caller's time: nothing is sent that it would not hear of
                 return {**late, "window": window}
             try:
-                res: ExecResult = d.execute(a)
+                # one step: what the driver sends in it is counted there (drivers/base.py), whichever driver it is
+                with input_scope():
+                    res: ExecResult = d.execute(a)
             except Exception as e:  # noqa: BLE001 -- thrown mid-action: what it sent before is not known
                 # unverified, never an error the layer above would read as "nothing went out". No mark is moved, as
                 # main moved none when the step threw (a doubt recorded during it is not wiped: InFlightAndTheMark)

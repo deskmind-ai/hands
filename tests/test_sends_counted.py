@@ -26,7 +26,6 @@ from deskmind_hands.drivers import axfield, axpopup, base, skylight   # noqa: E4
 from deskmind_hands.drivers.base import USER_BUSY, ExecResult, NothingSent, input_scope   # noqa: E402
 from deskmind_hands.drivers.peekaboo import PeekabooDriver, _post, _sh   # noqa: E402
 
-ROOT = Path(__file__).resolve().parent.parent / "deskmind_hands" / "drivers"
 OK, CANNOT_COMPLETE, FAILURE, INVALID, UNSUPPORTED, API_DISABLED = 0, -25204, -25200, -25202, -25205, -25211
 
 
@@ -187,78 +186,284 @@ class PrimitiveTable(unittest.TestCase):
         self.assertTrue(r.indeterminate)
         self.assertIsNone(r.performed)
 
-    def test_outside_a_step_nothing_counts_and_a_step_starts_at_zero(self):
+    def test_outside_a_step_nothing_is_claimed_and_a_step_starts_at_zero(self):
+        """Fail-safe: with no step open, a refusal is never performed:false (round 8)."""
         base.counted(lambda: None)
         self.assertEqual(base.sent_in_step(), 0)
+        self.assertIsNone(ExecResult(False, NothingSent("x")).performed)
         with input_scope():
             self.assertEqual(base.sent_in_step(), 0)
-            base.counted(lambda: None)
+            with input_scope():                                     # nested: the same step
+                base.counted(lambda: None)
             self.assertEqual(base.sent_in_step(), 1)
-        self.assertIs(ExecResult(False, NothingSent("x")).performed, False)
+
+    def test_a_refusal_after_a_send_keeps_no_not_done_flag_or_words(self):
+        """rv11 flags_kept: a stale or user-busy refusal after a send was unverified but still stale / deferred and
+        "nothing was done" -- the hands loop then said "Nothing changed. Take it again"."""
+        with input_scope():
+            base.counted(lambda: None)
+            stale = ExecResult(False, "the window moved since it was seen; observe again", stale=True)
+            busy = ExecResult(False, NothingSent(f"{USER_BUSY}; the step was not carried out before the caller's "
+                                                 f"deadline -- nothing was done; wait"))
+        for r in (stale, busy):
+            with self.subTest(r.detail):
+                self.assertEqual((r.indeterminate, r.stale, r.deferred, r.unsupported, r.performed), (True, False, False, False, None))
+                self.assertTrue(r.detail.startswith("input already went to the app in this step"))
+                self.assertNotRegex(r.detail.lower(), r"nothing was done|not carried out|nothing changed")
+        from deskmind_hands.errors import Kind, classify
+        self.assertIsNot(classify(busy.detail), Kind.USER_BUSY)
+
+    def test_each_thread_and_each_step_counts_its_own(self):
+        """rv11 global_count: a read under uncounted() on another thread silenced this step's sends, and another
+        thread's step closing restored this one's count to 0."""
+        import threading
+        go, done = threading.Event(), threading.Event()
+
+        def reader():
+            with base.uncounted():
+                go.set()
+                done.wait()
+        t = threading.Thread(target=reader)
+        t.start()
+        go.wait()
+        with input_scope():
+            base.counted(lambda: None)
+            r = ExecResult(False, NothingSent("only responds in the foreground"))
+        done.set()
+        t.join()
+        self.assertIsNone(r.performed)
+        go2, done2 = threading.Event(), threading.Event()
+
+        def other_step():
+            with input_scope():
+                go2.set()
+                done2.wait()
+        with input_scope():
+            t2 = threading.Thread(target=other_step)
+            t2.start()
+            go2.wait()
+            base.counted(lambda: None)
+            done2.set()
+            t2.join()
+            r2 = ExecResult(False, NothingSent("only responds in the foreground"))
+        self.assertIsNone(r2.performed)
 
 
 REAL_FOCUS = axfield.focus
 
 
+class TheRoutesUseTheCountedPrimitives(unittest.TestCase):
+    """Mutations the table did not reach (rv11): the step's scope in execute (M3), the session's set_value (M6),
+    a document opened (M13), a scripted save (M14), a reopen and a launch."""
+
+    def test_execute_opens_the_steps_scope(self):
+        d = driver()
+        d._require_session = lambda: None
+        d._browser_field_allowed = None
+        seen = {}
+
+        def outer(action):
+            seen["in_step"] = base.in_step()
+            return ExecResult(False, NothingSent("only responds in the foreground"))
+        d._execute_outer = outer
+        from deskmind_hands.actions import Action, ActionKind
+        res = d.execute(Action(kind=ActionKind.WAIT, duration_s=0.1))
+        self.assertTrue(seen["in_step"])
+        self.assertIs(res.performed, False)                       # in a step that sent nothing: nothing done
+
+    def test_the_sessions_calls(self):
+        d = driver()
+        d._mcp = types.SimpleNamespace(tool=lambda name, args: (True, {}, "", ""))
+        for tool, sends in (("set_value", True), ("click", True), ("see", False), ("menu", False)):
+            with self.subTest(tool), input_scope():
+                d._mcp_call(tool, {}, sends=sends) if not sends else d._mcp_call(tool, {})
+                self.assertEqual(base.sent_in_step(), 1 if sends else 0)
+
+    def test_a_set_value_through_the_session_is_counted(self):
+        """The MCP set_value route of _execute_inner (M6): reached with a fake session."""
+        import inspect
+        from deskmind_hands.drivers import peekaboo
+        src = inspect.getsource(peekaboo.PeekabooDriver._execute_inner)
+        self.assertIn('self._mcp_call("set_value"', src)
+        calls = [m.start() for m in __import__("re").finditer(r"self\._mcp\.tool\(", inspect.getsource(peekaboo))]
+        wrapper = inspect.getsource(peekaboo.PeekabooDriver._mcp_call)
+        self.assertEqual(len(calls), wrapper.count("self._mcp.tool("))   # only _mcp_call reaches the session
+
+    def test_opening_a_document_is_a_send(self):
+        import tempfile
+        from deskmind_hands.drivers import peekaboo
+        with tempfile.TemporaryDirectory() as ws:
+            (Path(ws) / "a.txt").write_text("x")
+            d = driver()
+            d.ws, d._app_name, d._window_id, d._pinned_window = Path(ws), "TextEdit", "1", None
+            d._scripted_actions = 0
+            d._opener = lambda p: "com.apple.TextEdit"
+            d._window_titled_once = lambda name: None
+            d._window_titled = lambda name, tries=2: "9"
+            ids = iter([set(), {"9"}])
+            d._window_ids = lambda: next(ids, {"9"})
+            with mock.patch("subprocess.run", lambda *a, **k: FakeProc()), \
+                    mock.patch.object(peekaboo.time, "sleep", lambda s: None), input_scope():
+                try:
+                    d._open_document("a.txt")
+                except Exception:   # noqa: BLE001 -- what follows the open is not this test's
+                    pass
+                self.assertEqual(base.sent_in_step(), 1)
+
+    def test_a_scripted_save_is_a_send(self):
+        from deskmind_hands.drivers import peekaboo
+
+        class Out:
+            returncode, stderr = 0, ""
+
+            def __init__(self, cmd):
+                self.stdout = "false" if "get modified" in cmd[-1] else ""
+        d = driver()
+        d._scripted_actions = 0
+        with mock.patch("subprocess.run", lambda cmd, **k: Out(cmd)), \
+                mock.patch.object(peekaboo.time, "sleep", lambda s: None), input_scope():
+            res = d._textedit_save("a.txt")
+            self.assertEqual(base.sent_in_step(), 1)                # the save; the reads of `modified` are not sends
+        self.assertTrue(res.ok)
+
+    def test_a_reopen_and_a_launch_are_sends(self):
+        d = driver()
+        with mock.patch("subprocess.run", lambda *a, **k: FakeProc()):
+            with input_scope():
+                d._bring_forward("com.example.app", browser=False)   # `open -b`: a reopen
+                self.assertEqual(base.sent_in_step(), 1)
+            for key in ("activate", "activate_by_name"):
+                with self.subTest(key), input_scope():
+                    d._run(key, app="com.example.app")
+                    self.assertEqual(base.sent_in_step(), 1)
+
+
 class NoSendBypassesTheCount(unittest.TestCase):
-    """A source scan of the drivers: every OS call that can reach an app is made inside a counted wrapper, or in a
-    function listed here as one that only reads or brings an app or a window forward."""
+    """A source scan of the whole package (AST): every OS call that can reach an app -- an accessibility write or
+    action, an event post (also taken as a value: `post = Q.CGEventPost`), SkyLight's post, NSAppleScript or
+    NSWorkspace's open / launch, and any subprocess call (run, Popen, call, check_call, check_output, ...: a shell,
+    osascript, open, the peekaboo binary) -- sits in a function listed below by its qualified name, with why. Nothing
+    else may make one: a new send goes through a counted wrapper (_sh, _run, _post, _mcp_call, ...), or is listed here
+    with its reason. A test aid: simple on purpose, strict by default (review of hands#64 round 8)."""
 
     SENDS = {"AXUIElementSetAttributeValue", "AXUIElementPerformAction", "CGEventPost", "CGEventPostToPid",
-             "AXUIElementPostKeyboardEvent"}
-    #: (file, function): where such a call may be made -- the counted wrappers, and the forward / key-window ones
-    ALLOWED = {
-        ("axfield.py", "_set"), ("axpopup.py", "_act"),
-        ("skylight.py", "post_key_event"), ("skylight.py", "CGEventPost"),
-        ("peekaboo.py", "_post"),
-        ("skylight.py", "_set_focused_window"),          # key window (not a send)
-        ("peekaboo.py", "_make_frontmost"),              # bring forward (not a send)
+             "AXUIElementPostKeyboardEvent", "NSAppleScript", "openURL_", "openURLs_withApplicationAtURL_configuration_completionHandler_",
+             "openApplicationAtURL_configuration_completionHandler_", "launchApplication_", "openFile_",
+             "openFile_withApplication_", "launchAppWithBundleIdentifier_options_additionalEventParamDescriptor_launchIdentifier_",
+             "activateWithOptions_"}
+    SUBPROCESS = {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
+    #: (module, qualified function, what): why it may be made there
+    EXEMPT = {
+        ("deskmind_hands.drivers.axfield", "_set", "AXUIElementSetAttributeValue"): "the counted wrapper (ax_counted)",
+        ("deskmind_hands.drivers.axpopup", "_act", "AXUIElementPerformAction"): "the counted wrapper (ax_counted)",
+        ("deskmind_hands.drivers.peekaboo", "_post", "CGEventPost"): "the counted wrapper of every event post",
+        ("deskmind_hands.drivers.skylight", "post_key_event", "CGEventPostToPid"): "counted around the post",
+        ("deskmind_hands.drivers.skylight", "post_key_event", 'fns["post"]'): "counted around the post",
+        ("deskmind_hands.drivers.skylight", "BackgroundQuartz.CGEventPost", "CGEventPostToPid"): "counted around the post",
+        ("deskmind_hands.drivers.skylight", "BackgroundQuartz.CGEventPost", 'fns["post"]'): "counted around the post",
+        ("deskmind_hands.drivers.skylight", "_post_record", 'fns["post_rec"]'): "focus records: a key-window change",
+        ("deskmind_hands.drivers.skylight", "_set_focused_window", "AXUIElementSetAttributeValue"): "AXFocusedWindow: a key-window change",
+        ("deskmind_hands.drivers.peekaboo", "PeekabooDriver._make_frontmost", "AXUIElementSetAttributeValue"): "AXFrontmost: a front, no reopen",
+        ("deskmind_hands.executor", "HandsExecutor._make_frontmost", "AXUIElementSetAttributeValue"): "AXFrontmost: a front, no reopen",
+        ("deskmind_hands.drivers.peekaboo", "_sh", "subprocess.run"): "the counted wrapper of commands",
+        ("deskmind_hands.drivers.peekaboo", "PeekabooDriver._run", "subprocess.run"): "the counted wrapper of peekaboo commands",
+        ("deskmind_hands.drivers.peekaboo", "_MCPSession.__init__", "subprocess.Popen"): "starts the peekaboo session; its calls go through _mcp_call",
+        ("deskmind_hands.drivers.peekaboo", "_app_running", "subprocess.run"): "pgrep: reads the process list",
+        ("deskmind_hands.drivers.peekaboo", "hid_idle_seconds", "subprocess.run"): "ioreg: reads the idle time",
+        ("deskmind_hands.drivers.peekaboo", "_ascii_input_source.__init__", "subprocess.Popen"): "the input-source child: switches this Mac's input source, no app",
+        ("deskmind_hands.drivers.peekaboo", "PeekabooDriver._ascii_input", "subprocess.run"): "reads the input source",
+        ("deskmind_hands.drivers.peekaboo", "PeekabooDriver._load_keys", "subprocess.run"): "reads the keyboard layout",
+        ("deskmind_hands.drivers.peekaboo", "PeekabooDriver._set_clipboard", "subprocess.run"): "pbcopy: the clipboard, no app",
+        ("deskmind_hands.drivers.peekaboo", "PeekabooDriver.clipboard", "subprocess.run"): "pbpaste: reads the clipboard",
+        ("deskmind_hands.drivers.peekaboo", "PeekabooDriver._stage", "subprocess.run"): "a task's stage command, before any step (the gym)",
+        ("deskmind_hands.drivers.peekaboo", "PeekabooDriver._stage_url", "subprocess.run"): "a task's stage command, before any step (the gym)",
+        ("deskmind_hands.drivers.capture", "capture_screencapture", "subprocess.run"): "screencapture: reads the screen",
+        ("deskmind_hands.drivers.skylight", "auth_safe", "subprocess.run"): "a self-test child, no app",
+        ("deskmind_hands.axdocument", "_osa", "subprocess.run"): "reads a window's document (get only)",
+        ("deskmind_hands.vision", "ocr", "subprocess.run"): "text recognition of a picture",
+        ("deskmind_hands.cli", "_verify_effect", "subprocess.run"): "a task's oracle check, after the run",
+        ("deskmind_hands.record.recorder", "environment_manifest._git", "subprocess.run"): "git: reads the checkout",
+        ("deskmind_hands.inputwatch", "track_children", "subprocess.Popen"): "wraps Popen to record children's pids",
+        ("deskmind_hands.inputwatch", "track_children._Tracked", "subprocess.Popen"): "wraps Popen to record children's pids",
+        # the executor's own window commands: outside any driver step, and no reply of them claims performed:false
+        ("deskmind_hands.executor", "HandsExecutor._pk", "subprocess.run"): "peekaboo window list / close (close_window's reply never says performed:false)",
+        ("deskmind_hands.executor", "HandsExecutor._open_window_now", "subprocess.run"): "open_window: its replies never say performed:false after it",
+        ("deskmind_hands.executor", "HandsExecutor._new_document", "subprocess.run"): "open_window: its replies never say performed:false after it",
+        ("deskmind_hands.executor", "HandsExecutor._navigate", "subprocess.run"): "open_window: its replies never say performed:false after it",
+        ("deskmind_hands.executor", "HandsExecutor._page_of", "subprocess.run"): "reads a browser window's address",
     }
-    #: programs a driver may run without counting: none of them reaches an app
-    QUIET = {"/usr/bin/pgrep", "/usr/sbin/ioreg", "/bin/sh", "/usr/bin/pbpaste", "/usr/bin/pbcopy",
-             "/usr/sbin/screencapture"}
-    #: processes started once, which themselves send nothing until asked through a counted command (_run)
-    STARTED = {("peekaboo.py", "__init__")}
 
-    def calls(self, path: Path):
-        tree = ast.parse(path.read_text())
+    @classmethod
+    def findings(cls, root: Path):
         out = []
+        for path in sorted(root.rglob("*.py")):
+            mod = str(path.relative_to(root.parent)).replace("/", ".")[:-3]
+            tree = ast.parse(path.read_text())
 
-        def walk(node, fn):
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    walk(child, child.name)
-                else:
-                    if isinstance(child, ast.Call):
-                        out.append((fn, child))
-                    walk(child, fn)
-        walk(tree, "<module>")
+            def walk(node, q):
+                for ch in ast.iter_child_nodes(node):
+                    if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        walk(ch, f"{q}.{ch.name}" if q else ch.name)
+                        continue
+                    what = None
+                    if isinstance(ch, ast.Attribute) and ch.attr in cls.SENDS:
+                        what = ch.attr
+                    elif isinstance(ch, ast.Name) and ch.id in cls.SENDS and isinstance(ch.ctx, ast.Load):
+                        what = ch.id
+                    elif isinstance(ch, ast.Subscript) and isinstance(ch.slice, ast.Constant) and ch.slice.value in ("post", "post_rec"):
+                        what = f'fns["{ch.slice.value}"]'
+                    elif isinstance(ch, ast.Attribute) and ch.attr in cls.SUBPROCESS and isinstance(ch.value, ast.Name) \
+                            and ch.value.id == "subprocess":
+                        what = f"subprocess.{ch.attr}"
+                    if what:
+                        out.append((mod, q or "<module>", what, f"{path.name}:{ch.lineno}"))
+                    walk(ch, q)
+            walk(tree, "")
         return out
 
-    def test_no_os_send_outside_a_counted_wrapper(self):
-        bad = []
-        for path in sorted(ROOT.glob("*.py")):
-            if path.name in ("mock.py", "base.py"):
-                continue
-            for fn, call in self.calls(path):
-                f = call.func
-                name = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else None
-                if name in self.SENDS and (path.name, fn) not in self.ALLOWED:
-                    bad.append(f"{path.name}:{call.lineno} {name} in {fn}")
-                # fns["post"](...): SkyLight's event post
-                if isinstance(f, ast.Subscript) and isinstance(f.slice, ast.Constant) and f.slice.value == "post" \
-                        and (path.name, fn) not in self.ALLOWED:
-                    bad.append(f"{path.name}:{call.lineno} fns['post'] in {fn}")
-                # subprocess.run / Popen: only through _sh or _run, or a program that reaches no app
-                if name in ("run", "Popen") and isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) \
-                        and f.value.id == "subprocess" and fn not in ("_sh", "_run") and call.args \
-                        and (path.name, fn) not in self.STARTED:
-                    first = call.args[0]
-                    prog = first.elts[0].value if isinstance(first, ast.List) and first.elts and isinstance(first.elts[0], ast.Constant) else None
-                    if prog not in self.QUIET and not (isinstance(first, ast.List) and first.elts and isinstance(first.elts[0], ast.Attribute)
-                                                       and first.elts[0].attr in ("executable", "bin")):
-                        bad.append(f"{path.name}:{call.lineno} subprocess {prog} in {fn}")
+    def test_every_os_send_is_counted_or_listed_with_why(self):
+        bad = [f"{where} {what} in {mod}.{fn}" for mod, fn, what, where in self.findings(PACKAGE)
+               if (mod, fn, what) not in self.EXEMPT]
         self.assertEqual(bad, [])
+
+    def test_the_scan_catches_the_reviewers_four_planted_sends(self):
+        """rv11 scan_holes.sh: a peekaboo binary call, an osascript check_output, an aliased event post and a shell
+        open, planted in a driver module."""
+        import shutil
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = Path(tmp) / "deskmind_hands"
+            shutil.copytree(PACKAGE, pkg, ignore=shutil.ignore_patterns("__pycache__"))
+            with open(pkg / "drivers" / "axchrome.py", "a") as f:
+                f.write(PLANTED)
+            planted = [x for x in self.findings(pkg) if x[1].startswith("_rv11_") and (x[0], x[1], x[2]) not in self.EXEMPT]
+        self.assertEqual(sorted({x[1] for x in planted}), ["_rv11_alias_post", "_rv11_osascript_send",
+                                                           "_rv11_peekaboo_click", "_rv11_shell_open"])
+
+
+PACKAGE = Path(__file__).resolve().parent.parent / "deskmind_hands"
+PLANTED = """
+
+
+def _rv11_peekaboo_click(self):
+    import subprocess
+    subprocess.run([self.bin, "click", "--on", "B1", "--json"])
+
+
+def _rv11_osascript_send():
+    import subprocess
+    subprocess.check_output(["/usr/bin/osascript", "-e", 'tell application "Mail" to send (first outgoing message)'])
+
+
+def _rv11_alias_post(Q, ev):
+    post = Q.CGEventPost
+    post(Q.kCGHIDEventTap, ev)
+
+
+def _rv11_shell_open():
+    import subprocess
+    subprocess.run(["/bin/sh", "-c", "open -b com.apple.mail"])
+"""
 
 
 if __name__ == "__main__":

@@ -238,10 +238,11 @@ PROJECTION = os.environ.get("HANDS_PROJECTION", "1") != "0"
 WEB_SEARCH = "syn:websearch"
 
 MCP_ROUTED = {"see", "see_window", "click_on", "click_on_fg"}
-#: Commands that only read, or only bring an app or a window forward (not counted as sent: base.NothingSent). Every
-#: other command acts on an app and is counted before it runs (_run).
+#: Commands that only read, or only bring a window forward (not counted as sent: base.NothingSent). Every other
+#: command acts on an app and is counted before it runs (_run) -- `activate` and `activate_by_name` too: `app
+#: launch` starts an app that is not running.
 READ_ONLY_COMMANDS = {"see", "see_window", "window_list", "window_list_of", "permissions", "menu_list",
-                      "window_focus", "activate", "activate_by_name"}
+                      "window_focus"}
 
 
 
@@ -2796,7 +2797,7 @@ class PeekabooDriver:
         # give-back, whatever happened.
         token = self._front_taken(CHAT_APP, t0)
         try:
-            _sh(["/usr/bin/open", "-b", CHAT_APP], sends=False, capture_output=True, timeout=10)   # forward only
+            _sh(["/usr/bin/open", "-b", CHAT_APP], capture_output=True, timeout=10)   # a reopen: counted
             for _ in range(30):
                 if self._front_bundle() == CHAT_APP:
                     break
@@ -3533,7 +3534,9 @@ class PeekabooDriver:
         accessibility (AXFrontmost; NSRunningApplication.activate is refused to a background process on recent
         macOS), never `open -b`, a reopen that raises the user's windows (deskmind#73). Any other app: `open -b`."""
         if not browser:
-            _sh(["/usr/bin/open", "-b", bundle], sends=False, capture_output=True, timeout=10)   # forward only
+            # counted: `open -b` sends the app a reopen, which un-minimises its windows and opens one on an app that
+            # has none -- a lasting change, not only a front (NothingSent's definition; review of hands#64 round 8)
+            _sh(["/usr/bin/open", "-b", bundle], capture_output=True, timeout=10)
             return True
         key = bundle.lower()
         own = str(getattr(self, "_own_browser", {}).get(key) or "")
@@ -4486,8 +4489,7 @@ class PeekabooDriver:
                 # would. The accessibility write shows in the field but is not the page's own value, and the paste
                 # that followed it to make it so landed in the field focused before -- the merchant took the date.
                 return self._vision_act(action, submit=False)
-            counted(lambda: None)    # the accessibility write through the session: counted before it is asked
-            ok, meta, text, detail = self._mcp.tool("set_value", {"on": eid, "snapshot": self._snapshot,
+            ok, meta, text, detail = self._mcp_call("set_value", {"on": eid, "snapshot": self._snapshot,
                                                                    "value": new})
             effect = meta.get("effect")
             unverified = (ok and effect not in (None, "confirmed")) or (not ok and "could not be verified" in
@@ -4826,7 +4828,7 @@ class PeekabooDriver:
             return None
         cache = self._menu_shortcuts.get(self.app)
         if cache is None:
-            ok, _, text, _ = self._mcp.tool("menu", {"action": "list", "app": self._app_selector()})
+            ok, _, text, _ = self._mcp_call("menu", {"action": "list", "app": self._app_selector()}, sends=False)
             cache = {}
             top = None
             for line in (text.splitlines() if ok else []):
@@ -5369,6 +5371,14 @@ class PeekabooDriver:
                                      f"directly (TYPE_TEXT)")
         return ExecResult(False, f"{action.kind.value} does not apply to {eid}")
 
+    def _mcp_call(self, tool: str, args: dict, sends: bool = True):
+        """Every call to the Peekaboo session: one that acts on an app (`sends`: a click, a value written) is counted
+        as sent before it is asked (base.counted); a read (see, a menu list) is not."""
+        if not sends:
+            with uncounted():
+                return self._mcp.tool(tool, args)
+        return counted(lambda: self._mcp.tool(tool, args))
+
     def _run_mcp(self, key: str, extra: list[str], **fmt) -> tuple[bool, dict, str]:
         """The same commands through the live session. Returns the CLI's data shape so parsing is shared."""
         assert self._mcp is not None
@@ -5380,13 +5390,13 @@ class PeekabooDriver:
                     "window_id": int(fmt["window"]) if fmt.get("window") else None}
             if self._mcp.accepts("see", "include_elements"):
                 args["include_elements"] = True
-            ok, meta, text, detail = self._mcp.tool("see", args)
+            ok, meta, text, detail = self._mcp_call("see", args, sends=False)
             receipt = (meta or {}).get("target_receipt") or {}
             if receipt.get("pid"):
                 self._target_pid = str(receipt["pid"])   # what a background menu click has to name the app by
             return ok, (_mcp_see_as_cli_data(meta, text) if ok else {}), detail
         if key in ("click_on", "click_on_fg"):
-            ok, meta, text, detail = self._mcp.tool("click", {
+            ok, meta, text, detail = self._mcp_call("click", {
                 "on": fmt.get("element"), "snapshot": fmt.get("snapshot"), "background": True,
                 "double": "--double" in extra or None, "right": "--right" in extra or None})
             # What Peekaboo actually did, not what was asked: a click can land through the accessibility API

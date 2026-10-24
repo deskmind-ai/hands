@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -212,10 +214,19 @@ class ExecResult:
             self.indeterminate = True
         if not self.ok and self.performed is None and not self.indeterminate and (
                 self.stale or self.unsupported or self.deferred or isinstance(self.detail, NothingSent)):
-            # the one place a refusal becomes "nothing done": only while this step sent nothing. A route that claims
-            # it after something went (a fall-through, a refusal after a focus write) gets unverified instead
-            if sent_in_step():
-                self.indeterminate = True
+            # The one place a refusal becomes "nothing done": inside a step that sent nothing. Outside any step
+            # nothing is claimed (performed stays unknown: fail-safe). A refusal after something went in this step
+            # (a fall-through, a refusal after a focus write) is unverified, and nothing of it says "not done" any
+            # more: no stale / deferred / unsupported flag, no "nothing was done" words -- a reader of either would
+            # take it again (review of hands#64 round 8: the hands loop said "Nothing changed. Take it again").
+            if not in_step():
+                pass
+            elif sent_in_step():
+                why = _NOT_DONE.sub("", str(self.detail)).strip(" ;-")
+                self.indeterminate, self.stale, self.deferred, self.unsupported = True, False, False, False
+                self.detail = MaybeSent(f"input already went to the app in this step before it stopped"
+                                        f"{f' ({why})' if why else ''} -- it may have taken effect; observe before "
+                                        f"doing it again")
             else:
                 self.performed = False
 
@@ -249,31 +260,31 @@ AX_NOT_DELIVERED = frozenset({
     -25211,   # kAXErrorAPIDisabled
 })
 
-_SENDS = {"n": 0, "scopes": 0, "quiet": 0}
+class _Step:
+    """One step's count of sends (and how deep it is inside uncounted())."""
+    __slots__ = ("n", "quiet")
+
+    def __init__(self):
+        self.n, self.quiet = 0, 0
+
+
+#: The step in progress, per thread (a context variable: a new thread starts with none). A send on another thread,
+#: or another thread's step, never touches this one's count (review of hands#64 round 8: one process-wide dict).
+_STEP: ContextVar[_Step | None] = ContextVar("hands_step", default=None)
 
 
 def counted(call, refused=None):
-    """Count a send, then make it: `call()`. `refused(result)` True only for an answer that definitely means it was
-    not delivered (then the count is taken back). An exception leaves it counted. Inside uncounted(): not counted."""
-    if _SENDS["quiet"]:
+    """Count a send in the step in progress, then make it: `call()`. `refused(result)` True only for an answer that
+    definitely means it was not delivered (then the count is taken back). An exception leaves it counted. Inside
+    uncounted(), or outside any step (nothing to count it in), it is just made."""
+    st = _STEP.get()
+    if st is None or st.quiet:
         return call()
-    _SENDS["n"] += 1
+    st.n += 1
     result = call()
     if refused is not None and refused(result):
-        _SENDS["n"] -= 1
+        st.n -= 1
     return result
-
-
-class uncounted:
-    """What runs inside is no send: a read, or bringing an app or a window forward (NothingSent's definition)."""
-
-    def __enter__(self):
-        _SENDS["quiet"] += 1
-        return self
-
-    def __exit__(self, *exc):
-        _SENDS["quiet"] -= 1
-        return False
 
 
 def ax_counted(call):
@@ -281,36 +292,67 @@ def ax_counted(call):
     return counted(call, refused=lambda err: err in AX_NOT_DELIVERED)
 
 
-def sends_so_far() -> int:
-    """The process's running count of sends (for a route that compares before and after its own sending)."""
-    return _SENDS["n"]
-
-
-class input_scope:
-    """One step's count of sends: entered by Driver.execute. Outside one, nothing counts as sent (sent_in_step 0)."""
+class uncounted:
+    """What runs inside is no send: a read, or bringing an app or a window forward (NothingSent's definition)."""
 
     def __enter__(self):
-        self._saved = (_SENDS["n"], _SENDS["scopes"])
-        _SENDS["n"], _SENDS["scopes"] = 0, _SENDS["scopes"] + 1
+        self._st = _STEP.get()
+        if self._st is not None:
+            self._st.quiet += 1
         return self
 
     def __exit__(self, *exc):
-        _SENDS["n"], _SENDS["scopes"] = self._saved
+        if self._st is not None:
+            self._st.quiet -= 1
         return False
+
+
+class input_scope:
+    """One step: its sends are counted in it (Driver.execute, the executor around it, a runtime around it). Entered
+    inside another step's scope on the same thread, it is that step: the count is shared, never reset."""
+
+    def __enter__(self):
+        self._token = _STEP.set(_Step()) if _STEP.get() is None else None
+        return self
+
+    def __exit__(self, *exc):
+        if self._token is not None:
+            _STEP.reset(self._token)
+        return False
+
+
+def in_step() -> bool:
+    """Whether a step's scope is open on this thread."""
+    return _STEP.get() is not None
+
+
+def sends_so_far() -> int:
+    """How many sends the step in progress has made so far (0 outside a step): for a route that compares before and
+    after its own sending."""
+    st = _STEP.get()
+    return st.n if st is not None else 0
 
 
 def sent_in_step() -> int:
     """How many sends the step in progress made (0 outside a step)."""
-    return _SENDS["n"] if _SENDS["scopes"] else 0
+    return sends_so_far()
+
+
+#: Our own words for "nothing was done", taken out of a refusal that comes after a send (it was not nothing)
+_NOT_DONE = re.compile(r"(?:\s*(?:;|--)\s*)?(?:nothing was done|nothing was sent|none was sent|the step was not carried "
+                       r"out(?: before the caller's deadline)?|the click was not made|nothing changed)(?:;\s*wait)?",
+                       re.IGNORECASE)
 
 
 class NothingSent(str):
     """A driver's words for a refusal made before any input was sent (ExecResult.performed becomes False). Words built
     from them by formatting are plain strings again: unknown, the safe side.
 
-    What "nothing was sent" means (the coordinator's decision, review of hands#64 round 6): nothing went to the app
-    that could change its content or lasting state -- no click, key, paste, typing, accessibility write, and no
-    accessibility focus moved into a field. Bringing the app to the front, or making a window its key window, and
+    What "nothing was sent" means (the coordinator's decision, review of hands#64 rounds 6 and 8): nothing went to the
+    app that could change its content or lasting state -- no click, key, paste, typing, accessibility write, no
+    accessibility focus moved into a field, no scripted command, no document or URL opened, no app launched, and no
+    reopen (`open -b` sends one: it un-minimises windows, and opens a window on an app with none). Bringing a running
+    app to the front without a reopen (AXFrontmost, AppleScript `activate`), or making a window its key window, and
     giving that back, does not count: a refusal after only those is still "nothing was sent"."""
 
 

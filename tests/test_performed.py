@@ -53,7 +53,8 @@ class AddressBar(unittest.TestCase):
                 d.events.append(("paste", text))
                 raise skylight.WindowKeyRefused("the user came to the app")
             d._paste_and_submit = refuse
-        res = c.act(d)
+        with input_scope():                                         # one step, as execute opens it
+            res = c.act(d)
         return res, [e[0] for e in d.events if e[0] != "focus back"]
 
     def test_table(self):
@@ -82,9 +83,9 @@ class Flash(unittest.TestCase):
     def test_refusals_before_the_front_is_taken_say_nothing_was_sent(self):
         from test_caller_deadline import APP, Clock, FlashDriver
         d = FlashDriver(Clock(), busy_s=0.0)
-        with mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": ""}):
+        with mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": ""}), input_scope():
             ok, detail = d._flash(APP, lambda Q: self.fail("sent"), what="type")
-        res = ExecResult(ok, detail)
+            res = ExecResult(ok, detail)
         self.assertEqual((res.ok, res.performed), (False, False), detail)
 
 
@@ -97,17 +98,18 @@ class Executor(unittest.TestCase):
         self.assertIs(ex.perform({"kind": "click", "window": "com.apple.TextEdit#13", "target": "B2"}).get("performed"), False)
         self.assertIs(ex.perform({"kind": "dance", "window": TE.W12}).get("performed"), False)
         self.assertIs(ex.perform({"kind": "focus_window", "window": "com.apple.TextEdit#99"}).get("performed"), False)
+        # made when the driver answers, inside the step the executor opens around it
         rows = [
-            (ExecResult(False, "moved; observe again", stale=True), False),
-            (ExecResult(False, "drag is not wired", unsupported=True), False),
-            (ExecResult(False, f"{USER_BUSY}; the step was not carried out -- wait"), False),
-            (ExecResult(False, "typing stopped after 3 of 9 chars"), None),
-            (ExecResult(True, "done"), None),
-            (ExecResult(True, "pressed; nothing read back", indeterminate=True), None),
+            (lambda: ExecResult(False, "moved; observe again", stale=True), False),
+            (lambda: ExecResult(False, "drag is not wired", unsupported=True), False),
+            (lambda: ExecResult(False, f"{USER_BUSY}; the step was not carried out -- wait"), False),
+            (lambda: ExecResult(False, "typing stopped after 3 of 9 chars"), None),
+            (lambda: ExecResult(True, "done"), None),
+            (lambda: ExecResult(True, "pressed; nothing read back", indeterminate=True), None),
         ]
-        for res, performed in rows:
-            with self.subTest(res.detail):
-                stub.execute = lambda action, res=res: res
+        for make, performed in rows:
+            with self.subTest(make().detail):
+                stub.execute = lambda action, make=make: make()
                 ex.observe(TE.W12)
                 self.assertIs(ex.perform({"kind": "click", "window": TE.W12, "target": "B2"}).get("performed"), performed)
 

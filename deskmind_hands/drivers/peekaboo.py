@@ -1301,7 +1301,7 @@ class PeekabooDriver:
         try:
             if taken and front_before and self._mcp is not None:
                 self._foreground_actions += 1
-                self._osa_forward(f'tell application "{self._q(front_before)}" to activate')
+                self._restore_front(before_bundle, front_before)
         finally:
             for token in tokens:
                 self._front_given_back(token)
@@ -4107,8 +4107,16 @@ class PeekabooDriver:
         except Exception:  # noqa: BLE001
             pass
 
+    @staticmethod
+    def _restore_front(bundle: str, name: str = "") -> bool:
+        """Every give-back of the front (drivers/front.py): the running process -- by bundle id, else by name --
+        activated without a reopen, else AXFrontmost; never `open -b`, never AppleScript `activate`, never a
+        launch."""
+        from deskmind_hands.drivers.front import restore_front
+        return restore_front(bundle, name)
+
     def _give_front_back(self, prev: str, ours: str | None = None, late_s: float = 0.0) -> None:
-        """Give `prev` the front again, through accessibility (AXFrontmost) for every app: `open -b` is a reopen,
+        """Give `prev` the front again (_restore_front: activated without a reopen, else AXFrontmost): `open -b` is a reopen,
         which un-minimises a browser's windows (deskmind#73) and opens a new Finder window on a bare desktop (hands
         #55 review). With `ours`, the app the driver brought forward: given back only while that one is in front,
         and the tries stop once the user has gone to a third app. A front that cannot be read is not taken for the
@@ -4129,7 +4137,7 @@ class PeekabooDriver:
                 continue
             if ours is not None and front.lower() != ours.lower():
                 return              # the user went elsewhere: theirs to keep
-            self._make_frontmost(prev)
+            self._restore_front(prev)
             tries += 1
             time.sleep(0.1)
 
@@ -4684,14 +4692,14 @@ class PeekabooDriver:
         try:
             if before and after and after != before and self._ours(after) and not self._ours(before):
                 self._foreground_actions += 1
-                self._osa_forward(f'tell application "{self._q(before)}" to activate')
+                self._restore_front(before_bundle, before)
                 res = replace(res, detail=f"{res.detail} [took the foreground ({after}); given back to {before}]")
             elif (before and after and after != before and not self._ours(before) and not action.foreground
                   and self._hid_idle() >= time.time() - t0):
                 # Something else took the front while the step ran -- a helper app, a notification, an app the click
                 # launched -- and the user did not do it (untouched since the step began): the user's app gets it
                 # back (cua's focus guard). An intended foreground step, or the user switching apps, is left alone.
-                self._osa_forward(f'tell application "{self._q(before)}" to activate')
+                self._restore_front(before_bundle, before)
                 if effect_notes():
                     res = replace(res, detail=f"{res.detail} [{after} took the front during the step; given back to {before}]")
         finally:

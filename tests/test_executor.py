@@ -859,7 +859,7 @@ class Background(unittest.TestCase):
             return SimpleNamespace(returncode=1, stdout="")
         ex._front_bundle_id = lambda: front[0]              # noqa: SLF001
         given = []
-        ex._make_frontmost = lambda b: given.append(b) or True   # noqa: SLF001
+        ex._restore_front = lambda b: given.append(b) or True   # noqa: SLF001
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[]), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=TE), \

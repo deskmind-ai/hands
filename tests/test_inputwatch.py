@@ -819,6 +819,8 @@ class FlashesTold(_EpochCase):
         d._task_windows = lambda: []
         d.activated = []
         d._osa = lambda script: d.activated.append(script) or (True, "")
+        # the give-back of the front: by bundle id, else by name (_restore_front, never AppleScript activate)
+        d._restore_front = lambda b, name="": d.activated.append(("front back", b or name)) or True
         t0 = time.time()
         d._execute_inner = lambda a: (time.sleep(0.05), ExecResult(True, "done"))[1]
         d._execute_outer(Action(kind=ActionKind.CLICK, foreground=foreground, binding=Binding(element_id="B2")))
@@ -918,6 +920,8 @@ class FlashesTold(_EpochCase):
         d._front_app = lambda: next(it)
         d.activated = []
         d._osa = lambda script: d.activated.append(script) or (True, "")
+        # the give-back of the front: by bundle id, else by name (_restore_front, never AppleScript activate)
+        d._restore_front = lambda b, name="": d.activated.append(("front back", b or name)) or True
         d._run = lambda key, _extra=None, **fmt: (False, {}, "not here")
         d.clipboard = lambda: ""
         d._set_clipboard = lambda value: None
@@ -945,7 +949,7 @@ class FlashesTold(_EpochCase):
         front's name is compared with as well as its bundle id."""
         d, t = self._stage("com.example.other", ["网易云音乐"], [("iTerm2", "com.googlecode.iterm2"), ("网易云音乐", NE)])
         self.assertIn(NE.lower(), [f[0] for f in self.iw.FLASHES])
-        self.assertIn('tell application "iTerm2" to activate', d.activated)   # main's: the name is in the set
+        self.assertTrue([a for a in d.activated if a[0] == "front back" and "iterm" in a[1].lower()], d.activated)   # main's: the name is in the set
 
     def test_a_cold_launch_that_took_the_front_is_told(self):
         from deskmind_hands import executor as exe
@@ -955,7 +959,7 @@ class FlashesTold(_EpochCase):
         ex._known_windows = lambda: set()                  # noqa: SLF001
         fronts = iter(["com.googlecode.iterm2", NE] + ["com.googlecode.iterm2"] * 5)
         ex._front_bundle_id = lambda: next(fronts)         # noqa: SLF001 -- the app took the front on launch
-        ex._make_frontmost = lambda b: True                # noqa: SLF001
+        ex._restore_front = lambda b: True                # noqa: SLF001
         inside = []
         ex._launch_windows = lambda *a: inside.append(time.time()) or []   # noqa: SLF001 -- a moment in the launch
         ex._settled = mock.Mock(side_effect=RuntimeError("stop here"))   # noqa: SLF001
@@ -1159,7 +1163,7 @@ class FlashesToldBeforeTheFront(_EpochCase):
         ex._watch, ex._watch_tried = self.w, True
         ex._known_windows = lambda: set()                  # noqa: SLF001
         ex._front_bundle_id = lambda: "com.googlecode.iterm2"   # noqa: SLF001 -- in front before, and again after
-        ex._make_frontmost = lambda b: True                # noqa: SLF001
+        ex._restore_front = lambda b: True                # noqa: SLF001
 
         def windows(*a):
             self._users_key_elsewhere()                    # the app took the front at launch; the user's key in it
@@ -1507,7 +1511,7 @@ class MainIsTheFloor(_EpochCase):
         ex.current[NE] = f"{NE}#7"                         # the task goes on to operate the launched app
         ex._known_windows = lambda: set()                  # noqa: SLF001
         ex._front_bundle_id = lambda: "com.googlecode.iterm2"   # noqa: SLF001
-        ex._make_frontmost = lambda b: True                # noqa: SLF001
+        ex._restore_front = lambda b: True                # noqa: SLF001
 
         def windows(*a):
             self.focus(NE_PID, settle=False)               # it took the front at launch ...

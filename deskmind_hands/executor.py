@@ -57,6 +57,7 @@ from pathlib import Path
 
 from .actions import Action, ActionKind, Binding
 from .axdocument import _q, document_text, window_document
+from .drivers.front import restore_front
 from .grounding import STOP
 from .drivers.base import (ExecResult, Observation, StepExpired, act_by, input_scope, release_all, set_wait_sink,
                            step_expired_result)
@@ -335,17 +336,9 @@ class HandsExecutor:
             pre.discard(wid)
 
     @staticmethod
-    def _make_frontmost(bundle: str) -> bool:
-        """Make the app frontmost through accessibility (AXFrontmost), without a reopen."""
-        try:
-            import ApplicationServices as AS
-            from AppKit import NSRunningApplication
-            apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle)
-            if not apps:
-                return False
-            return AS.AXUIElementSetAttributeValue(AS.AXUIElementCreateApplication(apps[0].processIdentifier()), "AXFrontmost", True) == 0
-        except Exception:  # noqa: BLE001
-            return False
+    def _restore_front(bundle: str) -> bool:
+        """A give-back of the front: the running process activated without a reopen, else AXFrontmost (front.py)."""
+        return restore_front(bundle)
 
     @staticmethod
     def _front_bundle_id() -> str:
@@ -1241,7 +1234,7 @@ class HandsExecutor:
                 launched = self._launch_windows(bundle, before_launch, self.LAUNCH_WAIT_S)
                 if front_before and front_before != bundle and self._front_bundle_id() == bundle:
                     # some apps take the front on their first launch whatever -g says: given back at once
-                    self._make_frontmost(front_before)
+                    self._restore_front(front_before)        # a give-back: never a reopen (drivers/front.py)
             finally:
                 front_given_back(taken)
                 self._step_ended(step)

@@ -4108,12 +4108,18 @@ class PeekabooDriver:
             pass
 
     @staticmethod
-    def _restore_front(bundle: str, name: str = "") -> bool:
-        """Every give-back of the front (drivers/front.py): the running process -- by bundle id, else by name --
-        activated without a reopen, else AXFrontmost; never `open -b`, never AppleScript `activate`, never a
-        launch."""
+    def _restore_front(bundle: str, name: str = "") -> str:
+        """Every give-back of the front (drivers/front.py): the running process -- by bundle id, else (no bundle id)
+        by its one ordinary app of that name -- activated without a reopen, then AXFrontmost when it is not in front;
+        never `open -b`, never AppleScript `activate`, never a launch. What happened (front.GIVEN, QUIT, ...)."""
         from deskmind_hands.drivers.front import restore_front
         return restore_front(bundle, name)
+
+    @staticmethod
+    def _given_back(status, app: str) -> str:
+        """What a give-back did, for the step's result: given back, or not and why (the app quit, refused, ...)."""
+        from deskmind_hands.drivers.front import GIVEN
+        return f"given back to {app}" if status is True or status == GIVEN else f"{status} ({app})"
 
     def _give_front_back(self, prev: str, ours: str | None = None, late_s: float = 0.0) -> None:
         """Give `prev` the front again (_restore_front: activated without a reopen, else AXFrontmost): `open -b` is a reopen,
@@ -4692,16 +4698,18 @@ class PeekabooDriver:
         try:
             if before and after and after != before and self._ours(after) and not self._ours(before):
                 self._foreground_actions += 1
-                self._restore_front(before_bundle, before)
-                res = replace(res, detail=f"{res.detail} [took the foreground ({after}); given back to {before}]")
+                back = self._restore_front(before_bundle, before)
+                res = replace(res, detail=f"{res.detail} [took the foreground ({after}); "
+                                          f"{self._given_back(back, before)}]")
             elif (before and after and after != before and not self._ours(before) and not action.foreground
                   and self._hid_idle() >= time.time() - t0):
                 # Something else took the front while the step ran -- a helper app, a notification, an app the click
                 # launched -- and the user did not do it (untouched since the step began): the user's app gets it
                 # back (cua's focus guard). An intended foreground step, or the user switching apps, is left alone.
-                self._restore_front(before_bundle, before)
+                back = self._restore_front(before_bundle, before)
                 if effect_notes():
-                    res = replace(res, detail=f"{res.detail} [{after} took the front during the step; given back to {before}]")
+                    res = replace(res, detail=f"{res.detail} [{after} took the front during the step; "
+                                              f"{self._given_back(back, before)}]")
         finally:
             for token in tokens:
                 self._front_given_back(token)

@@ -336,7 +336,7 @@ class HandsExecutor:
             pre.discard(wid)
 
     @staticmethod
-    def _restore_front(bundle: str) -> bool:
+    def _restore_front(bundle: str) -> str:
         """A give-back of the front: the running process activated without a reopen, else AXFrontmost (front.py)."""
         return restore_front(bundle)
 

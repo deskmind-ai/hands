@@ -9,34 +9,65 @@ the app is activated without a reopen, so a window the user had minimised stays 
 """
 from __future__ import annotations
 
+#: what restore_front did
+GIVEN, QUIT, REFUSED = "given back", "not given back: the app is no longer running", \
+    "not given back: the activation was refused"
+REFUSED_AMBIGUOUS = "not given back: several running apps have that name"
 
-def restore_front(bundle: str, name: str = "") -> bool:
-    """Give `bundle` the front again -- or, its bundle id not known, the running app called `name` -- its running
-    process only (one that quit is not launched again), activated without a reopen
-    (NSRunningApplication.activateWithOptions_), else -- activation refused, as recent macOS may to a background
-    process -- made frontmost through accessibility (AXFrontmost). True when either said yes."""
-    if not bundle and not name:
-        return False
+
+def _front_pid() -> int | None:
+    """The front app's pid with no accessibility wait: the window server, else NSWorkspace; None when neither tells."""
     try:
-        from AppKit import NSApplicationActivateIgnoringOtherApps, NSRunningApplication, NSWorkspace
-        apps = [a for a in (NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle) or [] if bundle
-                            else []) if not a.isTerminated()]
-        if not apps and name:
-            apps = [a for a in (NSWorkspace.sharedWorkspace().runningApplications() or [])
-                    if str(a.localizedName() or "") == name and not a.isTerminated()]
-    except Exception:  # noqa: BLE001 -- not known: nothing is done
-        return False
-    if not apps:
-        return False                                      # quit meanwhile: not launched again
-    app = max(apps, key=lambda a: int(a.processIdentifier()))
-    try:
-        if app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps):
-            return True
-    except Exception:  # noqa: BLE001 -- refused: the fallback
+        from deskmind_hands.drivers import skylight
+        pid = skylight.front_pid()
+        if pid is not None:
+            return pid
+    except Exception:  # noqa: BLE001
         pass
     try:
-        import ApplicationServices as AS
-        return AS.AXUIElementSetAttributeValue(AS.AXUIElementCreateApplication(int(app.processIdentifier())),
-                                               "AXFrontmost", True) == 0
+        from AppKit import NSWorkspace
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        return int(app.processIdentifier()) if app is not None else None
     except Exception:  # noqa: BLE001
-        return False
+        return None
+
+
+def restore_front(bundle: str, name: str = "") -> str:
+    """Give `bundle` the front again -- or, only when its bundle id is not known, the one running ordinary app called
+    `name` -- and say what happened (GIVEN, QUIT, REFUSED). Its running process only: one that quit is not launched
+    again, and a name that matches no app or several (Xcode and Xcode-beta, many "Electron") brings nothing forward.
+    Activated without a reopen (NSRunningApplication.activateWithOptions_); then the front is read (the window
+    server or NSWorkspace, no accessibility wait) -- under cooperative activation (macOS 14+) activation can say yes
+    and do nothing -- and when the app is not in front, it is made frontmost through accessibility (AXFrontmost)."""
+    try:
+        from AppKit import NSApplicationActivateIgnoringOtherApps, NSRunningApplication, NSWorkspace
+        if bundle:
+            apps = [a for a in (NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle) or [])
+                    if not a.isTerminated()]
+        elif name:
+            apps = [a for a in (NSWorkspace.sharedWorkspace().runningApplications() or [])
+                    if str(a.localizedName() or "") == name and not a.isTerminated()
+                    and int(a.activationPolicy()) == 0]                  # an ordinary app (the Dock's)
+            if len(apps) > 1:
+                return REFUSED_AMBIGUOUS
+        else:
+            apps = []
+    except Exception:  # noqa: BLE001 -- not known: nothing is done
+        return QUIT
+    if not apps:
+        return QUIT                                       # quit meanwhile: not launched again
+    app = max(apps, key=lambda a: int(a.processIdentifier()))
+    pid = int(app.processIdentifier())
+    try:
+        app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+    except Exception:  # noqa: BLE001 -- refused: the front is read below
+        pass
+    if _front_pid() == pid:
+        return GIVEN
+    try:
+        import ApplicationServices as AS
+        ok = AS.AXUIElementSetAttributeValue(AS.AXUIElementCreateApplication(pid), "AXFrontmost", True) == 0
+    except Exception:  # noqa: BLE001
+        ok = False
+    return GIVEN if ok else REFUSED
+

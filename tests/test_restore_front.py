@@ -59,15 +59,17 @@ class EveryGiveBackGoesThroughRestoreFront(unittest.TestCase):
 
 
 class RestoreFrontTable(unittest.TestCase):
-    """running -> activated, no reopen; activation refused -> AXFrontmost; quit -> nothing, not launched; known only
-    by its name -> the running app of that name."""
+    """running -> activated, no reopen; activation that says yes and does nothing (cooperative activation) or is
+    refused -> AXFrontmost; quit -> nothing, not launched; the bundle known and quit -> not another app of the same
+    name; no bundle id -> the one ordinary app of that name, none when several match."""
 
-    def run_row(self, apps, activates=True, by_name=()):
+    def run_row(self, apps, activates=True, takes=True, ax_ok=True, by_name=(), bundle="ai.deskmind.app"):
         log = []
+        state = {"front": 1}                                     # another app in front
 
         class App:
-            def __init__(self, pid, name=""):
-                self.pid, self.name = pid, name
+            def __init__(self, pid, name="", policy=0):
+                self.pid, self.name, self.policy = pid, name, policy
 
             def processIdentifier(self):
                 return self.pid
@@ -75,38 +77,67 @@ class RestoreFrontTable(unittest.TestCase):
             def localizedName(self):
                 return self.name
 
+            def activationPolicy(self):
+                return self.policy
+
             def isTerminated(self):
                 return False
 
             def activateWithOptions_(self, opts):
                 log.append(("activate", self.pid))
+                if activates and takes:
+                    state["front"] = self.pid
                 return activates
         appkit = types.ModuleType("AppKit")
         appkit.NSApplicationActivateIgnoringOtherApps = 2
         appkit.NSRunningApplication = types.SimpleNamespace(
             runningApplicationsWithBundleIdentifier_=lambda b: [App(p) for p in apps])
         appkit.NSWorkspace = types.SimpleNamespace(sharedWorkspace=lambda: types.SimpleNamespace(
-            runningApplications=lambda: [App(p, n) for p, n in by_name]))
+            runningApplications=lambda: [App(*x) for x in by_name]))
         ax = types.ModuleType("ApplicationServices")
         ax.AXUIElementCreateApplication = lambda pid: ("app", pid)
-        ax.AXUIElementSetAttributeValue = lambda el, attr, v: log.append((attr, el[1])) or 0
+
+        def set_attr(el, attr, v):
+            log.append((attr, el[1]))
+            if ax_ok:
+                state["front"] = el[1]
+            return 0 if ax_ok else -25200
+        ax.AXUIElementSetAttributeValue = set_attr
         from deskmind_hands.drivers import front
         with mock.patch.dict(sys.modules, {"AppKit": appkit, "ApplicationServices": ax}), \
+                mock.patch.object(front, "_front_pid", lambda: state["front"], create=True), \
                 mock.patch("subprocess.run", side_effect=AssertionError("nothing is launched or opened")):
-            ok = front.restore_front("ai.deskmind.app", "DeskMind")
-        return ok, log
+            got = front.restore_front(bundle, "DeskMind")
+        return got, log
 
     def test_running_is_activated_without_a_reopen(self):
-        self.assertEqual(self.run_row([501]), (True, [("activate", 501)]))
+        self.assertEqual(self.run_row([501]), ("given back", [("activate", 501)]))
+
+    def test_an_activation_that_says_yes_and_does_nothing_falls_back_to_axfrontmost(self):
+        self.assertEqual(self.run_row([501], takes=False), ("given back", [("activate", 501), ("AXFrontmost", 501)]))
 
     def test_activation_refused_falls_back_to_axfrontmost(self):
-        self.assertEqual(self.run_row([501], activates=False), (True, [("activate", 501), ("AXFrontmost", 501)]))
+        self.assertEqual(self.run_row([501], activates=False),
+                         ("given back", [("activate", 501), ("AXFrontmost", 501)]))
+
+    def test_both_refused_is_said(self):
+        self.assertEqual(self.run_row([501], activates=False, ax_ok=False)[0], "not given back: the activation was refused")
 
     def test_quit_is_not_launched_again(self):
-        self.assertEqual(self.run_row([]), (False, []))
+        self.assertEqual(self.run_row([]), ("not given back: the app is no longer running", []))
 
-    def test_known_only_by_name_is_the_running_app_of_that_name(self):
-        self.assertEqual(self.run_row([], by_name=[(777, "DeskMind"), (888, "Other")]), (True, [("activate", 777)]))
+    def test_the_bundle_known_and_quit_brings_no_app_of_the_same_name(self):
+        self.assertEqual(self.run_row([], by_name=[(777, "DeskMind")]), ("not given back: the app is no longer running", []))
+
+    def test_no_bundle_id_the_one_ordinary_app_of_that_name(self):
+        from deskmind_hands.drivers import front
+        rows = [(777, "DeskMind"), (888, "Other"), (999, "DeskMind", 1)]       # 999: an accessory, not ordinary
+        self.assertEqual(self.run_row([], by_name=rows, bundle=""), ("given back", [("activate", 777)]))
+
+    def test_no_bundle_id_and_several_of_that_name_brings_none(self):
+        from deskmind_hands.drivers import front
+        rows = [(777, "DeskMind"), (778, "DeskMind")]
+        self.assertEqual(self.run_row([], by_name=rows, bundle=""), ("not given back: several running apps have that name", []))
 
 
 if __name__ == "__main__":

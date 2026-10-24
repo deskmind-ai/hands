@@ -721,6 +721,10 @@ def _transient_read(detail: str) -> bool:
 
 
 
+class _NotReady(Exception):
+    """Raised inside a flash before anything is typed: the element could not be made ready (focus) for keys."""
+
+
 def _post(Q, tap, event, press=None, release=None) -> None:
     """Every event this driver posts (see the rest below). `press`: (key, let_go) -- a down whose up must follow,
     remembered until it does (base.release_all lets it go whatever ends the step). `release`: the key of an up -- the
@@ -3428,77 +3432,146 @@ class PeekabooDriver:
         except Exception:   # noqa: BLE001
             return None
 
-    def _type_by_keys(self, action: Action, eid: str, why: str, background_tried: bool = False) -> ExecResult:
-        """Type `action.text` into `eid` with key events, for an element that takes no value written through
-        accessibility (`why`): decided from the element (its value not settable, or a write that did not show), never
-        by app. Keys to the window in the background first (_type_in_background, unless already tried); else in the
-        brief foreground where this step may use it (_flash's rules): a click on the element, cmd+A when replacing,
-        the text pasted (an input method takes synthesized letters) with Return pressed for each newline (a pasted
-        newline is not Return in a shell). Verified by reading the element's text back; unverified, said so, when it
-        cannot be read or does not show the text."""
+    def _type_by_keys(self, action: Action, eid: str) -> ExecResult:
+        """Type `action.text` into `eid`, an element whose value is not settable, with key events -- the way in chosen
+        before anything is sent, from the element's own accessibility, never by app:
+        - a text target: a text role (TEXT_ROLES), or an element that shows a caret (AXSelectedTextRange or
+          AXInsertionPointLineNumber); anything else -- a button -- is refused, nothing sent;
+        - a newline is Return only in a multi-line one (AXTextArea, as a terminal's view reads), which is what the
+          user's own key does there; text with a newline for a one-line field is refused, nothing sent;
+        - the keyboard focus given through accessibility, never by a click (a click moves the caret): left alone when
+          the element has it already, the caret kept; refused, nothing sent, when it can be neither;
+        - replacing: the whole text selected (accessibility, else cmd+A), then typed.
+        Keys to the window in the background where this Mac allows it (ASCII input source, the window made key);
+        else in the brief foreground where this step may use it (_flash's rules), the text pasted line by line (an
+        input method takes synthesized letters) with Return between. Read back from the element once after: verified,
+        or unverified, said so -- a read-back never sends anything more."""
         from deskmind_hands.drivers import axfield
         text = (action.text or "").replace("\r\n", "\n").replace("\r", "\n")
         label = self._labels_by_id.get(eid) or eid
-        if not background_tried and self._element_role.get(eid, "").lower() in ("textfield", "textarea"):
-            typed = self._type_in_background(eid, text, action.clear_first)
-            if typed is not None:
-                return typed
-        r = self._rects.get(eid)
-        if r is None:
-            return ExecResult(False, NothingSent(f"{label!r} takes no typed value ({why}) and is not on the current "
-                                                 f"screen to type into with keys; observe again"))
+        field = self._field_now(eid)
+        if field is None:
+            return ExecResult(False, NothingSent(f"{label!r} takes no value written through accessibility, and no "
+                                                 f"text element was found at its place to type into; observe again"))
+        role = axfield.role(field)
+        if role not in axfield.TEXT_ROLES and not axfield.shows_caret(field):
+            return ExecResult(False, NothingSent(f"{label!r} is not a text target ({role or 'no role'}): nothing was "
+                                                 f"typed -- click it, or type into a text field"))
+        multiline = role == "AXTextArea"
+        if "\n" in text and not multiline:
+            return ExecResult(False, NothingSent(f"{label!r} is a one-line field and the text has a newline, which "
+                                                 f"would submit it part way: nothing was typed. Type the text without "
+                                                 f"it, then press Return as its own step if you mean to submit"))
+        focused = axfield.is_focused(field)
+        if not focused and not axfield.can_set(field, "AXFocused"):
+            return ExecResult(False, NothingSent(f"{label!r} cannot be given the keyboard focus without a click, which "
+                                                 f"would move its caret: nothing was typed"))
         moved = self._moved_since_seen()
         if moved:
             return ExecResult(False, moved, stale=True)
-        field = self._field_now(eid)
+        if STOP.is_set():
+            return ExecResult(False, "stopped by the app; nothing was done")
         before = self._read_field(field)
-        x, y = self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2
-        lines = text.split("\n")
 
-        def perform(Q):
-            from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
-            pb = NSPasteboard.generalPasteboard()
-            saved = [{t: it.dataForType_(t) for t in it.types()} for it in (pb.pasteboardItems() or [])]
+        def ready() -> str | None:
+            """The focus on the element (the caret kept when it had it) and, replacing, its text selected; why not."""
+            if not focused and not axfield.focus(field):
+                return "it did not take the keyboard focus"
+            return None
+
+        def select_all(q) -> None:
+            if action.clear_first and not axfield.select(field, True):
+                self._post_key(q, self._keycode(q, "a"), q.kCGEventFlagMaskCommand)
+
+        res = self._keys_in_background(field, text, ready, select_all)
+        if res is None:
+            lines = text.split("\n")
+
+            def perform(Q):
+                from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
+                why = ready()
+                if why:
+                    raise _NotReady(why)
+                pb = NSPasteboard.generalPasteboard()
+                saved = [{t: it.dataForType_(t) for t in it.types()} for it in (pb.pasteboardItems() or [])]
+                try:
+                    select_all(Q)
+                    for i, line in enumerate(lines):
+                        if STOP.is_set():
+                            return f"stopped by the app after {i} of {len(lines)} lines"
+                        if i:
+                            self._post_key(Q, keys.RETURN)
+                            time.sleep(0.2)
+                        if line:
+                            pb.clearContents()
+                            pb.setString_forType_(line, NSPasteboardTypeString)
+                            self._post_key(Q, self._keycode(Q, "v"), Q.kCGEventFlagMaskCommand)
+                            time.sleep(0.4)
+                finally:
+                    release_all()   # what this step still holds down is let go first, before anything is given back
+                    pb.clearContents()
+                    items = []
+                    for d in saved:
+                        item = NSPasteboardItem.alloc().init()
+                        for t, data in d.items():
+                            if data is not None:
+                                item.setData_forType_(data, t)
+                        items.append(item)
+                    if items:
+                        pb.writeObjects_(items)
+                return f"typed {len(text)} chars into {label!r} with keys"
             try:
-                self._post_click(Q, x, y)
-                time.sleep(0.2)
-                if action.clear_first:
-                    self._post_key(Q, self._keycode(Q, "a"), Q.kCGEventFlagMaskCommand)
-                for i, line in enumerate(lines):
-                    if STOP.is_set():
-                        return f"stopped by the app after {i} of {len(lines)} lines"
-                    if i:
-                        self._post_key(Q, keys.RETURN)
-                        time.sleep(0.2)
-                    if line:
-                        pb.clearContents()
-                        pb.setString_forType_(line, NSPasteboardTypeString)
-                        self._post_key(Q, self._keycode(Q, "v"), Q.kCGEventFlagMaskCommand)
-                        time.sleep(0.4)
-            finally:
-                release_all()   # what this step still holds down is let go first, before anything is given back
-                pb.clearContents()
-                items = []
-                for d in saved:
-                    item = NSPasteboardItem.alloc().init()
-                    for t, data in d.items():
-                        if data is not None:
-                            item.setData_forType_(data, t)
-                    items.append(item)
-                if items:
-                    pb.writeObjects_(items)
-            return f"typed {len(text)} chars into {label!r} with keys"
-
-        ok, detail = self._flash(self.app, perform, what=f"type {text!r} into {label!r}")
+                ok, detail = self._flash(self.app, perform, what=f"type {text!r} into {label!r}")
+            except _NotReady as exc:
+                return ExecResult(False, NothingSent(f"{label!r}: {exc}; nothing was typed"))
+            if not ok:
+                return ExecResult(False, detail)
+            res = detail
+        if isinstance(res, ExecResult):
+            return res
         self._snapshot = None
-        if not ok:
-            return ExecResult(False, detail)
         after = axfield.settled_value(field, before, wait=self.AX_INSERT_WAIT_S) if before is not None else None
         if axfield.typed_in(before, after, text, action.clear_first):
-            return ExecResult(True, f"{detail} ({why}), verified by read-back")
+            return ExecResult(True, f"{res}, verified by read-back")
         shown = "it cannot be read back" if after is None else f"it reads {after[-120:]!r}"
-        return ExecResult(True, indeterminate=True,
-                          detail=f"{detail} ({why}), unverified: {shown} -- observe before typing again")
+        return ExecResult(True, indeterminate=True, detail=f"{res}, unverified: {shown} -- observe before typing again")
+
+    def _keys_in_background(self, field, text: str, ready, select_all):
+        """`text` as keys to the observed window without bringing anything forward (the window made its app's key
+        window, proven so; Unicode payloads, a newline as Return): a detail string when typed, an ExecResult when it
+        stopped, None when this route does not apply -- decided before anything is sent (no background keys on this
+        Mac, an input method on, not the run's window, the user's front app, the window could not be made key)."""
+        from deskmind_hands.drivers import axfield, skylight
+        if not self._background_keys() or not self._ascii_input():
+            return None
+        target = self._key_target()
+        if not isinstance(target, tuple):
+            return None
+        pid, wid = target
+        if skylight.user_on(pid):
+            return None
+        sent_before = sends_so_far()
+        try:
+            with skylight.enter_window_key(pid, wid) as key:
+                why = ready()
+                if why:
+                    return ExecResult(False, NothingSent(f"{why}; nothing was typed"))
+                q = skylight.BackgroundQuartz(pid, wid, (self._origin.x, self._origin.y), key=key)
+
+                def lost() -> str | None:
+                    if STOP.is_set():
+                        return "stopped by the app"
+                    return key.lost() or (None if axfield.is_focused(field) else "the element lost the focus")
+                select_all(q)
+                sent, why = self._post_unicode(q, text, stop=lost)
+        except skylight.WindowKeyRefused as exc:
+            if sends_so_far() == sent_before:
+                return None             # refused before anything went: the foreground route, chosen before a send
+            return ExecResult(False, indeterminate=True, detail=f"typing stopped part way: {exc}")
+        if sent < len(text):
+            return ExecResult(False, indeterminate=True,
+                              detail=f"typing stopped after {sent} of {len(text)} chars: {why}")
+        return f"typed {len(text)} chars with keys to window {wid} in the background"
 
     def _type_in_background(self, eid: str, text: str, clear_first: bool) -> ExecResult | None:
         """Type `text` into the observed window's field `eid` without bringing anything forward: first the
@@ -4704,19 +4777,19 @@ class PeekabooDriver:
                 # refuses it), so where the user allowed the brief foreground it is typed there: click, paste,
                 # Return, as in a screenshot-only app.
                 return self._vision_act(action)
-            field_role = self._element_role.get(eid, "").lower() in ("textfield", "textarea")
-            if field_role:
+            if getattr(self, "_element_settable", {}).get(eid) is False:
+                # The way in is chosen from the element, once, before anything is sent -- never a second way after a
+                # first was sent (hands#66 review: each fallback after a send typed twice or in the wrong place).
+                # Its value is not settable (a terminal's text view): a value written through accessibility is
+                # accepted and never shows -- rc.15, five "set_value ... without valid canonical result semantics"
+                # in one run, each an uncertain step that put every later action to the user. Keys, or nothing.
+                return self._type_by_keys(action, eid)
+            if self._element_role.get(eid, "").lower() in ("textfield", "textarea"):
                 # Into the field itself, in the background, whichever app: the accessibility insertion, then keys to
                 # the window proven key; each read back from the field. None: no field there to read back by.
                 typed = self._type_in_background(eid, action.text or "", action.clear_first)
                 if typed is not None:
                     return typed
-            if getattr(self, "_element_settable", {}).get(eid) is False:
-                # Its value is not settable (a terminal's text view): a value written through accessibility is
-                # accepted and never shows -- rc.15, five "set_value ... without valid canonical result semantics"
-                # in one run, each an uncertain step that put every later action to the user. Keys, not a write.
-                return self._type_by_keys(action, eid, "its value cannot be set through accessibility",
-                                          background_tried=field_role)
             if (action.clear_first and self._background_input(self.app) and eid in self._rects
                     and self._element_role.get(eid, "").lower() in ("textfield", "textarea")):
                 # A web page's field in an app that takes background input: clicked and pasted into, as a person
@@ -4728,18 +4801,6 @@ class PeekabooDriver:
             ok, meta, text, detail = self._mcp_call("set_value", {"on": eid, "snapshot": self._snapshot,
                                                                    "value": new})
             effect = meta.get("effect")
-            if not (ok and effect in (None, "confirmed")) and seen_before is not None:
-                # Not confirmed: the element itself says. Showing the value written, the write is done; showing what
-                # it showed before, the element took no value (it does not report a value written back) and the text
-                # is typed with keys; anything else is reported as before (unverified).
-                from deskmind_hands.drivers import axfield
-                after = axfield.settled_value(field, seen_before, wait=self.AX_INSERT_WAIT_S)
-                if axfield.typed_in(seen_before, after, new, True):
-                    self._snapshot = None
-                    return ExecResult(True, f"set {len(new)} chars in the background, verified by read-back")
-                if after == seen_before:
-                    return self._type_by_keys(action, eid, "the value written through accessibility did not show "
-                                                           "in it", background_tried=field_role)
             unverified = (ok and effect not in (None, "confirmed")) or (not ok and "could not be verified" in
                                                                           (detail or ""))
             if (unverified and os.environ.get("HANDS_WEB_TYPE_FALLBACK") == "1" and action.clear_first
@@ -4749,7 +4810,18 @@ class PeekabooDriver:
                 # brief foreground is allowed, the text is pasted into the field instead, without Return.
                 return self._vision_act(action, submit=False)
             if ok and effect not in (None, "confirmed"):
-                return self._settle(True, f"set {len(new)} chars in the background ({effect})")
+                # Accepted, not confirmed: the element itself is read back -- showing the value, verified; else
+                # unverified, said so. A read-back never sends anything more (no keys after a write).
+                from deskmind_hands.drivers import axfield
+                after = (axfield.settled_value(field, seen_before, wait=self.AX_INSERT_WAIT_S)
+                         if seen_before is not None else None)
+                self._snapshot = None
+                if axfield.typed_in(seen_before, after, new, True):
+                    return ExecResult(True, f"set {len(new)} chars in the background, verified by read-back")
+                shown = "it cannot be read back" if after is None else f"it reads {after[-120:]!r}"
+                return ExecResult(True, indeterminate=True,
+                                  detail=f"set {len(new)} chars in the background ({effect}), unverified: {shown} -- "
+                                         f"observe before typing again")
             return self._settle(ok, f"set {len(new)} chars in the background, verified" if ok else detail)
 
         if k is ActionKind.TYPE_TEXT:

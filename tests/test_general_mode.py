@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import types
 import tempfile
 import unittest
 from pathlib import Path
@@ -1088,104 +1089,170 @@ class GymSplit(unittest.TestCase):
 class TypingWhereNoValueIsTaken(unittest.TestCase):
     """rc.15 (10-24): typing into a terminal's text view ended "unverified" every time -- the accessibility write
     ("set_value ... without valid canonical result semantics") was accepted and never showed, and each uncertain step
-    put every later action to the user. Decided from the element, never by app: a value that is not settable is not
-    written through accessibility, and a write that does not show in the element falls back to key typing; each read
-    back from the element. Fail on 76e3bfd."""
+    put every later action to the user. The way in is chosen from the element, once, before anything is sent, never
+    by app: a settable value is written (unconfirmed: unverified, no keys after); a text element that takes no value
+    gets keys (the focus by accessibility, never a click; a newline is Return only where it is a new line); anything
+    else is refused with nothing sent. Read back once after. Codex's four cases on hands#66 @29714a4 first."""
 
-    def _driver(self, settable, reflects, keys_land=True):
+    def setUp(self):
+        from deskmind_hands.drivers import axfield
+        self.shown = {"value": "~ % "}
+        self.el = {"role": "AXTextArea", "focused": False, "can_focus": True, "caret": True}
+        self.log = []
+        el = self.el
+        for name, fn in {"value": lambda f: self.shown["value"],
+                         "role": lambda f: el["role"],
+                         "is_focused": lambda f: el["focused"],
+                         "can_set": lambda f, attr: el["can_focus"],
+                         "shows_caret": lambda f: el["caret"],
+                         "focus": lambda f, wait=0.5: self.log.append("focus") or el.update(focused=True) or True,
+                         "select": lambda f, all_, wait=0.3: self.log.append(("select", all_)) or True}.items():
+            p = mock.patch.object(axfield, name, fn, create=True)     # can_set, shows_caret: new here
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(PeekabooDriver, "AX_INSERT_WAIT_S", 0.0)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _driver(self, settable, reflects=False, keys_land=True, field=True, late_write=False):
         from types import SimpleNamespace
         from deskmind_hands.geometry import Point, Rect
+        from deskmind_hands.drivers import peekaboo as P
         d = PeekabooDriver.__new__(PeekabooDriver)
         d.app = "com.example.term"
         d._rects, d._element_role = {"elem_3": Rect(0, 30, 580, 350)}, {"elem_3": "textArea"}
         d._element_value, d._labels_by_id = {"elem_3": "~ % "}, {"elem_3": "Shell"}
         d._element_settable = {"elem_3": settable}
-        d._origin, d._snapshot, d.calls = Point(100, 100), "s1", []
+        d._origin, d._snapshot = Point(100, 100), "s1"
         d._background_input = lambda bundle: False
-        d._type_in_background = lambda eid, text, clear: d.calls.append("background keys") and None
+        d._type_in_background = lambda eid, text, clear: self.log.append("ax insertion route") and None
+        d._keys_in_background = lambda field, text, ready, select_all: None      # this Mac: foreground keys
         d._moved_since_seen = lambda: None
-        self.shown = {"value": "~ % "}
-        d._field_now = lambda eid: "FIELD"
+        d._field_now = lambda eid: "FIELD" if field else None
+        pending = {}
 
         def tool(name, args):
-            d.calls.append((name, args.get("value")))
+            self.log.append((name, args.get("value")))
             if reflects:
                 self.shown["value"] = args.get("value")
+            if late_write:
+                pending["value"] = args.get("value")            # lands later, after the read-back
             return True, {"effect": "accepted"}, "", ""
         d._mcp = SimpleNamespace(tool=tool)
+        q = SimpleNamespace(kCGEventFlagMaskCommand=1 << 20)
+        board = {"text": ""}
+        d._post_click = lambda Q, x, y, count=1: self.log.append("click")
 
-        def flash(app, perform, what=""):
-            d.calls.append(("keys", what))
-            if keys_land:
-                self.shown["value"] += "ls -la"
-            return True, "typed 6 chars into 'Shell' with keys"
-        d._flash = flash
-        d._settle = lambda ok, detail: ExecResult(ok, detail)
-        return d
-
-    def _type(self, d, text="ls -la"):
-        from deskmind_hands.actions import Action, ActionKind, Binding
-        from deskmind_hands.drivers import axfield
-        with mock.patch.object(axfield, "value", lambda f: self.shown["value"]), \
-                mock.patch.object(PeekabooDriver, "AX_INSERT_WAIT_S", 0.0):
-            return d._execute_inner(Action(kind=ActionKind.TYPE_TEXT, text=text, clear_first=False,
-                                           binding=Binding(element_id="elem_3")))
-
-    def test_a_write_accepted_and_not_shown_falls_back_to_keys(self):
-        d = self._driver(settable=True, reflects=False)
-        res = self._type(d)
-        self.assertEqual(d.calls, ["background keys", ("set_value", "~ % ls -la"),        # background keys: once
-                                   ("keys", "type 'ls -la' into 'Shell'")])
-        self.assertTrue(res.ok)
-        self.assertFalse(res.indeterminate)
-        self.assertIn("verified by read-back", res.detail)
-
-    def test_a_value_that_is_not_settable_is_never_written_through_accessibility(self):
-        d = self._driver(settable=False, reflects=False)
-        res = self._type(d)
-        self.assertNotIn("set_value", [c[0] for c in d.calls if isinstance(c, tuple)])
-        self.assertEqual(d.calls[-1], ("keys", "type 'ls -la' into 'Shell'"))
-        self.assertTrue(res.ok and not res.indeterminate)
-
-    def test_a_write_that_shows_is_verified_and_no_key_is_sent(self):
-        d = self._driver(settable=True, reflects=True)
-        res = self._type(d)
-        self.assertEqual([c for c in d.calls if isinstance(c, tuple)], [("set_value", "~ % ls -la")])
-        self.assertTrue(res.ok and not res.indeterminate)
-
-    def test_keys_that_do_not_show_either_are_reported_unverified(self):
-        d = self._driver(settable=False, reflects=False, keys_land=False)
-        res = self._type(d)
-        self.assertTrue(res.indeterminate)
-        self.assertIn("unverified", res.detail)
-
-    def test_a_newline_is_pressed_as_return_between_pasted_lines(self):
-        """In a shell a pasted newline is not Return (bracketed paste): each line is pasted, Return pressed between."""
-        import types as _t
-        from deskmind_hands.drivers import peekaboo as P
-        d = self._driver(settable=False, reflects=False)
-        posted = []
-        q = _t.SimpleNamespace(kCGEventFlagMaskCommand=1 << 20)
-        d._post_click = lambda Q, x, y: posted.append("click")
-        d._post_key = lambda Q, code, flags=0: posted.append(("key", code, flags))
+        def post_key(Q, code, flags=0):
+            self.log.append(("key", code, flags))
+            if keys_land and code == 9 and flags:
+                self.shown["value"] += board["text"]
+            elif keys_land and code == P.keys.RETURN:
+                self.shown["value"] += "\n"
+        d._post_key = post_key
         d._keycode = lambda Q, ch: {"a": 0, "v": 9}[ch]
-        board = {"items": []}
 
         class PB:
             def pasteboardItems(self):
                 return []
 
             def clearContents(self):
-                board["items"] = []
+                board["text"] = ""
 
             def setString_forType_(self, s, t):
-                posted.append(("clipboard", s))
-        appkit = _t.ModuleType("AppKit")
-        appkit.NSPasteboard = _t.SimpleNamespace(generalPasteboard=lambda: PB())
+                board["text"] = s
+        appkit = types.ModuleType("AppKit")
+        appkit.NSPasteboard = SimpleNamespace(generalPasteboard=lambda: PB())
         appkit.NSPasteboardItem = object
         appkit.NSPasteboardTypeString = "str"
-        d._flash = lambda app, perform, what="": (True, perform(q))
-        with mock.patch.dict(sys.modules, {"AppKit": appkit}), mock.patch.object(P.time, "sleep", lambda s: None):
-            self._type(d, text="ls -la\nwhoami")
-        self.assertEqual(posted, ["click", ("clipboard", "ls -la"), ("key", 9, 1 << 20), ("key", P.keys.RETURN, 0),
-                                  ("clipboard", "whoami"), ("key", 9, 1 << 20)])
+        p = mock.patch.dict(sys.modules, {"AppKit": appkit})
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(P.time, "sleep", lambda s: None)
+        p.start()
+        self.addCleanup(p.stop)
+
+        def flash(app, perform, what=""):
+            if "value" in pending:                              # the write lands while the app comes forward
+                self.shown["value"] = pending.pop("value")
+            return True, perform(q)
+        d._flash = flash
+        d._settle = lambda ok, detail: ExecResult(ok, detail)
+        return d
+
+    def _type(self, d, text="ls -la", clear=False):
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        from deskmind_hands.drivers.base import input_scope
+        with input_scope(None):                                   # one step, as the executor runs it
+            return d._execute_inner(Action(kind=ActionKind.TYPE_TEXT, text=text, clear_first=clear,
+                                           binding=Binding(element_id="elem_3")))
+
+    def sent(self):
+        return [x for x in self.log if x not in ("ax insertion route",)]
+
+    # -- Codex on hands#66 @29714a4
+    def test_codex_a_newline_in_a_one_line_field_is_refused_not_submitted(self):
+        self.el["role"] = "AXTextField"
+        res = self._type(self._driver(settable=False), text="one\ntwo")
+        self.assertIs(res.performed, False)
+        self.assertIn("press Return as its own step", res.detail)
+        self.assertEqual(self.sent(), [])
+
+    def test_codex_a_button_is_not_a_keyboard_target(self):
+        self.el.update(role="AXButton", caret=False)
+        res = self._type(self._driver(settable=False))
+        self.assertIs(res.performed, False)
+        self.assertIn("not a text target", res.detail)
+        self.assertEqual(self.sent(), [])
+
+    def test_codex_no_element_found_is_refused(self):
+        res = self._type(self._driver(settable=False, field=False))
+        self.assertIs(res.performed, False)
+        self.assertEqual(self.sent(), [])
+
+    def test_codex_a_late_write_is_unverified_and_typed_once(self):
+        d = self._driver(settable=True, late_write=True)
+        res = self._type(d)
+        self.assertTrue(res.indeterminate)
+        self.assertIn("unverified", res.detail)
+        self.assertEqual([x for x in self.sent() if x[0] != "set_value"], [])     # no keys after the write
+        d._flash("x", lambda q: "")                                               # the write lands later
+        self.assertEqual(self.shown["value"].count("ls -la"), 1)
+
+    def test_codex_an_already_focused_field_is_not_clicked_and_keeps_its_caret(self):
+        self.el["focused"] = True
+        res = self._type(self._driver(settable=False))
+        self.assertNotIn("click", self.log)
+        self.assertNotIn("focus", self.log)
+        self.assertFalse([x for x in self.log if isinstance(x, tuple) and x[0] == "select"])
+        self.assertTrue(res.ok and not res.indeterminate)
+
+    # -- the rest of the table
+    def test_a_terminal_view_is_focused_by_accessibility_and_typed_with_return_between_lines(self):
+        from deskmind_hands.drivers import peekaboo as P
+        res = self._type(self._driver(settable=False), text="ls -la\nwhoami")
+        self.assertEqual(self.sent(), ["focus", ("key", 9, 1 << 20), ("key", P.keys.RETURN, 0), ("key", 9, 1 << 20)])
+        self.assertNotIn("set_value", [x[0] for x in self.sent() if isinstance(x, tuple)])
+        self.assertTrue(res.ok and not res.indeterminate)
+        self.assertIn("verified by read-back", res.detail)
+
+    def test_replacing_selects_all_then_types(self):
+        res = self._type(self._driver(settable=False), clear=True)
+        self.assertEqual(self.sent()[:2], ["focus", ("select", True)])
+        self.assertIsNotNone(res)
+
+    def test_an_element_that_cannot_take_the_focus_without_a_click_is_refused(self):
+        self.el["can_focus"] = False
+        res = self._type(self._driver(settable=False))
+        self.assertIs(res.performed, False)
+        self.assertEqual(self.sent(), [])
+
+    def test_keys_that_do_not_show_are_unverified_and_nothing_more_is_sent(self):
+        res = self._type(self._driver(settable=False, keys_land=False))
+        self.assertTrue(res.indeterminate)
+        self.assertEqual(self.sent(), ["focus", ("key", 9, 1 << 20)])
+
+    def test_a_settable_value_that_shows_is_verified_with_no_key(self):
+        res = self._type(self._driver(settable=True, reflects=True))
+        self.assertEqual([x for x in self.sent() if isinstance(x, tuple)], [("set_value", "~ % ls -la")])
+        self.assertTrue(res.ok and not res.indeterminate)

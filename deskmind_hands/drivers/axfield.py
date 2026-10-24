@@ -137,6 +137,21 @@ def is_focused(el) -> bool:
     return bool(_get(el, "AXFocused"))
 
 
+def can_set(el, attr: str) -> bool:
+    """Whether `attr` of the element is settable, as accessibility says (asking writes nothing)."""
+    try:
+        from ApplicationServices import AXUIElementIsAttributeSettable
+        err, ok = AXUIElementIsAttributeSettable(el, attr, None)
+        return err == 0 and bool(ok)
+    except Exception:  # noqa: BLE001 -- not known: no
+        return False
+
+
+def shows_caret(el) -> bool:
+    """Whether the element exposes a caret -- a selected text range or an insertion point: it takes typed text."""
+    return _get(el, "AXSelectedTextRange") is not None or _get(el, "AXInsertionPointLineNumber") is not None
+
+
 def role(el) -> str:
     return str(_get(el, "AXRole") or "")
 

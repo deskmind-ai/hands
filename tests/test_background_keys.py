@@ -12,6 +12,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deskmind_hands.drivers import axfield, base, keys, skylight   # noqa: E402
+from deskmind_hands.drivers import peekaboo as P_DRIVER   # noqa: E402
 from deskmind_hands.drivers.peekaboo import PeekabooDriver   # noqa: E402
 from deskmind_hands.geometry import Point, Rect   # noqa: E402
 from deskmind_hands.grounding import STOP   # noqa: E402
@@ -340,8 +341,8 @@ class FakeQ(skylight.BackgroundQuartz):
     kCGHIDEventTap, kCGEventFlagMaskCommand = 0, 1 << 20
     _q = None
 
-    def __init__(self, d, field, key=None):
-        self.d, self.field, self.key = d, field, key
+    def __init__(self, d, field, key=None, pid=None):
+        self.d, self.field, self.key, self.pid = d, field, key, pid if pid is not None else PID
 
     def post_checked(self, event, gate):
         self.CGEventPost(0, event)
@@ -437,7 +438,8 @@ class _TypeHarness(unittest.TestCase):
                    mock.patch.object(axfield, "role", lambda el: field.role),
                    mock.patch.object(axfield, "names", lambda el: field.names),
                    mock.patch.object(axfield, "in_web_area", lambda el: field.web),
-                   mock.patch.object(axfield, "is_focused", lambda el: field.focused),
+                   mock.patch.object(axfield, "is_focused",                       # a read that can wait: a test
+                                     lambda el: getattr(d, "on_focus_read", lambda: None)() or field.focused),
                    mock.patch.object(axfield, "focus", lambda el: d.log.append("focus") or sends()
                                      or setattr(field, "focused", True) or True),
                    mock.patch.object(axfield, "select", lambda el, replace_all: d.log.append("select") or sends()
@@ -451,7 +453,9 @@ class _TypeHarness(unittest.TestCase):
                    mock.patch.object(skylight, "user_on", lambda pid: user_on),
                    mock.patch.object(skylight, "BackgroundQuartz",
                                      type("HeldWindow", (FakeQ,), {"__init__": lambda self_, pid, wid, origin, key=None:
-                                                                   FakeQ.__init__(self_, d, field, key)})),
+                                                                   FakeQ.__init__(self_, d, field, key, pid)})),
+                   # the front app, as the gate's instant check reads it: another app, the user's, by default
+                   mock.patch.object(P_DRIVER, "_front_app_pid", lambda: getattr(d, "front_app", 1)),
                    mock.patch.object(PeekabooDriver, "_key_event",
                                      key_event or classmethod(lambda cls, Q, code, down: {"down": down, "code": code})),
                    mock.patch.object(skylight, "enter_window_key",
@@ -1099,6 +1103,31 @@ class GateAtEverySendSiteInTheBackground(_TypeHarness):
             with self.subTest(site=site):
                 d, res = self.row(site, None)
                 self.assertTrue(self.sent_at(d, site), d.log)
+
+    def test_the_user_coming_to_the_app_during_a_read_sends_nothing_there(self):
+        """hands#66's instant checks (Codex @0838225), here: the user comes to the target app during the window read
+        right before the focus write (T2), or during the field's focus read right before the first chunk (T5)."""
+        for at in ("window read before the focus write", "focus read before the first chunk"):
+            with self.subTest(at=at):
+                field = Field("start", takes_insertion=False)
+                d = driver()
+
+                def lost():
+                    if at.startswith("window"):
+                        d.front_app = PID                        # the user brought the target app forward
+                    return None
+                reads = []
+
+                def on_focus_read():
+                    reads.append(1)
+                    if at.startswith("focus") and len(reads) == 2:   # the select's gate, then the first chunk's
+                        d.front_app = PID
+                d.on_focus_read = on_focus_read
+                d, res = self.run_type(field, d=d, text="x" * 40, count_sends=True,
+                                       enter=lambda pid, wid: Key(d.log, lost=lost))
+                self.assertEqual(self.keys_sent(d), [])
+                if at.startswith("window"):
+                    self.assertNotIn("focus", d.log)
 
     def test_t3_the_length_read_moving_the_focus_writes_no_selection(self):
         """Review of #66 @24fbf21: the selection's length read (it can wait) sat between the gate and the write."""

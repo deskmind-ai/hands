@@ -3817,8 +3817,14 @@ class PeekabooDriver:
             return None
         if web and clear_first and self._background_input(self.app):
             return None             # a web field's replace: the click and paste route, ahead of this one as before
+        # T1's selection range read now (the text's length: an accessibility read that can wait), so the STOP check
+        # right below is right before the insertion's first write (review of #66 @24fbf21)
+        try:
+            insert_at = None if web else axfield.wanted(field, clear_first)
+        except Exception:   # noqa: BLE001 -- unread: the insertion reads it itself
+            insert_at = None
         if STOP.is_set():
-            return ExecResult(False, "stopped by the app; nothing was done")
+            return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
 
         def result(after: str | None, how: str, note: str = "") -> ExecResult:
             tail = f"; {note}" if note else ""
@@ -3842,7 +3848,7 @@ class PeekabooDriver:
             try:
                 # T1: STOP right before, nothing that can wait between; and between the insertion's own two writes
                 # (the selection, a read-back of up to 0.3 s, the text) once more
-                written = axfield.insert(field, text, clear_first, go=lambda: not STOP.is_set())
+                written = axfield.insert(field, text, clear_first, go=lambda: not STOP.is_set(), want=insert_at)
             except Exception:   # noqa: BLE001 -- refused or failed: it may have reached the app
                 written = True
             reached = written or sends_so_far() > sent_before
@@ -3891,10 +3897,11 @@ class PeekabooDriver:
                     return stop(why)
                 if not axfield.focus(field):
                     return stop("the field did not take the keyboard focus")
+                want = axfield.wanted(field, clear_first)    # the length read before the gate, not after it
                 why = gate.before_send()
                 if why:
                     return stop(why)
-                if not axfield.select(field, clear_first):
+                if not axfield.select_range(field, want):
                     # Chrome did not take a whole-text selection through accessibility (live, 10-21); cmd+A to the
                     # window does it, read back the same way. A caret that cannot be put at the end: not this route.
                     if not clear_first:

@@ -151,7 +151,7 @@ class PrimitiveTable(unittest.TestCase):
         with input_scope():
             field = BK.Field("start", takes_insertion=False)
             field.focused = False                                       # never reads back focused in time
-            d, typed = t.run_type(field, enter=enter, insert=lambda el, txt, r, go=None: False)
+            d, typed = t.run_type(field, enter=enter, insert=lambda el, txt, r, go=None, want=None: False)
             later = ExecResult(False, NothingSent("only responds in the foreground, which this run may not use"))
         self.assertIn(("set", "AXFocused", True), calls[0])
         # hands#66's rule since: after a send no other route -- the focus write went, so this route says so itself

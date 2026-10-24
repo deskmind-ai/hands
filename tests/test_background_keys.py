@@ -415,7 +415,7 @@ class _TypeHarness(unittest.TestCase):
                 field.value = ""
         d._post_key = post_key
 
-        def ax_insert(el, t, replace_all, go=None):
+        def ax_insert(el, t, replace_all, go=None, want=None):
             # takes_insertion: True, it shows; "ignored", it reaches the app and nothing shows (accepted, a no-op);
             # False, refused before it reached the app (nothing counted as sent)
             d.log.append(("ax insert", t))
@@ -442,6 +442,11 @@ class _TypeHarness(unittest.TestCase):
                                      or setattr(field, "focused", True) or True),
                    mock.patch.object(axfield, "select", lambda el, replace_all: d.log.append("select") or sends()
                                      or selects),
+                   # the selection's range read (it can wait), apart from its write: a test may act there
+                   mock.patch.object(axfield, "wanted", lambda el, all_: getattr(d, "on_length_read", lambda: None)()
+                                     or (0, 0), create=True),
+                   mock.patch.object(axfield, "select_range", lambda el, want, wait=0.3: d.log.append("select")
+                                     or sends() or selects, create=True),
                    mock.patch.object(axfield, "all_selected", lambda el, wait=0.5: all_selected),
                    mock.patch.object(skylight, "user_on", lambda pid: user_on),
                    mock.patch.object(skylight, "BackgroundQuartz",
@@ -480,7 +485,7 @@ class TypeText(_TypeHarness):
                                  ("keys", "hello 你好"), "exit"])
 
     def test_nothing_written_no_wait(self):
-        d, res = self.run_type(Field("start", takes_insertion=False), insert=lambda el, t, r, go=None: False)
+        d, res = self.run_type(Field("start", takes_insertion=False), insert=lambda el, t, r, go=None, want=None: False)
         self.assertEqual(d.settle_waits[0], 0)
 
     def test_an_insertion_shown_late_is_not_typed_again(self):
@@ -493,7 +498,7 @@ class TypeText(_TypeHarness):
                 field.value += pending.pop()
             return field.value
 
-        def insert(el, t, replace_all, go=None):
+        def insert(el, t, replace_all, go=None, want=None):
             pending.append(t)
             return True
         fake_time = types.SimpleNamespace(monotonic=lambda: clock[0],
@@ -1094,12 +1099,41 @@ class GateAtEverySendSiteInTheBackground(_TypeHarness):
                 d, res = self.row(site, None)
                 self.assertTrue(self.sent_at(d, site), d.log)
 
+    def test_t3_the_length_read_moving_the_focus_writes_no_selection(self):
+        """Review of #66 @24fbf21: the selection's length read (it can wait) sat between the gate and the write."""
+        field = Field("start", takes_insertion=False)
+        d = driver()
+        reads = []
+
+        def on_length_read():
+            reads.append(1)
+            if len(reads) == 2:                                   # T3's read (the first is T1's, the insertion's)
+                field.focused = False
+        d.on_length_read = on_length_read
+        d, res = self.run_type(field, d=d, text="x" * 40, count_sends=True,
+                               enter=lambda pid, wid: Key(d.log, lost=lambda: None))
+        self.assertNotIn("select", d.log)
+        self.assertIsNot(res.performed, False)                   # the focus write went before it: unverified
+        self.assertTrue(res.indeterminate, res.detail)
+
+    def test_t1_a_stop_during_the_length_read_writes_nothing(self):
+        from deskmind_hands.grounding import STOP
+        self.addCleanup(STOP.clear)
+        field = Field("start", takes_insertion=True)
+        d = driver()
+        d.on_length_read = STOP.set
+        writes = []
+        d, res = self.run_type(field, d=d, insert=lambda el, t, r, go=None, want=None: writes.append(t) or True)
+        self.assertEqual(writes, [])
+        self.assertIs(res.performed, False)
+
     def test_t1_a_stop_between_the_insertions_selection_and_its_text_writes_no_text(self):
         from deskmind_hands.grounding import STOP
         self.addCleanup(STOP.clear)
         writes = []
-        with mock.patch.object(axfield, "select", lambda el, all_, wait=0.3: writes.append("selection") or
+        with mock.patch.object(axfield, "select_range", lambda el, want, wait=0.3: writes.append("selection") or
                                STOP.set() or True), \
+                mock.patch.object(axfield, "_length", lambda el: 4), \
                 mock.patch.object(axfield, "_set", lambda el, attr, v: writes.append(attr) or True):
             self.assertFalse(axfield.insert("FIELD", "text", False, go=lambda: not STOP.is_set()))
         self.assertEqual(writes, ["selection"])                 # no AXSelectedText after the stop

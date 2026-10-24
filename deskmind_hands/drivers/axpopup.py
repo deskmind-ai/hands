@@ -66,12 +66,18 @@ def popups(pid: int) -> list[dict]:
     return out
 
 
+def _act(el, action: str) -> int:
+    """Every accessibility action of this module (press, show menu, cancel): counted as sent (base.ax_counted)."""
+    from .base import ax_counted
+    return ax_counted(lambda: _ax().AXUIElementPerformAction(el, action))
+
+
 def _open_menu(popup):
     """Open `popup`'s menu and return it (None if it did not open)."""
     AS = _ax()
     AS.AXUIElementSetMessagingTimeout(popup, TIMEOUT_S)
-    if AS.AXUIElementPerformAction(popup, "AXPress") != 0:
-        if AS.AXUIElementPerformAction(popup, "AXShowMenu") != 0:
+    if _act(popup, "AXPress") != 0:
+        if _act(popup, "AXShowMenu") != 0:
             return None
     for _ in range(10):
         time.sleep(0.1)
@@ -95,9 +101,8 @@ def options(popup) -> list[str]:
     if menu is None:
         return []
     titles = [t for t, _ in _items(menu)]
-    AS = _ax()
-    if AS.AXUIElementPerformAction(menu, "AXCancel") != 0:
-        AS.AXUIElementPerformAction(popup, "AXPress")   # a second press closes it
+    if _act(menu, "AXCancel") != 0:
+        _act(popup, "AXPress")   # a second press closes it
     time.sleep(0.1)
     return titles
 
@@ -110,11 +115,10 @@ def select(popup, option: str) -> tuple[bool, str]:
     items = _items(menu)
     hit = next((m for t, m in items if t == option), None) or \
         next((m for t, m in items if t.lower() == option.strip().lower()), None)
-    AS = _ax()
     if hit is None:
-        AS.AXUIElementPerformAction(menu, "AXCancel")
+        _act(menu, "AXCancel")
         return False, f"{option!r} is not one of its choices: {[t for t, _ in items]}"
-    AS.AXUIElementPerformAction(hit, "AXPress")
+    _act(hit, "AXPress")
     now = ""
     for _ in range(15):   # the page updates the value a moment after the item is pressed
         time.sleep(0.1)

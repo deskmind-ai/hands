@@ -9,7 +9,9 @@ support an action it silently drops.
 from __future__ import annotations
 
 import hashlib
+import os
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -199,14 +201,287 @@ class ExecResult:
     #: it wrote; a driver that cannot tell leaves it empty. A scratch file of the driver's own (the staged 未命名-N
     #: under .hands/) is never one of these.
     files: tuple[tuple[str, str | None], ...] = ()
+    #: A refusal's own words, kept when the step had already sent something (then `detail` is one fixed sentence):
+    #: for the trace only -- nothing turns it into guidance, so no "not done" in it can reach a planner.
+    refused_reason: str = ""
+    #: Whether any input reached the app: False only where the driver knows none was sent -- a refusal before acting
+    #: (stale, unsupported, waited out for the user, or words marked NothingSent). None: not known, which the layer
+    #: above takes as "may have happened". Never False on a guess: an action that may have gone out stays unknown.
+    performed: bool | None = None
 
     def __post_init__(self):
         if not self.ok and (self.detail or "").lower().startswith(USER_BUSY):
             self.deferred = True
+        if isinstance(self.detail, MaybeSent):
+            self.indeterminate = True
+        if not self.ok and self.performed is None and not self.indeterminate and (
+                self.stale or self.unsupported or self.deferred or isinstance(self.detail, NothingSent)):
+            # The one place a refusal becomes "nothing done": inside a step that sent nothing. Outside any step
+            # nothing is claimed (performed stays unknown: fail-safe). A refusal after something went in this step
+            # (a fall-through, a refusal after a focus write) is unverified, and nothing of it says "not done" any
+            # more: no stale / deferred / unsupported flag, no "nothing was done" words -- a reader of either would
+            # take it again (review of hands#64 round 8: the hands loop said "Nothing changed. Take it again").
+            if not in_step():
+                pass
+            elif sent_in_step():
+                # the words are replaced whole, not filtered: any part of a refusal ("the user is active -- wait",
+                # "not done: ...") read by a planner says "take it again" (review of hands#64 round 9)
+                self.refused_reason = str(self.detail)
+                self.indeterminate, self.stale, self.deferred, self.unsupported = True, False, False, False
+                self.detail = MaybeSent(SENT_THEN_STOPPED)
+            else:
+                self.performed = False
 
 
 #: How every driver says a step was left undone because the user was busy.
 USER_BUSY = "the user is active"
+
+
+# -- What a step sent to the user's apps, counted where it is sent (review of hands#64 round 7) -------------------------
+#
+# Every primitive that can reach an app counts itself BEFORE it calls the OS: an event post, an accessibility attribute
+# write or action, a scripted command that tells the app to do something. Counting at the hand-on points of each route
+# missed one send after another (the background route, the accessibility insertion, the focus write); counted here,
+# no route can forget. The one thing that takes a count back is an OS answer that definitely means "not delivered"
+# (AX_NOT_DELIVERED); anything else -- success, a timeout, kAXErrorCannotComplete, an exception -- stays counted.
+# Bringing an app forward and making a window its key window are not counted (the definition at NothingSent).
+#
+# The count belongs to one step: Driver.execute runs inside input_scope(), and only there does a NothingSent refusal
+# (or a stale / unsupported / user-busy one) become performed:false -- and only while nothing was counted in it
+# (ExecResult.__post_init__, the one place).
+
+#: Accessibility errors that mean the write or action never reached the app: an invalid argument or element, an
+#: attribute or action the element does not have, not implemented, the accessibility API disabled. Nothing else --
+#: kAXErrorFailure, kAXErrorCannotComplete (a timeout) and any unknown code may have been delivered.
+AX_NOT_DELIVERED = frozenset({
+    -25201,   # kAXErrorIllegalArgument
+    -25202,   # kAXErrorInvalidUIElement
+    -25205,   # kAXErrorAttributeUnsupported (includes not settable)
+    -25206,   # kAXErrorActionUnsupported
+    -25208,   # kAXErrorNotImplemented
+    -25211,   # kAXErrorAPIDisabled
+})
+
+class _Step:
+    """One step's count of sends (and how deep it is inside uncounted()), and `by`: the last moment it may send for its
+    caller (base.act_by of the caller's deadline; None: no caller deadline, `hands do`)."""
+    __slots__ = ("n", "quiet", "by", "releasing", "pressed")
+
+    def __init__(self, by: float | None = None):
+        self.n, self.quiet, self.by, self.releasing = 0, 0, by, 0
+        #: what is held down now (a key, a mouse button), with how to let it go: never left held, whatever ends the step
+        self.pressed: dict = {}
+
+
+class StepExpired(BaseException):
+    """A send asked for after the step's caller's deadline (less the margin): not made. Raised from the counted
+    primitive itself, so no route can send late (review of hands#64: the chat click and the address bar sent after
+    their checks); a BaseException, so no route's broad `except Exception` carries on past it. Driver.execute turns
+    it into the step's answer -- nothing done if nothing went yet, else the fixed sent-then-stopped result."""
+
+
+#: The step in progress, per thread (a context variable: a new thread starts with none). A send on another thread,
+#: or another thread's step, never touches this one's count (review of hands#64 round 8: one process-wide dict).
+_STEP: ContextVar[_Step | None] = ContextVar("hands_step", default=None)
+
+
+def counted(call, refused=None):
+    """Count a send in the step in progress, then make it: `call()`. `refused(result)` True only for an answer that
+    definitely means it was not delivered (then the count is taken back). An exception leaves it counted. Inside
+    uncounted(), or outside any step (nothing to count it in), it is just made."""
+    st = _STEP.get()
+    if st is None or st.quiet:
+        return call()
+    if st.by is not None and not st.releasing and time.time() > st.by:
+        # checked right before the OS call: no NEW input reaches an app late. The completion of input already started
+        # (an up for a down sent, a release) is never held back: it goes inside releasing() (review of hands#64,
+        # Codex: a key-up blocked by the deadline left the key held)
+        raise StepExpired()
+    st.n += 1
+    result = call()
+    if refused is not None and refused(result):
+        st.n -= 1
+    return result
+
+
+def ax_counted(call):
+    """An accessibility write or action (returns an AXError code): counted unless the code is in AX_NOT_DELIVERED."""
+    return counted(call, refused=lambda err: err in AX_NOT_DELIVERED)
+
+
+class releasing:
+    """What runs inside completes input already started (a key-up, a mouse-up) or cleans up after it: counted, never
+    refused by the deadline."""
+
+    def __enter__(self):
+        self._st = _STEP.get()
+        if self._st is not None:
+            self._st.releasing += 1
+        return self
+
+    def __exit__(self, *exc):
+        if self._st is not None:
+            self._st.releasing -= 1
+        return False
+
+
+def note_pressed(key, let_go) -> None:
+    """`key` (a key code, a mouse button) is going down in the step in progress -- told before the first OS call that
+    could deliver it; `let_go(in_place=False)` sends its up (`in_place`: without moving the pointer)."""
+    st = _STEP.get()
+    if st is not None:
+        st.pressed[key] = let_go
+
+
+def note_released(key) -> None:
+    st = _STEP.get()
+    if st is not None:
+        st.pressed.pop(key, None)
+
+
+def release_all(in_place: bool = False) -> None:
+    """Let go of everything the step in progress still holds down (its downs whose ups did not go: an exception, a
+    stop, the deadline between them). Called first in every cleanup that gives something back (the front, the focus,
+    the pointer, the clipboard, the input source), so the ups go where the downs went; and once more as the step ends,
+    whatever ended it, `in_place` -- the last resort, after the pointer may have been put back, never moving it."""
+    st = _STEP.get()
+    if st is None:
+        return
+    for key, let_go in list(st.pressed.items()):
+        try:
+            with releasing():
+                let_go(in_place=in_place)
+        except Exception:  # noqa: BLE001 -- one that cannot be let go must not keep the others held
+            pass
+        st.pressed.pop(key, None)
+
+
+class uncounted:
+    """What runs inside is no send: a read, or bringing an app or a window forward (NothingSent's definition)."""
+
+    def __enter__(self):
+        self._st = _STEP.get()
+        if self._st is not None:
+            self._st.quiet += 1
+        return self
+
+    def __exit__(self, *exc):
+        if self._st is not None:
+            self._st.quiet -= 1
+        return False
+
+
+class input_scope:
+    """One step: its sends are counted in it (Driver.execute, the executor around it, a runtime around it), and none is
+    made after `by` (the caller's deadline less the margin: act_by). Entered inside another step's scope on the same
+    thread, it is that step: the count is shared, never reset; the earlier `by` holds."""
+
+    def __init__(self, by: float | None = None):
+        self._by = by
+
+    def __enter__(self):
+        cur = _STEP.get()
+        self._token = _STEP.set(_Step(self._by)) if cur is None else None
+        if cur is not None and self._by is not None:
+            cur.by = self._by if cur.by is None else min(cur.by, self._by)
+        return self
+
+    def __exit__(self, *exc):
+        if self._token is not None:
+            _STEP.reset(self._token)
+        return False
+
+
+def step_expired_result() -> "ExecResult":
+    """The answer of a step stopped by StepExpired: nothing done if it had sent nothing, else (the enforcement in
+    ExecResult) the fixed sent-then-stopped one."""
+    return ExecResult(False, NothingSent("the caller's deadline came before the step could act; nothing was done"))
+
+
+def time_left() -> float | None:
+    """Seconds until the step in progress may no longer send (None: no deadline): what a preparation wait may take."""
+    st = _STEP.get()
+    return None if st is None or st.by is None else st.by - time.time()
+
+
+def in_step() -> bool:
+    """Whether a step's scope is open on this thread."""
+    return _STEP.get() is not None
+
+
+def sends_so_far() -> int:
+    """How many sends the step in progress has made so far (0 outside a step): for a route that compares before and
+    after its own sending."""
+    st = _STEP.get()
+    return st.n if st is not None else 0
+
+
+def sent_in_step() -> int:
+    """How many sends the step in progress made (0 outside a step)."""
+    return sends_so_far()
+
+
+#: The whole detail of a refusal that came after a send in the same step (its own words go to refused_reason)
+SENT_THEN_STOPPED = ("input already went to the app in this step; the outcome is unknown -- do not repeat it without "
+                     "checking: observe the window first")
+
+
+class NothingSent(str):
+    """A driver's words for a refusal made before any input was sent (ExecResult.performed becomes False). Words built
+    from them by formatting are plain strings again: unknown, the safe side.
+
+    What "nothing was sent" means (the coordinator's decision, review of hands#64 rounds 6 and 8): nothing went to the
+    app that could change its content or lasting state -- no click, key, paste, typing, accessibility write, no
+    accessibility focus moved into a field, no scripted command, no document or URL opened, no app launched, and no
+    reopen (`open -b` sends one: it un-minimises windows, and opens a window on an app with none -- so the drivers use
+    it only for an app with no window on screen). Bringing a running app with a window on screen to the front without
+    a reopen (NSRunningApplication activation, AXFrontmost, AppleScript `activate`), or making a window its key
+    window, and giving that back, does not count: a refusal after only those is still "nothing was sent"."""
+
+
+class MaybeSent(str):
+    """A driver's words for a step stopped after some of its input went (a click and a paste, then a refused key):
+    neither done nor not done -- ExecResult.indeterminate, so the reply is unverified."""
+
+#: Seconds kept before a caller's deadline for the action itself and what is read after it (the executor's window and
+#: document reads, the reply): a step that has not started acting by then does nothing. HANDS_DEADLINE_MARGIN_S
+#: overrides it.
+DEADLINE_MARGIN_S = 20.0
+
+
+def act_by(deadline: float | None) -> float | None:
+    """The last moment a step may start acting for a caller that gives up at `deadline` (epoch seconds); None when
+    the caller set no deadline (`hands do`)."""
+    if deadline is None:
+        return None
+    return deadline - float(os.environ.get("HANDS_DEADLINE_MARGIN_S", DEADLINE_MARGIN_S))
+
+
+#: Where a driver's wait for the user is told. None (the CLI, `hands do`): the plain lines on stdout it has always
+#: printed, `HANDS_WAIT {json}` then `HANDS_RESUME`, which the app's runner reads. The executor sets a function
+#: (kind, body) that writes a JSON event line beside its replies, under the same lock: a plain line there was not
+#: JSON, and harness dropped it, so a run waiting for the user never showed "paused".
+_WAIT_SINK = None
+
+
+def set_wait_sink(sink) -> None:
+    """Send the waits for the user to `sink(kind, body)` (kind "user_wait" or "user_resumed"); None: the plain lines."""
+    global _WAIT_SINK
+    _WAIT_SINK = sink
+
+
+def tell_wait(kind: str, body: dict) -> None:
+    """Say that a step waits for the user ("user_wait", with reason, app and what) or that the wait is over
+    ("user_resumed")."""
+    sink = _WAIT_SINK
+    if sink is not None:
+        sink(kind, body)
+        return
+    import json
+    if kind == "user_wait":
+        print("HANDS_WAIT " + json.dumps(body, ensure_ascii=False), flush=True)
+    else:
+        print("HANDS_RESUME", flush=True)
 
 
 EFFECTS = ("confirmed", "partial", "unverifiable", "suspected_noop", "refused")

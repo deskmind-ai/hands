@@ -26,6 +26,18 @@ One JSON request per line on stdin, one JSON reply per line on stdout (`{"id", "
     stop      {}                         the app's stop switch: every later perform is refused
     end       {}
 
+`observe` and `perform` take an optional `deadline_ms` (Unix ms): when the caller stops waiting for the reply. The
+request never outlives it. A wait for a still Mac (a step that needs the front, a pop-up's choices) ends
+DEADLINE_MARGIN_S before it, leaving time for the action and the reads after it; a perform that could not act in time
+answers `status: "user_busy"` (the user kept using the Mac) or `"error"`, both with `performed: false` -- nothing was
+sent. No kind starts inside the margin; an open_window not with less than OPEN_WINDOW_WORST_S left, and a wait sleeps
+at most until the margin. An observe's pop-ups share the one deadline and the choices not read are named in `notes`;
+a look read within OBSERVE_MARGIN_S of its deadline is not started. Without `deadline_ms`, HANDS_FLASH_WAIT_S alone bounds the waits, as before.
+
+While a request waits for the user, event lines go out beside the replies (they have no `id`):
+`{"event": "user_wait", "req": <request id>, "reason": "user_active", "app", "what"}`, then
+`{"event": "user_resumed", "req": <request id>, "waited_s"}` -- the CLI prints `HANDS_WAIT` / `HANDS_RESUME` instead.
+
 Ownership, consequence classes, consent and the guard live in harness (`src/executor/`); nothing here judges. The
 window inventory comes from Quartz (fast, every app at once); seeing and acting inside a window go through the
 PeekabooDriver, one per application, pinned to the window asked for, so its background input, projections
@@ -46,7 +58,8 @@ from pathlib import Path
 from .actions import Action, ActionKind, Binding
 from .axdocument import _q, document_text, window_document
 from .grounding import STOP
-from .drivers.base import ExecResult, Observation
+from .drivers.base import (ExecResult, Observation, StepExpired, act_by, input_scope, release_all, set_wait_sink,
+                           step_expired_result)
 from .audio import playing_apps
 from .browsers import installed_browsers, is_browser
 from .inputwatch import InputWatch, track_children
@@ -71,6 +84,10 @@ def takeover_until() -> float:
         return float(Path(path).read_text().strip() or 0) if path else 0.0
     except (OSError, ValueError):
         return 0.0
+
+
+#: A look read this close to its deadline is not started: it could not finish (a pop-up's choices, the reply).
+OBSERVE_MARGIN_S = 5.0
 
 
 def allow_flash(bundle: str) -> None:
@@ -640,9 +657,20 @@ class HandsExecutor:
         bundle, _, wid = window.partition("#")
         return bundle, wid
 
-    def observe(self, window: str, screenshot: bool = False) -> dict:
+    def observe(self, window: str, screenshot: bool = False, deadline: float | None = None) -> dict:
+        """One window close up. `deadline` (epoch seconds, from the request's `deadline_ms`): when the caller stops
+        waiting. A wait for a still Mac inside the look (reading a pop-up's choices) ends before it, one deadline
+        for the whole look; what could not be read is said in `notes`."""
         bundle, wid = self._split(window)
         d = self._driver(bundle)
+        d.caller_deadline = deadline
+        d.wait_notes = []
+        try:
+            return self._observe(d, window, bundle, wid, screenshot)
+        finally:
+            d.caller_deadline = None
+
+    def _observe(self, d, window: str, bundle: str, wid: str, screenshot: bool) -> dict:
         d._pinned_window = wid or None
         d._window_id = wid or None
         key = bundle.lower()
@@ -713,6 +741,9 @@ class HandsExecutor:
                                                # rect is local to it, so the app can place a mark on a picture of it
                                                **({"frame": frame} if frame else {})},
                "modal": {"title": "dialog"} if obs.dialog else None, "elements": els, "text": "\n".join(texts)[:4000]}
+        notes = list(getattr(d, "wait_notes", None) or [])
+        if notes:
+            out["notes"] = notes
         if screenshot and obs.screenshot_png:
             import base64
             out["screenshot_png"] = base64.b64encode(obs.screenshot_png).decode()
@@ -738,11 +769,23 @@ class HandsExecutor:
             return None
         return [round(float(v), 1) for v in b]
 
-    def perform(self, action: dict, shot: str | None = None, frames: bool = False) -> dict:
+    def perform(self, action: dict, shot: str | None = None, frames: bool = False, deadline: float | None = None) -> dict:
         """One action. With `frames`, where the window and the element acted on were on screen before acting. With
         `shot` (a file path the layer above chose, in its run folder), a picture of the window after it -- taken on a
         thread of its own while the reply goes out (`shot_pending`): the file appears at that path written whole (a
-        rename), or not at all when the capture fails. Neither asked for: nothing extra, not even a window list."""
+        rename), or not at all when the capture fails. Neither asked for: nothing extra, not even a window list.
+
+        `deadline` (epoch seconds, from the request's `deadline_ms`): when the caller stops waiting for the reply.
+        The step never outlives it: a wait for a still Mac ends before it (status `user_busy`, `performed: false`),
+        and a step that could not start acting in time does nothing (`performed: false`). None (`hands do`): only
+        HANDS_FLASH_WAIT_S bounds a wait, as before."""
+        self._caller_deadline = deadline
+        try:
+            return self._perform_framed(action, shot, frames)
+        finally:
+            self._caller_deadline = None
+
+    def _perform_framed(self, action: dict, shot: str | None, frames: bool) -> dict:
         window = action.get("window") or ""
         where: dict = {}
         if (frames or shot) and window and action.get("kind") not in (None, "wait", "open_window"):
@@ -822,13 +865,26 @@ class HandsExecutor:
 
     def _perform(self, action: dict) -> dict:
         if getattr(self, "stopped", False) or STOP.is_set():
-            return {"status": "error", "why": "stopped by the app"}
+            return {"status": "error", "performed": False, "why": "stopped by the app"}
+        late = self._too_late_to_start()
+        if late is not None:
+            # every kind, before anything moves (the epoch included): open_window can take ~30 s, and started inside
+            # the margin it answered after the caller had given up (review of hands#64)
+            return late
         kind = action.get("kind")
         self._advance({"by": "action", "kind": kind or "", "window": action.get("window") or ""})
         if kind == "wait":
-            time.sleep(min(float(action.get("ms") or 0) / 1000, 30))
+            # at most until the margin before the caller's deadline: a wait that ran past it answered late
+            by = act_by(getattr(self, "_caller_deadline", None))
+            time.sleep(max(0.0, min(float(action.get("ms") or 0) / 1000, 30, *((by - time.time(),) if by is not None else ()))))
             return {"status": "ok", "files": []}
         if kind == "open_window":
+            # an open takes up to OPEN_WINDOW_WORST_S (a launch waited for, the windows settling, a page loading): not
+            # started unless that much time is left before the caller's deadline
+            deadline = getattr(self, "_caller_deadline", None)
+            if deadline is not None and time.time() > min(act_by(deadline), deadline - self.OPEN_WINDOW_WORST_S):
+                return {"status": "error", "performed": False,
+                        "why": "the caller's deadline is too close to open a window in time; nothing was done"}
             return self._open_window(action.get("app") or "", action.get("url"))
         window = action.get("window") or ""
         bundle, wid = self._split(window)
@@ -843,7 +899,8 @@ class HandsExecutor:
             # count: it is not the task's) had their keys go into the task's window (hands #55 review). A step
             # that needs the foreground gets it for that step only, through the driver's flash.
             if not any(w["id"] == window for w in self._windows(every=True)):
-                return {"status": "error", "why": f"the window {window} is not there", "window": window, "files": []}
+                return {"status": "error", "performed": False, "why": f"the window {window} is not there", "window": window,
+                        "files": []}
             d = self._driver(bundle)
             d._pinned_window = wid or None
             d._window_id = wid or None
@@ -851,11 +908,12 @@ class HandsExecutor:
         d = self._driver(bundle)
         obs = self.last_obs.get(window)
         if obs is None:
-            return {"status": "error", "why": "observe the window before acting in it"}
+            return {"status": "error", "performed": False, "why": "observe the window before acting in it"}
         if self.current.get(bundle) != window:
             # the driver's snapshot and element ids are another window's of this app
-            return {"status": "error", "why": f"{window} is not the window last observed in this app "
-                                              f"({self.current.get(bundle)}); observe it again before acting in it"}
+            return {"status": "error", "performed": False,
+                    "why": f"{window} is not the window last observed in this app ({self.current.get(bundle)}); "
+                           f"observe it again before acting in it"}
         d._pinned_window = wid or None
         d._window_id = wid or None
         binding = Binding(observation_id=obs.id, app=bundle, window_id=wid, element_id=action.get("target"))
@@ -879,9 +937,9 @@ class HandsExecutor:
             elif kind == "scroll":
                 a = Action(kind=ActionKind.SCROLL, scroll_dy=int(action.get("dy") or 0), binding=binding, foreground=True)
             else:
-                return {"status": "unsupported", "why": f"unknown action {kind}"}
+                return {"status": "unsupported", "performed": False, "why": f"unknown action {kind}"}
         except Exception as e:  # noqa: BLE001 -- an action the model wrote wrong is its mistake to read
-            return {"status": "error", "why": str(e)}
+            return {"status": "error", "performed": False, "why": str(e)}
         wins = self._windows()
         if kind in ("set_value", "type", "select") and action.get("target") and hasattr(d, "allow_browser_field"):
             # the layer above judged this step (its judge, or the person); the driver's own guard against writing
@@ -905,76 +963,126 @@ class HandsExecutor:
             have = [b for b in (flash_before or "").split(",") if b.strip()]
             if bundle.lower() not in {b.lower() for b in have}:
                 os.environ["HANDS_FLASH_APPS"] = ",".join(have + [bundle])
-        # the driver may wait for a still Mac before a flash (HANDS_FLASH_WAIT_S), then act
+        # the driver may wait for a still Mac before a flash (HANDS_FLASH_WAIT_S, and never past the caller's
+        # deadline: caller_deadline), then act
+        deadline = getattr(self, "_caller_deadline", None)
         step = self._step_began(bundle, max_s=float(os.environ.get("HANDS_FLASH_WAIT_S", "60") or 60) + 120)
+        d.caller_deadline = deadline
         try:
             if getattr(self, "stopped", False) or STOP.is_set():   # read while this step was getting ready: nothing sent
-                return {"status": "error", "why": "stopped by the app"}
-            res: ExecResult = d.execute(a)
+                return {"status": "error", "performed": False, "why": "stopped by the app"}
+            late = self._too_late_to_start()
+            if late is not None:
+                # the reads before the action took the caller's time: nothing is sent that it would not hear of
+                return {**late, "window": window}
+            try:
+                # one step: what the driver sends in it is counted there (drivers/base.py), whichever driver it is
+                with input_scope(act_by(deadline)):
+                    try:
+                        res: ExecResult = d.execute(a)
+                    except StepExpired:           # a driver that does not end its own step on it
+                        release_all(in_place=True)
+                        res = step_expired_result()
+                    finally:
+                        release_all(in_place=True)  # nothing pressed is left held, whatever the driver did
+            except Exception as e:  # noqa: BLE001 -- thrown mid-action: what it sent before is not known
+                # unverified, never an error the layer above would read as "nothing went out". No mark is moved, as
+                # main moved none when the step threw (a doubt recorded during it is not wiped: InFlightAndTheMark)
+                return {"status": "unverified", "window": window,
+                        "why": f"the step raised {type(e).__name__}: {e} -- it may have acted; observe before doing "
+                               f"it again"}
         finally:
+            d.caller_deadline = None
             self._step_ended(step)
             if action.get("foreground_ok"):
                 if flash_before is None:
                     os.environ.pop("HANDS_FLASH_APPS", None)
                 else:
                     os.environ["HANDS_FLASH_APPS"] = flash_before
-        if res.ok and kind in self.SETTLE_KINDS and is_browser(bundle):
-            # a page loads after the action that asked for it, and its title changes when it has: waited for here, so
-            # the load lands before the layer above takes its after-action snapshot -- a title that changed later made
-            # the next step stale, eleven times in one search (rc.10, 10-21)
-            self._settle_title(window)
-        status = "ok" if res.ok else "unsupported" if res.unsupported else "error"
-        if res.ok and res.indeterminate:
-            status = "unverified"
-        out = {"status": status, "why": res.detail, "window": window}
-        # any action can open a window (a "new document" button in an open panel, cmd+N, a browser's pop-up). Two
-        # things are told apart (_created): which windows the driver may use and follow (the action's: absent before
-        # in any state, the acted app's, no input of the user's meanwhile), and which one the task made -- new_window,
-        # credited to the task upstream so steps in it ask no card -- which needs positive proof that it holds nothing
-        # of the user's; a window that appeared and is not claimed is told apart, with why
-        usable, made, appeared, wins = self._created(bundle, before, since)
-        for w in usable:
-            self._own(d, self._split(w["id"])[1])
-        if made is not None:
-            out["new_window"] = made
-        if appeared:
-            out["appeared"] = appeared
-        # the files receipt: what the driver knows it wrote, plus the window's own document when the app itself says
-        # it saved it during this action -- unsaved changes before (modified true), none after (false). A document
-        # that merely changed on disk is not credited: a sync program may have written it at that moment (PR #16
-        # review, eighth round). Read from the window, so no app is named here; the layer above credits a screen
-        # action's files by this alone and checks each path's version itself.
-        state1 = self._document(window, wins) if may_save else None
-        doc1 = state1[0] if state1 else None
-        files = list(res.files)
-        if doc1 and state0 and state0[1] is True and state1[1] is False and self._reportable(doc1):
-            # the digest of what the app holds (its document's text), never of the file on disk: a file another
-            # program rewrote after the app saved then fails the match upstream and stays unconfirmed. No text
-            # (an app that does not answer, a document that is not text): the path alone, told but not credited.
-            files.append((doc1, self._content_digest(window, wins)))
-        # `files: []` is a receipt too: this action could not have written a file (typing, scrolling). Around an
-        # action that could, the field is there only when a write is known; left out, the driver does not know
-        # (an app's own save panel in an app that says nothing of its document), and the layer above credits nothing.
-        if files:
-            seen: dict[str, str | None] = {}
-            for path, digest in files:
-                seen[path] = seen.get(path) or digest
-            out["files"] = [{"path": p, **({"sha256": seen[p]} if seen[p] else {})} for p in sorted(seen)]
-        elif not may_save:
-            out["files"] = []
-        if doc1:
-            out["document"] = doc1
-        if not self._input_by_source():
-            # The input this action itself sent is not the user's (PR #48, 10-19, before events could be told by
-            # their source). Where they can -- the tap watches keys, and the driver's own events are skipped by
-            # their source process (InputWatch.posted_by_us) -- the mark is not moved: moved, it wiped the user's
-            # own edit of the task's window during the action, and the next step was decided on a view it did not
-            # match (hands#62 re-review). Without the tap (the HID idle time) or without keys (a mouse-only tap
-            # counts key presses by the idle time), ours and theirs cannot be told apart: moved as before.
-            self._epoch_at = self._mark_now()
+        # From here the action has been handed to the driver: whatever the reads after it do, the reply never says
+        # "nothing went out". A read that throws (_settle_title, _created, _document, _windows) makes the step
+        # unverified with why, not an error the layer above would take for nothing done (review of hands#64).
+        try:
+            if res.ok and kind in self.SETTLE_KINDS and is_browser(bundle):
+                # a page loads after the action that asked for it, and its title changes when it has: waited for here, so
+                # the load lands before the layer above takes its after-action snapshot -- a title that changed later made
+                # the next step stale, eleven times in one search (rc.10, 10-21)
+                self._settle_title(window)
+            status = "ok" if res.ok else "unsupported" if res.unsupported else "user_busy" if res.deferred else "error"
+            if res.indeterminate:
+                # dispatched, outcome unknown -- whether the driver said ok or not (typing stopped part way, a step
+                # stopped after part of its input went): never "error", which reads as nothing done
+                status = "unverified"
+            out = {"status": status, "why": res.detail, "window": window}
+            if res.performed is False:
+                # the driver knows nothing was sent: a refusal before acting (stale, unsupported, waited out for the
+                # user, the deadline). A harness that does not know user_busy takes it as an error, as before
+                out["performed"] = False
+            # any action can open a window (a "new document" button in an open panel, cmd+N, a browser's pop-up). Two
+            # things are told apart (_created): which windows the driver may use and follow (the action's: absent before
+            # in any state, the acted app's, no input of the user's meanwhile), and which one the task made -- new_window,
+            # credited to the task upstream so steps in it ask no card -- which needs positive proof that it holds nothing
+            # of the user's; a window that appeared and is not claimed is told apart, with why
+            usable, made, appeared, wins = self._created(bundle, before, since)
+            for w in usable:
+                self._own(d, self._split(w["id"])[1])
+            if made is not None:
+                out["new_window"] = made
+            if appeared:
+                out["appeared"] = appeared
+            # the files receipt: what the driver knows it wrote, plus the window's own document when the app itself says
+            # it saved it during this action -- unsaved changes before (modified true), none after (false). A document
+            # that merely changed on disk is not credited: a sync program may have written it at that moment (PR #16
+            # review, eighth round). Read from the window, so no app is named here; the layer above credits a screen
+            # action's files by this alone and checks each path's version itself.
+            state1 = self._document(window, wins) if may_save else None
+            doc1 = state1[0] if state1 else None
+            files = list(res.files)
+            if doc1 and state0 and state0[1] is True and state1[1] is False and self._reportable(doc1):
+                # the digest of what the app holds (its document's text), never of the file on disk: a file another
+                # program rewrote after the app saved then fails the match upstream and stays unconfirmed. No text
+                # (an app that does not answer, a document that is not text): the path alone, told but not credited.
+                files.append((doc1, self._content_digest(window, wins)))
+            # `files: []` is a receipt too: this action could not have written a file (typing, scrolling). Around an
+            # action that could, the field is there only when a write is known; left out, the driver does not know
+            # (an app's own save panel in an app that says nothing of its document), and the layer above credits nothing.
+            if files:
+                seen: dict[str, str | None] = {}
+                for path, digest in files:
+                    seen[path] = seen.get(path) or digest
+                out["files"] = [{"path": p, **({"sha256": seen[p]} if seen[p] else {})} for p in sorted(seen)]
+            elif not may_save:
+                out["files"] = []
+            if doc1:
+                out["document"] = doc1
+            if not self._input_by_source():
+                # The input this action itself sent is not the user's (PR #48, 10-19, before events could be told by
+                # their source). Where they can -- the tap watches keys, and the driver's own events are skipped by
+                # their source process (InputWatch.posted_by_us) -- the mark is not moved: moved, it wiped the user's
+                # own edit of the task's window during the action, and the next step was decided on a view it did not
+                # match (hands#62 re-review). Without the tap (the HID idle time) or without keys (a mouse-only tap
+                # counts key presses by the idle time), ours and theirs cannot be told apart: moved as before.
+                self._epoch_at = self._mark_now()
+        except Exception as e:  # noqa: BLE001
+            # no mark is moved, as main moved none when a read here threw
+            gone = res.performed is False
+            return {"status": "error" if gone else "unverified", "window": window,
+                    "why": f"{res.detail}; reading the windows after the action failed ({type(e).__name__}: {e})"
+                           + ("" if gone else " -- it may have taken effect; observe before doing it again"),
+                    **({"performed": False} if gone else {})}
         # where main's mark went: a key counted only as main counted it, recorded before this, is wiped as on main
         self._action_end_at = self._mark_now()
         return out
+
+    def _too_late_to_start(self) -> dict | None:
+        """The reply for a step that may no longer start for its caller: past its deadline less DEADLINE_MARGIN_S
+        (base.act_by), the time kept for the action and the reads after it. None when it may start, or no caller set
+        a deadline."""
+        by = act_by(getattr(self, "_caller_deadline", None))
+        if by is None or time.time() <= by:
+            return None
+        return {"status": "error", "performed": False,
+                "why": "the caller's deadline came before the step could act; nothing was done"}
 
     def _doubt_after(self) -> float:
         return getattr(self, "_action_end_at", 0.0)
@@ -1034,7 +1142,9 @@ class HandsExecutor:
         fresh = [w for w in wins if w["id"] not in before and (w.get("bundle") or "") == bundle]
         if not fresh:
             return [], None, [], wins
-        if self._last_input_at() > since:
+        # input at the very instant the list was taken cannot be proved to come before it: counted (>=), so the
+        # window is not claimed -- the safe side (and with a microsecond clock the two reads can be equal)
+        if self._last_input_at() >= since:
             why = "the user's input reached an app the task operates while the action ran"
             return [], None, [{"id": w["id"], "why": why} for w in fresh], wins
         listed = self.__dict__.setdefault("_listed", set())
@@ -1127,7 +1237,7 @@ class HandsExecutor:
                 # in the background (-g): opening an app is no reason to take the front from the user; it comes
                 # forward only for a step, by the flash's rules (the user still, the step allowed) -- `open -b` did
                 # take it, and a music app kept jumping in front of the user's work (rc.10, 10-21)
-                subprocess.run(["open", "-g", "-b", bundle], capture_output=True, timeout=20)
+                subprocess.run(["open", "-g", "-b", bundle], capture_output=True, timeout=self.OPEN_CMD_S)
                 launched = self._launch_windows(bundle, before_launch, self.LAUNCH_WAIT_S)
                 if front_before and front_before != bundle and self._front_bundle_id() == bundle:
                     # some apps take the front on their first launch whatever -g says: given back at once
@@ -1135,7 +1245,7 @@ class HandsExecutor:
             finally:
                 front_given_back(taken)
                 self._step_ended(step)
-            self._settled(bundle)
+            self._settled(bundle, self.SETTLED_S)
         d = self._driver(bundle)      # started now, so the windows it finds are the ones there before the task's
         before = self._known_windows()
         # A window this open's launch brought up is one the task opened (opened_window): the task may look at it,
@@ -1181,14 +1291,14 @@ class HandsExecutor:
                 return {"status": "unverified", "window": window,
                         "why": f"the task's own browser window is there, but {url} could not be confirmed loaded in it"}
         elif url:
-            subprocess.run(["open", "-g", "-b", bundle, url], capture_output=True, timeout=20)
-            fresh = self._fresh_windows(before, 2.5, bundle)
+            subprocess.run(["open", "-g", "-b", bundle, url], capture_output=True, timeout=self.OPEN_CMD_S)
+            fresh = self._fresh_windows(before, self.FRESH_S - 0.5, bundle)
         else:
             # the app's own scripting only: cmd+N goes to whichever app is in front, the user's included, and a
             # check that it is this app races with the user switching (hands #55 review)
             proof = self._new_document(bundle)
         if proof:
-            fresh = [w for w in self._fresh_windows(set(), 3, bundle) if self._split(w["id"])[1] == str(proof)]
+            fresh = [w for w in self._fresh_windows(set(), self.FRESH_S, bundle) if self._split(w["id"])[1] == str(proof)]
         if not fresh:
             return {"status": "unverified", "why": f"{app} ({bundle}) was asked to open a window; none appeared"}
         w = fresh[-1]
@@ -1260,7 +1370,7 @@ class HandsExecutor:
                   'repeat with w in windows\ntry\nif document of w is d then return id of w\nend try\nend repeat\n'
                   'try\nreturn id of window 1\nend try\nreturn ""\nend tell')
         try:
-            p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=20)
+            p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=self.OPEN_CMD_S)
         except (OSError, subprocess.TimeoutExpired):
             return None
         out = (p.stdout or "").strip() if p.returncode == 0 else ""
@@ -1286,6 +1396,19 @@ class HandsExecutor:
 
     #: How long a launched app is waited for to show its first window.
     LAUNCH_WAIT_S = 20.0
+    #: The bound on one `open -g` or one `make new document` (osascript).
+    OPEN_CMD_S = 20.0
+    #: How long a just-launched app's windows are given to stop changing (_settled).
+    SETTLED_S = 10.0
+    #: How long a window asked for is looked for (_fresh_windows).
+    FRESH_S = 3.0
+    #: The longest an open_window takes, start to reply, along its real path: the launch (`open -g`, OPEN_CMD_S), its
+    #: windows waited for (LAUNCH_WAIT_S) and settling (SETTLED_S), then the window asked of the app (`open -g` with
+    #: the url, or `make new document`, OPEN_CMD_S) and looked for (FRESH_S): 73 s. It does not start with less left.
+    #: (A browser's own window and its page check go through the browser's scripting, each call bounded; a browser
+    #: that answers slowly to every one of them can take longer, and the caller then records it unverified.)
+    OPEN_WINDOW_WORST_S = OPEN_CMD_S + LAUNCH_WAIT_S + SETTLED_S + OPEN_CMD_S + FRESH_S
+
 
     def _launch_windows(self, bundle: str, before: set, seconds: float) -> list[dict]:
         """The windows of `bundle` that appeared after its launch: waited for up to `seconds` until the first, then a
@@ -1402,12 +1525,30 @@ def main() -> None:
         requests.put(None)
 
     threading.Thread(target=read, name="requests", daemon=True).start()
+    # A wait for the user inside a request is told as a JSON event line ({"event": "user_wait" | "user_resumed",
+    # "req": the request's id, ...}), under the reply lock: the plain HANDS_WAIT line the CLI prints was not JSON and
+    # harness dropped it. No "id" key: a harness that does not know events reads no reply into it.
+    set_wait_sink(lambda kind, body: write({"event": kind, "req": state.get("rid"), **body}))
     while True:
         req = requests.get()
         if req is None:
             break
         rid, op = req.get("id"), req.get("op")
+        state["rid"] = rid
         ex = state["ex"]
+        # `deadline_ms` (Unix ms, optional): when the caller stops waiting for this reply. A request read too late
+        # for it (queued behind one that took long) is not carried out: a perform past the deadline less the margin
+        # for acting (base.act_by, as every step's own check), a look past the deadline itself.
+        dl = req.get("deadline_ms")
+        deadline = float(dl) / 1000 if isinstance(dl, (int, float)) and not isinstance(dl, bool) else None
+        if op == "perform" and deadline is not None and time.time() > act_by(deadline):
+            write({"id": rid, "ok": True, "result": {"status": "error", "performed": False,
+                                                     "why": "read too late for the caller's deadline; nothing was done"}})
+            continue
+        if op == "observe" and deadline is not None and time.time() > deadline - OBSERVE_MARGIN_S:
+            write({"id": rid, "ok": False, "error": "read after the caller's deadline; not looked at"})
+            continue
+        extra = {"deadline": deadline} if deadline is not None else {}
         try:
             if op == "begin":
                 ex = state["ex"] = HandsExecutor(Path(req["scratch"]) if req.get("scratch") else None, Path(req["workspace"]) if req.get("workspace") else None)
@@ -1419,10 +1560,10 @@ def main() -> None:
             elif op == "snapshot":
                 res = ex.snapshot()
             elif op == "observe":
-                res = ex.observe(req["window"], bool(req.get("screenshot")))
+                res = ex.observe(req["window"], bool(req.get("screenshot")), **extra)
             elif op == "perform":
-                res = (ex.perform(req["action"], req.get("shot") or None, bool(req.get("frames")))
-                       if req.get("shot") or req.get("frames") else ex.perform(req["action"]))
+                res = (ex.perform(req["action"], req.get("shot") or None, bool(req.get("frames")), **extra)
+                       if req.get("shot") or req.get("frames") or extra else ex.perform(req["action"]))
             elif op == "end":
                 res = ex.end()
             else:
@@ -1430,6 +1571,8 @@ def main() -> None:
             write({"id": rid, "ok": True, "result": res})
         except Exception as e:  # noqa: BLE001 -- every failure is reported to the caller, the process stays up
             write({"id": rid, "ok": False, "error": f"{type(e).__name__}: {e}"})
+        state["rid"] = None
+    set_wait_sink(None)
 
 
 if __name__ == "__main__":

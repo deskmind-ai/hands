@@ -47,6 +47,8 @@ from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, vision_elements
 from . import keys
 from .session import MESSAGES as SESSION_BLOCKED, gui_session, require_usable
 from .base import (USER_BUSY, Driver, DriverUnavailable, Element, ExecResult, Observation, effect_notes,
+                   MaybeSent, NothingSent, StepExpired, act_by, counted, input_scope, note_pressed, note_released,
+                   release_all, releasing, sends_so_far, step_expired_result, tell_wait, time_left, uncounted,
                    WindowRef)
 
 #: Verified against `peekaboo help <cmd>` for 4.3.1. Collected here so a CLI
@@ -237,6 +239,11 @@ PROJECTION = os.environ.get("HANDS_PROJECTION", "1") != "0"
 WEB_SEARCH = "syn:websearch"
 
 MCP_ROUTED = {"see", "see_window", "click_on", "click_on_fg"}
+#: Commands that only read, or only bring a window forward (not counted as sent: base.NothingSent). Every other
+#: command acts on an app and is counted before it runs (_run) -- `activate` and `activate_by_name` too: `app
+#: launch` starts an app that is not running.
+READ_ONLY_COMMANDS = {"see", "see_window", "window_list", "window_list_of", "permissions", "menu_list",
+                      "window_focus"}
 
 
 
@@ -713,6 +720,65 @@ def _transient_read(detail: str) -> bool:
     return transient(detail)
 
 
+
+def _post(Q, tap, event, press=None, release=None) -> None:
+    """Every event this driver posts (see the rest below). `press`: (key, let_go) -- a down whose up must follow,
+    remembered until it does (base.release_all lets it go whatever ends the step). `release`: the key of an up -- the
+    completion of input already started, never refused by the deadline (base.releasing)."""
+    if release is not None:
+        with releasing():
+            _post_one(Q, tap, event)
+        note_released(release)
+        return
+    if press is None:
+        _post_one(Q, tap, event)
+        return
+    # Remembered BEFORE the first OS call that could deliver the down: a route with two transports (BackgroundQuartz
+    # sends a mouse down by SkyLight, then by CGEventPostToPid) may have delivered it by the first when the deadline
+    # refuses the second (Codex on hands#64 @b28b957). Let go unless this call made no send at all -- refused before
+    # any transport, nothing went, and an up then would turn "nothing sent" into "sent". An extra up is harmless.
+    note_pressed(*press)
+    before = sends_so_far()
+    try:
+        _post_one(Q, tap, event)
+    except BaseException:
+        if sends_so_far() == before:
+            note_released(press[0])
+        raise
+
+
+def _mouse_up(Q, make, at, button) -> callable:
+    """The let-go of a mouse button pressed at `at`: its up, there -- or, `in_place` (the last-resort release, after
+    the pointer was put back), where the pointer now is, so letting go never moves it. A window-targeted route
+    (BackgroundQuartz) does not move the pointer: its up keeps the click's place."""
+    def let_go(in_place: bool = False):
+        where = at
+        if in_place and not getattr(Q, "counts_own_posts", False):
+            try:
+                where = Q.CGEventGetLocation(Q.CGEventCreate(None))
+            except Exception:  # noqa: BLE001 -- unknown: the click's place, as before
+                where = at
+        _post(Q, Q.kCGHIDEventTap, make(where), release=button)
+    return let_go
+
+
+def _post_one(Q, tap, event) -> None:
+    """Every event this driver posts: counted as sent before it goes (base.counted) -- a BackgroundQuartz counts its
+    own, after its key check, so a key it refuses before posting is not counted."""
+    if getattr(Q, "counts_own_posts", False):
+        Q.CGEventPost(tap, event)
+    else:
+        counted(lambda: Q.CGEventPost(tap, event))
+
+
+def _sh(cmd: list, sends: bool = True, **kw):
+    """A command run for the driver. `sends`: it tells an app to do something (open a document or a URL, launch, a
+    scripted change) -- counted as sent before it runs. Reads, and bringing an app forward, are not."""
+    if not sends:
+        with uncounted():
+            return subprocess.run(cmd, **kw)
+    return counted(lambda: subprocess.run(cmd, **kw))
+
 class PeekabooDriver:
     name = "peekaboo"
 
@@ -835,6 +901,8 @@ class PeekabooDriver:
 
     def _run(self, key: str, _extra: list[str] | None = None, **fmt) -> tuple[bool, dict, str]:
         """Run one command and unwrap Peekaboo's ``{success, data, error}`` envelope."""
+        if key not in READ_ONLY_COMMANDS:
+            counted(lambda: None)    # a command that acts on an app: counted as sent before it runs, whatever comes back
         if self._mcp is not None and key in MCP_ROUTED:
             return self._run_mcp(key, _extra or [], **fmt)
         # --no-remote on every command, not just captures. A live Bridge daemon refuses every capture on this
@@ -1055,7 +1123,7 @@ class PeekabooDriver:
                     root = self._q(str(Path(os.path.realpath(str(self.ws)))) + "/")
                     ours = None
                     for _ in range(10):
-                        ok_n, out = self._osa('tell application "Finder"\n'
+                        ok_n, out = self._osa_read('tell application "Finder"\n'
                                               '  repeat with i from 1 to count of Finder windows\n'
                                               '    try\n'
                                               '      set t to POSIX path of ((target of Finder window i) as alias)\n'
@@ -1113,7 +1181,7 @@ class PeekabooDriver:
         try:
             if taken and front_before and self._mcp is not None:
                 self._foreground_actions += 1
-                self._osa(f'tell application "{self._q(front_before)}" to activate')
+                self._osa_forward(f'tell application "{self._q(front_before)}" to activate')
         finally:
             for token in tokens:
                 self._front_given_back(token)
@@ -1179,7 +1247,7 @@ class PeekabooDriver:
         user's (a restored session holds the user's tabs)."""
         # Safari reads -ApplePersistenceIgnoreState; a Chromium browser would take "YES" for a page to open.
         extra = ["--args", "-ApplePersistenceIgnoreState", "YES"] if bundle.lower() == "com.apple.safari" else []
-        subprocess.run(["/usr/bin/open", "-g", "-b", bundle, *extra], capture_output=True, timeout=15)
+        _sh(["/usr/bin/open", "-g", "-b", bundle, *extra], capture_output=True, timeout=15)
         for _ in range(20):
             if self._app_is_running(bundle):
                 break
@@ -1319,7 +1387,7 @@ class PeekabooDriver:
                             f"({(out or '').strip()[:200]})")
             return False
         for _ in range(10):
-            ok_u, now = self._osa(f'tell application id "com.apple.Safari" to get URL of {target}')
+            ok_u, now = self._osa_read(f'tell application id "com.apple.Safari" to get URL of {target}')
             if ok_u and now.strip() and not now.strip().lower().startswith("data:"):
                 self.__dict__.setdefault("_load_misses", {}).pop("com.apple.safari", None)
                 return True
@@ -1628,15 +1696,15 @@ class PeekabooDriver:
         allowed, self._browser_field_allowed = getattr(self, "_browser_field_allowed", None), None
         bar, r = getattr(self, "_address_bar", None), getattr(self, "_address_bar_rect", None)
         if bar is None or r is None:
-            return ExecResult(False, "this window shows no address bar to search from")
+            return ExecResult(False, NothingSent("this window shows no address bar to search from"))
         if allowed != WEB_SEARCH:
-            return ExecResult(False, "not searched from the address bar: what is typed there goes to a website, and "
-                                     "nothing judged that this text belongs there")
+            return ExecResult(False, NothingSent("not searched from the address bar: what is typed there goes to a "
+                                                 "website, and nothing judged that this text belongs there"))
         if not self._background_keys():
             # Not an app list: every step below is checked by reading back (the window proven key, the focus on this
             # window's address bar before the paste and before Return), and a check that fails sends nothing more.
-            return ExecResult(False, "not searched: the address bar is typed into only in the background, and "
-                                     "background input is off or not available on this Mac")
+            return ExecResult(False, NothingSent("not searched: the address bar is typed into only in the background, "
+                                                 "and background input is off or not available on this Mac"))
         moved = self._moved_since_seen()
         if moved:
             return ExecResult(False, moved, stale=True)
@@ -1653,9 +1721,9 @@ class PeekabooDriver:
         bg = self._background_quartz(self.app, observed_only=True)
         if bg is None:
             refused = getattr(self, "_bg_refused", None)
-            return ExecResult(False, f"not searched: {refused}" if refused else
-                              "not searched: the window this run observes was not found, and no other window is "
-                              "typed into")
+            return ExecResult(False, NothingSent(f"not searched: {refused}" if refused else
+                                                 "not searched: the window this run observes was not found, and no "
+                                                 "other window is typed into"))
         q, token = bg
         text = action.text or ""
         x, y = self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2
@@ -1681,9 +1749,14 @@ class PeekabooDriver:
                 res = self._settle(True, f"searched {text!r} from the address bar (in the background)")
         except skylight.WindowKeyRefused as exc:
             # No key reaches the app while the user is on it (or the run's window stopped being its key window):
-            # the user's own field would take them. Deferred, as any step that waits for the user.
-            res = ExecResult(False, f"{USER_BUSY}; not searched: {exc} -- wait")
+            # the user's own field would take them. Not "user busy, nothing done": the click into the address bar,
+            # and cmd+A / cmd+V, may already have gone when a later key was refused -- unverified, looked at before
+            # searching again (review of hands#64).
+            res = ExecResult(True, indeterminate=True,
+                             detail=f"the address bar may have been clicked and {text!r} pasted, but a key was refused "
+                                    f"({exc}), so the search may not have been made -- observe before searching again")
         finally:
+            release_all()   # what this step still holds down is let go first, before anything is given back
             skylight.give_focus_back(token)
         return self._with_key_note(res, token)
 
@@ -1706,6 +1779,7 @@ class PeekabooDriver:
             time.sleep(0.4)
             return True
         finally:
+            release_all()   # what this step still holds down is let go first, before anything is given back
             pb.clearContents()
             items = []
             for d in saved:
@@ -1848,7 +1922,7 @@ class PeekabooDriver:
                   '  end repeat\n'
                   'end tell')
         try:
-            subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=10)
+            _sh(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             return False
         return wid not in self._window_ids()
@@ -2128,14 +2202,14 @@ class PeekabooDriver:
         if not before:
             # An empty read is flakiness -- unless Finder really has no window, which is common and was paid for
             # with a blind 0.8 s wait on every such start. Finder is asked directly first.
-            ok_n, n = self._osa('tell application "Finder" to count of Finder windows')
+            ok_n, n = self._osa_read('tell application "Finder" to count of Finder windows')
             if not (ok_n and n.strip() == "0"):
                 self._incomplete_reads += 1
                 time.sleep(0.3)
                 before = self._window_ids()
         # -g: open without bringing Finder forward. Staging used to be where most of the visible focus theft came
         # from -- every task began by raising a window over whatever the user was doing.
-        subprocess.run(["/usr/bin/open", "-g", str(self.ws)], capture_output=True, timeout=15)
+        _sh(["/usr/bin/open", "-g", str(self.ws)], capture_output=True, timeout=15)
         wid = None
         # Polled, not slept on: each check is itself a Peekaboo call (~0.25 s), so a short pause between checks is
         # enough; the window usually exists by the first or second look. Same ~4 s budget as before.
@@ -2172,7 +2246,7 @@ class PeekabooDriver:
                   '  end repeat\n'
                   'end tell')
         try:
-            subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=10)
+            _sh(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             pass
         # The view switch is drawn by the time the osascript returns; the first observation retries on an
@@ -2209,7 +2283,7 @@ class PeekabooDriver:
         what `tell application ... to activate` takes; the bundle id is what the task's apps are known by (self.app,
         app_bundle) -- a name compared with a bundle id never matched an app outside a hard-coded few (hands#62
         review: the music app coming forward by itself was never told to the input watch)."""
-        ok, out = self._osa('tell application "System Events"\nset p to first process whose frontmost is true\n'
+        ok, out = self._osa_read('tell application "System Events"\nset p to first process whose frontmost is true\n'
                             'return (bundle identifier of p as text) & linefeed & (name of p)\nend tell')
         if not ok or not out:
             return "", ""
@@ -2217,9 +2291,21 @@ class PeekabooDriver:
         bundle = "" if bundle.strip() == "missing value" else bundle.strip()
         return name.strip(), bundle
 
+    def _osa_read(self, script: str) -> tuple[bool, str]:
+        """An AppleScript that only reads (a window list, a document's path, whether it is modified): not a send."""
+        with uncounted():
+            return self._osa(script)
+
+    def _osa_forward(self, script: str) -> tuple[bool, str]:
+        """An AppleScript that only brings an app or a window forward, or gives that back: not a send (NothingSent)."""
+        with uncounted():
+            return self._osa(script)
+
     def _osa(self, script: str) -> tuple[bool, str]:
+        """One AppleScript: it tells an app to do something, so it is counted as sent before it runs -- unless it is
+        made through _osa_read or _osa_forward."""
         try:
-            p = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=15)
+            p = _sh(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=15)
         except (OSError, subprocess.SubprocessError) as exc:
             return False, str(exc)
         return p.returncode == 0, (p.stdout.strip() or p.stderr.strip())
@@ -2231,7 +2317,7 @@ class PeekabooDriver:
     def _finder_folder(self) -> Path | None:
         """The folder the observed Finder window shows: by its title, preferring one inside the workspace."""
         title = self._q(self._window_title or self.ws.name)
-        ok, out = self._osa('tell application "Finder"\n'
+        ok, out = self._osa_read('tell application "Finder"\n'
                             '  set out to ""\n'
                             '  repeat with i from 1 to (count of Finder windows)\n'
                             '    set w to Finder window i\n'
@@ -2719,26 +2805,30 @@ class PeekabooDriver:
         import Quartz
         # The user being busy is not the planner's failure: told "not made", the 4B chose 发送 again, then wandered
         # into the message box until the run ended as a loop. The driver waits (up to 60 s) instead.
-        deadline = time.time() + 60
+        deadline = self._wait_until(60.0)
         t_wait = time.time()
         while True:
             if STOP.is_set():
                 self._add_wait(time.time() - t_wait)
-                return ExecResult(False, "stopped by the app; nothing was done")
+                return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
             prev = self._front_bundle()
             idle = hid_idle_seconds()
             if prev != CHAT_APP and idle >= 3:
                 break
             if time.time() > deadline:
                 self._add_wait(time.time() - t_wait)
-                return ExecResult(False, f"{USER_BUSY} (in the chat app, or typing); the click was not made -- wait")
+                return ExecResult(False, self._too_late(True)
+                                  or f"{USER_BUSY} (in the chat app, or typing); the click was not made -- wait")
             time.sleep(1)
         self._add_wait(time.time() - t_wait)
+        late = self._too_late(time.time() - t_wait > 0.5)
+        if late:
+            return ExecResult(False, late)
         moved = self._moved_since_seen()
         if moved:
             return ExecResult(False, moved, stale=True)
         if STOP.is_set():
-            return ExecResult(False, "stopped by the app; nothing was done")
+            return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
         r = self._rects[eid]
         x, y = self._origin.x + r.x + r.w / 2, self._origin.y + r.y + r.h / 2
         cur = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
@@ -2751,21 +2841,36 @@ class PeekabooDriver:
         # give-back, whatever happened.
         token = self._front_taken(CHAT_APP, t0)
         try:
-            subprocess.run(["/usr/bin/open", "-b", CHAT_APP], capture_output=True, timeout=10)
+            self._raise_app(CHAT_APP)
             for _ in range(30):
                 if self._front_bundle() == CHAT_APP:
                     break
+                left = time_left()
+                if left is not None and left <= 0:       # the wait ends in time; nothing is clicked late
+                    return ExecResult(False, NothingSent("the caller's deadline came while the chat app was coming "
+                                                         "forward; nothing was clicked"))
                 time.sleep(0.05)
             else:
                 return ExecResult(False, "the chat app did not come to the front; nothing was clicked")
             arrived = True
             time.sleep(0.15)
+            button = ("mouse", "left")
+
+            def mouse(kind):
+                return Quartz.CGEventCreateMouseEvent(None, kind, (x, y), Quartz.kCGMouseButtonLeft)
             for kind in (Quartz.kCGEventMouseMoved, Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
-                Quartz.CGEventPost(Quartz.kCGHIDEventTap,
-                                   Quartz.CGEventCreateMouseEvent(None, kind, (x, y), Quartz.kCGMouseButtonLeft))
+                if kind == Quartz.kCGEventLeftMouseDown:
+                    _post(Quartz, Quartz.kCGHIDEventTap, mouse(kind), press=(button, _mouse_up(
+                        Quartz, lambda at: Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp, at,
+                                                                          Quartz.kCGMouseButtonLeft), (x, y), button)))
+                elif kind == Quartz.kCGEventLeftMouseUp:
+                    _post(Quartz, Quartz.kCGHIDEventTap, mouse(kind), release=button)
+                else:
+                    _post(Quartz, Quartz.kCGHIDEventTap, mouse(kind))
                 time.sleep(0.05)
             time.sleep(0.2)
         finally:
+            release_all()   # what this step still holds down is let go first, before anything is given back
             try:
                 Quartz.CGWarpMouseCursorPosition(cur)
                 Quartz.CGAssociateMouseAndMouseCursorPosition(True)
@@ -2795,6 +2900,31 @@ class PeekabooDriver:
         except (OSError, ValueError):
             return False
 
+    def _act_by(self) -> float | None:
+        """The last moment a step may still start acting for its caller, epoch seconds: the caller's deadline
+        (`caller_deadline`, set by the executor from the request's `deadline_ms`) less base.DEADLINE_MARGIN_S. None
+        when no caller set one (`hands do`): then only HANDS_FLASH_WAIT_S bounds a wait, as before."""
+        return act_by(getattr(self, "caller_deadline", None))
+
+    def _wait_until(self, env_s: float) -> float:
+        """When a wait for a still Mac gives up: `env_s` from now, or the caller's _act_by if that comes first. The
+        caller stops listening at its deadline; a wait past it ended in an action nobody was waiting for (rc.14: the
+        caller gave up at 120 s and recorded an error, and the search box was filled 18 s later)."""
+        until = time.time() + env_s
+        by = self._act_by()
+        return until if by is None else min(until, by)
+
+    def _too_late(self, waited: bool) -> str | None:
+        """Why the step must not act now, or None: past the caller's _act_by, nothing is sent. Said as the user's
+        when the step was waiting for them (USER_BUSY: the run treats it as theirs, not a fault), else plainly."""
+        by = self._act_by()
+        if by is None or time.time() <= by:
+            return None
+        if waited:
+            return NothingSent(f"{USER_BUSY}; the step was not carried out before the caller's deadline (the Mac was "
+                               f"not still in time) -- nothing was done; wait")
+        return NothingSent("the caller's deadline came before the step could act; nothing was done")
+
     def _flash(self, bundle: str, perform, what: str = "") -> tuple[bool, str]:
         """Bring `bundle` forward for as long as `perform()` takes, then give the user's app the front back.
 
@@ -2804,6 +2934,8 @@ class PeekabooDriver:
         for that -- up to HANDS_FLASH_WAIT_S (60 s by default; the app allows a long wait, since a person at their
         Mac is not a failure) -- and says so on stdout (`HANDS_WAIT`, then `HANDS_RESUME`) so the app can show
         "paused while you use your Mac". While the user has handed the screen over (_takeover) it does not wait.
+        Never past the caller's deadline (`caller_deadline`, less the margin for the action: _act_by): there the
+        wait ends as USER_BUSY with nothing sent, and nothing is brought forward or sent after it.
         If the user touches anything while the app is being brought forward, the step is abandoned before any
         input is sent, the front is given back, and the wait starts again."""
         if self._background_input(bundle):
@@ -2813,7 +2945,7 @@ class PeekabooDriver:
             # move the mouse, and it is given back straight after. Kept, it left the user typing into nothing.
             waited = self._wait_until_still(bundle, what)
             if waited is not None:
-                return False, waited
+                return False, NothingSent(waited)
             bg = self._background_quartz(bundle)
             if bg is not None:
                 q, token = bg
@@ -2821,19 +2953,31 @@ class PeekabooDriver:
                 t0 = time.time()
                 if STOP.is_set():
                     skylight.give_focus_back(token)
-                    return False, "stopped by the app; nothing was done"
+                    return False, NothingSent("stopped by the app; nothing was done")
+                late = self._too_late(False)
+                if late:
+                    skylight.give_focus_back(token)
+                    return False, NothingSent(late)
                 refused = None
+                sent_before = sends_so_far()
                 try:
                     detail = perform(q)
                 except skylight.WindowKeyRefused as exc:
-                    refused = exc       # a key while the user is on the app (or the window lost key): none was sent
+                    refused = exc       # a key while the user is on the app (or the window lost key): that one not sent
                 finally:
+                    release_all()   # what this step still holds down is let go first, before anything is given back
                     skylight.give_focus_back(token)
                 note = token.note() if hasattr(token, "note") else ""
                 if refused is None:
                     return True, (f"{detail} (in the background, {bundle} not brought forward, "
                                   f"{time.time() - t0:.1f}s)" + (f"; {note}" if note else ""))
-                # Falls through to the path below, as with no background route: its own waits and flash rules.
+                if sends_so_far() > sent_before:
+                    # Some of the step went before the refused key (a click, a paste: counted where they were sent):
+                    # no other route now -- the front route would do it again (review of hands#64 round 5).
+                    return False, MaybeSent(f"part of the step went to {bundle} in the background before a key was "
+                                            f"refused ({refused}) -- it may have taken effect; observe before doing "
+                                            f"it again")
+                # Nothing went: falls through to the path below, as with no background route (its own waits and rules).
         allowed = {b.strip().lower() for b in os.environ.get("HANDS_FLASH_APPS", "").split(",") if b.strip()}
         browser = bundle.lower() in self.BROWSERS
         if browser and not (bundle.lower() in allowed and self._in_own_browser_window(bundle)):
@@ -2842,14 +2986,14 @@ class PeekabooDriver:
             # for this step (foreground_ok), and then by raising that window through the browser's scripting and
             # activating the app without a reopen (_bring_forward), checked before anything is sent (rc.10, 10-21:
             # a field in the run's own Chrome window could not be typed into).
-            return False, (f"not done: {bundle} is brought to the front only for the run's own window, when this "
-                           f"step is allowed to; the step could not be delivered in the background")
+            return False, NothingSent((f"not done: {bundle} is brought to the front only for the run's own window, when this "
+                           f"step is allowed to; the step could not be delivered in the background"))
         if bundle.lower() not in allowed:
-            return False, f"{bundle} only responds in the foreground, which this run is not allowed to use"
+            return False, NothingSent(f"{bundle} only responds in the foreground, which this run is not allowed to use")
         if STOP.is_set():
-            return False, "stopped by the app; nothing was done"
+            return False, NothingSent("stopped by the app; nothing was done")
         import Quartz
-        deadline = time.time() + float(os.environ.get("HANDS_FLASH_WAIT_S", "60"))
+        deadline = self._wait_until(float(os.environ.get("HANDS_FLASH_WAIT_S", "60")))
         waited = False
         # How long the user must have been still. It doubles each time they touch something while the app is being
         # brought forward (to 30 s): at a flat 3 s the app jumped forward and back again every few seconds while
@@ -2866,7 +3010,14 @@ class PeekabooDriver:
             if STOP.is_set():
                 if waited:
                     self._resumed()
-                return False, "stopped by the app; nothing was done"
+                return False, NothingSent("stopped by the app; nothing was done")
+            # Past the caller's deadline nothing is brought forward or sent, still Mac or not: the caller has given up
+            # on this step (or is about to), and an effect it never hears of is one it may do again.
+            late = self._too_late(waited)
+            if late:
+                if waited:
+                    self._resumed()
+                return False, NothingSent(late)
             prev = self._front_bundle()
             if browser and prev.lower() == bundle.lower() and not self._takeover():
                 # the user is in this browser: raising the run's window there would cover the page they are on
@@ -2875,7 +3026,8 @@ class PeekabooDriver:
                 if time.time() > deadline:
                     if waited:
                         self._resumed()
-                    return False, f"{USER_BUSY} (in {bundle}); the step was not carried out -- wait"
+                    return False, NothingSent((self._too_late(True)
+                                   or f"{USER_BUSY} (in {bundle}); the step was not carried out -- wait"))
                 waited = self._announce_wait(waited, bundle, what)
                 time.sleep(1)
                 continue
@@ -2905,7 +3057,7 @@ class PeekabooDriver:
                         self._front_given_back(token)
                     if restore:
                         try:
-                            self._osa(f'tell application id "{self._q(bundle)}" to set index of window id {restore} to 1')
+                            self._osa_forward(f'tell application id "{self._q(bundle)}" to set index of window id {restore} to 1')
                         except Exception:  # noqa: BLE001
                             pass
                 retry, sent, ime, brought, arrived = False, False, None, False, False
@@ -2924,13 +3076,17 @@ class PeekabooDriver:
                         token = self._front_taken(bundle, t0)
                     brought = self._bring_forward(bundle, browser)
                     if not brought:
-                        return False, f"the run's own {bundle} window could not be raised; nothing was done"
+                        return False, NothingSent(f"the run's own {bundle} window could not be raised; nothing was done")
                     for _ in range(30):
                         if self._front_bundle().lower() == bundle.lower():
                             break
+                        left = time_left()
+                        if left is not None and left <= 0:   # the wait ends in time; nothing is sent late
+                            return False, NothingSent(f"the caller's deadline came while {bundle} was coming forward; "
+                                                      f"nothing was done")
                         time.sleep(0.05)
                     else:
-                        return False, f"{bundle} did not come to the front; nothing was done"
+                        return False, NothingSent(f"{bundle} did not come to the front; nothing was done")
                     arrived = True
                     time.sleep(0.15)
                     # Touched while it came forward -- any input since the idle check, the spectator's too: nothing
@@ -2940,16 +3096,21 @@ class PeekabooDriver:
                         continue
                     if browser and not self._own_window_in_front(bundle):
                         # the run's own window is not the one in front (the user's came up): nothing is sent into it
-                        return False, f"the run's own {bundle} window could not be put in front; nothing was done"
+                        return False, NothingSent(f"the run's own {bundle} window could not be put in front; "
+                                                  f"nothing was done")
                     if waited:
                         self._resumed()
                     if STOP.is_set():
-                        return False, "stopped by the app; nothing was done"
+                        return False, NothingSent("stopped by the app; nothing was done")
+                    late = self._too_late(waited)     # bringing it forward took the last of the caller's time
+                    if late:
+                        return False, NothingSent(late)
                     self._foreground_actions += 1
                     ime = _ascii_input_source()
                     sent = True
                     detail = perform(Quartz)
                 finally:
+                    release_all()   # what this step still holds down is let go first, before anything is given back
                     if ime is not None:
                         try:
                             ime.restore()
@@ -2969,7 +3130,7 @@ class PeekabooDriver:
             if time.time() > deadline:
                 if waited:
                     self._resumed()
-                return False, f"{USER_BUSY}; the step was not carried out -- wait"
+                return False, NothingSent(self._too_late(True) or f"{USER_BUSY}; the step was not carried out -- wait")
             waited = self._announce_wait(waited, bundle, what)
             time.sleep(1)
 
@@ -3072,7 +3233,14 @@ class PeekabooDriver:
                 # stdout): skipped instead, a select stayed optionless for as long as the user kept working, and a
                 # run whose next step was to choose the category could not -- an oracle drive gave up on it as
                 # unreachable (09-30). Only a wait that runs out leaves it for the next look.
-                if self._wait_until_still(self.app, f"read the choices of {e.label!r}") is not None:
+                # With a caller's deadline the pop-ups of one look share it (an absolute time): a wait that ran out
+                # leaves every later pop-up unread at once, never a wait each -- rc.14 found a look could take tens of
+                # minutes at HANDS_FLASH_WAIT_S per pop-up. What was not read is said in the observation.
+                why = self._wait_until_still(self.app, f"read the choices of {e.label!r}")
+                if why is not None:
+                    if getattr(self, "caller_deadline", None) is not None:
+                        self.__dict__.setdefault("wait_notes", []).append(
+                            f"the choices of {e.label!r} were not read: {why}")
                     continue
                 cache[key] = [o for o in axpopup.options(pop["el"]) if not self.POPUP_PROMPT.search(o)]
             if cache[key]:
@@ -3094,28 +3262,32 @@ class PeekabooDriver:
         return self._settle(ok, f"{detail} in {self._labels_by_id.get(eid, eid)!r} (in the background)")
 
     def _wait_until_still(self, bundle: str, what: str = "") -> str | None:
-        """Wait (up to HANDS_FLASH_WAIT_S) until the user has not touched the keyboard or mouse for a moment, saying
-        so on stdout as the flash does; None when it is fine to go on, else why not. No wait while the user has
-        handed the screen over (_takeover)."""
+        """Wait (up to HANDS_FLASH_WAIT_S, and never past the caller's _act_by) until the user has not touched the
+        keyboard or mouse for a moment, saying so as the flash does; None when it is fine to go on, else why not. No
+        wait while the user has handed the screen over (_takeover)."""
         if self._takeover():
-            return None
-        deadline = time.time() + float(os.environ.get("HANDS_FLASH_WAIT_S", "60"))
+            return self._too_late(False)
+        deadline = self._wait_until(float(os.environ.get("HANDS_FLASH_WAIT_S", "60")))
         still = float(os.environ.get("HANDS_BG_STILL_S", "5"))
         waited = False
         while self._hid_idle() < still:
             if STOP.is_set():
                 if waited:
                     self._resumed()
-                return "stopped by the app; nothing was done"
+                return NothingSent("stopped by the app; nothing was done")
             if time.time() > deadline:
                 if waited:
                     self._resumed()
-                return f"{USER_BUSY}; the step was not carried out -- wait"
+                return self._too_late(True) or NothingSent(f"{USER_BUSY}; the step was not carried out -- wait")
             waited = self._announce_wait(waited, bundle, what)
             time.sleep(0.5)
         if waited:
             self._resumed()
-        return "stopped by the app; nothing was done" if STOP.is_set() else None
+        if STOP.is_set():
+            return NothingSent("stopped by the app; nothing was done")
+        # still now, but after the caller's deadline less the margin (the idle check comes first in the loop): too
+        # late to act for it
+        return self._too_late(waited)
 
     def _background_quartz(self, bundle: str, observed_only: bool = False):
         """A Quartz stand-in that delivers to `bundle`'s window (the pinned one, else its largest -- with
@@ -3399,8 +3571,7 @@ class PeekabooDriver:
         it was about to do read as frozen. The wait is timed from here (see _resumed)."""
         if not already:
             self._wait_t0 = time.time()
-            print("HANDS_WAIT " + json.dumps({"reason": "user_active", "app": bundle, "what": what},
-                                             ensure_ascii=False), flush=True)
+            tell_wait("user_wait", {"reason": "user_active", "app": bundle, "what": what})
         return True
 
     def _add_wait(self, seconds: float) -> None:
@@ -3415,7 +3586,7 @@ class PeekabooDriver:
         t0 = self.__dict__.pop("_wait_t0", None)
         if t0 is not None:
             self._add_wait(time.time() - t0)
-        print("HANDS_RESUME", flush=True)
+        tell_wait("user_resumed", {"waited_s": round(time.time() - t0, 1)} if t0 is not None else {})
 
     def _in_own_browser_window(self, bundle: str) -> bool:
         """Whether the window this step acts in is the run's own browser window (opened by the run, _run_windows)."""
@@ -3428,19 +3599,53 @@ class PeekabooDriver:
         accessibility (AXFrontmost; NSRunningApplication.activate is refused to a background process on recent
         macOS), never `open -b`, a reopen that raises the user's windows (deskmind#73). Any other app: `open -b`."""
         if not browser:
-            subprocess.run(["/usr/bin/open", "-b", bundle], capture_output=True, timeout=10)
-            return True
+            return self._raise_app(bundle)
         key = bundle.lower()
         own = str(getattr(self, "_own_browser", {}).get(key) or "")
         sid = str(getattr(self, "_own_browser_script", {}).get(key) or "")
         if not own or own != str(self._window_id) or not sid.isdigit():
             return False
-        ok, _ = self._osa(f'tell application id "{self._q(bundle)}" to set index of window id {int(sid)} to 1')
+        ok, _ = self._osa_forward(f'tell application id "{self._q(bundle)}" to set index of window id {int(sid)} to 1')
         return ok and self._make_frontmost(bundle)
+
+    def _raise_app(self, bundle: str) -> bool:
+        """Bring a front-only app forward. With a window of it on screen: activated, no reopen (NSRunningApplication,
+        else AXFrontmost) -- not a send, so a user who stays busy still ends the step user_busy / nothing done. With
+        none: `open -b`, whose reopen opens or restores a window (a lasting change: counted). The coordinator's rule,
+        review of hands#64 round 9. False when it could not be asked."""
+        if self._has_window_on_screen(bundle):
+            return self._activate_without_reopen(bundle) or self._make_frontmost(bundle)
+        _sh(["/usr/bin/open", "-b", bundle], capture_output=True, timeout=10)     # a reopen: counted
+        return True
+
+    def _has_window_on_screen(self, bundle: str) -> bool:
+        """Whether `bundle` has an ordinary window on screen now; False when that cannot be read (then the reopen,
+        counted: the safe side)."""
+        try:
+            import Quartz
+            pid = self._app_pid(bundle)
+            if not pid:
+                return False
+            wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly
+                                                     | Quartz.kCGWindowListExcludeDesktopElements, 0) or []
+            return any(int(w.get("kCGWindowOwnerPID") or 0) == pid and w.get("kCGWindowLayer", 0) == 0 for w in wins)
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _activate_without_reopen(bundle: str) -> bool:
+        """Activate the running app without a reopen (no window is un-minimised or made); True when it said yes."""
+        try:
+            from AppKit import NSApplicationActivateIgnoringOtherApps, NSRunningApplication
+            apps = [a for a in (NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle) or [])
+                    if not a.isTerminated()]
+            return bool(apps) and bool(apps[0].activateWithOptions_(NSApplicationActivateIgnoringOtherApps))
+        except Exception:  # noqa: BLE001
+            return False
 
     def _browser_front_sid(self, bundle: str) -> str | None:
         """The id the browser's scripting gives its front window now (to put the stacking back after a flash)."""
-        ok, out = self._osa(f'tell application id "{self._q(bundle)}" to return id of window 1')
+        ok, out = self._osa_read(f'tell application id "{self._q(bundle)}" to return id of window 1')
         out = (out or "").strip()
         own = str(getattr(self, "_own_browser_script", {}).get(bundle.lower()) or "")
         return out if ok and out.isdigit() and out != own else None
@@ -3525,11 +3730,20 @@ class PeekabooDriver:
         song row never played, a gym card never started."""
         kinds = (Q.kCGEventLeftMouseDown, Q.kCGEventLeftMouseUp) if count > 1 else \
             (Q.kCGEventMouseMoved, Q.kCGEventLeftMouseDown, Q.kCGEventLeftMouseUp)
-        for kind in kinds:
-            ev = Q.CGEventCreateMouseEvent(None, kind, (x, y), Q.kCGMouseButtonLeft)
+        def event(kind, at=None):
+            ev = Q.CGEventCreateMouseEvent(None, kind, (x, y) if at is None else at, Q.kCGMouseButtonLeft)
             if kind != Q.kCGEventMouseMoved:
                 Q.CGEventSetIntegerValueField(ev, Q.kCGMouseEventClickState, count)
-            Q.CGEventPost(Q.kCGHIDEventTap, ev)
+            return ev
+        button = ("mouse", "left")
+        for kind in kinds:
+            if kind == Q.kCGEventLeftMouseDown:
+                _post(Q, Q.kCGHIDEventTap, event(kind),
+                      press=(button, _mouse_up(Q, lambda at: event(Q.kCGEventLeftMouseUp, at), (x, y), button)))
+            elif kind == Q.kCGEventLeftMouseUp:
+                _post(Q, Q.kCGHIDEventTap, event(kind), release=button)
+            else:
+                _post(Q, Q.kCGHIDEventTap, event(kind))
             time.sleep(0.05 if count == 1 else 0.02)
 
     #: The key events, serialized: "<key code>:<1 down | 0 up>" -> bytes, and the key code that types each letter
@@ -3597,12 +3811,20 @@ class PeekabooDriver:
 
     @classmethod
     def _post_key(cls, Q, keycode: int, flags: int = 0) -> None:
+        def up_event():
+            ev = cls._key_event(Q, keycode, False)
+            Q.CGEventSetFlags(ev, flags)
+            return ev
         for down in (True, False):
-            ev = cls._key_event(Q, keycode, down)
+            ev = cls._key_event(Q, keycode, down) if down else up_event()
             # Always, the empty flags too: an event can carry modifiers held when it was made, and a stray shift or
             # cmd turns a key into another shortcut (cua's keyboard.rs does the same).
             Q.CGEventSetFlags(ev, flags)
-            Q.CGEventPost(Q.kCGHIDEventTap, ev)
+            key = ("key", keycode)
+            if down:
+                _post(Q, Q.kCGHIDEventTap, ev, press=(key, lambda in_place=False: _post(Q, Q.kCGHIDEventTap, up_event(), release=key)))
+            else:
+                _post(Q, Q.kCGHIDEventTap, ev, release=key)
             time.sleep(0.03)
 
     def _post_unicode(self, Q, text: str, stop=None) -> tuple[int, str | None]:
@@ -3628,12 +3850,17 @@ class PeekabooDriver:
             self._post_key(Q, keys.TAB if chunk == "\t" else keys.RETURN)
             return
         units = len(chunk.encode("utf-16-le")) // 2
-        for down in (True, False):
+
+        def event(down: bool):
             ev = self._key_event(Q, 0, down)
             Q.CGEventKeyboardSetUnicodeString(ev, units, chunk)
             Q.CGEventSetFlags(ev, 0)
-            Q.CGEventPost(Q.kCGHIDEventTap, ev)
-            time.sleep(0.01)
+            return ev
+        key = ("key", 0)
+        _post(Q, Q.kCGHIDEventTap, event(True), press=(key, lambda in_place=False: _post(Q, Q.kCGHIDEventTap, event(False), release=key)))
+        time.sleep(0.01)
+        _post(Q, Q.kCGHIDEventTap, event(False), release=key)
+        time.sleep(0.01)
         time.sleep(0.02)
 
     #: Apps found at run time to show no accessibility structure: observed and acted on through the screenshot
@@ -3716,11 +3943,11 @@ class PeekabooDriver:
                                                                            ActionKind.SCROLL):
             lines = -8 if eid.endswith("down") else 8
             def perform(Q):
-                Q.CGEventPost(Q.kCGHIDEventTap, Q.CGEventCreateMouseEvent(None, Q.kCGEventMouseMoved, (x, y),
-                                                                          Q.kCGMouseButtonLeft))
+                _post(Q, Q.kCGHIDEventTap, Q.CGEventCreateMouseEvent(None, Q.kCGEventMouseMoved, (x, y),
+                                                                     Q.kCGMouseButtonLeft))
                 for _ in range(3):
-                    Q.CGEventPost(Q.kCGHIDEventTap, Q.CGEventCreateScrollWheelEvent(None, Q.kCGScrollEventUnitLine,
-                                                                                    1, lines))
+                    _post(Q, Q.kCGHIDEventTap, Q.CGEventCreateScrollWheelEvent(None, Q.kCGScrollEventUnitLine,
+                                                                               1, lines))
                     time.sleep(0.05)
                 time.sleep(0.3)
                 return f"scrolled {'down' if lines < 0 else 'up'}"
@@ -3759,6 +3986,7 @@ class PeekabooDriver:
                         self._post_key(Q, keys.RETURN)               # Return: a search box searches on Enter
                         time.sleep(0.4)
                 finally:
+                    release_all()   # what this step still holds down is let go first, before anything is given back
                     pb.clearContents()
                     items = []
                     for d in saved:
@@ -3864,8 +4092,8 @@ class PeekabooDriver:
         return data
 
     def _front_bundle(self) -> str:
-        return subprocess.run(["osascript", "-e", 'tell application "System Events" to get bundle identifier of '
-                               'first process whose frontmost is true'], capture_output=True, text=True,
+        return _sh(["osascript", "-e", 'tell application "System Events" to get bundle identifier of '
+                               'first process whose frontmost is true'], sends=False, capture_output=True, text=True,
                               timeout=10).stdout.strip()
 
     def _vision_capture(self, shot: Path, wid: str | None = None) -> tuple[bool, dict, str]:
@@ -4002,13 +4230,22 @@ class PeekabooDriver:
 
     def execute(self, action: Action) -> ExecResult:
         self._require_session()      # nothing is done on a locked screen, however the action was chosen
+        # One step's sends, counted where they are made (base.counted): a refusal in it says "nothing was sent" only
+        # while none was (ExecResult.__post_init__), whichever route refuses and whichever route sent
+        scope = input_scope(act_by(getattr(self, "caller_deadline", None))).__enter__()
         try:
             if self.CONFIRM_BY_DIFF and action.kind in (ActionKind.CLICK, ActionKind.DOUBLE_CLICK,
                                                         ActionKind.RIGHT_CLICK):
                 res = self._execute_outer(action)
                 return self._confirm_by_diff(res) if res.indeterminate else res
             return self._execute_outer(action)
+        except StepExpired:
+            # a send asked for past the caller's deadline was not made (base.counted): the step ends here
+            release_all(in_place=True)
+            return step_expired_result()
         finally:
+            release_all(in_place=True)          # the last resort: nothing left held, the pointer not moved
+            scope.__exit__(None, None, None)
             # A browser-field allowance is for this one step: an early return or an error must not leave it for the
             # next one.
             self._browser_field_allowed = None
@@ -4037,14 +4274,14 @@ class PeekabooDriver:
         try:
             if before and after and after != before and self._ours(after) and not self._ours(before):
                 self._foreground_actions += 1
-                self._osa(f'tell application "{self._q(before)}" to activate')
+                self._osa_forward(f'tell application "{self._q(before)}" to activate')
                 res = replace(res, detail=f"{res.detail} [took the foreground ({after}); given back to {before}]")
             elif (before and after and after != before and not self._ours(before) and not action.foreground
                   and self._hid_idle() >= time.time() - t0):
                 # Something else took the front while the step ran -- a helper app, a notification, an app the click
                 # launched -- and the user did not do it (untouched since the step began): the user's app gets it
                 # back (cua's focus guard). An intended foreground step, or the user switching apps, is left alone.
-                self._osa(f'tell application "{self._q(before)}" to activate')
+                self._osa_forward(f'tell application "{self._q(before)}" to activate')
                 if effect_notes():
                     res = replace(res, detail=f"{res.detail} [{after} took the front during the step; given back to {before}]")
         finally:
@@ -4159,9 +4396,9 @@ class PeekabooDriver:
                 # The same as switching windows: observe the other app, do not raise it. `see` resolves an app
                 # that is running in the background; launching one that is not is still done with -g.
                 if "." in target:
-                    subprocess.run(["/usr/bin/open", "-g", "-b", target], capture_output=True, timeout=15)
+                    _sh(["/usr/bin/open", "-g", "-b", target], capture_output=True, timeout=15)
                 else:
-                    subprocess.run(["/usr/bin/open", "-g", "-a", target], capture_output=True, timeout=15)
+                    _sh(["/usr/bin/open", "-g", "-a", target], capture_output=True, timeout=15)
                 self.app = target
                 self._target_pid = None
                 self._pinned_window = None
@@ -4377,7 +4614,7 @@ class PeekabooDriver:
                 # would. The accessibility write shows in the field but is not the page's own value, and the paste
                 # that followed it to make it so landed in the field focused before -- the merchant took the date.
                 return self._vision_act(action, submit=False)
-            ok, meta, text, detail = self._mcp.tool("set_value", {"on": eid, "snapshot": self._snapshot,
+            ok, meta, text, detail = self._mcp_call("set_value", {"on": eid, "snapshot": self._snapshot,
                                                                    "value": new})
             effect = meta.get("effect")
             unverified = (ok and effect not in (None, "confirmed")) or (not ok and "could not be verified" in
@@ -4716,7 +4953,7 @@ class PeekabooDriver:
             return None
         cache = self._menu_shortcuts.get(self.app)
         if cache is None:
-            ok, _, text, _ = self._mcp.tool("menu", {"action": "list", "app": self._app_selector()})
+            ok, _, text, _ = self._mcp_call("menu", {"action": "list", "app": self._app_selector()}, sends=False)
             cache = {}
             top = None
             for line in (text.splitlines() if ok else []):
@@ -4803,7 +5040,7 @@ class PeekabooDriver:
         if getattr(self, "ws", None) is None:
             return set()
         root = os.path.realpath(str(self.ws))
-        ok, out = self._osa('tell application "TextEdit"\nset r to ""\nrepeat with w in windows\ntry\n'
+        ok, out = self._osa_read('tell application "TextEdit"\nset r to ""\nrepeat with w in windows\ntry\n'
                             'set b to bounds of w\nset r to r & (name of w) & tab & (path of document of w) & tab & '
                             '(item 1 of b) & tab & (item 2 of b) & linefeed\nend try\nend repeat\nreturn r\nend tell')
         return parse_textedit_windows(out, root) if ok else set()
@@ -4862,21 +5099,21 @@ class PeekabooDriver:
         doc = self._q(name)
         # The receipt needs a save to have happened: unsaved changes before, none after. A save of a document with
         # nothing to save writes nothing the task can be credited with (PR #16 review, eighth round).
-        ok, before = self._osa(f'tell application "TextEdit" to get modified of (first document whose name is "{doc}")')
+        ok, before = self._osa_read(f'tell application "TextEdit" to get modified of (first document whose name is "{doc}")')
         was_modified = ok and before.strip() == "true"
         self._osa('ignoring application responses\n'
                   f'  tell application "TextEdit" to save (first document whose name is "{doc}")\n'
                   'end ignoring')
         for _ in range(25):
             time.sleep(0.2)
-            ok, out = self._osa(f'tell application "TextEdit" to get modified of (first document whose name is "{doc}")')
+            ok, out = self._osa_read(f'tell application "TextEdit" to get modified of (first document whose name is "{doc}")')
             if ok and out.strip() == "false":
                 self._scripted_actions += 1
                 # The receipt: where the document was written, asked of TextEdit by the same query
                 # _open_workspace_documents uses. The driver's own scratch file is not a file the task wrote.
                 written: tuple[tuple[str, str | None], ...] = ()
                 if was_modified:
-                    ok, where = self._osa(f'tell application "TextEdit" to get path of (first document whose name is "{doc}")')
+                    ok, where = self._osa_read(f'tell application "TextEdit" to get path of (first document whose name is "{doc}")')
                     # the digest of what TextEdit holds (plain text as UTF-8, its line breaks and trailing newline as
                     # they are -- _osa strips its output, so the generic reader is used), not of the file on disk
                     from ..axdocument import document_text
@@ -4917,7 +5154,7 @@ class PeekabooDriver:
             doc = scratch / f"未命名-{n}"
             doc.write_text("", encoding="utf-8")
             before = self._window_ids()
-            subprocess.run(["/usr/bin/open", "-g", "-a", "TextEdit", str(doc), "--args", "-ApplePersistenceIgnoreState", "YES"], capture_output=True, timeout=15)
+            _sh(["/usr/bin/open", "-g", "-a", "TextEdit", str(doc), "--args", "-ApplePersistenceIgnoreState", "YES"], capture_output=True, timeout=15)
             # The new window is the one that was not there before. Found by title it was missed whenever the
             # window list came back without titles, and the planner, told "did not open", opened four more.
             wid = None
@@ -4966,7 +5203,7 @@ class PeekabooDriver:
             # save went there. The document's text is written to the target as plain UTF-8, the scratch copy is
             # closed unsaved, and the target is opened in the background as the document from now on.
             doc = self._q(self._window_title)
-            ok, text = self._osa(f'tell application "TextEdit" to get text of (first document whose name is "{doc}")')
+            ok, text = self._osa_read(f'tell application "TextEdit" to get text of (first document whose name is "{doc}")')
             if not ok:
                 return self._settle(False, f"could not read the document to save it as {name!r}: {text[:160]}")
             written = text.replace("\r", "\n").encode("utf-8")
@@ -4976,7 +5213,7 @@ class PeekabooDriver:
             if old.exists():
                 old.unlink()
             before = self._window_ids()
-            subprocess.run(["/usr/bin/open", "-g", "-a", "TextEdit", str(target), "--args", "-ApplePersistenceIgnoreState", "YES"], capture_output=True, timeout=15)
+            _sh(["/usr/bin/open", "-g", "-a", "TextEdit", str(target), "--args", "-ApplePersistenceIgnoreState", "YES"], capture_output=True, timeout=15)
             wid = None
             for _ in range(20):
                 time.sleep(0.25)
@@ -5141,7 +5378,7 @@ class PeekabooDriver:
         opened = wid is None
         if opened:
             before = self._window_ids()
-            subprocess.run(["/usr/bin/open", "-g", "-b", bundle, str(p)], capture_output=True, timeout=15)
+            _sh(["/usr/bin/open", "-g", "-b", bundle, str(p)], capture_output=True, timeout=15)
             # The new window is the one that was not there before (see syn:newdoc); by title only as a fallback.
             for _ in range(20):
                 time.sleep(0.25)
@@ -5164,7 +5401,7 @@ class PeekabooDriver:
         if not title:
             return ExecResult(False, "no document window is being observed")
         doc = f'(first document whose name is "{self._q(title)}")'
-        ok, out = self._osa(f'tell application "TextEdit" to get modified of {doc}')
+        ok, out = self._osa_read(f'tell application "TextEdit" to get modified of {doc}')
         if not ok:
             return ExecResult(False, f"cannot find the document {title!r} to close")
         if out.strip() == "true":
@@ -5259,6 +5496,14 @@ class PeekabooDriver:
                                      f"directly (TYPE_TEXT)")
         return ExecResult(False, f"{action.kind.value} does not apply to {eid}")
 
+    def _mcp_call(self, tool: str, args: dict, sends: bool = True):
+        """Every call to the Peekaboo session: one that acts on an app (`sends`: a click, a value written) is counted
+        as sent before it is asked (base.counted); a read (see, a menu list) is not."""
+        if not sends:
+            with uncounted():
+                return self._mcp.tool(tool, args)
+        return counted(lambda: self._mcp.tool(tool, args))
+
     def _run_mcp(self, key: str, extra: list[str], **fmt) -> tuple[bool, dict, str]:
         """The same commands through the live session. Returns the CLI's data shape so parsing is shared."""
         assert self._mcp is not None
@@ -5270,13 +5515,13 @@ class PeekabooDriver:
                     "window_id": int(fmt["window"]) if fmt.get("window") else None}
             if self._mcp.accepts("see", "include_elements"):
                 args["include_elements"] = True
-            ok, meta, text, detail = self._mcp.tool("see", args)
+            ok, meta, text, detail = self._mcp_call("see", args, sends=False)
             receipt = (meta or {}).get("target_receipt") or {}
             if receipt.get("pid"):
                 self._target_pid = str(receipt["pid"])   # what a background menu click has to name the app by
             return ok, (_mcp_see_as_cli_data(meta, text) if ok else {}), detail
         if key in ("click_on", "click_on_fg"):
-            ok, meta, text, detail = self._mcp.tool("click", {
+            ok, meta, text, detail = self._mcp_call("click", {
                 "on": fmt.get("element"), "snapshot": fmt.get("snapshot"), "background": True,
                 "double": "--double" in extra or None, "right": "--right" in extra or None})
             # What Peekaboo actually did, not what was asked: a click can land through the accessibility API

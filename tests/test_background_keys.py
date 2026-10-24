@@ -851,13 +851,17 @@ class NoKeysToTheUsersApp(unittest.TestCase):
                 mock.patch.object(axchrome, "focused_identifier", lambda pid, fr, wid=None: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"):
             res = d._execute_projected(Action(kind=ActionKind.TYPE_TEXT, text="天气",
                                               binding=Binding(observation_id="o", app="Chrome", element_id=WEB_SEARCH)))
-        self.assertFalse(res.ok)
-        self.assertIn(USER_BUSY, res.detail)
+        # the click into the address bar went before the first key was refused: not "busy, nothing done" but
+        # unverified (review of hands#64), and still no key reached the user's app
+        self.assertTrue(res.ok and res.indeterminate, res.detail)
+        self.assertNotIn(USER_BUSY, res.detail)
+        self.assertIsNot(res.performed, False)
         self.assertEqual(self.keys_posted, [])
 
-    def test_a_flash_paste_sends_no_key_and_takes_the_original_path(self):
-        """_vision_act's paste (click, cmd+A, cmd+V) through _flash: refused before the first key, then the path
-        that waits for the user and keeps the flash rules -- here, a browser not allowed forward."""
+    def test_a_flash_paste_sends_no_key_and_takes_no_other_path(self):
+        """_vision_act's paste (click, cmd+A, cmd+V) through _flash: refused at the first key, after the click went.
+        No key reaches the user's app, and the step does not fall through to the front route: the click may have
+        done something, so it is unverified, never that route's "not done" (review of hands#64 round 5)."""
         d = driver()
         d.app = "com.apple.Safari"
         d._background_input = lambda bundle: True
@@ -871,10 +875,13 @@ class NoKeysToTheUsersApp(unittest.TestCase):
             PeekabooDriver._post_key(Q, 0, Q.kCGEventFlagMaskCommand)     # cmd+A: the user's mail body
             PeekabooDriver._post_key(Q, 9, Q.kCGEventFlagMaskCommand)
             return "entered"
-        with mock.patch.object(skylight, "_load", lambda: None):
+        from deskmind_hands.drivers.base import ExecResult, input_scope, sent_in_step
+        with mock.patch.object(skylight, "_load", lambda: None), input_scope():
             ok, detail = d._flash("com.apple.Safari", perform, what="type")
+            self.assertGreater(sent_in_step(), 0)                       # the click (its mouse events), counted
         self.assertFalse(ok)
-        self.assertIn("not done", detail)
+        self.assertIn("may have taken effect", detail)
+        self.assertTrue(ExecResult(ok, detail).indeterminate)
         self.assertEqual(self.keys_posted, [])
 
     def test_flash_reports_a_key_window_not_given_back(self):

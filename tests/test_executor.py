@@ -89,6 +89,10 @@ def _executor():
     ex._text = lambda w: None                  # noqa: SLF001 -- ... nor what a document holds
     ex._last_input_at = lambda: 0.0            # noqa: SLF001 -- the user has not touched the Mac
     ex._ax_window_kinds = lambda pid: None      # noqa: SLF001 -- no accessibility: every window counts
+    # no window server, no peekaboo: a test that needs windows gives them (a real `peekaboo app list` could hang the
+    # run where Quartz is not importable -- review of hands#64)
+    ex._windows = lambda every=False: []        # noqa: SLF001
+    ex._pk = lambda args: None                  # noqa: SLF001
     return ex, stub
 
 
@@ -407,6 +411,7 @@ class Windows(unittest.TestCase):
     def test_pk_tells_failure_from_an_empty_answer(self):
         from types import SimpleNamespace
         ex, _ = _executor()
+        del ex._pk                                       # noqa: SLF001 -- the real one, over a faked subprocess
         with mock.patch("deskmind_hands.executor.subprocess.run", return_value=SimpleNamespace(stdout='{"success": false, "error": "Window not found"}')):
             self.assertIsNone(ex._pk(["window", "close"]))   # noqa: SLF001
         with mock.patch("deskmind_hands.executor.subprocess.run", return_value=SimpleNamespace(stdout='{"success": true}')):

@@ -5351,11 +5351,14 @@ class PeekabooDriver:
 
     def _replace_by_paste(self, eid: str, label: str, text: str) -> ExecResult:
         """Replace the field's text with `text` (it has a newline) by a paste: a paste inserts at the caret, so the
-        field's text is selected first -- the field given the keyboard focus inside its app and its whole text
-        selected through accessibility, each write right after a STOP check, the range read before -- then pasted
-        in the foreground and verified by the field holding exactly the text (review of #68 @1194dde: without the
-        selection "old" became "olda\nb" and read as done). Refused before anything is sent when the field cannot be
-        found or its selection cannot be read; a write refused after one went is said so (unverified)."""
+        field's text is selected first (review of #68 @1194dde: without the selection "old" became "olda\nb" and
+        read as done), and verified by the field holding exactly the text.
+        Prepared first: the field, its range, whether its selection can be read, the app's process; the app brought
+        forward (activated without a reopen where it has a window on screen: _raise_app); then a foreground Gate
+        (hands#66: the reads that can wait first -- the field's focus -- then STOP and the app still in front),
+        asked right before each write: the focus given through accessibility (before_focus_write), the whole text
+        selected (before_send), the paste (before_send). Refused before anything is sent when the field is not found,
+        its selection cannot be read or its app not found; a refusal after a write went is unverified."""
         from deskmind_hands.drivers import axfield
         field = self._field_now(eid) if eid else None
         refused = (f"replacing {label!r} with text that has a newline needs its text selected first, and "
@@ -5365,28 +5368,40 @@ class PeekabooDriver:
         try:
             want = axfield.wanted(field, True)                  # the reads before the writes
             readable = axfield._selection(field) is not None
-            focused = axfield.is_focused(field)
         except Exception:   # noqa: BLE001 -- unread
             readable = False
         if not readable:
             return ExecResult(False, NothingSent(refused.format(why="its selection cannot be read")))
+        pid = self._pid_of(self.app) or _pid_by_bundle(self.app)
+        if not pid:
+            return ExecResult(False, NothingSent(refused.format(why=f"the process of {self.app} was not found")))
         sent_before = sends_so_far()
 
         def stop(why: str) -> ExecResult:
             if sends_so_far() > sent_before:
-                return ExecResult(False, MaybeSent(f"replacing {label!r} stopped part way: {why} -- the focus or the "
-                                                   f"selection may have changed; observe before typing again"))
+                return ExecResult(False, MaybeSent(f"replacing {label!r} stopped part way: {why} -- the front, the "
+                                                   f"focus or the selection may have changed; observe before typing "
+                                                   f"again"))
             return ExecResult(False, NothingSent(refused.format(why=why)))
         if STOP.is_set():
             return stop("stopped by the app")
-        if not focused and not axfield.focus(field):
-            return stop("the field did not take the keyboard focus")
-        if STOP.is_set():
-            return stop("stopped by the app")
+        if not self._raise_app(self.app):
+            return stop(f"{self.app} could not be brought forward")
+        gate = Gate.foreground(pid, field)
+        if gate.before_send() is not None:                      # not holding the focus (or the gate says no)
+            why = gate.before_focus_write()
+            if why:
+                return stop(why)
+            if not axfield.focus(field):
+                return stop("the field did not take the keyboard focus")
+        why = gate.before_send()
+        if why:
+            return stop(why)
         if not axfield.select_range(field, want):
             return stop("its text could not be selected")
-        if STOP.is_set():
-            return stop("stopped by the app")
+        why = gate.before_send()
+        if why:
+            return stop(why)
         return self._type_foreground(text, clear_first=True, element_bound=True)
 
     def _geometry(self) -> ScreenGeometry:

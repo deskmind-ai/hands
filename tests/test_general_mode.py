@@ -2110,35 +2110,57 @@ class NewlinesGoInAsText(unittest.TestCase):
         self.assertIn("paste_fg", [x[0] for x in self.sent])
         self.assertFalse([x for x in self.sent if x[2] == "return"], self.sent)
 
-    def replace_fakes(self, readable=True, selects=True):
-        from deskmind_hands.drivers import axfield
-        self.writes = []
+    def replace_fakes(self, readable=True, selects=True, focused=True):
+        from deskmind_hands.drivers import axfield, peekaboo as P
+        self.writes, self.focused, self.front, self.reads = [], focused, 4242, []
+        self.on_read = {}                                         # the n-th focus read: what happens during it
+
+        from deskmind_hands.drivers import base
 
         def select_range(el, want, wait=0.3):
             self.writes.append("select all")
+            base.ax_counted(lambda: 0)                            # an accessibility write: counted as sent
             self.selected_all = selects
             return selects
+
+        def is_focused(el):                                       # a read that can wait
+            self.reads.append(1)
+            self.on_read.get(len(self.reads), lambda: None)()
+            return self.focused
+
+        def focus(el, wait=0.5):
+            self.writes.append("focus")
+            base.ax_counted(lambda: 0)
+            self.focused = True
+            return True
         for name, fn in (("wanted", lambda el, all_: (0, len(self.shown["value"]))),
                          ("_selection", lambda el: (0, 0) if readable else None),
-                         ("is_focused", lambda el: True),
-                         ("focus", lambda el, wait=0.5: self.writes.append("focus") or True),
-                         ("select_range", select_range)):
+                         ("is_focused", is_focused), ("focus", focus), ("select_range", select_range)):
             p = mock.patch.object(axfield, name, fn)
             p.start()
             self.addCleanup(p.stop)
+        p = mock.patch.object(P, "_front_app_pid", lambda: self.front)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def replace_driver(self):
+        d = self.driver(settable=False, foreground=True)
+        d._raise_app = lambda bundle: self.writes.append("raise") or True
+        d._pid_of = lambda bundle, all_wins=None: 4242
+        return d
 
     def test_replacing_with_lines_by_a_paste_selects_all_first_and_verifies_by_equality(self):
         """B3: a replace on the paste route did not clear -- "old" became "olda\nb" and read as verified."""
         self.replace_fakes()
-        res = self.type_(self.driver(settable=False, foreground=True), "a\nb", clear=True, foreground=True)
-        self.assertEqual(self.writes, ["select all"])
+        res = self.type_(self.replace_driver(), "a\nb", clear=True, foreground=True)
+        self.assertEqual(self.writes, ["raise", "select all"])
         self.assertEqual([x[0] for x in self.sent], ["paste_fg"])
         self.assertEqual(self.shown["value"], "a\nb")
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
 
     def test_a_replace_that_only_contains_the_text_is_not_verified(self):
         self.replace_fakes(selects=True)
-        d = self.driver(settable=False, foreground=True)
+        d = self.replace_driver()
         real_run = d._run
 
         def run(key, _extra=None, **fmt):                              # the paste lands after the old text anyway
@@ -2152,9 +2174,38 @@ class NewlinesGoInAsText(unittest.TestCase):
 
     def test_a_replace_whose_selection_cannot_be_read_is_refused_before_a_send(self):
         self.replace_fakes(readable=False)
-        res = self.type_(self.driver(settable=False, foreground=True), "a\nb", clear=True, foreground=True)
+        res = self.type_(self.replace_driver(), "a\nb", clear=True, foreground=True)
         self.assertEqual((self.sent, self.writes), ([], []))
         self.assertIs(res.performed, False, res.detail)
+
+    def test_the_replace_gate_before_each_write(self):
+        """#68 B3 behind the foreground Gate: the app brought forward, then the gate before the focus write, the
+        select-all and the paste -- the focus read first, STOP and the front app last. A STOP or another app coming
+        forward during the read before a write: that write and none after it is made."""
+        from deskmind_hands.grounding import STOP
+        order = ("focus write", "select all", "paste")
+        for n, write in enumerate(order, start=1):              # the n-th focus read precedes that write
+            for what in ("front", "stop"):
+                with self.subTest(write=write, condition=what):
+                    STOP.clear()
+                    self.addCleanup(STOP.clear)
+                    self.replace_fakes(focused=False)
+                    d = self.replace_driver()
+
+                    def arise(what=what):
+                        if what == "stop":
+                            STOP.set()
+                        else:
+                            self.front = 9999                      # the user brought another app forward
+                    self.on_read[n] = arise
+                    res = self.type_(d, "a\nb", clear=True, foreground=True)
+                    made = [w for w in self.writes if w != "raise"] + [x[0] for x in self.sent]
+                    expected = {"focus write": [], "select all": ["focus"], "paste": ["focus", "select all"]}[write]
+                    self.assertEqual(made, expected)
+                    if write == "focus write":
+                        self.assertIs(res.performed, False, res.detail)
+                    else:
+                        self.assertTrue(res.indeterminate, res.detail)
 
     def test_a_failed_value_write_says_so(self):
         res = self.type_(self.driver(takes="fails"), "a\nb")

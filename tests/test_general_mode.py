@@ -1086,6 +1086,15 @@ class GymSplit(unittest.TestCase):
             self.assertEqual(fam.make_task(30123, 2), fam.make_task(30123, 2))
 
 
+def held_window_key(case, lost=None):
+    """A WindowKey (the type the background Gate insists on) whose lost() is the case's `window_lost`."""
+    from deskmind_hands.drivers import skylight
+    key = skylight.WindowKey.__new__(skylight.WindowKey)
+    key.lost = lost or (lambda: case.window_lost)
+    key.note = lambda: ""
+    return key
+
+
 class _KeysFixture(unittest.TestCase):
     """A text element whose value is not settable, its focus, a clipboard and the key posts, all faked."""
 
@@ -1097,21 +1106,45 @@ class _KeysFixture(unittest.TestCase):
         self.log = []
         el = self.el
 
+        from deskmind_hands.drivers import skylight
+        from deskmind_hands.grounding import STOP
+        self.addCleanup(STOP.clear)
+        self.front = 4242                               # the app in front (the foreground gate asks)
+        self.window_lost = None                         # why the held window stopped being key (background gate)
+        self.hooks = {}                                 # after a send site: what happens next (a condition flips)
+        self.select_takes = True
+
+        def after(site):
+            hook = self.hooks.get(site)
+            if hook:
+                hook()
+
         def focus(f, wait=0.5):
             self.log.append("focus")
             base.ax_counted(lambda: 0)                  # an accessibility write: counted as sent
             if el["focus_takes"]:
                 el["focused"] = True
+            after("focus")
             return el["focus_takes"]
+
+        def select(f, all_, wait=0.3):
+            self.log.append(("select", all_))
+            base.ax_counted(lambda: 0)                  # an accessibility write: counted as sent
+            after("select")
+            return self.select_takes
+        self.after = after
         for name, fn in {"value": lambda f: self.shown["value"],
                          "role": lambda f: el["role"],
                          "is_focused": lambda f: el["focused"],
                          "can_set": lambda f, attr: el["can_focus"],
                          "focus": focus,
-                         "select": lambda f, all_, wait=0.3: self.log.append(("select", all_)) or True}.items():
+                         "select": select}.items():
             p = mock.patch.object(axfield, name, fn, create=True)     # can_set: new here
             p.start()
             self.addCleanup(p.stop)
+        p = mock.patch.object(skylight, "front_pid", lambda: self.front)
+        p.start()
+        self.addCleanup(p.stop)
         p = mock.patch.object(PeekabooDriver, "AX_INSERT_WAIT_S", 0.0)
         p.start()
         self.addCleanup(p.stop)
@@ -1120,7 +1153,7 @@ class _KeysFixture(unittest.TestCase):
                 fail_paste=False):
         from types import SimpleNamespace
         from deskmind_hands.geometry import Point, Rect
-        from deskmind_hands.drivers import peekaboo as P
+        from deskmind_hands.drivers import base, peekaboo as P
         d = PeekabooDriver.__new__(PeekabooDriver)
         d.app = "com.example.term"
         d._rects, d._element_role = {"elem_3": Rect(0, 30, 580, 350)}, {"elem_3": "textArea"}
@@ -1132,6 +1165,7 @@ class _KeysFixture(unittest.TestCase):
         d._keys_in_background = lambda *a: None                                  # this Mac: foreground keys
         d._moved_since_seen = lambda: None
         d._field_now = lambda eid: "FIELD" if field else None
+        d._pid_of = lambda bundle, all_wins=None: 4242
         pending = {}
 
         def tool(name, args):
@@ -1159,9 +1193,11 @@ class _KeysFixture(unittest.TestCase):
         # the press primitives: events built beforehand are ("down"|"up", code, flags); a down is the key, as typed
         d._key_pair = lambda Q, code, flags=0: (("down", code, flags), ("up", code, flags), ("key", code))
 
-        def post(Q, tap, ev, press=None, release=None, checked=False):
+        def post(Q, tap, ev, press=None, release=None, **_how):
             if ev[0] == "down":
+                base.counted(lambda: None)                      # a key went: counted as sent
                 post_key(Q, ev[1], ev[2])
+                self.after(("key", ev[1]))
         p = mock.patch.object(P, "_post", post)
         p.start()
         self.addCleanup(p.stop)
@@ -1337,7 +1373,7 @@ class TypingWhereNoValueIsTaken(_KeysFixture):
                                                                      kCGHIDEventTap=0), token)
         from deskmind_hands.drivers import peekaboo as P
 
-        def post(Q, tap, ev, press=None, release=None, checked=False):
+        def post(Q, tap, ev, press=None, release=None, **_how):
             if ev[:2] == ("down", 9):
                 base.counted(lambda: None)                                   # the paste went
                 raise skylight.WindowKeyRefused("the user came back to the app")
@@ -1441,7 +1477,7 @@ class FocusMovesWhilePreparing(_KeysFixture):
         d._key_pair = stealing_pair
         d._unicode_pair = lambda Q, chunk: self.steal() or (("down", "u", chunk), ("up", "u", chunk), ("key", 0))
 
-        def post(Q, tap, ev, press=None, release=None, checked=False):
+        def post(Q, tap, ev, press=None, release=None, **_how):
             if not (isinstance(ev, tuple) and ev[0] == "down"):
                 return
             into = self.shown if self.el["focused"] else self.other
@@ -1459,7 +1495,7 @@ class FocusMovesWhilePreparing(_KeysFixture):
             d._background_keys = lambda: True
             d._ascii_input = lambda: True
             d._key_target = lambda: (4242, 200)
-            key = types.SimpleNamespace(lost=lambda: None, note=lambda: "")
+            key = held_window_key(self)
 
             class Enter:
                 def __enter__(self_):
@@ -1467,16 +1503,19 @@ class FocusMovesWhilePreparing(_KeysFixture):
 
                 def __exit__(self_, *a):
                     return False
+            outer = self
 
-            def make_q(*a, **k):
-                self.steal()
-                return types.SimpleNamespace(
-                    kCGEventFlagMaskCommand=1 << 20, kCGHIDEventTap=0,
-                    CGEventCreateKeyboardEvent=lambda src, code, down: ("down" if down else "up", code, 0),
-                    CGEventSetFlags=lambda ev, f: None, CGEventKeyboardSetUnicodeString=lambda ev, n, t: None)
+            class StealingQuartz(skylight.BackgroundQuartz):      # the window's event source: made while preparing
+                def __init__(self_, pid, wid, origin, key=None):
+                    outer.steal()
+                    self_._q, self_.pid, self_.wid, self_.key = types.SimpleNamespace(
+                        kCGEventFlagMaskCommand=1 << 20, kCGHIDEventTap=0,
+                        CGEventCreateKeyboardEvent=lambda src, code, down: ("down" if down else "up", code, 0),
+                        CGEventSetFlags=lambda ev, f: None, CGEventKeyboardSetUnicodeString=lambda ev, n, t: None
+                    ), pid, wid, key
             chunks = skylight.text_chunks
             for name, fn in (("user_on", lambda pid: False), ("enter_window_key", lambda pid, wid: Enter()),
-                             ("BackgroundQuartz", make_q),
+                             ("BackgroundQuartz", StealingQuartz),
                              ("text_chunks", lambda t, *a: self.steal() or chunks(t, *a))):
                 p = mock.patch.object(skylight, name, fn)
                 p.start()
@@ -1518,6 +1557,154 @@ class FocusMovesWhilePreparing(_KeysFixture):
         self.assertIs(res.performed, False)
 
 
+class GateAtEverySendSite(_KeysFixture):
+    """Review of #66 @8086268, the third of the "check before send" family: each send site picked its own checks --
+    the WebKit background paste asked the focus but not the window (cmd+V went after the user came back to the app,
+    reported verified), and a STOP during the preparing was asked only at the keys (the focus was still written).
+    One Gate per route now, asked before every send. The table: every send site x {STOP, the window lost (or, in the
+    foreground, the app no longer in front), the focus lost}, the condition arising right before that site. Nothing
+    is sent there, and the result is honest: nothing sent when nothing went before, else unverified."""
+
+    CMD = 1 << 20
+
+    def route(self, kind):
+        from deskmind_hands.drivers import skylight
+        d = self._driver(settable=False)
+        pair = d._key_pair
+        d._key_pair = lambda Q, code, flags=0: self.prepare_hook() or pair(Q, code, flags)
+        d._unicode_pair = lambda Q, chunk: self.prepare_hook() or (("down", "u", chunk), ("up", "u", chunk), ("key", 0))
+        q = types.SimpleNamespace(kCGEventFlagMaskCommand=self.CMD, kCGHIDEventTap=0)
+        bq = skylight.BackgroundQuartz.__new__(skylight.BackgroundQuartz)
+        bq._q, bq.pid, bq.wid, bq.key = q, 4242, 200, held_window_key(self)
+        if kind == "webkit":                                   # _flash's background branch: a held window
+            d._flash = lambda app, perform, what="": (True, perform(bq))
+        elif kind == "background":                             # _keys_in_background
+            del d._keys_in_background
+            d._background_keys = lambda: True
+            d._ascii_input = lambda: True
+            d._key_target = lambda: (4242, 200)
+
+            class Enter:
+                def __enter__(self_):
+                    return bq.key
+
+                def __exit__(self_, *a):
+                    return False
+            for name, fn in (("user_on", lambda pid: False), ("enter_window_key", lambda pid, wid: Enter())):
+                p = mock.patch.object(skylight, name, fn)
+                p.start()
+                self.addCleanup(p.stop)
+
+            def held(self_, pid, wid, origin, key=None):        # the real type, made without Quartz
+                self_._q, self_.pid, self_.wid, self_.key = q, pid, wid, key
+            p = mock.patch.object(skylight.BackgroundQuartz, "__init__", held)
+            p.start()
+            self.addCleanup(p.stop)
+        return d
+
+    def condition(self, kind, what):
+        from deskmind_hands.grounding import STOP
+
+        def flip():
+            if what == "stop":
+                STOP.set()
+            elif what == "window" and kind == "foreground":
+                self.front = 9999                               # the user brought another app forward
+            elif what == "window":
+                self.window_lost = "the user brought the app forward"
+            elif what == "focus":
+                self.el["focused"] = False                      # the user clicked another field
+        return flip                                             # what None: the control, nothing happens
+
+    @staticmethod
+    def once(flip):
+        fired = []
+
+        def hook():
+            if not fired:
+                fired.append(1)
+                flip()
+        return hook
+
+    def run_row(self, kind, site, what):
+        self.prepare_hook = lambda: None
+        flip = self.condition(kind, what)
+        text, clear = ("x" * 40 if kind == "background" else "ls -la"), False
+        if site == "focus write":
+            self.el["focused"] = False
+            self.prepare_hook = self.once(flip)                              # while preparing (Codex: STOP)
+        elif site == "select":
+            self.el["focused"], clear = False, True
+            self.hooks["focus"] = flip
+        elif site == "cmd+A":
+            self.el["focused"], clear, self.select_takes = True, True, False
+            self.hooks["select"] = flip
+        elif site == "cmd+V":
+            self.el["focused"], clear = True, True
+            self.hooks["select"] = flip
+        elif site == "chunk":
+            self.el["focused"] = True
+            self.hooks[("key", "u")] = self.once(flip)                       # after the first chunk
+        d = self.route(kind)
+        res = self._type(d, text=text, clear=clear)
+        return res
+
+    def sent_at(self, site):
+        if site == "focus write":
+            return "focus" in self.log
+        if site == "select":
+            return ("select", True) in self.log
+        if site == "cmd+A":
+            return ("key", 0, self.CMD) in self.log
+        if site == "cmd+V":
+            return ("key", 9, self.CMD) in self.log
+        return len([x for x in self.log if isinstance(x, tuple) and x[:2] == ("key", "u")]) > 1
+
+    def test_every_site_under_every_condition(self):
+        from deskmind_hands.grounding import STOP
+        sites = {"foreground": ("focus write", "select", "cmd+A", "cmd+V"),
+                 "webkit": ("focus write", "select", "cmd+A", "cmd+V"),
+                 "background": ("focus write", "select", "cmd+A", "chunk")}
+        for kind, kind_sites in sites.items():
+            for site in kind_sites:
+                for what in ("stop", "window", "focus"):
+                    if site == "focus write" and what == "focus":
+                        continue                                # the focus is what that write sets
+                    with self.subTest(route=kind, site=site, condition=what):
+                        STOP.clear()
+                        self.setUp()
+                        res = self.run_row(kind, site, what)
+                        self.assertFalse(self.sent_at(site), (res.detail, self.log))
+                        if site == "focus write":               # nothing went before it
+                            self.assertIs(res.performed, False, res.detail)
+                        else:
+                            self.assertIsNot(res.performed, False, res.detail)
+                            self.assertTrue(res.indeterminate, res.detail)
+                        STOP.clear()
+
+    def test_the_control_every_site_is_reached_when_nothing_happens(self):
+        from deskmind_hands.grounding import STOP
+        for kind, site in (("foreground", "focus write"), ("foreground", "select"), ("foreground", "cmd+A"),
+                           ("foreground", "cmd+V"), ("webkit", "focus write"), ("webkit", "select"),
+                           ("webkit", "cmd+A"), ("webkit", "cmd+V"), ("background", "focus write"),
+                           ("background", "select"), ("background", "cmd+A"), ("background", "chunk")):
+            with self.subTest(route=kind, site=site):
+                STOP.clear()
+                self.setUp()
+                self.run_row(kind, site, None)
+                self.assertTrue(self.sent_at(site), self.log)
+
+    def test_codex_the_webkit_paste_after_the_user_came_back_is_not_sent(self):
+        res = self.run_row("webkit", "cmd+V", "window")
+        self.assertNotIn(("key", 9, self.CMD), self.log)
+        self.assertFalse(res.ok and not res.indeterminate, res.detail)          # never "verified"
+
+    def test_codex_a_stop_while_preparing_writes_nothing(self):
+        res = self.run_row("foreground", "focus write", "stop")
+        self.assertNotIn("focus", self.log)
+        self.assertIs(res.performed, False, res.detail)
+
+
 class CheckedPressPostsWithoutAskingAgain(unittest.TestCase):
     """Review of #66 @92fbf45: a checked press (_press_checked: the window, then the focus) went on to
     BackgroundQuartz.CGEventPost, whose key check asks key.lost() again -- an accessibility read of the focused window
@@ -1543,12 +1730,26 @@ class CheckedPressPostsWithoutAskingAgain(unittest.TestCase):
         self.q = skylight.BackgroundQuartz(4242, 200, (0, 0), key=key)
 
     def test_a_checked_press_is_not_asked_again_between_the_check_and_the_down(self):
-        from deskmind_hands.drivers import base
-        with base.input_scope(None):
-            why = PeekabooDriver._press_checked(self.q, (10,), (11,), ("key", 0),
-                                                lambda: self.log.append("check") or None)
+        from deskmind_hands.drivers import axfield, base
+        from deskmind_hands.drivers.peekaboo import Gate
+        gate = Gate.background(self.q, "FIELD")
+        with base.input_scope(None), mock.patch.object(axfield, "is_focused",
+                                                       lambda f: self.log.append("focus read") or True):
+            why = PeekabooDriver._press_checked(self.q, (10,), (11,), ("key", 0), gate)
         self.assertIsNone(why)
-        self.assertEqual(self.log, ["check", ("posted", 10), ("posted", 11)])
+        self.assertEqual(self.log, ["key.lost: an accessibility read that can wait", "focus read",   # the gate
+                                    ("posted", 10), ("posted", 11)])                              # not asked again
+
+    def test_a_check_that_is_not_a_gate_is_refused(self):
+        with self.assertRaises(TypeError):
+            PeekabooDriver._press_checked(self.q, (10,), (11,), ("key", 0), lambda: None)
+
+    def test_post_checked_with_a_gate_of_another_window_asks_the_window(self):
+        from deskmind_hands.drivers import skylight
+        from deskmind_hands.drivers.peekaboo import Gate
+        other = skylight.BackgroundQuartz(4242, 201, (0, 0), key=held_window_key(self, lambda: None))
+        self.q.post_checked((10,), Gate.background(other, "FIELD"))
+        self.assertEqual(self.log, ["key.lost: an accessibility read that can wait", ("posted", 10)])
 
     def test_any_other_key_down_keeps_the_check(self):
         from deskmind_hands.drivers.peekaboo import _post

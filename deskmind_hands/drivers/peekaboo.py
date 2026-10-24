@@ -725,19 +725,70 @@ class _NotReady(Exception):
     """Raised inside a flash before anything is typed: the element could not be made ready (focus) for keys."""
 
 
-def _post(Q, tap, event, press=None, release=None, checked=False) -> None:
+class Gate:
+    """The one check of a typing route, built once while it is prepared and asked before every send of that route:
+    the accessibility focus write, the select-all, cmd+A, cmd+V and every chunk (hands#66, the third of the "check
+    before send" family: each site chose its own checks, and one left the window out).
+
+    background (a window held as its app's key window, BackgroundQuartz): STOP, then the window (WindowKey.lost),
+    then the element's focus, last. foreground (the app brought to the front): STOP, then the app still the front
+    one (skylight.front_pid: the window server, no accessibility wait), then the element's focus, last.
+    before_focus_write leaves the focus out (it is what the write sets); before_send asks all of it. Built only by
+    its two constructors; a background gate is bound to its BackgroundQuartz's WindowKey, and only such a gate lets
+    a key go without the window being asked again in the post (BackgroundQuartz.post_checked)."""
+
+    __slots__ = ("field", "window_key", "front_pid")
+
+    def __init__(self, field, window_key, front_pid, _token):
+        if _token is not Gate._MADE:
+            raise TypeError("a Gate is made by Gate.background or Gate.foreground")
+        self.field, self.window_key, self.front_pid = field, window_key, front_pid
+
+    _MADE = object()
+
+    @classmethod
+    def background(cls, q, field) -> "Gate":
+        from deskmind_hands.drivers import skylight
+        if not isinstance(q, skylight.BackgroundQuartz) or not isinstance(q.key, skylight.WindowKey):
+            raise TypeError("a background gate needs a BackgroundQuartz holding a WindowKey")
+        return cls(field, q.key, None, cls._MADE)
+
+    @classmethod
+    def foreground(cls, pid: int, field) -> "Gate":
+        return cls(field, None, int(pid), cls._MADE)
+
+    def before_focus_write(self) -> str | None:
+        """STOP, then the window (background) or the app still in front (foreground); why not."""
+        from deskmind_hands.drivers import skylight
+        if STOP.is_set():
+            return "stopped by the app"
+        if self.window_key is not None:
+            return self.window_key.lost()
+        front = skylight.front_pid()
+        if front is None:
+            return "the front app could not be read"
+        return None if front == self.front_pid else "the app is no longer the front app (the user went elsewhere)"
+
+    def before_send(self) -> str | None:
+        """All of it: before_focus_write, then the element's focus, last; why not."""
+        from deskmind_hands.drivers import axfield
+        return self.before_focus_write() or (None if axfield.is_focused(self.field)
+                                             else "the element lost the keyboard focus")
+
+
+def _post(Q, tap, event, press=None, release=None, gate=None) -> None:
     """Every event this driver posts (see the rest below). `press`: (key, let_go) -- a down whose up must follow,
     remembered until it does (base.release_all lets it go whatever ends the step). `release`: the key of an up -- the
-    completion of input already started, never refused by the deadline (base.releasing). `checked`: a down whose
-    window and focus the caller checked right before (_press_checked) -- a BackgroundQuartz posts it without asking
-    the window again (post_checked)."""
+    completion of input already started, never refused by the deadline (base.releasing). `gate`: the Gate a down was
+    checked with right before (_press_checked) -- a BackgroundQuartz posts it without asking the window again
+    (post_checked), only for a background gate bound to its own WindowKey."""
     if release is not None:
         with releasing():
-            _post_one(Q, tap, event, checked)
+            _post_one(Q, tap, event, gate)
         note_released(release)
         return
     if press is None:
-        _post_one(Q, tap, event, checked)
+        _post_one(Q, tap, event, gate)
         return
     # Remembered BEFORE the first OS call that could deliver the down: a route with two transports (BackgroundQuartz
     # sends a mouse down by SkyLight, then by CGEventPostToPid) may have delivered it by the first when the deadline
@@ -746,7 +797,7 @@ def _post(Q, tap, event, press=None, release=None, checked=False) -> None:
     note_pressed(*press)
     before = sends_so_far()
     try:
-        _post_one(Q, tap, event, checked)
+        _post_one(Q, tap, event, gate)
     except BaseException:
         if sends_so_far() == before:
             note_released(press[0])
@@ -768,13 +819,13 @@ def _mouse_up(Q, make, at, button) -> callable:
     return let_go
 
 
-def _post_one(Q, tap, event, checked=False) -> None:
+def _post_one(Q, tap, event, gate=None) -> None:
     """Every event this driver posts: counted as sent before it goes (base.counted) -- a BackgroundQuartz counts its
-    own, after its key check, so a key it refuses before posting is not counted (`checked`: the caller's check
-    stands for it, BackgroundQuartz.post_checked)."""
+    own, after its key check, so a key it refuses before posting is not counted (a background `gate` stands for that
+    check: BackgroundQuartz.post_checked, which refuses any other)."""
     if getattr(Q, "counts_own_posts", False):
-        if checked and hasattr(Q, "post_checked"):
-            Q.post_checked(event)
+        if gate is not None and gate.window_key is not None and hasattr(Q, "post_checked"):
+            Q.post_checked(event, gate)
         else:
             Q.CGEventPost(tap, event)
     else:
@@ -3484,28 +3535,40 @@ class PeekabooDriver:
             return ExecResult(False, "stopped by the app; nothing was done")
         before = self._read_field(field)
 
-        def ready() -> str | None:
+        def ready(gate: Gate) -> str | None:
             """The first check, right before anything is sent: the element holds the keyboard focus (left alone when
-            it does, the caret kept; else given through accessibility and read back); why not."""
-            if axfield.is_focused(field):
+            it does, the caret kept); else, the gate's STOP and window / front app asked right before it, the focus
+            given through accessibility and read back. Why not."""
+            if not isinstance(gate, Gate):
+                raise TypeError("a route is made ready by its Gate")
+            if gate.before_send() is None:
                 return None
+            why = gate.before_focus_write()
+            if why:
+                return why
             if not axfield.can_set(field, "AXFocused"):
                 return "it lost the keyboard focus and cannot be given it back without a click"
+            why = gate.before_focus_write()           # again: the read above can wait; nothing between this and it
+            if why:
+                return why
             if not axfield.focus(field):
                 return "it did not take the keyboard focus"
             return None
 
-        def still_focused() -> str | None:
-            """The check before every later press (and after any wait): no focus given back once input went."""
-            if STOP.is_set():
-                return "stopped by the app"
-            return None if axfield.is_focused(field) else "the element lost the keyboard focus"
+        def select_all(gate: Gate) -> str | None | bool:
+            """The accessibility select-all when replacing, its gate asked right before: True when it took, False when
+            it did not (cmd+A then), a reason when the gate refused."""
+            why = gate.before_send()
+            if why:
+                return why
+            return axfield.select(field, True)
 
         # prepare, before any check: everything that can block or wait -- the keyboard layout and key events (a child
         # process on a cold or stale cache, up to 20 s: Codex on #66 @3f82851, the focus moved meanwhile and cmd+V
         # pasted into another field), the clipboard. Between a check and its press there is then nothing but the
         # press (_press_checked).
         codes = {c: self._keycode(None, c) for c in "av"}     # loads (or refreshes) the layout and key events
+        pid = self._pid_of(self.app)                          # the app the foreground gate asks to be in front
         sent_before = sends_so_far()
 
         def stopped(why: str) -> ExecResult:
@@ -3515,7 +3578,7 @@ class PeekabooDriver:
             return ExecResult(False, NothingSent(f"{label!r}: {why}; nothing was typed"))
 
         # a newline goes in as text, pasted whole: never the background keys, which make it the Return key
-        res = None if newline else self._keys_in_background(field, text, ready, still_focused,
+        res = None if newline else self._keys_in_background(field, text, ready, select_all,
                                                             action.clear_first, codes["a"])
         if res is None:
             def perform(Q):
@@ -3523,20 +3586,33 @@ class PeekabooDriver:
                 cmd = Q.kCGEventFlagMaskCommand
                 select_key = self._key_pair(Q, codes["a"], cmd) if action.clear_first else None
                 paste_key = self._key_pair(Q, codes["v"], cmd)
+                from deskmind_hands.drivers import skylight
+                # the route's one gate: a window held in the background (the WebKit branch of _flash) or the app
+                # brought to the front
+                if isinstance(Q, skylight.BackgroundQuartz):
+                    if not isinstance(Q.key, skylight.WindowKey):
+                        raise _NotReady("the app is the user's front app: a key would land in its key window")
+                    gate = Gate.background(Q, field)
+                else:
+                    gate = Gate.foreground(pid, field)
                 pb = NSPasteboard.generalPasteboard()
                 saved = [{t: it.dataForType_(t) for t in it.types()} for it in (pb.pasteboardItems() or [])]
                 try:
                     pb.clearContents()
                     pb.setString_forType_(text, NSPasteboardTypeString)
-                    # send: the first check, then each press checked right before it
-                    why = ready()
+                    # send: the first check, then every send behind the gate right before it
+                    why = ready(gate)
                     if why:
                         raise _NotReady(why)
-                    if action.clear_first and not axfield.select(field, True):
-                        why = self._press_checked(Q, *select_key, still_focused)       # cmd+A
-                        if why:
-                            raise _NotReady(why)
-                    why = self._press_checked(Q, *paste_key, still_focused)            # cmd+V
+                    if action.clear_first:
+                        took = select_all(gate)
+                        if isinstance(took, str):
+                            raise _NotReady(took)
+                        if not took:
+                            why = self._press_checked(Q, *select_key, gate)                 # cmd+A
+                            if why:
+                                raise _NotReady(why)
+                    why = self._press_checked(Q, *paste_key, gate)                          # cmd+V
                     if why:
                         raise _NotReady(why)
                     time.sleep(0.4)                 # the paste read before the clipboard is put back
@@ -3599,21 +3675,23 @@ class PeekabooDriver:
         return pair[0], pair[1], ("key", 0)
 
     @staticmethod
-    def _press_checked(Q, down, up, key, check) -> str | None:
-        """One press of events built beforehand: `check()` right before the down -- nothing that can block or wait
-        between them -- and the up after it, never checked (the completion of input already started). Why it was not
-        pressed, or None."""
-        why = check()
+    def _press_checked(Q, down, up, key, gate: Gate) -> str | None:
+        """One press of events built beforehand: the route's Gate (before_send) right before the down -- nothing that
+        can block or wait between them -- and the up after it, never checked (the completion of input already
+        started). Why it was not pressed, or None."""
+        if not isinstance(gate, Gate):
+            raise TypeError("a press is checked by its route's Gate")
+        why = gate.before_send()
         if why:
             return why
-        _post(Q, Q.kCGHIDEventTap, down, checked=True,            # the check above stands: not asked again in the post
+        _post(Q, Q.kCGHIDEventTap, down, gate=gate,               # the gate above stands: not asked again in the post
               press=(key, lambda in_place=False: _post(Q, Q.kCGHIDEventTap, up, release=key)))
         time.sleep(0.02)
         _post(Q, Q.kCGHIDEventTap, up, release=key)
         time.sleep(0.02)
         return None
 
-    def _keys_in_background(self, field, text: str, ready, still_focused, clear_first: bool, select_code: int):
+    def _keys_in_background(self, field, text: str, ready, select_all, clear_first: bool, select_code: int):
         """`text` as keys to the observed window without bringing anything forward (the window made its app's key
         window, proven so; Unicode payloads): a detail string when typed, "stopped:<why>" when stopped, an
         ExecResult when the window refused a key part way, None when this route does not apply -- decided before
@@ -3638,17 +3716,20 @@ class PeekabooDriver:
                 pairs = [self._unicode_pair(q, c) for c in chunks]
                 select_key = self._key_pair(q, select_code, q.kCGEventFlagMaskCommand) if clear_first else None
 
-                def check() -> str | None:
-                    return key.lost() or still_focused()     # the window first, the element's focus last
-                why = ready()
+                gate = Gate.background(q, field)          # the route's one gate: STOP, the window, the focus
+                why = ready(gate)
                 if why:
                     return f"stopped:{why}"
-                if clear_first and not axfield.select(field, True):
-                    why = self._press_checked(q, *select_key, check)
-                    if why:
-                        return f"stopped:{why}"
+                if clear_first:
+                    took = select_all(gate)
+                    if isinstance(took, str):
+                        return f"stopped:{took}"
+                    if not took:
+                        why = self._press_checked(q, *select_key, gate)
+                        if why:
+                            return f"stopped:{why}"
                 for chunk, pair in zip(chunks, pairs):
-                    why = self._press_checked(q, *pair, check)
+                    why = self._press_checked(q, *pair, gate)
                     if why:
                         return f"stopped:{why} (after {typed} of {len(text)} chars)"
                     typed += len(chunk)

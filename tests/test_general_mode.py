@@ -1309,6 +1309,37 @@ class TypingWhereNoValueIsTaken(unittest.TestCase):
         self.assertIn("press Return as its own step", res.detail)
         self.assertEqual(self.sent(), [])
 
+    def test_a_newline_paste_stopped_part_way_in_the_background_stays_unverified(self):
+        """Review of #66 @e04edab: the WebKit background branch of _flash -- the focus written, the paste posted, then
+        a key refused -- answers MaybeSent; the newline wrapper relabelled it "nothing sent", and outside a step
+        (`hands do`) that invited a retry that pasted twice."""
+        from deskmind_hands.drivers import base, skylight
+        d = self._driver(settable=False)
+        del d._flash                                                          # the real one, its background branch
+        d._background_input = lambda bundle: True
+        d._wait_until_still = lambda bundle, what: None
+        d._too_late = lambda waited: None
+        token = types.SimpleNamespace(note=lambda: "")
+        d._background_quartz = lambda bundle: (types.SimpleNamespace(kCGEventFlagMaskCommand=1 << 20), token)
+        posts = []
+
+        def post_key(Q, code, flags=0):
+            posts.append((code, flags))
+            if code == 9:
+                base.counted(lambda: None)                                   # the paste went
+                raise skylight.WindowKeyRefused("the user came back to the app")
+        d._post_key = post_key
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        d._require_session = lambda: None
+        d.CONFIRM_BY_DIFF = False
+        with mock.patch.object(skylight, "give_focus_back", lambda t: None):
+            res = d.execute(Action(kind=ActionKind.TYPE_TEXT, text="one\ntwo",       # its own step, as `hands do`
+                                   binding=Binding(element_id="elem_3")))
+        self.assertIsInstance(res.detail, base.MaybeSent)                     # passed through, not relabelled
+        self.assertIn("may have taken effect", res.detail)
+        self.assertIsNot(res.performed, False)
+        self.assertTrue(res.indeterminate, res.detail)
+
     # -- the rest
     def test_a_button_is_not_a_keyboard_target(self):
         self.el["role"] = "AXButton"

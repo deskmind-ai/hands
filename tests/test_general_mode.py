@@ -1773,11 +1773,14 @@ class GateAtEverySendSite(_KeysFixture):
                 quartz.kCGWindowListOptionOnScreenOnly, quartz.kCGWindowListExcludeDesktopElements = 1, 16
                 quartz.CGWindowListCopyWindowInfo = lambda o, w, owner=owner: (
                     [{"kCGWindowLayer": 0, "kCGWindowOwnerPID": owner}] if owner else [])
-                with mock.patch.object(skylight, "front_pid", lambda: None), \
-                        mock.patch.dict(sys.modules, {"Quartz": quartz}):
-                    d = self.route("foreground")
-                    self.workspace_front = 9999                           # NSWorkspace, stale: not asked
-                    res = self._type(d)
+                # started before the route's own patches of sys.modules, so stopped after them: nothing leaks
+                for p in (mock.patch.dict(sys.modules, {"Quartz": quartz}),
+                          mock.patch.object(skylight, "front_pid", lambda: None)):
+                    p.start()
+                    self.addCleanup(p.stop)
+                d = self.route("foreground")
+                self.workspace_front = 9999                               # NSWorkspace, stale: not asked
+                res = self._type(d)
                 if ok:
                     self.assertTrue(res.ok and not res.indeterminate, res.detail)
                 else:                                                     # neither tells: refused

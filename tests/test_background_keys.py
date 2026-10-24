@@ -313,8 +313,8 @@ class TextAndChords(unittest.TestCase):
         self.assertFalse(axfield.typed_in("old", "old new", "new", True))         # not in place of what was there
 
 
-class Key:
-    """A WindowKey stand-in: records its use; `lose_after` chunks typed, it reads as lost."""
+class Key(skylight.WindowKey):
+    """A WindowKey (the type a background Gate holds), made without a window: records its use; `lost()` as told."""
 
     def __init__(self, log, via="records", lost=None, note=""):
         self.log, self.via, self._lost, self._note = log, via, lost, note
@@ -334,12 +334,17 @@ class Key:
         return self._note
 
 
-class FakeQ:
-    """Quartz as _post_unicode uses it: each Unicode key-down goes into `field` (as an app would type it)."""
+class FakeQ(skylight.BackgroundQuartz):
+    """A BackgroundQuartz (the type a background Gate holds), made without Quartz: each Unicode key-down goes into
+    `field` (as an app would type it), or into another field when it has lost the focus."""
     kCGHIDEventTap, kCGEventFlagMaskCommand = 0, 1 << 20
+    _q = None
 
-    def __init__(self, d, field):
-        self.d, self.field = d, field
+    def __init__(self, d, field, key=None):
+        self.d, self.field, self.key = d, field, key
+
+    def post_checked(self, event, gate):
+        self.CGEventPost(0, event)
 
     def CGEventKeyboardSetUnicodeString(self, ev, n, s):   # noqa: N802
         ev["text"] = s
@@ -348,6 +353,8 @@ class FakeQ:
         ev["flags"] = f
 
     def CGEventPost(self, tap, ev):   # noqa: N802
+        if ev["down"] and getattr(self.d, "count_sends", False):
+            base.counted(lambda: None)
         if ev["down"] and "text" in ev:
             self.d.log.append(("keys", ev["text"]))
             if not self.field.focused:                                  # the keyboard focus is elsewhere: there
@@ -388,12 +395,17 @@ class Field:
         self.other = ""                     # another field of the window, where keys go when this one lost the focus
 
 
-class TypeText(unittest.TestCase):
+class _TypeHarness(unittest.TestCase):
     def run_type(self, field, keys_land=True, enter=None, text="hello 你好", clear=False, selects=True,
                  all_selected=True, d=None, settle=None, value=None, insert=None, extra=(), user_on=False,
-                 key_event=None, real_keycode=False):
+                 key_event=None, real_keycode=False, count_sends=False):
         d = d or driver()
         d.keys_land = keys_land
+        d.count_sends = count_sends                     # the fake focus, selection and keys counted as sends
+
+        def sends():
+            if count_sends:
+                base.ax_counted(lambda: 0)
         if not real_keycode:
             d._keycode = lambda q, letter: {"a": 0}[letter]
 
@@ -403,7 +415,7 @@ class TypeText(unittest.TestCase):
                 field.value = ""
         d._post_key = post_key
 
-        def ax_insert(el, t, replace_all):
+        def ax_insert(el, t, replace_all, go=None):
             # takes_insertion: True, it shows; "ignored", it reaches the app and nothing shows (accepted, a no-op);
             # False, refused before it reached the app (nothing counted as sent)
             d.log.append(("ax insert", t))
@@ -426,12 +438,15 @@ class TypeText(unittest.TestCase):
                    mock.patch.object(axfield, "names", lambda el: field.names),
                    mock.patch.object(axfield, "in_web_area", lambda el: field.web),
                    mock.patch.object(axfield, "is_focused", lambda el: field.focused),
-                   mock.patch.object(axfield, "focus",
-                                     lambda el: d.log.append("focus") or setattr(field, "focused", True) or True),
-                   mock.patch.object(axfield, "select", lambda el, replace_all: d.log.append("select") or selects),
+                   mock.patch.object(axfield, "focus", lambda el: d.log.append("focus") or sends()
+                                     or setattr(field, "focused", True) or True),
+                   mock.patch.object(axfield, "select", lambda el, replace_all: d.log.append("select") or sends()
+                                     or selects),
                    mock.patch.object(axfield, "all_selected", lambda el, wait=0.5: all_selected),
                    mock.patch.object(skylight, "user_on", lambda pid: user_on),
-                   mock.patch.object(skylight, "BackgroundQuartz", lambda pid, wid, origin, key=None: FakeQ(d, field)),
+                   mock.patch.object(skylight, "BackgroundQuartz",
+                                     type("HeldWindow", (FakeQ,), {"__init__": lambda self_, pid, wid, origin, key=None:
+                                                                   FakeQ.__init__(self_, d, field, key)})),
                    mock.patch.object(PeekabooDriver, "_key_event",
                                      key_event or classmethod(lambda cls, Q, code, down: {"down": down, "code": code})),
                    mock.patch.object(skylight, "enter_window_key",
@@ -448,6 +463,9 @@ class TypeText(unittest.TestCase):
     def keys_sent(self, d):
         return [e for e in d.log if isinstance(e, tuple) and e[0] == "keys"]
 
+
+class TypeText(_TypeHarness):
+
     def test_the_accessibility_insertion_first(self):
         d, res = self.run_type(Field("start\n", takes_insertion=True))
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
@@ -462,7 +480,7 @@ class TypeText(unittest.TestCase):
                                  ("keys", "hello 你好"), "exit"])
 
     def test_nothing_written_no_wait(self):
-        d, res = self.run_type(Field("start", takes_insertion=False), insert=lambda el, t, r: False)
+        d, res = self.run_type(Field("start", takes_insertion=False), insert=lambda el, t, r, go=None: False)
         self.assertEqual(d.settle_waits[0], 0)
 
     def test_an_insertion_shown_late_is_not_typed_again(self):
@@ -475,7 +493,7 @@ class TypeText(unittest.TestCase):
                 field.value += pending.pop()
             return field.value
 
-        def insert(el, t, replace_all):
+        def insert(el, t, replace_all, go=None):
             pending.append(t)
             return True
         fake_time = types.SimpleNamespace(monotonic=lambda: clock[0],
@@ -572,7 +590,8 @@ class TypeText(unittest.TestCase):
 
         def lost():
             chunks[0] += 1
-            return "window 200 is no longer the app's key window (now 100)" if chunks[0] > 3 else None
+            # asked by the gate before the focus write and the selection, then before each chunk: lost after three
+            return "window 200 is no longer the app's key window (now 100)" if chunks[0] > 5 else None
         d, res = self.run_type(Field("start", takes_insertion=False), d=d, text="x" * 2000,
                                enter=lambda pid, wid: Key(d.log, lost=lost))
         self.assertFalse(res.ok)
@@ -591,7 +610,7 @@ class TypeText(unittest.TestCase):
             field.focused = False                                        # e.g. a Tab moved it, or a dialog took it
         with mock.patch.object(FakeQ, "CGEventPost", post):
             d, res = self.run_type(field, d=d, text="y" * 40)
-        self.assertIn("no longer has the focus", res.detail)
+        self.assertIn("lost the keyboard focus", res.detail)
         self.assertEqual(len(self.keys_sent(d)), 1)
 
     def test_no_cmd_a_when_the_window_is_lost(self):
@@ -996,3 +1015,95 @@ class FrontApp(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GateAtEverySendSiteInTheBackground(_TypeHarness):
+    """hands#66's one-gate rule in _type_in_background's key route (review of #66 @8086268, the third of the "check
+    before send" family): every send site -- the focus write (T2), the selection (T3), cmd+A (T4), each chunk (T5)
+    -- x {STOP, the window lost, the focus lost}, the condition arising right before that site: nothing is sent
+    there, and the result is honest -- nothing sent when nothing went before (or, the window lost before anything
+    went, None: the caller's route), else unverified. T1, the insertion: STOP between its selection and its text."""
+
+    SITE_CALL = {"focus write": 1, "select": 2, "cmd+A": 3, "chunk": 4}   # which ask of the window precedes it
+
+    def row(self, site, what):
+        from deskmind_hands.grounding import STOP
+        STOP.clear()
+        self.addCleanup(STOP.clear)
+        field = Field("start", takes_insertion=False)            # the insertion refused: the key route
+        d = driver()
+        calls = [0]
+        at = self.SITE_CALL[site]
+
+        def flip():
+            if what == "stop":
+                STOP.set()
+            elif what == "focus":
+                field.focused = False
+
+        def lost():
+            # the gate asks STOP, then this, then the focus: a STOP flips at the ask before the previous site, the
+            # window answers at the site's own ask, the focus flips there (it is read after this)
+            calls[0] += 1
+            if calls[0] == at and what == "window":
+                return "window 200 is no longer the app's key window (now 100)"
+            if (what == "stop" and calls[0] == at - 1) or (what == "focus" and calls[0] == at):
+                flip()
+            return None
+        prepare_flip = site == "focus write" and what == "stop"  # while preparing (Codex's repro: a STOP then)
+        text = "x" * 40
+        clear = site in ("select", "cmd+A")
+
+        def run():
+            return self.run_type(field, d=d, text=text, clear=clear, selects=site != "cmd+A", count_sends=True,
+                                 enter=lambda pid, wid: Key(d.log, lost=lost),
+                                 extra=[mock.patch.object(skylight, "text_chunks",
+                                                          lambda t, *a: (flip() if prepare_flip else None) or
+                                                          _chunks(t, *a))])
+        return run()
+
+    def sent_at(self, d, site):
+        if site == "focus write":
+            return "focus" in d.log
+        if site == "select":
+            return "select" in d.log
+        if site == "cmd+A":
+            return ("key", 0, 1 << 20) in d.log
+        return len(self.keys_sent(d)) > 1
+
+    def test_every_site_under_every_condition(self):
+        for site in ("focus write", "select", "cmd+A", "chunk"):
+            for what in ("stop", "window", "focus"):
+                if site == "focus write" and what == "focus":
+                    continue                                     # the focus is what that write sets
+                with self.subTest(site=site, condition=what):
+                    d, res = self.row(site, what)
+                    self.assertFalse(self.sent_at(d, site), (getattr(res, "detail", res), d.log))
+                    if site == "focus write":                    # nothing of this route went before it
+                        if what == "stop":
+                            self.assertIs(res.performed, False, res.detail)
+                        else:
+                            self.assertIsNone(res)               # the caller's route, chosen before a send
+                    else:
+                        self.assertIsNot(res.performed, False, res.detail)
+                        self.assertTrue(res.indeterminate, res.detail)
+
+    def test_the_control_every_site_is_reached_when_nothing_happens(self):
+        for site in ("focus write", "select", "cmd+A", "chunk"):
+            with self.subTest(site=site):
+                d, res = self.row(site, None)
+                self.assertTrue(self.sent_at(d, site), d.log)
+
+    def test_t1_a_stop_between_the_insertions_selection_and_its_text_writes_no_text(self):
+        from deskmind_hands.grounding import STOP
+        self.addCleanup(STOP.clear)
+        writes = []
+        with mock.patch.object(axfield, "select", lambda el, all_, wait=0.3: writes.append("selection") or
+                               STOP.set() or True), \
+                mock.patch.object(axfield, "_set", lambda el, attr, v: writes.append(attr) or True):
+            self.assertFalse(axfield.insert("FIELD", "text", False, go=lambda: not STOP.is_set()))
+        self.assertEqual(writes, ["selection"])                 # no AXSelectedText after the stop
+
+
+_chunks = skylight.text_chunks
+

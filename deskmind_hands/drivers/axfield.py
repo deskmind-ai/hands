@@ -113,11 +113,11 @@ def _selection(el) -> tuple[int, int] | None:
     return (int(r[0]), int(r[1])) if isinstance(r, tuple) else (int(r.location), int(r.length))
 
 
-def insert(el, text: str, replace_all: bool) -> bool:
+def insert(el, text: str, replace_all: bool, go=None) -> bool:
     """`text` in place of the whole text (replace_all) or at the end, by the accessibility insertion
     (AXSelectedText); True when the write was sent and accepted -- which is not proof it changed anything. False:
-    nothing was written (the selection was refused, or the write)."""
-    return select(el, replace_all) and _set(el, "AXSelectedText", text)
+    nothing was written (the selection was refused, or the write, or `go()` said no after the selection's wait)."""
+    return select(el, replace_all) and (go is None or bool(go())) and _set(el, "AXSelectedText", text)
 
 
 def focus(el, wait: float = 0.5) -> bool:

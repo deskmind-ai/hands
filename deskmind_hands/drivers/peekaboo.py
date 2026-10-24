@@ -3804,7 +3804,9 @@ class PeekabooDriver:
         if not web:
             sent_before = sends_so_far()
             try:
-                written = axfield.insert(field, text, clear_first)
+                # T1: STOP right before, nothing that can wait between; and between the insertion's own two writes
+                # (the selection, a read-back of up to 0.3 s, the text) once more
+                written = axfield.insert(field, text, clear_first, go=lambda: not STOP.is_set())
             except Exception:   # noqa: BLE001 -- refused or failed: it may have reached the app
                 written = True
             reached = written or sends_so_far() > sent_before
@@ -3833,32 +3835,45 @@ class PeekabooDriver:
                 pairs = [self._unicode_pair(q, c) for c in chunks]
                 select_key = self._key_pair(q, select_code, q.kCGEventFlagMaskCommand) if clear_first else None
 
-                def lost() -> str | None:
-                    if STOP.is_set():
-                        return "stopped by the app"
-                    why = key.lost()
-                    if why:
-                        return why
-                    return None if axfield.is_focused(field) else "the field no longer has the focus in its window"
+                # send: the route's one gate (hands#66) asked before every send -- the focus write (STOP, the
+                # window), the selection, cmd+A and every chunk (STOP, the window, the field's focus, last)
+                gate = Gate.background(q, field)
+                route_before = sends_so_far()
 
-                # send: the focus, the selection (each may wait), then each press checked right before it
-                if not axfield.focus(field):
+                def stop(why: str) -> ExecResult | None:
+                    """Refused at a send: told as it is -- part went (unverified), the app's stop (nothing sent),
+                    else None, nothing of this route went: the caller's route."""
+                    if sends_so_far() > route_before:
+                        return ExecResult(False, MaybeSent(f"typing into {label!r} stopped part way: {why} -- it may "
+                                                           f"have taken effect; observe before typing again"))
+                    if STOP.is_set():
+                        return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
                     return None
+
+                why = gate.before_focus_write()
+                if why:
+                    return stop(why)
+                if not axfield.focus(field):
+                    return stop("the field did not take the keyboard focus")
+                why = gate.before_send()
+                if why:
+                    return stop(why)
                 if not axfield.select(field, clear_first):
                     # Chrome did not take a whole-text selection through accessibility (live, 10-21); cmd+A to the
                     # window does it, read back the same way. A caret that cannot be put at the end: not this route.
-                    if not clear_first or lost():
-                        return None
+                    if not clear_first:
+                        return stop("the caret could not be put at the end of the field")
                     try:
-                        if self._press_checked(q, *select_key, lost):
-                            return None
-                    except skylight.WindowKeyRefused:
-                        return None         # refused before it was sent: nothing typed
+                        why = self._press_checked(q, *select_key, gate)
+                    except skylight.WindowKeyRefused as exc:
+                        why = str(exc)
+                    if why:
+                        return stop(why)
                     if not axfield.all_selected(field):
-                        return None
+                        return stop("the field's text could not be selected")
                 for chunk, pair in zip(chunks, pairs):
                     try:
-                        why = self._press_checked(q, *pair, lost)
+                        why = self._press_checked(q, *pair, gate)
                     except skylight.WindowKeyRefused as exc:   # the window refused the key: not sent
                         why = str(exc)
                     if why:

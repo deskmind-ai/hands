@@ -1159,7 +1159,7 @@ class _KeysFixture(unittest.TestCase):
         # the press primitives: events built beforehand are ("down"|"up", code, flags); a down is the key, as typed
         d._key_pair = lambda Q, code, flags=0: (("down", code, flags), ("up", code, flags), ("key", code))
 
-        def post(Q, tap, ev, press=None, release=None):
+        def post(Q, tap, ev, press=None, release=None, checked=False):
             if ev[0] == "down":
                 post_key(Q, ev[1], ev[2])
         p = mock.patch.object(P, "_post", post)
@@ -1337,7 +1337,7 @@ class TypingWhereNoValueIsTaken(_KeysFixture):
                                                                      kCGHIDEventTap=0), token)
         from deskmind_hands.drivers import peekaboo as P
 
-        def post(Q, tap, ev, press=None, release=None):
+        def post(Q, tap, ev, press=None, release=None, checked=False):
             if ev[:2] == ("down", 9):
                 base.counted(lambda: None)                                   # the paste went
                 raise skylight.WindowKeyRefused("the user came back to the app")
@@ -1441,7 +1441,7 @@ class FocusMovesWhilePreparing(_KeysFixture):
         d._key_pair = stealing_pair
         d._unicode_pair = lambda Q, chunk: self.steal() or (("down", "u", chunk), ("up", "u", chunk), ("key", 0))
 
-        def post(Q, tap, ev, press=None, release=None):
+        def post(Q, tap, ev, press=None, release=None, checked=False):
             if not (isinstance(ev, tuple) and ev[0] == "down"):
                 return
             into = self.shown if self.el["focused"] else self.other
@@ -1516,6 +1516,44 @@ class FocusMovesWhilePreparing(_KeysFixture):
         res = self._type(self.driver(background=True, can_focus=False))
         self.assert_nothing_in_the_other_field(res)
         self.assertIs(res.performed, False)
+
+
+class CheckedPressPostsWithoutAskingAgain(unittest.TestCase):
+    """Review of #66 @92fbf45: a checked press (_press_checked: the window, then the focus) went on to
+    BackgroundQuartz.CGEventPost, whose key check asks key.lost() again -- an accessibility read of the focused window
+    that can wait its whole timeout, between the focus check and the key-down. Posted through post_checked now; every
+    other post keeps the check."""
+
+    def setUp(self):
+        from deskmind_hands.drivers import skylight
+        self.log = []
+        q = types.ModuleType("Quartz")
+        q.kCGEventKeyDown, q.kCGEventKeyUp, q.kCGEventFlagsChanged, q.kCGHIDEventTap = 10, 11, 12, 0
+        q.CGEventGetType = lambda ev: ev[0]
+        p = mock.patch.dict(sys.modules, {"Quartz": q})
+        p.start()
+        self.addCleanup(p.stop)
+        for name, fn in (("_load", lambda: {}),
+                         ("post_key_event", lambda pid, ev, auth=True: self.log.append(("posted", ev[0])))):
+            p = mock.patch.object(skylight, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+        key = skylight.WindowKey.__new__(skylight.WindowKey)
+        key.lost = lambda: self.log.append("key.lost: an accessibility read that can wait") or None
+        self.q = skylight.BackgroundQuartz(4242, 200, (0, 0), key=key)
+
+    def test_a_checked_press_is_not_asked_again_between_the_check_and_the_down(self):
+        from deskmind_hands.drivers import base
+        with base.input_scope(None):
+            why = PeekabooDriver._press_checked(self.q, (10,), (11,), ("key", 0),
+                                                lambda: self.log.append("check") or None)
+        self.assertIsNone(why)
+        self.assertEqual(self.log, ["check", ("posted", 10), ("posted", 11)])
+
+    def test_any_other_key_down_keeps_the_check(self):
+        from deskmind_hands.drivers.peekaboo import _post
+        _post(self.q, 0, (10,))
+        self.assertEqual(self.log, ["key.lost: an accessibility read that can wait", ("posted", 10)])
 
 
 class TextTargetFoundByItsRole(unittest.TestCase):

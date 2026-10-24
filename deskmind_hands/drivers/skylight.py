@@ -590,6 +590,21 @@ class BackgroundQuartz:
     def CGAssociateMouseAndMouseCursorPosition(self, *_):   # noqa: N802
         return 0
 
+    def post_checked(self, event) -> None:
+        """A key-down whose window and focus the caller checked right before it, with nothing that can wait between
+        (PeekabooDriver._press_checked): posted without asking the window again -- key.lost() reads the app's focused
+        window through accessibility, which can wait as long as its timeout, and asked here it put that wait between
+        the caller's focus check and the key (review of hands#66 @92fbf45). Still never without a WindowKey. Any other
+        event: as CGEventPost."""
+        q = self._q
+        if q.CGEventGetType(event) in (q.kCGEventKeyDown, q.kCGEventKeyUp, q.kCGEventFlagsChanged):
+            if not isinstance(self.key, WindowKey):
+                raise _refuse("front", "the app is the user's front app: a key would land in its key window, the "
+                                       "user's; none was sent")
+            post_key_event(self.pid, event, auth=self.key_auth)     # counted there (base.counted)
+            return
+        self.CGEventPost(0, event)
+
     def CGEventPost(self, _tap, event):   # noqa: N802
         q, fns = self._q, self._fns
         kind = q.CGEventGetType(event)

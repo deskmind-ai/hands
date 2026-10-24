@@ -424,6 +424,8 @@ class NoSendBypassesTheCount(unittest.TestCase):
     EXEMPT = {
         ("deskmind_hands.drivers.axfield", "_set", "AXUIElementSetAttributeValue"): "the counted wrapper (ax_counted)",
         ("deskmind_hands.drivers.axpopup", "_act", "AXUIElementPerformAction"): "the counted wrapper (ax_counted)",
+        ("deskmind_hands.drivers.skylight", "BackgroundQuartz.post_checked", "CGEventPost"):
+            "any event other than a key: BackgroundQuartz's own CGEventPost, which counts its posts (counts_own_posts)",
         ("deskmind_hands.drivers.peekaboo", "_post_one", "CGEventPost"): "the counted wrapper of every event post (_post marks presses and releases around it)",
         ("deskmind_hands.drivers.skylight", "post_key_event", "CGEventPostToPid"): "counted around the post",
         ("deskmind_hands.drivers.skylight", "post_key_event", 'fns["post"]'): "counted around the post",

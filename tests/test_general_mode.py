@@ -1761,22 +1761,28 @@ class GateAtEverySendSite(_KeysFixture):
         res = self._type(d)                                     # its process by bundle id: typed
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
 
-    def test_the_front_app_without_the_window_server_falls_back_to_nsworkspace(self):
+    def test_the_front_app_without_the_window_server_is_read_from_the_window_list(self):
+        """hands#69: with SkyLight's front process unavailable, the front is the frontmost ordinary window's owner --
+        never NSWorkspace's frontmostApplication, stale without a run loop (here it says another app: ignored)."""
         from deskmind_hands.drivers import skylight
-        self.el["focused"] = True
-        with mock.patch.object(skylight, "front_pid", lambda: None):    # the window server does not tell
-            d = self.route("foreground")
-            self.workspace_front = 4242                                    # NSWorkspace does
-            res = self._type(d)
-            self.assertTrue(res.ok and not res.indeterminate, res.detail)
-        self.setUp()
-        self.el["focused"] = True
-        with mock.patch.object(skylight, "front_pid", lambda: None):
-            d = self.route("foreground")
-            self.workspace_front = None                                    # neither tells: refused
-            res = self._type(d)
-        self.assertIs(res.performed, False, res.detail)
-        self.assertEqual(self.pastes(), [])
+        for owner, ok in ((4242, True), (None, False)):
+            with self.subTest(window_owner=owner):
+                self.setUp()
+                self.el["focused"] = True
+                quartz = types.ModuleType("Quartz")
+                quartz.kCGWindowListOptionOnScreenOnly, quartz.kCGWindowListExcludeDesktopElements = 1, 16
+                quartz.CGWindowListCopyWindowInfo = lambda o, w, owner=owner: (
+                    [{"kCGWindowLayer": 0, "kCGWindowOwnerPID": owner}] if owner else [])
+                with mock.patch.object(skylight, "front_pid", lambda: None), \
+                        mock.patch.dict(sys.modules, {"Quartz": quartz}):
+                    d = self.route("foreground")
+                    self.workspace_front = 9999                           # NSWorkspace, stale: not asked
+                    res = self._type(d)
+                if ok:
+                    self.assertTrue(res.ok and not res.indeterminate, res.detail)
+                else:                                                     # neither tells: refused
+                    self.assertIs(res.performed, False, res.detail)
+                    self.assertEqual(self.pastes(), [])
 
     # -- Codex on #66 @79cd02d: what can wait is asked first, the instant checks last
     def nth(self, n, flip):

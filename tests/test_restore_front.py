@@ -140,5 +140,72 @@ class RestoreFrontTable(unittest.TestCase):
         self.assertEqual(self.run_row([], by_name=rows, bundle=""), ("not given back: several running apps have that name", []))
 
 
+class TheFrontIsReadFresh(unittest.TestCase):
+    """Codex on #69 @2baf2f8: with SkyLight unavailable the front was NSWorkspace's frontmostApplication -- stale in a
+    process with no AppKit run loop (the executor). A refused activation read as given back (the stale front was the
+    target), and the gate's front check could pass or refuse on the wrong app. One fresh read now
+    (front.fresh_front_pid: SkyLight, else the frontmost ordinary window's owner), for the give-back and the gates."""
+
+    def modules(self, window_owner, stale_front):
+        quartz = types.ModuleType("Quartz")
+        quartz.kCGWindowListOptionOnScreenOnly, quartz.kCGWindowListExcludeDesktopElements = 1, 16
+        quartz.CGWindowListCopyWindowInfo = lambda opts, wid: [
+            {"kCGWindowLayer": 25, "kCGWindowOwnerPID": 55},                 # a status item above: not layer 0
+            {"kCGWindowLayer": 0, "kCGWindowOwnerPID": window_owner}]
+        stale = types.SimpleNamespace(processIdentifier=lambda: stale_front)
+        workspace = types.SimpleNamespace(frontmostApplication=lambda: stale, runningApplications=lambda: [])
+        return quartz, workspace
+
+    def test_a_refused_activation_with_a_stale_front_still_tries_axfrontmost(self):
+        from deskmind_hands.drivers import front, skylight
+        log = []
+        quartz, workspace = self.modules(window_owner=1, stale_front=501)     # stale: says the target is in front
+
+        class App:
+            def processIdentifier(self):
+                return 501
+
+            def isTerminated(self):
+                return False
+
+            def activateWithOptions_(self, opts):
+                log.append("activate")
+                return False                                                  # refused
+        appkit = types.ModuleType("AppKit")
+        appkit.NSApplicationActivateIgnoringOtherApps = 2
+        appkit.NSRunningApplication = types.SimpleNamespace(runningApplicationsWithBundleIdentifier_=lambda b: [App()])
+        appkit.NSWorkspace = types.SimpleNamespace(sharedWorkspace=lambda: workspace)
+        ax = types.ModuleType("ApplicationServices")
+        ax.AXUIElementCreateApplication = lambda pid: pid
+        ax.AXUIElementSetAttributeValue = lambda el, attr, v: log.append(attr) or 0
+        with mock.patch.dict(sys.modules, {"AppKit": appkit, "ApplicationServices": ax, "Quartz": quartz}), \
+                mock.patch.object(skylight, "front_pid", lambda: None):
+            front.restore_front("com.example.app")
+        self.assertEqual(log, ["activate", "AXFrontmost"])
+
+    def test_the_gates_front_check_reads_the_fresh_front(self):
+        from deskmind_hands.drivers import skylight
+        from deskmind_hands.drivers.peekaboo import Gate
+        from deskmind_hands.grounding import STOP
+        STOP.clear()
+        for owner, stale, refused in ((4242, 1111, False), (1111, 4242, True)):
+            with self.subTest(window_owner=owner, stale=stale):
+                quartz, workspace = self.modules(window_owner=owner, stale_front=stale)
+                appkit = types.ModuleType("AppKit")
+                appkit.NSWorkspace = types.SimpleNamespace(sharedWorkspace=lambda: workspace)
+                with mock.patch.dict(sys.modules, {"AppKit": appkit, "Quartz": quartz}), \
+                        mock.patch.object(skylight, "front_pid", lambda: None):
+                    why = Gate.foreground(4242, "FIELD").before_focus_write()
+                self.assertEqual(bool(why), refused, why)
+
+    def test_no_front_check_reads_nsworkspace_frontmost_application(self):
+        found = []
+        for path in PKG.rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Attribute) and node.attr == "frontmostApplication":
+                    found.append(f"{path.name}:{node.lineno}")
+        self.assertEqual(found, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -341,13 +341,21 @@ class HandsExecutor:
         return restore_front(bundle)
 
     @staticmethod
-    def _front_bundle_id() -> str:
+    def _front_running_app():
+        """The front app (NSRunningApplication), read fresh (drivers/front.fresh_front_pid -- never NSWorkspace's
+        frontmostApplication, stale in this process with no run loop); None when unknown."""
         try:
-            from AppKit import NSWorkspace
-            app = NSWorkspace.sharedWorkspace().frontmostApplication()
-            return str(app.bundleIdentifier() or "") if app else ""
+            from AppKit import NSRunningApplication
+            from .drivers.front import fresh_front_pid
+            pid = fresh_front_pid()
+            return NSRunningApplication.runningApplicationWithProcessIdentifier_(pid) if pid else None
         except Exception:  # noqa: BLE001
-            return ""
+            return None
+
+    @classmethod
+    def _front_bundle_id(cls) -> str:
+        app = cls._front_running_app()
+        return str(app.bundleIdentifier() or "") if app else ""
 
     def _known_windows(self) -> set[str]:
         """Every window that exists now, on screen or not: a window not among these afterwards was made meanwhile."""
@@ -366,7 +374,7 @@ class HandsExecutor:
     def _front(self) -> str:
         if AppKit is None:
             return ""
-        app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        app = self._front_running_app()
         return (app.localizedName() if app else None) or ""
 
     #: The user is "active" when the keyboard or mouse moved within this many seconds (hands' driver uses the same

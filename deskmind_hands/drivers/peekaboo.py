@@ -737,19 +737,11 @@ def _pid_by_bundle(bundle: str) -> int | None:
 
 
 def _front_app_pid() -> int | None:
-    """The front app's pid without an accessibility wait: the window server (skylight.front_pid), else -- its symbols
-    missing on some macOS -- NSWorkspace's frontmost application (review of #66 @24fbf21: with the window server's
-    answer alone, every foreground paste refused there). None only when neither tells."""
-    from deskmind_hands.drivers import skylight
-    front = skylight.front_pid()
-    if front is not None:
-        return front
-    try:
-        from AppKit import NSWorkspace
-        app = NSWorkspace.sharedWorkspace().frontmostApplication()
-        return int(app.processIdentifier()) if app is not None else None
-    except Exception:  # noqa: BLE001 -- not known
-        return None
+    """The front app's pid for the gates' instant check: drivers/front.fresh_front_pid -- the window server, else the
+    frontmost ordinary window's owner; never NSWorkspace's frontmostApplication, stale without a run loop (review of
+    #69 @2baf2f8). None when unknown: the gate refuses."""
+    from deskmind_hands.drivers.front import fresh_front_pid
+    return fresh_front_pid()
 
 
 class Gate:

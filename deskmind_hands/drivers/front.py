@@ -15,21 +15,33 @@ GIVEN, QUIT, REFUSED = "given back", "not given back: the app is no longer runni
 REFUSED_AMBIGUOUS = "not given back: several running apps have that name"
 
 
-def _front_pid() -> int | None:
-    """The front app's pid with no accessibility wait: the window server, else NSWorkspace; None when neither tells."""
+def fresh_front_pid() -> int | None:
+    """The front app's pid, read fresh and with no accessibility wait: the window server's front process (SkyLight),
+    else -- its symbols missing on some macOS -- the owner of the frontmost ordinary (layer 0) window on screen.
+    Never NSWorkspace's frontmostApplication: in a process with no AppKit run loop (the executor) it keeps the app
+    that was in front when first read (InputWatch._front_pid; review of #69 @2baf2f8). None when neither answers:
+    unknown -- a check refuses on it, a give-back tries AXFrontmost and says what that answered."""
     try:
         from deskmind_hands.drivers import skylight
         pid = skylight.front_pid()
-        if pid is not None:
-            return pid
+        if pid:
+            return int(pid)
     except Exception:  # noqa: BLE001
         pass
     try:
-        from AppKit import NSWorkspace
-        app = NSWorkspace.sharedWorkspace().frontmostApplication()
-        return int(app.processIdentifier()) if app is not None else None
+        import Quartz
+        wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly
+                                                 | Quartz.kCGWindowListExcludeDesktopElements, 0) or []
+        for w in wins:                                    # front to back
+            if w.get("kCGWindowLayer") == 0 and w.get("kCGWindowOwnerPID"):
+                return int(w["kCGWindowOwnerPID"])
     except Exception:  # noqa: BLE001
-        return None
+        pass
+    return None
+
+
+def _front_pid() -> int | None:
+    return fresh_front_pid()
 
 
 def restore_front(bundle: str, name: str = "") -> str:

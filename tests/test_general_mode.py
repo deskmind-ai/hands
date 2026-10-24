@@ -1135,7 +1135,7 @@ class _KeysFixture(unittest.TestCase):
         self.after = after
         for name, fn in {"value": lambda f: self.shown["value"],
                          "role": lambda f: el["role"],
-                         "is_focused": lambda f: el["focused"],
+                         "is_focused": lambda f: after("focus read") or el["focused"],     # a read that can wait
                          "can_set": lambda f, attr: el["can_focus"],
                          "focus": focus,
                          "select": select,
@@ -1609,6 +1609,7 @@ class GateAtEverySendSite(_KeysFixture):
         q = types.SimpleNamespace(kCGEventFlagMaskCommand=self.CMD, kCGHIDEventTap=0)
         bq = skylight.BackgroundQuartz.__new__(skylight.BackgroundQuartz)
         bq._q, bq.pid, bq.wid, bq.key = q, 4242, 200, held_window_key(self)
+        self.held = bq.key
         if kind == "webkit":                                   # _flash's background branch: a held window
             d._flash = lambda app, perform, what="": (True, perform(bq))
         elif kind == "background":                             # _keys_in_background
@@ -1773,6 +1774,49 @@ class GateAtEverySendSite(_KeysFixture):
             res = self._type(d)
         self.assertIs(res.performed, False, res.detail)
         self.assertEqual(self.pastes(), [])
+
+    # -- Codex on #66 @79cd02d: what can wait is asked first, the instant checks last
+    def nth(self, n, flip):
+        count = []
+
+        def hook():
+            count.append(1)
+            if len(count) == n:
+                flip()
+        return hook
+
+    def test_codex_a_stop_during_the_focus_read_before_the_paste_sends_nothing(self):
+        from deskmind_hands.grounding import STOP
+        self.el["focused"] = True
+        self.hooks["focus read"] = self.nth(3, STOP.set)        # the read in cmd+V's gate (before: the route's
+                                                                 # choice, then ready's)
+        res = self._type(self.route("foreground"))
+        self.assertEqual(self.pastes(), [])
+        self.assertIs(res.performed, False, res.detail)
+
+    def test_codex_the_front_app_changing_during_the_focus_read_sends_nothing(self):
+        self.el["focused"] = True
+
+        def away():
+            self.front = 9999
+        self.hooks["focus read"] = self.nth(3, away)
+        res = self._type(self.route("foreground"))
+        self.assertEqual(self.pastes(), [])
+        self.assertIs(res.performed, False, res.detail)
+
+    def test_a_stop_during_the_window_read_before_the_focus_write_writes_nothing(self):
+        from deskmind_hands.grounding import STOP
+        self.el["focused"] = False
+        d = self.route("webkit")
+        reads = self.nth(3, STOP.set)                            # the window read right before the focus write
+
+        def lost():
+            reads()
+            return None
+        self.held.lost = lost
+        res = self._type(d)
+        self.assertNotIn("focus", self.log)
+        self.assertIs(res.performed, False, res.detail)
 
     def test_codex_the_webkit_paste_after_the_user_came_back_is_not_sent(self):
         res = self.run_row("webkit", "cmd+V", "window")

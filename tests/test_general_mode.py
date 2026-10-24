@@ -1522,6 +1522,7 @@ class FocusMovesWhilePreparing(_KeysFixture):
         self.addCleanup(p.stop)
         d._post_key = lambda Q, code, flags=0: post(Q, 0, ("down", code, flags))  # a key pressed whole: the same
         if background:
+            self.front = 1111                              # the user is in another app
             del d._keys_in_background                      # the real background route
             d._background_keys = lambda: True
             d._ascii_input = lambda: True
@@ -1610,6 +1611,8 @@ class GateAtEverySendSite(_KeysFixture):
         bq = skylight.BackgroundQuartz.__new__(skylight.BackgroundQuartz)
         bq._q, bq.pid, bq.wid, bq.key = q, 4242, 200, held_window_key(self)
         self.held = bq.key
+        if kind != "foreground":
+            self.front = 1111                                   # held in the background: the user is in another app
         if kind == "webkit":                                   # _flash's background branch: a held window
             d._flash = lambda app, perform, what="": (True, perform(bq))
         elif kind == "background":                             # _keys_in_background
@@ -1818,6 +1821,60 @@ class GateAtEverySendSite(_KeysFixture):
         self.assertNotIn("focus", self.log)
         self.assertIs(res.performed, False, res.detail)
 
+    # -- Codex on #66 @0838225: every condition with an instant form asked again last, on both routes
+    def test_codex_the_user_coming_to_the_app_during_the_background_focus_read_sends_nothing(self):
+        for kind in ("background", "webkit"):
+            with self.subTest(route=kind):
+                self.setUp()
+                self.el["focused"] = True
+                d = self.route(kind)
+
+                def come_back():
+                    self.front = 4242                           # the user brought the target app forward
+                self.hooks["focus read"] = self.nth(3, come_back)   # the read in the first key's gate
+                res = self._type(d, text="x" * 40 if kind == "background" else "ls -la")
+                self.assertEqual(self.pastes(), [])
+                self.assertEqual([x for x in self.log if isinstance(x, tuple) and x[1] == "u"], [])
+                self.assertIs(res.performed, False, res.detail)
+
+    def test_the_user_coming_to_the_app_during_the_window_read_before_the_focus_write_writes_nothing(self):
+        self.el["focused"] = False
+        d = self.route("webkit")
+
+        def come_back():
+            self.front = 4242
+        reads = self.nth(3, come_back)                          # the window read right before the focus write
+
+        def lost():
+            reads()
+            return None
+        self.held.lost = lost
+        res = self._type(d)
+        self.assertNotIn("focus", self.log)
+        self.assertIs(res.performed, False, res.detail)
+
+    def test_every_instant_condition_on_every_route_during_the_last_read(self):
+        """One row per instant condition, per route: it arises during the last read before the first key (the
+        focus read in its gate) -- nothing is sent."""
+        from deskmind_hands.grounding import STOP
+        rows = (("foreground", "STOP", STOP.set), ("foreground", "the app no longer in front", "away"),
+                ("webkit", "STOP", STOP.set), ("webkit", "the user came to the app", "back"),
+                ("background", "STOP", STOP.set), ("background", "the user came to the app", "back"))
+        for kind, name, flip in rows:
+            with self.subTest(route=kind, condition=name):
+                STOP.clear()
+                self.setUp()
+                self.el["focused"] = True
+                d = self.route(kind)
+                if flip == "away":
+                    flip = lambda: setattr(self, "front", 9999)          # noqa: E731
+                elif flip == "back":
+                    flip = lambda: setattr(self, "front", 4242)          # noqa: E731
+                self.hooks["focus read"] = self.nth(3, flip)
+                res = self._type(d, text="x" * 40 if kind == "background" else "ls -la")
+                self.assertEqual([x for x in self.log if isinstance(x, tuple) and x[0] == "key"], [])
+                self.assertIs(res.performed, False, res.detail)
+
     def test_codex_the_webkit_paste_after_the_user_came_back_is_not_sent(self):
         res = self.run_row("webkit", "cmd+V", "window")
         self.assertNotIn(("key", 9, self.CMD), self.log)
@@ -1852,6 +1909,10 @@ class CheckedPressPostsWithoutAskingAgain(unittest.TestCase):
         key = skylight.WindowKey.__new__(skylight.WindowKey)
         key.lost = lambda: self.log.append("key.lost: an accessibility read that can wait") or None
         self.q = skylight.BackgroundQuartz(4242, 200, (0, 0), key=key)
+        from deskmind_hands.drivers import peekaboo as P
+        p = mock.patch.object(P, "_front_app_pid", lambda: 1111)          # the user is in another app
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_a_checked_press_is_not_asked_again_between_the_check_and_the_down(self):
         from deskmind_hands.drivers import axfield, base

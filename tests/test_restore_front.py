@@ -143,8 +143,9 @@ class RestoreFrontTable(unittest.TestCase):
 class TheFrontIsReadFresh(unittest.TestCase):
     """Codex on #69 @2baf2f8: with SkyLight unavailable the front was NSWorkspace's frontmostApplication -- stale in a
     process with no AppKit run loop (the executor). A refused activation read as given back (the stale front was the
-    target), and the gate's front check could pass or refuse on the wrong app. One fresh read now
-    (front.fresh_front_pid: SkyLight, else the frontmost ordinary window's owner), for the give-back and the gates."""
+    target), and the gate's front check could pass or refuse on the wrong app. One read now (front.fresh_front_pid:
+    SkyLight's front process only -- @3d0d781: never inferred from window order either), for the give-back and the
+    gates; unknown without it."""
 
     def modules(self, window_owner, stale_front):
         quartz = types.ModuleType("Quartz")
@@ -183,20 +184,66 @@ class TheFrontIsReadFresh(unittest.TestCase):
             front.restore_front("com.example.app")
         self.assertEqual(log, ["activate", "AXFrontmost"])
 
-    def test_the_gates_front_check_reads_the_fresh_front(self):
+    # Codex on #69 @3d0d781: the window order is not the active app. Each with SkyLight unavailable, the target's
+    # window first in the list while the user's app is the active one.
+    SCENARIOS = {
+        "the user's app has no window": [{"kCGWindowLayer": 0, "kCGWindowOwnerPID": 4242}],
+        "the user's app has only a panel": [{"kCGWindowLayer": 3, "kCGWindowOwnerPID": 1111},
+                                            {"kCGWindowLayer": 0, "kCGWindowOwnerPID": 4242}],
+        "another app's window ordered front without activation": [
+            {"kCGWindowLayer": 0, "kCGWindowOwnerPID": 4242}, {"kCGWindowLayer": 0, "kCGWindowOwnerPID": 1111}],
+    }
+
+    def quartz_listing(self, wins):
+        quartz = types.ModuleType("Quartz")
+        quartz.kCGWindowListOptionOnScreenOnly, quartz.kCGWindowListExcludeDesktopElements = 1, 16
+        quartz.CGWindowListCopyWindowInfo = lambda opts, wid: wins
+        return quartz
+
+    def test_codex_scenarios_the_gate_refuses(self):
         from deskmind_hands.drivers import skylight
         from deskmind_hands.drivers.peekaboo import Gate
         from deskmind_hands.grounding import STOP
         STOP.clear()
-        for owner, stale, refused in ((4242, 1111, False), (1111, 4242, True)):
-            with self.subTest(window_owner=owner, stale=stale):
-                quartz, workspace = self.modules(window_owner=owner, stale_front=stale)
+        for name, wins in self.SCENARIOS.items():
+            with self.subTest(scenario=name):
                 appkit = types.ModuleType("AppKit")
-                appkit.NSWorkspace = types.SimpleNamespace(sharedWorkspace=lambda: workspace)
-                with mock.patch.dict(sys.modules, {"AppKit": appkit, "Quartz": quartz}), \
+                stale = types.SimpleNamespace(processIdentifier=lambda: 4242)
+                appkit.NSWorkspace = types.SimpleNamespace(sharedWorkspace=lambda: types.SimpleNamespace(
+                    frontmostApplication=lambda: stale))
+                with mock.patch.dict(sys.modules, {"Quartz": self.quartz_listing(wins), "AppKit": appkit}), \
                         mock.patch.object(skylight, "front_pid", lambda: None):
                     why = Gate.foreground(4242, "FIELD").before_focus_write()
-                self.assertEqual(bool(why), refused, why)
+                self.assertTrue(why, "the gate let the paste go to the user's app")
+
+    def test_codex_scenarios_restore_front_does_not_claim_confirmed(self):
+        from deskmind_hands.drivers import front, skylight
+        for name, wins in self.SCENARIOS.items():
+            with self.subTest(scenario=name):
+                class App:
+                    def processIdentifier(self):
+                        return 4242
+
+                    def isTerminated(self):
+                        return False
+
+                    def activateWithOptions_(self, opts):
+                        return True                                   # says yes; does nothing
+                appkit = types.ModuleType("AppKit")
+                appkit.NSApplicationActivateIgnoringOtherApps = 2
+                appkit.NSRunningApplication = types.SimpleNamespace(
+                    runningApplicationsWithBundleIdentifier_=lambda b: [App()])
+                appkit.NSWorkspace = types.SimpleNamespace(sharedWorkspace=lambda: types.SimpleNamespace(
+                    frontmostApplication=lambda: App(), runningApplications=lambda: []))
+                ax = types.ModuleType("ApplicationServices")
+                ax.AXUIElementCreateApplication = lambda pid: pid
+                ax.AXUIElementSetAttributeValue = lambda el, attr, v: 0
+                with mock.patch.dict(sys.modules, {"AppKit": appkit, "ApplicationServices": ax,
+                                                   "Quartz": self.quartz_listing(wins)}), \
+                        mock.patch.object(skylight, "front_pid", lambda: None):
+                    got = front.restore_front("com.example.app")
+                self.assertNotEqual(got, "given back")
+                self.assertEqual(got, "given back (not confirmed)")
 
     def test_no_front_check_reads_nsworkspace_frontmost_application(self):
         found = []

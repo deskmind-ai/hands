@@ -737,9 +737,9 @@ def _pid_by_bundle(bundle: str) -> int | None:
 
 
 def _front_app_pid() -> int | None:
-    """The front app's pid for the gates' instant check: drivers/front.fresh_front_pid -- the window server, else the
-    frontmost ordinary window's owner; never NSWorkspace's frontmostApplication, stale without a run loop (review of
-    #69 @2baf2f8). None when unknown: the gate refuses."""
+    """The front app's pid for the gates' instant check: drivers/front.fresh_front_pid -- the window server's front
+    process only, never inferred (window order, NSWorkspace's stale frontmostApplication). None when unknown: the gate
+    refuses."""
     from deskmind_hands.drivers.front import fresh_front_pid
     return fresh_front_pid()
 
@@ -4188,8 +4188,12 @@ class PeekabooDriver:
     @staticmethod
     def _given_back(status, app: str) -> str:
         """What a give-back did, for the step's result: given back, or not and why (the app quit, refused, ...)."""
-        from deskmind_hands.drivers.front import GIVEN
-        return f"given back to {app}" if status is True or status == GIVEN else f"{status} ({app})"
+        from deskmind_hands.drivers.front import GIVEN, UNCONFIRMED
+        if status is True or status == GIVEN:
+            return f"given back to {app}"
+        if status == UNCONFIRMED:
+            return f"given back to {app} (not confirmed: the front app cannot be read)"
+        return f"{status} ({app})"
 
     def _give_front_back(self, prev: str, ours: str | None = None, late_s: float = 0.0) -> None:
         """Give `prev` the front again (_restore_front: activated without a reopen, else AXFrontmost): `open -b` is a reopen,

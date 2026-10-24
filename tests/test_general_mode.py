@@ -1761,31 +1761,24 @@ class GateAtEverySendSite(_KeysFixture):
         res = self._type(d)                                     # its process by bundle id: typed
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
 
-    def test_the_front_app_without_the_window_server_is_read_from_the_window_list(self):
-        """hands#69: with SkyLight's front process unavailable, the front is the frontmost ordinary window's owner --
-        never NSWorkspace's frontmostApplication, stale without a run loop (here it says another app: ignored)."""
+    def test_the_front_app_unknown_without_the_window_server_is_refused(self):
+        """hands#69: the front app comes only from the window server's front process; without it the front is unknown
+        and the gate refuses -- not inferred from window order, not NSWorkspace's stale frontmostApplication."""
         from deskmind_hands.drivers import skylight
-        for owner, ok in ((4242, True), (None, False)):
-            with self.subTest(window_owner=owner):
-                self.setUp()
-                self.el["focused"] = True
-                quartz = types.ModuleType("Quartz")
-                quartz.kCGWindowListOptionOnScreenOnly, quartz.kCGWindowListExcludeDesktopElements = 1, 16
-                quartz.CGWindowListCopyWindowInfo = lambda o, w, owner=owner: (
-                    [{"kCGWindowLayer": 0, "kCGWindowOwnerPID": owner}] if owner else [])
-                # started before the route's own patches of sys.modules, so stopped after them: nothing leaks
-                for p in (mock.patch.dict(sys.modules, {"Quartz": quartz}),
-                          mock.patch.object(skylight, "front_pid", lambda: None)):
-                    p.start()
-                    self.addCleanup(p.stop)
-                d = self.route("foreground")
-                self.workspace_front = 9999                               # NSWorkspace, stale: not asked
-                res = self._type(d)
-                if ok:
-                    self.assertTrue(res.ok and not res.indeterminate, res.detail)
-                else:                                                     # neither tells: refused
-                    self.assertIs(res.performed, False, res.detail)
-                    self.assertEqual(self.pastes(), [])
+        self.el["focused"] = True
+        quartz = types.ModuleType("Quartz")
+        quartz.kCGWindowListOptionOnScreenOnly, quartz.kCGWindowListExcludeDesktopElements = 1, 16
+        quartz.CGWindowListCopyWindowInfo = lambda o, w: [{"kCGWindowLayer": 0, "kCGWindowOwnerPID": 4242}]
+        # started before the route's own patches of sys.modules, so stopped after them: nothing leaks
+        for p in (mock.patch.dict(sys.modules, {"Quartz": quartz}),
+                  mock.patch.object(skylight, "front_pid", lambda: None)):
+            p.start()
+            self.addCleanup(p.stop)
+        d = self.route("foreground")
+        self.workspace_front = 4242                                       # NSWorkspace, stale: not asked
+        res = self._type(d)
+        self.assertIs(res.performed, False, res.detail)
+        self.assertEqual(self.pastes(), [])
 
     # -- Codex on #66 @79cd02d: what can wait is asked first, the instant checks last
     def nth(self, n, flip):

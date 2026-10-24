@@ -12,32 +12,23 @@ from __future__ import annotations
 #: what restore_front did
 GIVEN, QUIT, REFUSED = "given back", "not given back: the app is no longer running", \
     "not given back: the activation was refused"
+#: AXFrontmost accepted, the front not readable to confirm it
+UNCONFIRMED = "given back (not confirmed)"
 REFUSED_AMBIGUOUS = "not given back: several running apps have that name"
 
 
 def fresh_front_pid() -> int | None:
-    """The front app's pid, read fresh and with no accessibility wait: the window server's front process (SkyLight),
-    else -- its symbols missing on some macOS -- the owner of the frontmost ordinary (layer 0) window on screen.
-    Never NSWorkspace's frontmostApplication: in a process with no AppKit run loop (the executor) it keeps the app
-    that was in front when first read (InputWatch._front_pid; review of #69 @2baf2f8). None when neither answers:
-    unknown -- a check refuses on it, a give-back tries AXFrontmost and says what that answered."""
+    """The front app's pid, from the one source that reports the active process itself, fresh and with no
+    accessibility wait: the window server's front process (SkyLight). Never inferred -- not from window order (a user's
+    app with no window or only a panel, a window ordered front without activation: review of #69 @3d0d781), not from
+    NSWorkspace's frontmostApplication (stale without a run loop: @2baf2f8). None when SkyLight cannot answer:
+    unknown -- a gate refuses, a give-back is not claimed confirmed."""
     try:
         from deskmind_hands.drivers import skylight
         pid = skylight.front_pid()
-        if pid:
-            return int(pid)
+        return int(pid) if pid else None
     except Exception:  # noqa: BLE001
-        pass
-    try:
-        import Quartz
-        wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly
-                                                 | Quartz.kCGWindowListExcludeDesktopElements, 0) or []
-        for w in wins:                                    # front to back
-            if w.get("kCGWindowLayer") == 0 and w.get("kCGWindowOwnerPID"):
-                return int(w["kCGWindowOwnerPID"])
-    except Exception:  # noqa: BLE001
-        pass
-    return None
+        return None
 
 
 def _front_pid() -> int | None:
@@ -50,7 +41,8 @@ def restore_front(bundle: str, name: str = "") -> str:
     again, and a name that matches no app or several (Xcode and Xcode-beta, many "Electron") brings nothing forward.
     Activated without a reopen (NSRunningApplication.activateWithOptions_); then the front is read (the window
     server or NSWorkspace, no accessibility wait) -- under cooperative activation (macOS 14+) activation can say yes
-    and do nothing -- and when the app is not in front, it is made frontmost through accessibility (AXFrontmost)."""
+    and do nothing -- and when the app is not in front, it is made frontmost through accessibility (AXFrontmost).
+    GIVEN only on a read that shows it in front; AXFrontmost accepted with the front unreadable: UNCONFIRMED."""
     try:
         from AppKit import NSApplicationActivateIgnoringOtherApps, NSRunningApplication, NSWorkspace
         if bundle:
@@ -75,11 +67,16 @@ def restore_front(bundle: str, name: str = "") -> str:
     except Exception:  # noqa: BLE001 -- refused: the front is read below
         pass
     if _front_pid() == pid:
-        return GIVEN
+        return GIVEN                                      # confirmed by a read
     try:
         import ApplicationServices as AS
         ok = AS.AXUIElementSetAttributeValue(AS.AXUIElementCreateApplication(pid), "AXFrontmost", True) == 0
     except Exception:  # noqa: BLE001
         ok = False
-    return GIVEN if ok else REFUSED
+    front = _front_pid()
+    if front == pid:
+        return GIVEN
+    if ok and front is None:
+        return UNCONFIRMED                                # accepted, and nothing can confirm it: said so
+    return REFUSED
 

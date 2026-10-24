@@ -147,11 +147,6 @@ def can_set(el, attr: str) -> bool:
         return False
 
 
-def shows_caret(el) -> bool:
-    """Whether the element exposes a caret -- a selected text range or an insertion point: it takes typed text."""
-    return _get(el, "AXSelectedTextRange") is not None or _get(el, "AXInsertionPointLineNumber") is not None
-
-
 def role(el) -> str:
     return str(_get(el, "AXRole") or "")
 

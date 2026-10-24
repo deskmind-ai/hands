@@ -3435,35 +3435,40 @@ class PeekabooDriver:
     def _type_by_keys(self, action: Action, eid: str) -> ExecResult:
         """Type `action.text` into `eid`, an element whose value is not settable, with key events -- the way in chosen
         before anything is sent, from the element's own accessibility, never by app:
-        - a text target: a text role (TEXT_ROLES), or an element that shows a caret (AXSelectedTextRange or
-          AXInsertionPointLineNumber); anything else -- a button -- is refused, nothing sent;
-        - a newline is Return only in a multi-line one (AXTextArea, as a terminal's view reads), which is what the
-          user's own key does there; text with a newline for a one-line field is refused, nothing sent;
-        - the keyboard focus given through accessibility, never by a click (a click moves the caret): left alone when
-          the element has it already, the caret kept; refused, nothing sent, when it can be neither;
+        - a text target: an element with a text role found at the element's place (_field_now); anything else -- a
+          button -- is refused, nothing sent;
+        - a newline is never a bare Return key (hands#66 review, the second of the newline family: in a chat box
+          Return sends, and "one\ntwo" sent "one"). Text with a newline goes in as text, pasted whole, into a
+          multi-line element only (AXTextArea) and only where the brief foreground may be used; to a one-line field
+          it is refused, nothing sent -- submitting is the caller's own step (a Return key action);
+        - the keys go only to the element holding the keyboard focus at the moment they are sent: the focus is
+          confirmed right before (after the wait for a still Mac, the app in front or the window made key) -- left
+          alone when the element has it (the caret kept), else given through accessibility (never by a click, which
+          moves the caret) and read back; refused when it can be neither. That accessibility write is a send: a
+          refused read-back after it is reported unverified (base.ExecResult), not "nothing sent";
         - replacing: the whole text selected (accessibility, else cmd+A), then typed.
-        Keys to the window in the background where this Mac allows it (ASCII input source, the window made key);
-        else in the brief foreground where this step may use it (_flash's rules), the text pasted line by line (an
-        input method takes synthesized letters) with Return between. Read back from the element once after: verified,
-        or unverified, said so -- a read-back never sends anything more."""
+        Text without a newline: keys to the window in the background where this Mac allows it (ASCII input source, the
+        window made key), else pasted in the brief foreground under _flash's rules (an input method takes synthesized
+        letters). The user's clipboard is put back on every way out of the paste. Read back from the element once
+        after: verified, or unverified, said so -- a read-back never sends anything more."""
         from deskmind_hands.drivers import axfield
         text = (action.text or "").replace("\r\n", "\n").replace("\r", "\n")
         label = self._labels_by_id.get(eid) or eid
         field = self._field_now(eid)
         if field is None:
-            return ExecResult(False, NothingSent(f"{label!r} takes no value written through accessibility, and no "
-                                                 f"text element was found at its place to type into; observe again"))
+            return ExecResult(False, NothingSent(f"{label!r} is not a text element that takes typed text (none was "
+                                                 f"found at its place): nothing was typed -- click it, or type into a "
+                                                 f"text field"))
         role = axfield.role(field)
-        if role not in axfield.TEXT_ROLES and not axfield.shows_caret(field):
+        if role not in axfield.TEXT_ROLES:
             return ExecResult(False, NothingSent(f"{label!r} is not a text target ({role or 'no role'}): nothing was "
                                                  f"typed -- click it, or type into a text field"))
-        multiline = role == "AXTextArea"
-        if "\n" in text and not multiline:
+        newline = "\n" in text
+        if newline and role != "AXTextArea":
             return ExecResult(False, NothingSent(f"{label!r} is a one-line field and the text has a newline, which "
                                                  f"would submit it part way: nothing was typed. Type the text without "
                                                  f"it, then press Return as its own step if you mean to submit"))
-        focused = axfield.is_focused(field)
-        if not focused and not axfield.can_set(field, "AXFocused"):
+        if not axfield.is_focused(field) and not axfield.can_set(field, "AXFocused"):
             return ExecResult(False, NothingSent(f"{label!r} cannot be given the keyboard focus without a click, which "
                                                  f"would move its caret: nothing was typed"))
         moved = self._moved_since_seen()
@@ -3474,8 +3479,13 @@ class PeekabooDriver:
         before = self._read_field(field)
 
         def ready() -> str | None:
-            """The focus on the element (the caret kept when it had it) and, replacing, its text selected; why not."""
-            if not focused and not axfield.focus(field):
+            """Right before the keys: the element holds the keyboard focus (left alone when it does, the caret kept;
+            else given through accessibility and read back); why not."""
+            if axfield.is_focused(field):
+                return None
+            if not axfield.can_set(field, "AXFocused"):
+                return "it lost the keyboard focus and cannot be given it back without a click"
+            if not axfield.focus(field):
                 return "it did not take the keyboard focus"
             return None
 
@@ -3483,10 +3493,9 @@ class PeekabooDriver:
             if action.clear_first and not axfield.select(field, True):
                 self._post_key(q, self._keycode(q, "a"), q.kCGEventFlagMaskCommand)
 
-        res = self._keys_in_background(field, text, ready, select_all)
+        # a newline goes in as text, pasted whole: never the background keys, which make it the Return key
+        res = None if newline else self._keys_in_background(field, text, ready, select_all)
         if res is None:
-            lines = text.split("\n")
-
             def perform(Q):
                 from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
                 why = ready()
@@ -3496,17 +3505,12 @@ class PeekabooDriver:
                 saved = [{t: it.dataForType_(t) for t in it.types()} for it in (pb.pasteboardItems() or [])]
                 try:
                     select_all(Q)
-                    for i, line in enumerate(lines):
-                        if STOP.is_set():
-                            return f"stopped by the app after {i} of {len(lines)} lines"
-                        if i:
-                            self._post_key(Q, keys.RETURN)
-                            time.sleep(0.2)
-                        if line:
-                            pb.clearContents()
-                            pb.setString_forType_(line, NSPasteboardTypeString)
-                            self._post_key(Q, self._keycode(Q, "v"), Q.kCGEventFlagMaskCommand)
-                            time.sleep(0.4)
+                    if STOP.is_set():
+                        return "stopped by the app before the text was pasted"
+                    pb.clearContents()
+                    pb.setString_forType_(text, NSPasteboardTypeString)
+                    self._post_key(Q, self._keycode(Q, "v"), Q.kCGEventFlagMaskCommand)
+                    time.sleep(0.4)                 # the paste read before the clipboard is put back
                 finally:
                     release_all()   # what this step still holds down is let go first, before anything is given back
                     pb.clearContents()
@@ -3519,12 +3523,15 @@ class PeekabooDriver:
                         items.append(item)
                     if items:
                         pb.writeObjects_(items)
-                return f"typed {len(text)} chars into {label!r} with keys"
+                return f"pasted {len(text)} chars into {label!r}"
             try:
                 ok, detail = self._flash(self.app, perform, what=f"type {text!r} into {label!r}")
             except _NotReady as exc:
                 return ExecResult(False, NothingSent(f"{label!r}: {exc}; nothing was typed"))
             if not ok:
+                if newline:
+                    return ExecResult(False, NothingSent(f"{detail} -- text with a newline goes in only pasted, in "
+                                                         f"the foreground"))
                 return ExecResult(False, detail)
             res = detail
         if isinstance(res, ExecResult):

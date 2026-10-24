@@ -536,3 +536,118 @@ def _rv11_shell_open():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def step(by):
+    """A step with this deadline (on a head without one, a plain step: the test then shows what was sent late)."""
+    try:
+        return input_scope(by=by)
+    except TypeError:
+        return input_scope()
+
+
+class DeadlineAtTheSend(unittest.TestCase):
+    """Codex P1 on hands#64 @5042e94: the caller's deadline was checked before the app was raised and the front
+    polled, not at the send -- the chat click went out at 27.25 s against 25 s, the address bar's click and paste at
+    121 s against 120 s, both answered ok. Now every counted send checks it right before the OS call (base.counted)."""
+
+    class Clock:
+        def __init__(self):
+            self.t = 1_000_000.0
+
+        def time(self):
+            return self.t
+
+        def monotonic(self):
+            return self.t
+
+        def sleep(self, s):
+            self.t += max(0.0, s)
+
+    def test_an_expired_step_makes_no_os_call(self):
+        calls = []
+        with input_scope(by=0.0):                                     # long past
+            with self.assertRaises(base.StepExpired):
+                base.counted(lambda: calls.append("posted"))
+            with self.assertRaises(base.StepExpired):
+                base.ax_counted(lambda: calls.append("written") or 0)
+            with base.uncounted():                                      # a read is no send: not refused
+                base.counted(lambda: calls.append("read"))
+        self.assertEqual(calls, ["read"])
+
+    def test_the_chat_click_is_not_made_past_the_deadline(self):
+        """The chat app comes forward slowly; the deadline (less the margin) passes while the front is polled."""
+        import os
+        from deskmind_hands.drivers import peekaboo as P
+        from deskmind_hands.geometry import Point, Rect
+        clock = self.Clock()
+        posted = []
+        q = types.ModuleType("Quartz")
+        q.kCGEventMouseMoved, q.kCGEventLeftMouseDown, q.kCGEventLeftMouseUp, q.kCGHIDEventTap, q.kCGMouseButtonLeft = 1, 2, 3, 0, 0
+        q.CGEventCreateMouseEvent = lambda src, kind, pt, btn: kind
+        q.CGEventPost = lambda tap, ev: posted.append((clock.t, ev))
+        q.CGEventGetLocation = lambda e: (0, 0)
+        q.CGEventCreate = lambda x: None
+        q.CGWarpMouseCursorPosition = lambda p: None
+        q.CGAssociateMouseAndMouseCursorPosition = lambda b: None
+        d = P.PeekabooDriver.__new__(P.PeekabooDriver)
+        d.app, d._foreground_actions, d._chat_sends, d._snapshot = P.CHAT_APP, 0, 0, None
+        d._labels_by_id, d._rects, d._origin = {"b1": "表情"}, {"b1": Rect(10, 10, 20, 20)}, Point(0, 0)
+        d._moved_since_seen = lambda: None
+        d._takeover = lambda: False
+        d._raise_app = lambda b: True                                   # activated: no send
+        fronts = iter(["com.googlecode.iterm2"] + ["com.googlecode.iterm2"] * 20 + [P.CHAT_APP] * 50)
+
+        def front():
+            clock.sleep(0.5)                                            # each read of the front takes a while
+            return next(fronts)
+        d._front_bundle = front
+        d._front_taken = lambda b, t: None
+        d._front_given_back = lambda tok: None
+        d._give_front_back = lambda prev, ours=None, late_s=0.0: None
+        d.caller_deadline = clock.t + base.DEADLINE_MARGIN_S + 5       # 5 s to act in
+        with mock.patch.dict(sys.modules, {"Quartz": q}), mock.patch.dict(os.environ, {"HANDS_CHAT_FLASH": "1"}), \
+                mock.patch.object(P, "time", clock), mock.patch.object(base, "time", clock), \
+                mock.patch.object(P, "hid_idle_seconds", lambda: 10.0), mock.patch.object(P, "_ascii_input_source", lambda: None), \
+                step(base.act_by(d.caller_deadline)):
+            try:
+                res = d._chat_flash_click("b1")
+            except base.StepExpired:
+                res = base.step_expired_result()
+        self.assertEqual(posted, [])                                    # no click after the deadline
+        self.assertIs(res.performed, False, res.detail)
+
+    def test_the_address_bar_click_is_not_made_past_the_deadline(self):
+        """Its key window takes long to prepare; the deadline passes before the click and the paste."""
+        import test_web_search as WS
+        from deskmind_hands.drivers.peekaboo import WEB_SEARCH, PeekabooDriver as PD
+        from deskmind_hands.drivers import peekaboo as P
+        clock = self.Clock()
+        c = WS.Carried()
+        c._cleanups = []
+        d = c.searchable()
+        self.addCleanup(c.doCleanups)
+        d.allow_browser_field(WEB_SEARCH)
+        posted = []
+
+        class Q:                                                       # Quartz as the click needs it
+            kCGEventMouseMoved, kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGHIDEventTap, kCGMouseButtonLeft = 1, 2, 3, 0, 0
+            kCGMouseEventClickState = 1
+            CGEventCreateMouseEvent = staticmethod(lambda src, kind, pt, btn: {"kind": kind})
+            CGEventSetIntegerValueField = staticmethod(lambda ev, f, v: None)
+            CGEventPost = staticmethod(lambda tap, ev: posted.append(clock.t))
+
+        def prepare(bundle, observed_only=False):
+            clock.sleep(6.0)                                            # making the window key took a while
+            return (Q, "token")
+        d._background_quartz = prepare
+        d._post_click = lambda q, x, y: PD._post_click(q, x, y)          # the real click, through _post
+        d.caller_deadline = clock.t + base.DEADLINE_MARGIN_S + 5
+        with mock.patch.object(P, "time", clock), mock.patch.object(base, "time", clock), \
+                step(base.act_by(d.caller_deadline)):
+            try:
+                res = c.act(d)
+            except base.StepExpired:
+                res = base.step_expired_result()
+        self.assertEqual(posted, [])
+        self.assertIs(res.performed, False, res.detail)

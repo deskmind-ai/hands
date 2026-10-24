@@ -58,7 +58,7 @@ from pathlib import Path
 from .actions import Action, ActionKind, Binding
 from .axdocument import _q, document_text, window_document
 from .grounding import STOP
-from .drivers.base import ExecResult, Observation, act_by, input_scope, set_wait_sink
+from .drivers.base import ExecResult, Observation, StepExpired, act_by, input_scope, set_wait_sink, step_expired_result
 from .audio import playing_apps
 from .browsers import installed_browsers, is_browser
 from .inputwatch import InputWatch, track_children
@@ -976,8 +976,11 @@ class HandsExecutor:
                 return {**late, "window": window}
             try:
                 # one step: what the driver sends in it is counted there (drivers/base.py), whichever driver it is
-                with input_scope():
-                    res: ExecResult = d.execute(a)
+                with input_scope(act_by(deadline)):
+                    try:
+                        res: ExecResult = d.execute(a)
+                    except StepExpired:           # a driver that does not end its own step on it
+                        res = step_expired_result()
             except Exception as e:  # noqa: BLE001 -- thrown mid-action: what it sent before is not known
                 # unverified, never an error the layer above would read as "nothing went out". No mark is moved, as
                 # main moved none when the step threw (a doubt recorded during it is not wiped: InFlightAndTheMark)

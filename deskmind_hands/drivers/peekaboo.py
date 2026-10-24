@@ -47,8 +47,8 @@ from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, vision_elements
 from . import keys
 from .session import MESSAGES as SESSION_BLOCKED, gui_session, require_usable
 from .base import (USER_BUSY, Driver, DriverUnavailable, Element, ExecResult, Observation, effect_notes,
-                   MaybeSent, NothingSent, act_by, counted, input_scope, sends_so_far, tell_wait, uncounted,
-                   WindowRef)
+                   MaybeSent, NothingSent, StepExpired, act_by, counted, input_scope, sends_so_far, step_expired_result,
+                   tell_wait, time_left, uncounted, WindowRef)
 
 #: Verified against `peekaboo help <cmd>` for 4.3.1. Collected here so a CLI
 #: change is one edit rather than an archaeology exercise.
@@ -2801,6 +2801,10 @@ class PeekabooDriver:
             for _ in range(30):
                 if self._front_bundle() == CHAT_APP:
                     break
+                left = time_left()
+                if left is not None and left <= 0:       # the wait ends in time; nothing is clicked late
+                    return ExecResult(False, NothingSent("the caller's deadline came while the chat app was coming "
+                                                         "forward; nothing was clicked"))
                 time.sleep(0.05)
             else:
                 return ExecResult(False, "the chat app did not come to the front; nothing was clicked")
@@ -3020,6 +3024,10 @@ class PeekabooDriver:
                     for _ in range(30):
                         if self._front_bundle().lower() == bundle.lower():
                             break
+                        left = time_left()
+                        if left is not None and left <= 0:   # the wait ends in time; nothing is sent late
+                            return False, NothingSent(f"the caller's deadline came while {bundle} was coming forward; "
+                                                      f"nothing was done")
                         time.sleep(0.05)
                     else:
                         return False, NothingSent(f"{bundle} did not come to the front; nothing was done")
@@ -4144,13 +4152,16 @@ class PeekabooDriver:
         self._require_session()      # nothing is done on a locked screen, however the action was chosen
         # One step's sends, counted where they are made (base.counted): a refusal in it says "nothing was sent" only
         # while none was (ExecResult.__post_init__), whichever route refuses and whichever route sent
-        scope = input_scope().__enter__()
+        scope = input_scope(act_by(getattr(self, "caller_deadline", None))).__enter__()
         try:
             if self.CONFIRM_BY_DIFF and action.kind in (ActionKind.CLICK, ActionKind.DOUBLE_CLICK,
                                                         ActionKind.RIGHT_CLICK):
                 res = self._execute_outer(action)
                 return self._confirm_by_diff(res) if res.indeterminate else res
             return self._execute_outer(action)
+        except StepExpired:
+            # a send asked for past the caller's deadline was not made (base.counted): the step ends here
+            return step_expired_result()
         finally:
             scope.__exit__(None, None, None)
             # A browser-field allowance is for this one step: an early return or an error must not leave it for the

@@ -263,11 +263,19 @@ AX_NOT_DELIVERED = frozenset({
 })
 
 class _Step:
-    """One step's count of sends (and how deep it is inside uncounted())."""
-    __slots__ = ("n", "quiet")
+    """One step's count of sends (and how deep it is inside uncounted()), and `by`: the last moment it may send for its
+    caller (base.act_by of the caller's deadline; None: no caller deadline, `hands do`)."""
+    __slots__ = ("n", "quiet", "by")
 
-    def __init__(self):
-        self.n, self.quiet = 0, 0
+    def __init__(self, by: float | None = None):
+        self.n, self.quiet, self.by = 0, 0, by
+
+
+class StepExpired(BaseException):
+    """A send asked for after the step's caller's deadline (less the margin): not made. Raised from the counted
+    primitive itself, so no route can send late (review of hands#64: the chat click and the address bar sent after
+    their checks); a BaseException, so no route's broad `except Exception` carries on past it. Driver.execute turns
+    it into the step's answer -- nothing done if nothing went yet, else the fixed sent-then-stopped result."""
 
 
 #: The step in progress, per thread (a context variable: a new thread starts with none). A send on another thread,
@@ -282,6 +290,8 @@ def counted(call, refused=None):
     st = _STEP.get()
     if st is None or st.quiet:
         return call()
+    if st.by is not None and time.time() > st.by:
+        raise StepExpired()           # checked right before the OS call: nothing late reaches an app
     st.n += 1
     result = call()
     if refused is not None and refused(result):
@@ -310,17 +320,36 @@ class uncounted:
 
 
 class input_scope:
-    """One step: its sends are counted in it (Driver.execute, the executor around it, a runtime around it). Entered
-    inside another step's scope on the same thread, it is that step: the count is shared, never reset."""
+    """One step: its sends are counted in it (Driver.execute, the executor around it, a runtime around it), and none is
+    made after `by` (the caller's deadline less the margin: act_by). Entered inside another step's scope on the same
+    thread, it is that step: the count is shared, never reset; the earlier `by` holds."""
+
+    def __init__(self, by: float | None = None):
+        self._by = by
 
     def __enter__(self):
-        self._token = _STEP.set(_Step()) if _STEP.get() is None else None
+        cur = _STEP.get()
+        self._token = _STEP.set(_Step(self._by)) if cur is None else None
+        if cur is not None and self._by is not None:
+            cur.by = self._by if cur.by is None else min(cur.by, self._by)
         return self
 
     def __exit__(self, *exc):
         if self._token is not None:
             _STEP.reset(self._token)
         return False
+
+
+def step_expired_result() -> "ExecResult":
+    """The answer of a step stopped by StepExpired: nothing done if it had sent nothing, else (the enforcement in
+    ExecResult) the fixed sent-then-stopped one."""
+    return ExecResult(False, NothingSent("the caller's deadline came before the step could act; nothing was done"))
+
+
+def time_left() -> float | None:
+    """Seconds until the step in progress may no longer send (None: no deadline): what a preparation wait may take."""
+    st = _STEP.get()
+    return None if st is None or st.by is None else st.by - time.time()
 
 
 def in_step() -> bool:

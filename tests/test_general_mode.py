@@ -2079,6 +2079,40 @@ class NewlinesGoInAsText(unittest.TestCase):
         self.assertFalse([x for x in self.sent if x[0] == "set_value"], self.sent)
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
 
+    # -- review of #68 @870f1df
+    def test_an_append_to_a_web_page_field_is_never_an_accessibility_insertion(self):
+        """In a web page (a chat box in Chrome or Electron) the insertion reads back and the page's own state stays
+        old: a later submit sends the old content. Pasted in the foreground instead, or refused without it."""
+        self.replace_fakes()
+        self.insert_fakes()
+        self.web = True
+        d = self.replace_driver()
+        res = self.type_(d, "a\nb", foreground=True)
+        self.assertEqual(self.inserted, [])
+        self.assertEqual([x[0] for x in self.sent], ["paste_fg"])
+        self.setUp()
+        self.replace_fakes()
+        self.insert_fakes()
+        self.web = True
+        res = self.type_(self.driver(settable=False), "a\nb")             # no foreground: refused
+        self.assertEqual((self.inserted, self.sent), ([], []))
+        self.assertIs(res.performed, False, res.detail)
+
+    def test_the_paste_goes_at_the_real_end_when_the_field_grew_while_the_app_came_forward(self):
+        self.replace_fakes(focused=False)
+        self.insert_fakes(front=4242)                                      # the app in front: the paste route
+        d = self.replace_driver()
+        raise_app = d._raise_app
+
+        def raise_and_grow(bundle):
+            self.shown["value"] += " + more"                               # loaded while the app came forward
+            return raise_app(bundle)
+        d._raise_app = raise_and_grow
+        res = self.type_(d, "a\nb", foreground=True)
+        self.assertEqual(self.select_wants, [(len("old + more"), 0)])      # the caret at the real end
+        self.assertEqual(self.shown["value"], "old + morea\nb")
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
     def test_codex_a_text_area_peekaboo_calls_textfield_is_typed(self):
         """Review of #68 @98654dd: Peekaboo's role is textField for AXTextArea too; TextEdit's body was refused."""
         self.replace_fakes()
@@ -2158,8 +2192,9 @@ class NewlinesGoInAsText(unittest.TestCase):
 
         def select_range(el, want, wait=0.3):
             self.writes.append("select all")
+            self.select_wants = getattr(self, "select_wants", []) + [want]
             base.ax_counted(lambda: 0)                            # an accessibility write: counted as sent
-            self.selected_all = selects
+            self.selected_all = selects and want[1] > 0            # a range selected; (n, 0) is a caret
             return selects
 
         def is_focused(el):                                       # a read that can wait
@@ -2172,7 +2207,8 @@ class NewlinesGoInAsText(unittest.TestCase):
             base.ax_counted(lambda: 0)
             self.focused = True
             return True
-        for name, fn in (("wanted", lambda el, all_: (0, len(self.shown["value"]))),
+        for name, fn in (("wanted", lambda el, all_: (0, len(self.shown["value"])) if all_
+                          else (len(self.shown["value"]), 0)),
                          ("_selection", lambda el: (0, 0) if readable else None),
                          ("is_focused", is_focused), ("focus", focus), ("select_range", select_range)):
             p = mock.patch.object(axfield, name, fn)
@@ -2196,7 +2232,9 @@ class NewlinesGoInAsText(unittest.TestCase):
             self.inserted.append(text)
             self.shown["value"] += text                           # at the end: what is there stays
             return axfield.TEXT, None
-        for name, fn in (("insert", insert), ("selection_readable", lambda el: True)):
+        self.web = False
+        for name, fn in (("insert", insert), ("selection_readable", lambda el: True),
+                         ("in_web_area", lambda el: self.web)):
             p = mock.patch.object(axfield, name, fn)
             p.start()
             self.addCleanup(p.stop)

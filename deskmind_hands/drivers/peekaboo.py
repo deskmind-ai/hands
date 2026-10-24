@@ -736,6 +736,13 @@ def _pid_by_bundle(bundle: str) -> int | None:
         return None
 
 
+def _takes_ax_insertion(in_web_area: bool) -> bool:
+    """Whether a field takes text by the accessibility insertion: not in a web area -- there it can show (and read
+    back) without being the page's own value, and a later submit sends the old content (review of #68 @870f1df). The
+    one predicate for every insertion site (_type_in_background, _insert_at_end)."""
+    return not in_web_area
+
+
 def _front_app_pid() -> int | None:
     """The front app's pid without an accessibility wait: the window server (skylight.front_pid), else -- its symbols
     missing on some macOS -- NSWorkspace's frontmost application (review of #66 @24fbf21: with the window server's
@@ -3866,7 +3873,7 @@ class PeekabooDriver:
             # or select-all read back -- so a field whose selection cannot be read is not typed into here at all:
             # the caller's route, before anything is sent (review of #67 @8e08b5e)
             return None
-        insertable = not web
+        insertable = _takes_ax_insertion(web)
         t1 = Gate.untouched(pid, field)
         if STOP.is_set():
             return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
@@ -5457,6 +5464,8 @@ class PeekabooDriver:
         if field is None:
             return None
         try:
+            if not _takes_ax_insertion(axfield.in_web_area(field)):
+                return None             # a web page's field: the caller's next way (a paste in the foreground)
             if not axfield.selection_readable(field):
                 return None
             want = axfield.wanted(field, False)
@@ -5559,6 +5568,15 @@ class PeekabooDriver:
                 return stop(why)
             if not axfield.focus(field):
                 return stop("the field did not take the keyboard focus")
+        # read again now -- the field may have changed while the app came forward and took the focus (review of #68
+        # @870f1df): the range to select and the value the read-back compares with; then the gate, then the write
+        try:
+            want = axfield.wanted(field, replace)
+            before = axfield.value(field)
+        except Exception:   # noqa: BLE001
+            before = None
+        if before is None:
+            return stop("the field could not be read again")
         why = gate.before_send()
         if why:
             return stop(why)

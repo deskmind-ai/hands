@@ -208,8 +208,9 @@ class PrimitiveTable(unittest.TestCase):
         for r in (stale, busy):
             with self.subTest(r.detail):
                 self.assertEqual((r.indeterminate, r.stale, r.deferred, r.unsupported, r.performed), (True, False, False, False, None))
-                self.assertTrue(r.detail.startswith("input already went to the app in this step"))
-                self.assertNotRegex(r.detail.lower(), r"nothing was done|not carried out|nothing changed")
+                self.assertEqual(r.detail, base.SENT_THEN_STOPPED)       # one fixed sentence, nothing of the refusal
+                self.assertNotRegex(r.detail.lower(), r"nothing was done|not carried out|nothing changed|user is active|not done")
+                self.assertTrue(r.refused_reason)                           # the refusal's words: aside, for the trace
         from deskmind_hands.errors import Kind, classify
         self.assertIsNot(classify(busy.detail), Kind.USER_BUSY)
 
@@ -250,6 +251,71 @@ class PrimitiveTable(unittest.TestCase):
 
 
 REAL_FOCUS = axfield.focus
+
+
+class Round9(unittest.TestCase):
+    def test_no_refusal_word_survives_a_send(self):
+        """rv12 repro_words: the user-busy sentence, "-- wait" and the browser's "not done: ..." survived the filter."""
+        cases = [
+            NothingSent(f"{USER_BUSY}; the step was not carried out before the caller's deadline (the Mac was not still "
+                        f"in time) -- nothing was done; wait"),
+            NothingSent(f"{USER_BUSY}; the step was not carried out -- wait"),
+            NothingSent("not done: com.google.chrome is brought to the front only for the run's own window, when this "
+                        "step is allowed to; the step could not be delivered in the background"),
+        ]
+        for words in cases:
+            with self.subTest(words), input_scope():
+                base.counted(lambda: None)
+                r = ExecResult(False, words)
+                self.assertEqual(r.detail, base.SENT_THEN_STOPPED)
+                self.assertEqual(r.refused_reason, str(words))
+                self.assertEqual((r.indeterminate, r.deferred, r.performed), (True, False, None))
+                for bad in ("the user is active", "not done", "wait"):
+                    self.assertNotIn(bad, r.detail.lower())
+
+    def flash_retry(self, window_on_screen: bool):
+        """rv12 repro_flash_retry: the Mac still, the app brought forward, the user touches the mouse as it comes
+        (retry), then keeps working until the wait runs out."""
+        import itertools
+        import os
+        from deskmind_hands.drivers import peekaboo as P
+        q = types.ModuleType("Quartz")
+        q.CGEventGetLocation = lambda e: (0, 0)
+        q.CGEventCreate = lambda x: None
+        q.CGWarpMouseCursorPosition = lambda p: None
+        q.CGAssociateMouseAndMouseCursorPosition = lambda b: None
+        opened = []
+        d = P.PeekabooDriver.__new__(P.PeekabooDriver)
+        d.caller_deadline, d._foreground_actions = None, 0
+        d._background_input = lambda b: False
+        d._takeover = lambda: False
+        fronts = itertools.chain(["com.apple.finder", "com.example.chat"], itertools.repeat("com.apple.finder"))
+        d._front_bundle = lambda: next(fronts)
+        idle = iter([10.0, 0.0])
+        d._hid_idle = lambda: next(idle, 0.0)
+        d._announce_wait = lambda w, b="", what="": True
+        d._resumed = lambda: None
+        d._front_taken = lambda b, t: None
+        d._front_given_back = lambda tok: None
+        d._give_front_back = lambda prev, ours=None, late_s=0.0: None
+        d._has_window_on_screen = lambda b: window_on_screen
+        d._activate_without_reopen = lambda b: True
+        with mock.patch.dict(sys.modules, {"Quartz": q}), \
+                mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": "com.example.chat", "HANDS_FLASH_WAIT_S": "2"}), \
+                mock.patch("subprocess.run", lambda cmd, **k: opened.append(cmd) or FakeProc()), \
+                mock.patch.object(P, "_ascii_input_source", lambda: None), input_scope():
+            ok, detail = d._flash("com.example.chat", lambda Q: self.fail("sent"), "click")
+            return ExecResult(ok, detail), opened
+
+    def test_a_busy_user_with_the_apps_window_on_screen_is_user_busy_and_nothing_done(self):
+        r, opened = self.flash_retry(window_on_screen=True)
+        self.assertEqual(opened, [])                                     # activated, no `open -b`
+        self.assertEqual((r.deferred, r.performed, r.indeterminate), (True, False, False), r.detail)
+
+    def test_with_no_window_on_screen_the_reopen_counts(self):
+        r, opened = self.flash_retry(window_on_screen=False)
+        self.assertIn(["/usr/bin/open", "-b", "com.example.chat"], opened)
+        self.assertEqual((r.indeterminate, r.performed, r.deferred), (True, None, False), r.detail)
 
 
 class TheRoutesUseTheCountedPrimitives(unittest.TestCase):
@@ -328,6 +394,7 @@ class TheRoutesUseTheCountedPrimitives(unittest.TestCase):
 
     def test_a_reopen_and_a_launch_are_sends(self):
         d = driver()
+        d._has_window_on_screen = lambda bundle: False                 # no window: the reopen makes one
         with mock.patch("subprocess.run", lambda *a, **k: FakeProc()):
             with input_scope():
                 d._bring_forward("com.example.app", browser=False)   # `open -b`: a reopen
@@ -365,6 +432,7 @@ class NoSendBypassesTheCount(unittest.TestCase):
         ("deskmind_hands.drivers.skylight", "_set_focused_window", "AXUIElementSetAttributeValue"): "AXFocusedWindow: a key-window change",
         ("deskmind_hands.drivers.peekaboo", "PeekabooDriver._make_frontmost", "AXUIElementSetAttributeValue"): "AXFrontmost: a front, no reopen",
         ("deskmind_hands.executor", "HandsExecutor._make_frontmost", "AXUIElementSetAttributeValue"): "AXFrontmost: a front, no reopen",
+        ("deskmind_hands.drivers.peekaboo", "PeekabooDriver._activate_without_reopen", "activateWithOptions_"): "activation without a reopen: a front, for an app with a window on screen",
         ("deskmind_hands.drivers.peekaboo", "_sh", "subprocess.run"): "the counted wrapper of commands",
         ("deskmind_hands.drivers.peekaboo", "PeekabooDriver._run", "subprocess.run"): "the counted wrapper of peekaboo commands",
         ("deskmind_hands.drivers.peekaboo", "_MCPSession.__init__", "subprocess.Popen"): "starts the peekaboo session; its calls go through _mcp_call",

@@ -2797,7 +2797,7 @@ class PeekabooDriver:
         # give-back, whatever happened.
         token = self._front_taken(CHAT_APP, t0)
         try:
-            _sh(["/usr/bin/open", "-b", CHAT_APP], capture_output=True, timeout=10)   # a reopen: counted
+            self._raise_app(CHAT_APP)
             for _ in range(30):
                 if self._front_bundle() == CHAT_APP:
                     break
@@ -3534,10 +3534,7 @@ class PeekabooDriver:
         accessibility (AXFrontmost; NSRunningApplication.activate is refused to a background process on recent
         macOS), never `open -b`, a reopen that raises the user's windows (deskmind#73). Any other app: `open -b`."""
         if not browser:
-            # counted: `open -b` sends the app a reopen, which un-minimises its windows and opens one on an app that
-            # has none -- a lasting change, not only a front (NothingSent's definition; review of hands#64 round 8)
-            _sh(["/usr/bin/open", "-b", bundle], capture_output=True, timeout=10)
-            return True
+            return self._raise_app(bundle)
         key = bundle.lower()
         own = str(getattr(self, "_own_browser", {}).get(key) or "")
         sid = str(getattr(self, "_own_browser_script", {}).get(key) or "")
@@ -3545,6 +3542,41 @@ class PeekabooDriver:
             return False
         ok, _ = self._osa_forward(f'tell application id "{self._q(bundle)}" to set index of window id {int(sid)} to 1')
         return ok and self._make_frontmost(bundle)
+
+    def _raise_app(self, bundle: str) -> bool:
+        """Bring a front-only app forward. With a window of it on screen: activated, no reopen (NSRunningApplication,
+        else AXFrontmost) -- not a send, so a user who stays busy still ends the step user_busy / nothing done. With
+        none: `open -b`, whose reopen opens or restores a window (a lasting change: counted). The coordinator's rule,
+        review of hands#64 round 9. False when it could not be asked."""
+        if self._has_window_on_screen(bundle):
+            return self._activate_without_reopen(bundle) or self._make_frontmost(bundle)
+        _sh(["/usr/bin/open", "-b", bundle], capture_output=True, timeout=10)     # a reopen: counted
+        return True
+
+    def _has_window_on_screen(self, bundle: str) -> bool:
+        """Whether `bundle` has an ordinary window on screen now; False when that cannot be read (then the reopen,
+        counted: the safe side)."""
+        try:
+            import Quartz
+            pid = self._app_pid(bundle)
+            if not pid:
+                return False
+            wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly
+                                                     | Quartz.kCGWindowListExcludeDesktopElements, 0) or []
+            return any(int(w.get("kCGWindowOwnerPID") or 0) == pid and w.get("kCGWindowLayer", 0) == 0 for w in wins)
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _activate_without_reopen(bundle: str) -> bool:
+        """Activate the running app without a reopen (no window is un-minimised or made); True when it said yes."""
+        try:
+            from AppKit import NSApplicationActivateIgnoringOtherApps, NSRunningApplication
+            apps = [a for a in (NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle) or [])
+                    if not a.isTerminated()]
+            return bool(apps) and bool(apps[0].activateWithOptions_(NSApplicationActivateIgnoringOtherApps))
+        except Exception:  # noqa: BLE001
+            return False
 
     def _browser_front_sid(self, bundle: str) -> str | None:
         """The id the browser's scripting gives its front window now (to put the stacking back after a flash)."""

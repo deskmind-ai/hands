@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -202,6 +201,9 @@ class ExecResult:
     #: it wrote; a driver that cannot tell leaves it empty. A scratch file of the driver's own (the staged 未命名-N
     #: under .hands/) is never one of these.
     files: tuple[tuple[str, str | None], ...] = ()
+    #: A refusal's own words, kept when the step had already sent something (then `detail` is one fixed sentence):
+    #: for the trace only -- nothing turns it into guidance, so no "not done" in it can reach a planner.
+    refused_reason: str = ""
     #: Whether any input reached the app: False only where the driver knows none was sent -- a refusal before acting
     #: (stale, unsupported, waited out for the user, or words marked NothingSent). None: not known, which the layer
     #: above takes as "may have happened". Never False on a guess: an action that may have gone out stays unknown.
@@ -222,11 +224,11 @@ class ExecResult:
             if not in_step():
                 pass
             elif sent_in_step():
-                why = _NOT_DONE.sub("", str(self.detail)).strip(" ;-")
+                # the words are replaced whole, not filtered: any part of a refusal ("the user is active -- wait",
+                # "not done: ...") read by a planner says "take it again" (review of hands#64 round 9)
+                self.refused_reason = str(self.detail)
                 self.indeterminate, self.stale, self.deferred, self.unsupported = True, False, False, False
-                self.detail = MaybeSent(f"input already went to the app in this step before it stopped"
-                                        f"{f' ({why})' if why else ''} -- it may have taken effect; observe before "
-                                        f"doing it again")
+                self.detail = MaybeSent(SENT_THEN_STOPPED)
             else:
                 self.performed = False
 
@@ -338,10 +340,9 @@ def sent_in_step() -> int:
     return sends_so_far()
 
 
-#: Our own words for "nothing was done", taken out of a refusal that comes after a send (it was not nothing)
-_NOT_DONE = re.compile(r"(?:\s*(?:;|--)\s*)?(?:nothing was done|nothing was sent|none was sent|the step was not carried "
-                       r"out(?: before the caller's deadline)?|the click was not made|nothing changed)(?:;\s*wait)?",
-                       re.IGNORECASE)
+#: The whole detail of a refusal that came after a send in the same step (its own words go to refused_reason)
+SENT_THEN_STOPPED = ("input already went to the app in this step; the outcome is unknown -- do not repeat it without "
+                     "checking: observe the window first")
 
 
 class NothingSent(str):
@@ -351,9 +352,10 @@ class NothingSent(str):
     What "nothing was sent" means (the coordinator's decision, review of hands#64 rounds 6 and 8): nothing went to the
     app that could change its content or lasting state -- no click, key, paste, typing, accessibility write, no
     accessibility focus moved into a field, no scripted command, no document or URL opened, no app launched, and no
-    reopen (`open -b` sends one: it un-minimises windows, and opens a window on an app with none). Bringing a running
-    app to the front without a reopen (AXFrontmost, AppleScript `activate`), or making a window its key window, and
-    giving that back, does not count: a refusal after only those is still "nothing was sent"."""
+    reopen (`open -b` sends one: it un-minimises windows, and opens a window on an app with none -- so the drivers use
+    it only for an app with no window on screen). Bringing a running app with a window on screen to the front without
+    a reopen (NSRunningApplication activation, AXFrontmost, AppleScript `activate`), or making a window its key
+    window, and giving that back, does not count: a refusal after only those is still "nothing was sent"."""
 
 
 class MaybeSent(str):

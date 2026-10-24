@@ -2102,7 +2102,8 @@ class NewlinesGoInAsText(unittest.TestCase):
 
     def test_the_paste_goes_at_the_real_end_when_the_field_grew_while_the_app_came_forward(self):
         self.replace_fakes(focused=False)
-        self.insert_fakes(front=4242)                                      # the app in front: the paste route
+        self.insert_fakes(front=4242)
+        self.web = True                                                    # a web page's field: the paste route
         d = self.replace_driver()
         raise_app = d._raise_app
 
@@ -2114,6 +2115,55 @@ class NewlinesGoInAsText(unittest.TestCase):
         self.assertEqual(self.select_wants, [(len("old + more"), 0)])      # the caret at the real end
         self.assertEqual(self.shown["value"], "old + morea\nb")
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def real_field(self, d, ax_role="AXTextArea", tree_role="AXTextArea", label="Body"):
+        """The real _field_now / _field_is_observed over an accessibility tree, the element as the CLI reports it."""
+        from deskmind_hands.drivers import axchrome, axfield
+        from deskmind_hands.geometry import Point, Rect
+        del d._field_now
+        el = {"AXRole": tree_role, "AXTitle": label, "AXChildren": [], "frame": (100, 130, 580, 350)}
+        win = {"AXRole": "AXWindow", "AXChildren": [el], "frame": (100, 100, 600, 400)}
+        d._rects, d._origin, d._role_labels = {"e1": Rect(0, 30, 580, 350)}, Point(100, 100), set()
+        d._key_target = lambda: (4242, 200)
+        d._element_role, d._element_ax_role = {"e1": "textField"}, {"e1": ax_role}   # Peekaboo's role: textField
+        for target, name, fn in ((axfield, "window", lambda pid, wid: win),
+                                 (axfield, "_get", lambda e, attr: e.get(attr) if isinstance(e, dict) else None),
+                                 (axchrome, "_frame", lambda e: e.get("frame"))):
+            p = mock.patch.object(target, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+        return el
+
+    def test_codex_a_text_area_found_by_the_real_lookup_is_appended_to(self):
+        """Codex on #68 @4dbe852: the field lookup still went by Peekaboo's role (textField), which never matches an
+        AXTextArea -- the multi-line append was refused. Through the real _field_now, CLI-shaped data."""
+        self.replace_fakes()
+        self.insert_fakes()
+        d = self.driver(role="textField")
+        el = self.real_field(d)
+        self.assertIs(d._field_now("e1"), el)
+        res = self.type_(d, "a\nb")
+        self.assertEqual(self.inserted, ["a\nb"])
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_a_text_area_found_by_the_real_lookup_is_replaced_and_read_back(self):
+        d = self.driver(role="textField")
+        self.real_field(d)
+        res = self.type_(d, "a\nb", clear=True)
+        self.assertEqual(self.sent, [("set_value", "a\nb", None)])
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_a_one_line_field_by_its_raw_role_is_refused_and_an_unknown_kind_is_looked_up(self):
+        d = self.driver(role="textField")
+        self.real_field(d, ax_role="AXTextField", tree_role="AXTextField")
+        res = self.type_(d, "a\nb")
+        self.assertIn("one-line", res.detail)
+        self.setUp()
+        self.replace_fakes()
+        self.insert_fakes()
+        d = self.driver(role="textField")
+        el = self.real_field(d, ax_role="")                              # the raw role not reported
+        self.assertIs(d._field_now("e1"), el)                            # Peekaboo's textField: either kind
 
     def test_codex_a_text_area_peekaboo_calls_textfield_is_typed(self):
         """Review of #68 @98654dd: Peekaboo's role is textField for AXTextArea too; TextEdit's body was refused."""
@@ -2144,7 +2194,8 @@ class NewlinesGoInAsText(unittest.TestCase):
 
     def test_no_value_to_write_pastes_in_the_foreground_and_never_types_it(self):
         self.replace_fakes()
-        self.insert_fakes(front=4242)                             # the app in front: no insertion in the background
+        self.insert_fakes(front=4242)
+        self.web = True                                           # a web page's field: pasted, never the insertion
         d = self.driver(settable=False, foreground=True, paste="unknown")
         d._raise_app = lambda bundle: True
         d._front_bundle = lambda: d.app
@@ -2168,22 +2219,30 @@ class NewlinesGoInAsText(unittest.TestCase):
         self.type_(self.driver(), "a\rb", clear=True)
         self.assertEqual(self.sent, [("set_value", "a\nb", None)])
         self.replace_fakes()
-        self.insert_fakes(front=4242)                             # the app in front: the paste route
+        self.insert_fakes()
+        self.web = True                                           # a web page's field: the paste route
         d = self.driver(settable=False, foreground=True)
         d._raise_app, d._front_bundle = (lambda bundle: True), (lambda: d.app)
+        self.front = 4242
         self.type_(d, "a\rb", foreground=True)
         self.assertFalse([x for x in self.sent if "\r" in (x[1] or "")], self.sent)
         self.assertEqual(self.sent, [("paste_fg", "a\nb", None)])
 
-    def test_text_with_a_newline_into_the_focused_field_is_never_submitted(self):
-        """B2: TYPE_FOCUSED (no element) pasted, then pressed Return as the rename's commit -- a chat message sent."""
+    def test_text_with_a_newline_into_the_focused_field_is_refused(self):
+        """B2 (pasted, then committed with Return -- a chat message sent), then Codex on #68 @4dbe852 (an unbound
+        replace pasted at the caret: "old" became "olda\nb"): with no field named, multi-line text is refused."""
         from deskmind_hands.actions import Action, ActionKind, Binding
         from deskmind_hands.drivers.base import input_scope
-        d = self.driver(settable=False, foreground=True)
-        with input_scope(None):
-            d._execute_inner(Action(kind=ActionKind.TYPE_TEXT, text="one\ntwo", foreground=True, binding=Binding()))
-        self.assertIn("paste_fg", [x[0] for x in self.sent])
-        self.assertFalse([x for x in self.sent if x[2] == "return"], self.sent)
+        for clear in (False, True):
+            with self.subTest(replace=clear):
+                d = self.driver(settable=False, foreground=True)
+                with input_scope(None):
+                    res = d._execute_inner(Action(kind=ActionKind.TYPE_TEXT, text="one\ntwo", foreground=True,
+                                                  clear_first=clear, binding=Binding()))
+                self.assertEqual(self.sent, [])
+                self.assertIs(res.performed, False, res.detail)
+                self.assertIn("needs a target field", res.detail)
+                self.assertEqual(self.shown["value"], "old")
 
     def replace_fakes(self, readable=True, selects=True, focused=True):
         from deskmind_hands.drivers import axfield, peekaboo as P

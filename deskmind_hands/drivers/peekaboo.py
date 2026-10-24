@@ -3492,12 +3492,25 @@ class PeekabooDriver:
     #: Peekaboo's role names and the accessibility roles each may be.
     FIELD_ROLES = {"textfield": {"AXTextField", "AXSearchField", "AXComboBox"}, "textarea": {"AXTextArea"}}
 
-    def _field_is_observed(self, eid: str, field) -> bool:
-        """Whether the field found at the observed element's place is that element: the same kind of field and, when
-        the element has a label, one of the field's names (title, description, placeholder) reads the same."""
-        from deskmind_hands.drivers import axfield
+    def _field_ax_roles(self, eid: str) -> set[str]:
+        """The accessibility roles element `eid` can be: its raw role as observed (ax_role) when known -- Peekaboo's own
+        role says textField for an AXTextArea too (review of #68 @98654dd, @4dbe852) -- else what Peekaboo's role
+        allows (FIELD_ROLES). The one mapping, for finding the field (_field_is_observed) and for telling a one-line
+        field (_text_with_newlines)."""
+        raw = getattr(self, "_element_ax_role", {}).get(eid, "")
+        if raw:
+            return {raw}
         role = self._element_role.get(eid, "").lower()
-        if axfield.role(field) not in self.FIELD_ROLES.get(role, set()):
+        if role == "textfield":                  # Peekaboo's textField: a one-line field or a text area, either
+            return self.FIELD_ROLES["textfield"] | self.FIELD_ROLES["textarea"]
+        return self.FIELD_ROLES.get(role, set())
+
+    def _field_is_observed(self, eid: str, field) -> bool:
+        """Whether the field found at the observed element's place is that element: the same kind of field
+        (_field_ax_roles) and, when the element has a label, one of the field's names (title, description,
+        placeholder) reads the same."""
+        from deskmind_hands.drivers import axfield
+        if axfield.role(field) not in self._field_ax_roles(eid):
             return False
         label = "" if eid in getattr(self, "_role_labels", set()) else (self._labels_by_id.get(eid) or "")
         label = label.strip().casefold()
@@ -5173,9 +5186,7 @@ class PeekabooDriver:
                 # one (AXorcist Element.typeText), and _type_multiline pressed it between lines. Text with one goes in
                 # as text, the way chosen before the first send: a value written (the element takes one), else a
                 # paste in the foreground (this step may use it: the block below), else nothing.
-                routed = self._text_with_newlines(action, text)
-                if routed is not None:
-                    return routed
+                return self._text_with_newlines(action, text)
             # Only the set-the-field form can be verified by value readback.
             # Insert-at-caret is dispatched but unconfirmable, and Peekaboo says
             # so rather than pretending; we pass that through unchanged.
@@ -5399,55 +5410,62 @@ class PeekabooDriver:
     #: Accessibility roles that hold one line: a newline there would submit part way
     ONE_LINE_AX_ROLES = {"AXTextField", "AXSecureTextField", "AXSearchField", "AXComboBox"}
 
-    def _text_with_newlines(self, action: Action, text: str) -> ExecResult | None:
-        """Text with a newline, on the command-line channel: in as text, never with a Return key -- the way chosen
-        before the first send.
-        - A field known one-line by its accessibility role (ONE_LINE_AX_ROLES; Peekaboo's own role cannot tell a text
-          area from a field): refused. An unknown role is not refused on.
-        - Replacing: the element's value settable -> written whole (set-value), read back; else, where the step may
-          use the foreground, pasted over its whole text selected (_paste_into); else refused.
-        - Appending: never a rewrite of what is there (review of #68 @98654dd: cached + text, set as the value,
-          deleted what loaded after the observation). Inserted at the end through accessibility (_insert_at_end);
-          that not possible with nothing sent -> pasted at the end in the foreground; else refused. Verified by the
-          field holding exactly what it held just before, then the text.
-        - No element (the focused field): the foreground paste below, never submitted after.
-        Each result read back from the element: verified or unverified, never another way after a send."""
+    def _text_with_newlines(self, action: Action, text: str) -> ExecResult:
+        """Text with a newline, on the command-line channel: in as text, never with a Return key, and only where it can
+        be done and read back safely -- the way chosen before the first send; everything else refused, nothing sent
+        (the PR's list of what is refused; review of #68 @4dbe852).
+        - No element named: refused ("multi-line text needs a target field") -- never a blind write.
+        - The element, found through _field_now (its raw accessibility role: _field_ax_roles); not found: refused. One
+          line by that role: refused.
+        - Replacing: the value settable -> written whole (set-value); else, where the step may use the foreground,
+          its whole text selected and pasted over (_paste_into). The field read back must equal the text.
+        - Appending: a native field -> the accessibility insertion at the end (_insert_at_end); a web page's field,
+          where the step may use the foreground -> the caret put at the end and pasted (_paste_into). The field read
+          back must equal what it held just before, then the text.
+        Anything else: refused."""
         from deskmind_hands.drivers import axfield
         eid = action.binding.element_id or ""
         label = self._labels_by_id.get(eid) or eid or "the focused field"
-        if eid and getattr(self, "_element_ax_role", {}).get(eid, "") in self.ONE_LINE_AX_ROLES:
+        if not eid:
+            return ExecResult(False, NothingSent("multi-line text needs a target field: nothing was typed into the "
+                                                 "focused field. Name the field, or type the text without the newline "
+                                                 "and press Return as its own step if you mean to submit"))
+        roles = self._field_ax_roles(eid)
+        if roles and roles <= self.ONE_LINE_AX_ROLES:       # known one-line (an unknown kind is not refused on)
             return ExecResult(False, NothingSent(f"{label!r} is a one-line field and the text has a newline, which "
                                                  f"would submit it part way: nothing was typed. Type the text without "
                                                  f"it, then press Return as its own step if you mean to submit"))
+        field = self._field_now(eid)
+        if field is None:
+            return self._no_way_for_newlines(label)
         foreground = bool(action.foreground and self.allow_foreground)
-        if not eid:
-            return None if foreground else self._no_way_for_newlines(label)
-        if action.clear_first and getattr(self, "_element_settable", {}).get(eid):
-            new = text
-            field = self._field_now(eid)
-            before = self._read_field(field)
-            ok, _, detail = self._run("set_value", text=new, element=eid, snapshot=self._snapshot)
-            self._snapshot = None
-            after = (axfield.settled_value(field, before, wait=self.AX_INSERT_WAIT_S)
-                     if before is not None else None)
-            if after is not None and axfield.typed_in(before, after, new, True):
-                return ExecResult(True, f"set {len(new)} chars (with their newlines) into {label!r}, verified by "
-                                        f"read-back")
-            shown = "it cannot be read back" if after is None else f"it reads {after[-120:]!r}"
-            if not ok:
-                # the write said it failed: said so, unverified (it may still have landed) -- review of #68 @1194dde
-                return ExecResult(False, indeterminate=True,
-                                  detail=f"the write of {len(new)} chars (with their newlines) into {label!r} failed "
-                                         f"({detail[:160]}); unverified: {shown} -- observe before typing again")
-            return ExecResult(True, indeterminate=True,
-                              detail=f"set {len(new)} chars (with their newlines) into {label!r}, unverified: {shown} "
-                                     f"-- observe before typing again")
-        if not action.clear_first:
+        if action.clear_first:
+            if getattr(self, "_element_settable", {}).get(eid):
+                before = self._read_field(field)
+                ok, _, detail = self._run("set_value", text=text, element=eid, snapshot=self._snapshot)
+                self._snapshot = None
+                after = (axfield.settled_value(field, before, wait=self.AX_INSERT_WAIT_S)
+                         if before is not None else None)
+                res = self._read_back(label, field, before or "", after, text,
+                                      f"set {len(text)} chars (with their newlines)")
+                if not ok and res.indeterminate:
+                    # the write said it failed: said so, unverified (it may still have landed) -- review @1194dde
+                    return ExecResult(False, indeterminate=True,
+                                      detail=f"the write of {len(text)} chars (with their newlines) into {label!r} "
+                                             f"failed ({detail[:160]}); {res.detail}")
+                return res
+            if foreground:
+                return self._paste_into(eid, label, text, replace=True)
+            return self._no_way_for_newlines(label)
+        try:
+            web = axfield.in_web_area(field)
+        except Exception:   # noqa: BLE001 -- not known: no insertion
+            web = True
+        if _takes_ax_insertion(web):
             inserted = self._insert_at_end(eid, label, text)
-            if inserted is not None:
-                return inserted
+            return inserted if inserted is not None else self._no_way_for_newlines(label)
         if foreground:
-            return self._paste_into(eid, label, text, replace=action.clear_first)
+            return self._paste_into(eid, label, text, replace=False)
         return self._no_way_for_newlines(label)
 
     @staticmethod

@@ -78,8 +78,18 @@ def _length(el) -> int:
 def select(el, replace_all: bool, wait: float = 0.3) -> bool:
     """The selection to the whole text (replace_all) or a caret at its end; True when it reads back so (within
     `wait` seconds: a web view applies it asynchronously)."""
+    return select_range(el, wanted(el, replace_all), wait)
+
+
+def wanted(el, replace_all: bool) -> tuple[int, int]:
+    """The range select() writes: the whole text, or a caret at its end -- read (the text's length, an accessibility
+    read that can wait) apart from the write, so a caller's check can sit right before the write (select_range)."""
     n = _length(el)
-    want = (0, n) if replace_all else (n, 0)
+    return (0, n) if replace_all else (n, 0)
+
+
+def select_range(el, want: tuple[int, int], wait: float = 0.3) -> bool:
+    """The selection written as `want` (wanted), nothing read before the write; True when it reads back so."""
     if not _set(el, "AXSelectedTextRange", _range(*want)):
         return False
     return selected(el, want, wait)
@@ -135,6 +145,16 @@ def focus(el, wait: float = 0.5) -> bool:
 
 def is_focused(el) -> bool:
     return bool(_get(el, "AXFocused"))
+
+
+def can_set(el, attr: str) -> bool:
+    """Whether `attr` of the element is settable, as accessibility says (asking writes nothing)."""
+    try:
+        from ApplicationServices import AXUIElementIsAttributeSettable
+        err, ok = AXUIElementIsAttributeSettable(el, attr, None)
+        return err == 0 and bool(ok)
+    except Exception:  # noqa: BLE001 -- not known: no
+        return False
 
 
 def role(el) -> str:

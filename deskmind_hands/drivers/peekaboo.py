@@ -4724,6 +4724,10 @@ class PeekabooDriver:
                 for w in wins if pid and w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowLayer") == 0]
 
     def _execute_inner(self, action: Action) -> ExecResult:
+        if action.kind is ActionKind.TYPE_TEXT and action.text and "\r" in action.text:
+            # one newline, whatever the source: "\r\n" and a lone "\r" are "\n" before any route is chosen (a lone
+            # "\r" reached Peekaboo's `type` and was pressed as Return: review of #68 @1194dde)
+            action = replace(action, text=action.text.replace("\r\n", "\n").replace("\r", "\n"))
         # A synthetic control (open a document of the folder, save, close, ...) is carried out by script and needs no
         # Peekaboo snapshot. After the last document window was closed there is none, and "open parts.csv" was
         # refused as "observe before acting" until the run ended as a loop (D1 from the folder, 09-30/10-01).
@@ -5269,7 +5273,8 @@ class PeekabooDriver:
         if not ok and "unknown" in detail.lower() and "\n" not in text:
             # Peekaboo's `type` types a newline as the Return key (AXorcist Element.typeText): never for text with one
             ok, _, detail = self._run("type_fg", text=text)
-        if ok and not element_bound:
+        if ok and not element_bound and "\n" not in text:
+            # (never for text with a newline: Return there sends -- a chat message -- review of #68 @1194dde)
             # A blind write goes into a field nobody can read back -- an item in inline rename mode is not in the
             # tree at all -- so leaving it uncommitted leaves the run in a state it cannot inspect: the planner
             # retyped the name five times because nothing it could see had changed. Typing a name and confirming
@@ -5287,7 +5292,9 @@ class PeekabooDriver:
         self._snapshot = None
         obs = self.observe()
         fields = [e.value for e in obs.elements if e.settable and e.value]
-        if any(text in (v or "") for v in fields):
+        # a replace is verified only by the field holding exactly the text (containing it, "old" + text read as done:
+        # review of #68 @1194dde); an insertion by holding it
+        if any((v == text) if clear_first else (text in (v or "")) for v in fields):
             return self._settle(True, f"typed {text!r} in the foreground, verified by readback")
         # Say what the field actually holds. Finder's rename field pre-selects
         # only the base name, so typing "final.txt" over "draft.txt" yields
@@ -5326,16 +5333,61 @@ class PeekabooDriver:
                                         f"read-back")
             shown = "it cannot be read back" if after is None else f"it reads {after[-120:]!r}"
             if not ok:
-                shown += f" (the write answered: {detail[:160]})"
+                # the write said it failed: said so, unverified (it may still have landed) -- review of #68 @1194dde
+                return ExecResult(False, indeterminate=True,
+                                  detail=f"the write of {len(new)} chars (with their newlines) into {label!r} failed "
+                                         f"({detail[:160]}); unverified: {shown} -- observe before typing again")
             return ExecResult(True, indeterminate=True,
                               detail=f"set {len(new)} chars (with their newlines) into {label!r}, unverified: {shown} "
                                      f"-- observe before typing again")
         if action.foreground and self.allow_foreground:
+            if action.clear_first:
+                return self._replace_by_paste(eid, label, text)
             return None
         return ExecResult(False, NothingSent(f"text with a newline goes in only as text -- a value written ({label!r} "
                                              f"takes none) or a paste (the foreground, which this step may not use): "
                                              f"nothing was typed. Type it without the newline, and press Return as "
                                              f"its own step if you mean to submit"))
+
+    def _replace_by_paste(self, eid: str, label: str, text: str) -> ExecResult:
+        """Replace the field's text with `text` (it has a newline) by a paste: a paste inserts at the caret, so the
+        field's text is selected first -- the field given the keyboard focus inside its app and its whole text
+        selected through accessibility, each write right after a STOP check, the range read before -- then pasted
+        in the foreground and verified by the field holding exactly the text (review of #68 @1194dde: without the
+        selection "old" became "olda\nb" and read as done). Refused before anything is sent when the field cannot be
+        found or its selection cannot be read; a write refused after one went is said so (unverified)."""
+        from deskmind_hands.drivers import axfield
+        field = self._field_now(eid) if eid else None
+        refused = (f"replacing {label!r} with text that has a newline needs its text selected first, and "
+                   f"{{why}}: nothing was typed")
+        if field is None:
+            return ExecResult(False, NothingSent(refused.format(why="the field was not found to select it")))
+        try:
+            want = axfield.wanted(field, True)                  # the reads before the writes
+            readable = axfield._selection(field) is not None
+            focused = axfield.is_focused(field)
+        except Exception:   # noqa: BLE001 -- unread
+            readable = False
+        if not readable:
+            return ExecResult(False, NothingSent(refused.format(why="its selection cannot be read")))
+        sent_before = sends_so_far()
+
+        def stop(why: str) -> ExecResult:
+            if sends_so_far() > sent_before:
+                return ExecResult(False, MaybeSent(f"replacing {label!r} stopped part way: {why} -- the focus or the "
+                                                   f"selection may have changed; observe before typing again"))
+            return ExecResult(False, NothingSent(refused.format(why=why)))
+        if STOP.is_set():
+            return stop("stopped by the app")
+        if not focused and not axfield.focus(field):
+            return stop("the field did not take the keyboard focus")
+        if STOP.is_set():
+            return stop("stopped by the app")
+        if not axfield.select_range(field, want):
+            return stop("its text could not be selected")
+        if STOP.is_set():
+            return stop("stopped by the app")
+        return self._type_foreground(text, clear_first=True, element_bound=True)
 
     def _geometry(self) -> ScreenGeometry:
         """The frame the last observation reported, for converting a model point."""

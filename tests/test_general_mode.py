@@ -2013,6 +2013,7 @@ class NewlinesGoInAsText(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def driver(self, role="textArea", settable=True, foreground=False, takes=True, paste="ok"):
+        self.selected_all = False
         d = PeekabooDriver.__new__(PeekabooDriver)
         d.app, d._mcp, d._snapshot = "com.example.notes", None, "s1"
         d._pinned_window, d._element_window, d._window_id = None, {"e1": ""}, "200"
@@ -2023,19 +2024,23 @@ class NewlinesGoInAsText(unittest.TestCase):
         d._field_now = lambda eid: "FIELD"
         d._foreground_refusal = lambda: None
         d._browser_field_refusal = lambda vid: None
-        d.observe = lambda: SimpleNamespace(elements=[])
+        # the field as the next observation reads it (the foreground route's read-back)
+        d.observe = lambda: SimpleNamespace(elements=[SimpleNamespace(settable=True, value=self.shown["value"])])
         d._settle = lambda ok, detail: ExecResult(ok, detail)
         d.AX_INSERT_WAIT_S = 0.0
         self.sent = []
 
         def run(key, _extra=None, **fmt):
             self.sent.append((key, fmt.get("text"), fmt.get("chord")))
+            if key == "set_value" and takes == "fails":
+                return False, {}, "ERROR: the value could not be set"
             if key == "set_value" and takes:
                 self.shown["value"] = fmt["text"]
             if key == "paste_fg":
                 if paste == "unknown":
                     return False, {}, "UNKNOWN: the outcome is unknown"
-                self.shown["value"] += fmt["text"]
+                # a paste replaces the selection, else goes in at the caret (the end)
+                self.shown["value"] = (fmt["text"] if self.selected_all else self.shown["value"] + fmt["text"])
             return True, {}, ""
         d._run = run
         return d
@@ -2084,6 +2089,78 @@ class NewlinesGoInAsText(unittest.TestCase):
     def test_text_without_a_newline_is_typed_as_before(self):
         self.type_(self.driver(), "ab")
         self.assertEqual([s[0] for s in self.sent][:1], ["type"])
+
+    # -- review of #68 @1194dde
+    def test_a_lone_carriage_return_is_a_newline_before_any_route(self):
+        """B1: a lone "\r" reached Peekaboo's `type`."""
+        self.type_(self.driver(), "a\rb")
+        self.assertEqual(self.sent, [("set_value", "olda\nb", None)])
+        self.sent.clear()
+        self.type_(self.driver(settable=False, foreground=True), "a\rb", foreground=True)
+        self.assertFalse([x for x in self.sent if "\r" in (x[1] or "")], self.sent)
+        self.assertEqual([x[0] for x in self.sent], ["paste_fg"])
+
+    def test_text_with_a_newline_into_the_focused_field_is_never_submitted(self):
+        """B2: TYPE_FOCUSED (no element) pasted, then pressed Return as the rename's commit -- a chat message sent."""
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        from deskmind_hands.drivers.base import input_scope
+        d = self.driver(settable=False, foreground=True)
+        with input_scope(None):
+            d._execute_inner(Action(kind=ActionKind.TYPE_TEXT, text="one\ntwo", foreground=True, binding=Binding()))
+        self.assertIn("paste_fg", [x[0] for x in self.sent])
+        self.assertFalse([x for x in self.sent if x[2] == "return"], self.sent)
+
+    def replace_fakes(self, readable=True, selects=True):
+        from deskmind_hands.drivers import axfield
+        self.writes = []
+
+        def select_range(el, want, wait=0.3):
+            self.writes.append("select all")
+            self.selected_all = selects
+            return selects
+        for name, fn in (("wanted", lambda el, all_: (0, len(self.shown["value"]))),
+                         ("_selection", lambda el: (0, 0) if readable else None),
+                         ("is_focused", lambda el: True),
+                         ("focus", lambda el, wait=0.5: self.writes.append("focus") or True),
+                         ("select_range", select_range)):
+            p = mock.patch.object(axfield, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_replacing_with_lines_by_a_paste_selects_all_first_and_verifies_by_equality(self):
+        """B3: a replace on the paste route did not clear -- "old" became "olda\nb" and read as verified."""
+        self.replace_fakes()
+        res = self.type_(self.driver(settable=False, foreground=True), "a\nb", clear=True, foreground=True)
+        self.assertEqual(self.writes, ["select all"])
+        self.assertEqual([x[0] for x in self.sent], ["paste_fg"])
+        self.assertEqual(self.shown["value"], "a\nb")
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_a_replace_that_only_contains_the_text_is_not_verified(self):
+        self.replace_fakes(selects=True)
+        d = self.driver(settable=False, foreground=True)
+        real_run = d._run
+
+        def run(key, _extra=None, **fmt):                              # the paste lands after the old text anyway
+            if key == "paste_fg":
+                self.selected_all = False
+            return real_run(key, _extra, **fmt)
+        d._run = run
+        res = self.type_(d, "a\nb", clear=True, foreground=True)
+        self.assertEqual(self.shown["value"], "olda\nb")
+        self.assertTrue(res.indeterminate, res.detail)                  # contains it, does not equal it
+
+    def test_a_replace_whose_selection_cannot_be_read_is_refused_before_a_send(self):
+        self.replace_fakes(readable=False)
+        res = self.type_(self.driver(settable=False, foreground=True), "a\nb", clear=True, foreground=True)
+        self.assertEqual((self.sent, self.writes), ([], []))
+        self.assertIs(res.performed, False, res.detail)
+
+    def test_a_failed_value_write_says_so(self):
+        res = self.type_(self.driver(takes="fails"), "a\nb")
+        self.assertFalse(res.ok)
+        self.assertTrue(res.indeterminate, res.detail)
+        self.assertIn("failed", res.detail)
 
     def test_no_key_route_sends_a_newline_as_return(self):
         d = PeekabooDriver.__new__(PeekabooDriver)

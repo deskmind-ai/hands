@@ -14,6 +14,7 @@ performed:false)."""
 from __future__ import annotations
 
 import ast
+import os
 import sys
 import types
 import unittest
@@ -732,7 +733,7 @@ class ReleasesSurviveTheDeadline(unittest.TestCase):
 
         def broken(a):
             key = ("key", 7)
-            P._post(q, 0, "7-down", press=(key, lambda: P._post(q, 0, "7-up", release=key)))
+            P._post(q, 0, "7-down", press=(key, lambda in_place=False: P._post(q, 0, "7-up", release=key)))
             raise RuntimeError("the route failed half way")
         d = P.PeekabooDriver.__new__(P.PeekabooDriver)
         d.caller_deadline = None
@@ -742,3 +743,156 @@ class ReleasesSurviveTheDeadline(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             d.execute(Action(kind=ActionKind.KEY, keys=("a",)))
         self.assertEqual(seen, ["7-down", "7-up"])
+
+
+class CleanupLetsGoFirst(unittest.TestCase):
+    """Codex on hands#64 @b28b957. (1) A down is remembered before the first OS call that could deliver it: a
+    BackgroundQuartz click goes by SkyLight then by CGEventPostToPid, and a deadline between the two left the down
+    SkyLight delivered with no up. (2) What is held is let go before anything is given back: the up went after the
+    user's app had the front again and moved the pointer back to the task's place. Fail on b28b957."""
+
+    Clock = ReleasesSurviveTheDeadline.Clock
+
+    @staticmethod
+    def quartz():
+        q = types.ModuleType("Quartz")
+        q.kCGHIDEventTap = q.kCGMouseButtonLeft = 0
+        q.kCGMouseEventClickState = 1
+        q.kCGEventMouseMoved, q.kCGEventLeftMouseDown, q.kCGEventLeftMouseUp = "move", "down", "up"
+        q.kCGEventKeyDown, q.kCGEventKeyUp, q.kCGEventFlagsChanged = "kd", "ku", "fc"
+        q.CGEventCreateMouseEvent = lambda _, kind, loc, btn: {"kind": kind, "loc": loc}
+        q.CGEventSetIntegerValueField = lambda *args: None
+        q.CGEventGetIntegerValueField = lambda *args: 1
+        q.CGEventGetType = lambda event: event["kind"]
+        q.CGEventGetLocation = lambda event: types.SimpleNamespace(x=event["loc"][0], y=event["loc"][1])
+        return q
+
+    def driver(self, clock, allowance=10.0):
+        from deskmind_hands.drivers import peekaboo as P
+        d = P.PeekabooDriver.__new__(P.PeekabooDriver)
+        d.caller_deadline = clock.t + base.DEADLINE_MARGIN_S + allowance
+        d._require_session = lambda: None
+        d.CONFIRM_BY_DIFF = False
+        return d
+
+    def setUp(self):
+        from deskmind_hands.grounding import STOP
+        STOP.clear()
+        self.addCleanup(STOP.clear)
+
+    def test_a_deadline_between_the_two_transports_of_a_down_still_sends_its_up(self):
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        from deskmind_hands.drivers import peekaboo as P, skylight
+        clock, sent = self.Clock(), []
+        q = self.quartz()
+        q.CGEventPostToPid = lambda pid, event: sent.append(("CG", event["kind"]))
+
+        def sl_post(pid, event):
+            sent.append(("SL", event["kind"]))
+            if event["kind"] == "down":
+                clock.sleep(0.04)                         # the deadline passes between SkyLight and PostToPid
+        fns = {"post": sl_post, "set_int": lambda *a: None, "set_loc": lambda *a: None}
+        with mock.patch.dict(sys.modules, {"Quartz": q}), mock.patch.object(skylight, "_load", lambda: fns), \
+                mock.patch.object(skylight, "_ptr", lambda event: event), \
+                mock.patch.object(base, "time", clock), mock.patch.object(P, "time", clock):
+            bg = skylight.BackgroundQuartz(123, 456, (0, 0))
+            d = self.driver(clock, allowance=0.075)
+            d._execute_outer = lambda a: d._post_click(bg, 10, 10) or ExecResult(True, "done")
+            result = d.execute(Action(kind=ActionKind.CLICK, binding=Binding(element_id="b")))
+        self.assertEqual(sent, [("SL", "move"), ("CG", "move"), ("SL", "down"), ("SL", "up"), ("CG", "up")])
+        self.assertIsNone(result.performed)              # the down went: sent, then stopped
+        self.assertTrue(result.indeterminate)
+
+    def test_a_down_refused_before_any_transport_is_not_let_go(self):
+        """The other side of (1): a down the deadline refused before anything went sends no up -- nothing sent stays
+        nothing sent."""
+        from deskmind_hands.actions import Action, ActionKind
+        from deskmind_hands.drivers import peekaboo as P
+        clock, events = self.Clock(), []
+        q = types.SimpleNamespace(kCGHIDEventTap=0, CGEventSetFlags=lambda *a: None,
+                                  CGEventPost=lambda tap, ev: events.append(ev))
+        d = self.driver(clock, allowance=-1.0)
+        d._execute_outer = lambda a: d._post_key(q, 2) or ExecResult(True, "done")
+        with mock.patch.object(base, "time", clock), mock.patch.object(P, "time", clock), \
+                mock.patch.object(P.PeekabooDriver, "_key_event",
+                                  classmethod(lambda cls, Q, keycode, down: f"{keycode}-{'down' if down else 'up'}")):
+            result = d.execute(Action(kind=ActionKind.KEY, keys=("d",)))
+        self.assertEqual(events, [])
+        self.assertIs(result.performed, False)
+
+    def test_an_error_between_a_down_and_its_up_lets_go_before_the_pointer_and_the_front_go_back(self):
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        from deskmind_hands.drivers import peekaboo as P
+        clock, log = self.Clock(), []
+        q = self.quartz()
+        d = self.driver(clock)
+        d.app, d.BROWSERS, d._foreground_actions = "com.example.task", set(), 0
+        desk = {"front": "com.example.user", "pointer": (100, 100)}
+        d._background_input = lambda bundle: False
+        d._takeover = lambda: True
+        d._front_bundle = lambda: desk["front"]
+        d._front_taken = lambda *args: None
+        d._front_given_back = lambda token: None
+
+        def bring(bundle, browser):
+            desk["front"] = bundle
+            return True
+
+        def give(prev, **kw):
+            log.append("front back")
+            desk["front"] = prev
+        d._bring_forward, d._give_front_back = bring, give
+        q.CGEventCreate = lambda _: None
+        q.CGEventGetLocation = lambda event: desk["pointer"] if event is None else \
+            types.SimpleNamespace(x=event["loc"][0], y=event["loc"][1])
+
+        def warp(loc):
+            log.append("pointer back")
+            desk["pointer"] = loc
+        q.CGWarpMouseCursorPosition = warp
+        q.CGAssociateMouseAndMouseCursorPosition = lambda value: None
+        create, first_up = q.CGEventCreateMouseEvent, [True]
+
+        def create_failing_once(src, kind, loc, button):
+            if kind == "up" and first_up[0]:
+                first_up[0] = False
+                raise RuntimeError("the mouse-up could not be built")
+            return create(src, kind, loc, button)
+        q.CGEventCreateMouseEvent = create_failing_once
+
+        def post(tap, event):
+            log.append((event["kind"], desk["front"], event["loc"]))
+            desk["pointer"] = event["loc"]
+        q.CGEventPost = post
+        d._execute_outer = lambda a: d._flash(d.app, lambda Q: d._post_click(Q, 10, 10))
+        with mock.patch.dict(sys.modules, {"Quartz": q}), mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": d.app}), \
+                mock.patch.object(P, "_ascii_input_source", lambda: None), \
+                mock.patch.object(base, "time", clock), mock.patch.object(P, "time", clock):
+            with self.assertRaises(RuntimeError):
+                d.execute(Action(kind=ActionKind.CLICK, binding=Binding(element_id="b")))
+        self.assertEqual(log, [("move", "com.example.task", (10, 10)), ("down", "com.example.task", (10, 10)),
+                               ("up", "com.example.task", (10, 10)), "pointer back", "front back"])
+        self.assertEqual(desk, {"front": "com.example.user", "pointer": (100, 100)})
+
+    def test_the_last_resort_release_does_not_move_the_pointer(self):
+        """A button still held when the step ends (no cleanup of its own let it go): the up goes where the pointer is,
+        not at the click's place."""
+        from deskmind_hands.actions import Action, ActionKind
+        from deskmind_hands.drivers import peekaboo as P
+        clock, log = self.Clock(), []
+        q = self.quartz()
+        q.CGEventCreate = lambda _: None
+        q.CGEventGetLocation = lambda event: (100, 100)
+        q.CGEventPost = lambda tap, ev: log.append((ev["kind"], ev["loc"]))
+
+        def held(a):
+            P._post(q, 0, q.CGEventCreateMouseEvent(None, "down", (10, 10), 0),
+                    press=(("mouse", "left"), P._mouse_up(
+                        q, lambda at: q.CGEventCreateMouseEvent(None, "up", at, 0), (10, 10), ("mouse", "left"))))
+            raise RuntimeError("stopped half way")
+        d = self.driver(clock)
+        d._execute_outer = held
+        with mock.patch.object(base, "time", clock), mock.patch.object(P, "time", clock):
+            with self.assertRaises(RuntimeError):
+                d.execute(Action(kind=ActionKind.KEY, keys=("a",)))
+        self.assertEqual(log, [("down", (10, 10)), ("up", (100, 100))])

@@ -730,9 +730,36 @@ def _post(Q, tap, event, press=None, release=None) -> None:
             _post_one(Q, tap, event)
         note_released(release)
         return
-    _post_one(Q, tap, event)
-    if press is not None:
-        note_pressed(*press)
+    if press is None:
+        _post_one(Q, tap, event)
+        return
+    # Remembered BEFORE the first OS call that could deliver the down: a route with two transports (BackgroundQuartz
+    # sends a mouse down by SkyLight, then by CGEventPostToPid) may have delivered it by the first when the deadline
+    # refuses the second (Codex on hands#64 @b28b957). Let go unless this call made no send at all -- refused before
+    # any transport, nothing went, and an up then would turn "nothing sent" into "sent". An extra up is harmless.
+    note_pressed(*press)
+    before = sends_so_far()
+    try:
+        _post_one(Q, tap, event)
+    except BaseException:
+        if sends_so_far() == before:
+            note_released(press[0])
+        raise
+
+
+def _mouse_up(Q, make, at, button) -> callable:
+    """The let-go of a mouse button pressed at `at`: its up, there -- or, `in_place` (the last-resort release, after
+    the pointer was put back), where the pointer now is, so letting go never moves it. A window-targeted route
+    (BackgroundQuartz) does not move the pointer: its up keeps the click's place."""
+    def let_go(in_place: bool = False):
+        where = at
+        if in_place and not getattr(Q, "counts_own_posts", False):
+            try:
+                where = Q.CGEventGetLocation(Q.CGEventCreate(None))
+            except Exception:  # noqa: BLE001 -- unknown: the click's place, as before
+                where = at
+        _post(Q, Q.kCGHIDEventTap, make(where), release=button)
+    return let_go
 
 
 def _post_one(Q, tap, event) -> None:
@@ -1729,6 +1756,7 @@ class PeekabooDriver:
                              detail=f"the address bar may have been clicked and {text!r} pasted, but a key was refused "
                                     f"({exc}), so the search may not have been made -- observe before searching again")
         finally:
+            release_all()   # what this step still holds down is let go first, before anything is given back
             skylight.give_focus_back(token)
         return self._with_key_note(res, token)
 
@@ -1751,6 +1779,7 @@ class PeekabooDriver:
             time.sleep(0.4)
             return True
         finally:
+            release_all()   # what this step still holds down is let go first, before anything is given back
             pb.clearContents()
             items = []
             for d in saved:
@@ -2831,8 +2860,9 @@ class PeekabooDriver:
                 return Quartz.CGEventCreateMouseEvent(None, kind, (x, y), Quartz.kCGMouseButtonLeft)
             for kind in (Quartz.kCGEventMouseMoved, Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
                 if kind == Quartz.kCGEventLeftMouseDown:
-                    _post(Quartz, Quartz.kCGHIDEventTap, mouse(kind), press=(button, lambda: _post(
-                        Quartz, Quartz.kCGHIDEventTap, mouse(Quartz.kCGEventLeftMouseUp), release=button)))
+                    _post(Quartz, Quartz.kCGHIDEventTap, mouse(kind), press=(button, _mouse_up(
+                        Quartz, lambda at: Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp, at,
+                                                                          Quartz.kCGMouseButtonLeft), (x, y), button)))
                 elif kind == Quartz.kCGEventLeftMouseUp:
                     _post(Quartz, Quartz.kCGHIDEventTap, mouse(kind), release=button)
                 else:
@@ -2840,6 +2870,7 @@ class PeekabooDriver:
                 time.sleep(0.05)
             time.sleep(0.2)
         finally:
+            release_all()   # what this step still holds down is let go first, before anything is given back
             try:
                 Quartz.CGWarpMouseCursorPosition(cur)
                 Quartz.CGAssociateMouseAndMouseCursorPosition(True)
@@ -2934,6 +2965,7 @@ class PeekabooDriver:
                 except skylight.WindowKeyRefused as exc:
                     refused = exc       # a key while the user is on the app (or the window lost key): that one not sent
                 finally:
+                    release_all()   # what this step still holds down is let go first, before anything is given back
                     skylight.give_focus_back(token)
                 note = token.note() if hasattr(token, "note") else ""
                 if refused is None:
@@ -3078,6 +3110,7 @@ class PeekabooDriver:
                     sent = True
                     detail = perform(Quartz)
                 finally:
+                    release_all()   # what this step still holds down is let go first, before anything is given back
                     if ime is not None:
                         try:
                             ime.restore()
@@ -3697,8 +3730,8 @@ class PeekabooDriver:
         song row never played, a gym card never started."""
         kinds = (Q.kCGEventLeftMouseDown, Q.kCGEventLeftMouseUp) if count > 1 else \
             (Q.kCGEventMouseMoved, Q.kCGEventLeftMouseDown, Q.kCGEventLeftMouseUp)
-        def event(kind):
-            ev = Q.CGEventCreateMouseEvent(None, kind, (x, y), Q.kCGMouseButtonLeft)
+        def event(kind, at=None):
+            ev = Q.CGEventCreateMouseEvent(None, kind, (x, y) if at is None else at, Q.kCGMouseButtonLeft)
             if kind != Q.kCGEventMouseMoved:
                 Q.CGEventSetIntegerValueField(ev, Q.kCGMouseEventClickState, count)
             return ev
@@ -3706,7 +3739,7 @@ class PeekabooDriver:
         for kind in kinds:
             if kind == Q.kCGEventLeftMouseDown:
                 _post(Q, Q.kCGHIDEventTap, event(kind),
-                      press=(button, lambda: _post(Q, Q.kCGHIDEventTap, event(Q.kCGEventLeftMouseUp), release=button)))
+                      press=(button, _mouse_up(Q, lambda at: event(Q.kCGEventLeftMouseUp, at), (x, y), button)))
             elif kind == Q.kCGEventLeftMouseUp:
                 _post(Q, Q.kCGHIDEventTap, event(kind), release=button)
             else:
@@ -3789,7 +3822,7 @@ class PeekabooDriver:
             Q.CGEventSetFlags(ev, flags)
             key = ("key", keycode)
             if down:
-                _post(Q, Q.kCGHIDEventTap, ev, press=(key, lambda: _post(Q, Q.kCGHIDEventTap, up_event(), release=key)))
+                _post(Q, Q.kCGHIDEventTap, ev, press=(key, lambda in_place=False: _post(Q, Q.kCGHIDEventTap, up_event(), release=key)))
             else:
                 _post(Q, Q.kCGHIDEventTap, ev, release=key)
             time.sleep(0.03)
@@ -3824,7 +3857,7 @@ class PeekabooDriver:
             Q.CGEventSetFlags(ev, 0)
             return ev
         key = ("key", 0)
-        _post(Q, Q.kCGHIDEventTap, event(True), press=(key, lambda: _post(Q, Q.kCGHIDEventTap, event(False), release=key)))
+        _post(Q, Q.kCGHIDEventTap, event(True), press=(key, lambda in_place=False: _post(Q, Q.kCGHIDEventTap, event(False), release=key)))
         time.sleep(0.01)
         _post(Q, Q.kCGHIDEventTap, event(False), release=key)
         time.sleep(0.01)
@@ -3953,6 +3986,7 @@ class PeekabooDriver:
                         self._post_key(Q, keys.RETURN)               # Return: a search box searches on Enter
                         time.sleep(0.4)
                 finally:
+                    release_all()   # what this step still holds down is let go first, before anything is given back
                     pb.clearContents()
                     items = []
                     for d in saved:
@@ -4207,10 +4241,10 @@ class PeekabooDriver:
             return self._execute_outer(action)
         except StepExpired:
             # a send asked for past the caller's deadline was not made (base.counted): the step ends here
-            release_all()
+            release_all(in_place=True)
             return step_expired_result()
         finally:
-            release_all()                     # nothing the step pressed is left held, however it ended
+            release_all(in_place=True)          # the last resort: nothing left held, the pointer not moved
             scope.__exit__(None, None, None)
             # A browser-field allowance is for this one step: an early return or an error must not leave it for the
             # next one.

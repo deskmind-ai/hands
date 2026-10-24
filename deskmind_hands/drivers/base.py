@@ -326,7 +326,8 @@ class releasing:
 
 
 def note_pressed(key, let_go) -> None:
-    """`key` (a key code, a mouse button) went down in the step in progress; `let_go()` sends its up."""
+    """`key` (a key code, a mouse button) is going down in the step in progress -- told before the first OS call that
+    could deliver it; `let_go(in_place=False)` sends its up (`in_place`: without moving the pointer)."""
     st = _STEP.get()
     if st is not None:
         st.pressed[key] = let_go
@@ -338,16 +339,18 @@ def note_released(key) -> None:
         st.pressed.pop(key, None)
 
 
-def release_all() -> None:
+def release_all(in_place: bool = False) -> None:
     """Let go of everything the step in progress still holds down (its downs whose ups did not go: an exception, a
-    stop, the deadline between them). Called as the step ends, whatever ended it."""
+    stop, the deadline between them). Called first in every cleanup that gives something back (the front, the focus,
+    the pointer, the clipboard, the input source), so the ups go where the downs went; and once more as the step ends,
+    whatever ended it, `in_place` -- the last resort, after the pointer may have been put back, never moving it."""
     st = _STEP.get()
     if st is None:
         return
     for key, let_go in list(st.pressed.items()):
         try:
             with releasing():
-                let_go()
+                let_go(in_place=in_place)
         except Exception:  # noqa: BLE001 -- one that cannot be let go must not keep the others held
             pass
         st.pressed.pop(key, None)

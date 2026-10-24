@@ -3529,7 +3529,10 @@ class PeekabooDriver:
             except _NotReady as exc:
                 return ExecResult(False, NothingSent(f"{label!r}: {exc}; nothing was typed"))
             if not ok:
-                if newline:
+                if newline and isinstance(detail, NothingSent):
+                    # Said more, as nothing sent only when it was: a MaybeSent (a focus write, cmd+A or the paste
+                    # went before a refused key) stays unverified -- relabelled "nothing sent", it invited a retry
+                    # that pasted twice (review of #66 @e04edab).
                     return ExecResult(False, NothingSent(f"{detail} -- text with a newline goes in only pasted, in "
                                                          f"the foreground"))
                 return ExecResult(False, detail)

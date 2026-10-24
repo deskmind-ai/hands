@@ -1994,3 +1994,102 @@ class TextTargetFoundByItsRole(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         self.assertIs(self._driver()._field_now("elem_3"), el)
+
+
+class NewlinesGoInAsText(unittest.TestCase):
+    """hands#66's newline rule on the command-line channel: a newline in the text is never a bare Return key. Peekaboo's
+    `type` presses Return for each one (AXorcist Element.typeText), _type_multiline pressed it between lines, and the
+    type_fg fallback typed it the same way. Text with a newline goes in as text, the way chosen before the first send:
+    the element's value written (then verified or unverified, never a paste after), else a paste where the step may
+    use the foreground, else nothing; a one-line field refuses it. Fail on 10d5b71."""
+
+    def setUp(self):
+        from deskmind_hands.drivers import axfield
+        self.shown = {"value": "old"}
+        for name, fn in (("value", lambda f: self.shown["value"]),
+                         ("settled_value", lambda f, before, wait=0.6: self.shown["value"])):
+            p = mock.patch.object(axfield, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def driver(self, role="textArea", settable=True, foreground=False, takes=True, paste="ok"):
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        d.app, d._mcp, d._snapshot = "com.example.notes", None, "s1"
+        d._pinned_window, d._element_window, d._window_id = None, {"e1": ""}, "200"
+        d._element_role, d._element_settable = {"e1": role}, {"e1": settable}
+        d._element_value, d._labels_by_id = {"e1": "old"}, {"e1": "Body"}
+        d.allow_foreground, d._blind_write = foreground, None
+        d._foreground_actions = d._escalations = 0
+        d._field_now = lambda eid: "FIELD"
+        d._foreground_refusal = lambda: None
+        d._browser_field_refusal = lambda vid: None
+        d.observe = lambda: SimpleNamespace(elements=[])
+        d._settle = lambda ok, detail: ExecResult(ok, detail)
+        d.AX_INSERT_WAIT_S = 0.0
+        self.sent = []
+
+        def run(key, _extra=None, **fmt):
+            self.sent.append((key, fmt.get("text"), fmt.get("chord")))
+            if key == "set_value" and takes:
+                self.shown["value"] = fmt["text"]
+            if key == "paste_fg":
+                if paste == "unknown":
+                    return False, {}, "UNKNOWN: the outcome is unknown"
+                self.shown["value"] += fmt["text"]
+            return True, {}, ""
+        d._run = run
+        return d
+
+    def type_(self, d, text, clear=False, foreground=False):
+        from deskmind_hands.actions import Action, ActionKind, Binding
+        from deskmind_hands.drivers.base import input_scope
+        with input_scope(None):
+            return d._execute_inner(Action(kind=ActionKind.TYPE_TEXT, text=text, clear_first=clear,
+                                           foreground=foreground, binding=Binding(element_id="e1")))
+
+    def no_return(self):
+        self.assertFalse([s for s in self.sent if s[0].startswith("press") and s[2] == "return"], self.sent)
+        self.assertFalse([s for s in self.sent if s[0] in ("type", "type_clear", "type_fg") and "\n" in (s[1] or "")],
+                         self.sent)
+
+    def test_appended_text_with_a_newline_is_written_as_the_value(self):
+        res = self.type_(self.driver(), "a\nb")
+        self.assertEqual(self.sent, [("set_value", "olda\nb", None)])
+        self.no_return()
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_replacing_with_lines_is_written_whole_and_not_shown_is_unverified_with_no_paste_after(self):
+        res = self.type_(self.driver(takes=False, foreground=True), "a\nb", clear=True, foreground=True)
+        self.assertEqual(self.sent, [("set_value", "a\nb", None)])             # no paste after the write
+        self.no_return()
+        self.assertTrue(res.indeterminate, res.detail)
+
+    def test_a_one_line_field_refuses_a_newline(self):
+        res = self.type_(self.driver(role="textField"), "a\nb")
+        self.assertEqual(self.sent, [])
+        self.assertIs(res.performed, False, res.detail)
+        self.assertIn("press Return as its own step", res.detail)
+
+    def test_no_value_to_write_pastes_in_the_foreground_and_never_types_it(self):
+        res = self.type_(self.driver(settable=False, foreground=True, paste="unknown"), "a\nb", foreground=True)
+        self.assertEqual([s[0] for s in self.sent], ["paste_fg"])               # no type_fg after it
+        self.no_return()
+        self.assertIsNotNone(res)
+
+    def test_no_value_and_no_foreground_sends_nothing(self):
+        res = self.type_(self.driver(settable=False), "a\nb")
+        self.assertEqual(self.sent, [])
+        self.assertIs(res.performed, False, res.detail)
+
+    def test_text_without_a_newline_is_typed_as_before(self):
+        self.type_(self.driver(), "ab")
+        self.assertEqual([s[0] for s in self.sent][:1], ["type"])
+
+    def test_no_key_route_sends_a_newline_as_return(self):
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        posted = []
+        d._post_key = lambda Q, code, flags=0: posted.append(code)
+        for nl in ("\n", "\r"):
+            with self.assertRaises(ValueError):
+                d._post_chunk(None, nl)
+        self.assertEqual(posted, [])

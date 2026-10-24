@@ -3877,8 +3877,11 @@ class PeekabooDriver:
             if written:
                 noop.add(str(wid))
         multiline = axfield.role(field) == "AXTextArea"
-        if not multiline and ("\n" in text or "\t" in text):
-            return None             # Return would submit a one-line field, Tab move its focus: not typed as keys
+        if "\n" in text or (not multiline and "\t" in text):
+            # A newline is never a bare Return key (hands#66: in a chat box Return sends, "one\ntwo" sent "one"): text
+            # with one goes in as text -- the insertion above, a value written, or a paste -- never as keys here. A
+            # Tab in a one-line field would move its focus.
+            return None
         if not self._ascii_input():
             return None             # an input method would take the keys (a candidate window): no background route
         late = axfield.value(field)
@@ -4255,9 +4258,13 @@ class PeekabooDriver:
         return sent, None
 
     def _post_chunk(self, Q, chunk: str) -> None:
-        """One run of text as a Unicode payload on key code 0, or a newline / tab as the Return / Tab key."""
-        if chunk in ("\n", "\r", "\t"):
-            self._post_key(Q, keys.TAB if chunk == "\t" else keys.RETURN)
+        """One run of text as a Unicode payload on key code 0, or a tab as the Tab key. A newline is never the Return
+        key (hands#66's rule: in a chat box Return sends): refused here, whoever asks -- text with one goes in as
+        text (a value written, an insertion, a paste)."""
+        if chunk in ("\n", "\r"):
+            raise ValueError("a newline is never sent as the Return key: text with one goes in as text")
+        if chunk == "\t":
+            self._post_key(Q, keys.TAB)
             return
         units = len(chunk.encode("utf-16-le")) // 2
 
@@ -5068,8 +5075,14 @@ class PeekabooDriver:
             if eid and self._pinned_window and self._element_window.get(eid) not in (None, "", self._pinned_window):
                 return ExecResult(False, f"{eid} belongs to window {self._element_window.get(eid)}, not the pinned "
                                          f"window {self._pinned_window}; observe the window you mean first")
-            if "\n" in text and action.clear_first:
-                return self._type_multiline(text)
+            if "\n" in text:
+                # A newline is never a bare Return key (hands#66's rule): Peekaboo's `type` presses Return for each
+                # one (AXorcist Element.typeText), and _type_multiline pressed it between lines. Text with one goes in
+                # as text, the way chosen before the first send: a value written (the element takes one), else a
+                # paste in the foreground (this step may use it: the block below), else nothing.
+                routed = self._text_with_newlines(action, text)
+                if routed is not None:
+                    return routed
             # Only the set-the-field form can be verified by value readback.
             # Insert-at-caret is dispatched but unconfirmable, and Peekaboo says
             # so rather than pretending; we pass that through unchanged.
@@ -5253,7 +5266,8 @@ class PeekabooDriver:
         # folder name came out as "a'r'chi'v'e". `paste` sets the clipboard, sends cmd+V and restores the previous
         # contents in one operation, so the text arrives as text whatever IME is active.
         ok, _, detail = self._run("paste_fg", text=text)
-        if not ok and "unknown" in detail.lower():
+        if not ok and "unknown" in detail.lower() and "\n" not in text:
+            # Peekaboo's `type` types a newline as the Return key (AXorcist Element.typeText): never for text with one
             ok, _, detail = self._run("type_fg", text=text)
         if ok and not element_bound:
             # A blind write goes into a field nobody can read back -- an item in inline rename mode is not in the
@@ -5286,54 +5300,42 @@ class PeekabooDriver:
                     "consequence of committing it. Note that a rename field usually "
                     "pre-selects the base name only, so an extension typed in is kept twice."))
 
-    def _type_multiline(self, text: str) -> ExecResult:
-        """Type text containing newlines, then prove it landed by reading it back.
-
-        A newline is a Return keypress, not a literal character, so Peekaboo's
-        own confirmation (which compares literal text) cannot cover it -- a
-        trailing newline alone is enough to make a correct write report failure.
-        Real keystrokes are still used, because setting the accessibility value
-        directly would bypass the interface a GUI run exists to measure. The
-        write is then verified the only honest way available: observe again and
-        compare what the field actually holds.
-        """
-        segments = text.split("\n")
-        ok, _, detail = self._run("type_clear", text=segments[0], snapshot=self._snapshot)
-        if not ok and "different window" in detail and self.allow_foreground:
-            # The single-line path escalates here and this one did not, so the
-            # very same write succeeded or failed depending on whether the text
-            # happened to contain a newline. The symptom was a driver that
-            # could not type Chinese with line breaks; the cause was one
-            # recovery living on one of two branches.
-            self._escalations += 1
-            return self._type_foreground(text)
-        if not ok:
-            return self._settle(False, f"multiline type failed on first segment: {detail}")
-        for seg in segments[1:]:
-            if STOP.is_set():                       # line by line: a stop between two lines sends no more of them
-                return self._settle(False, "stopped by the app partway: the lines before were typed, no more")
+    def _text_with_newlines(self, action: Action, text: str) -> ExecResult | None:
+        """Text with a newline, on the command-line channel: in as text, never with a Return key -- the way chosen
+        before the first send. A one-line field: refused (a newline would submit it part way). The element's value
+        settable: written whole (set-value), then read back from the element -- verified or unverified, never a paste
+        after it. Else, where this step may use the foreground: None, the paste below (_type_foreground: paste_fg,
+        never type_fg for text with a newline). Else: refused, nothing sent."""
+        from deskmind_hands.drivers import axfield
+        eid = action.binding.element_id or ""
+        label = self._labels_by_id.get(eid) or eid or "the focused field"
+        if eid and self._element_role.get(eid, "").lower() == "textfield":
+            return ExecResult(False, NothingSent(f"{label!r} is a one-line field and the text has a newline, which "
+                                                 f"would submit it part way: nothing was typed. Type the text without "
+                                                 f"it, then press Return as its own step if you mean to submit"))
+        if eid and getattr(self, "_element_settable", {}).get(eid):
+            new = text if action.clear_first else self._element_value.get(eid, "") + text
+            field = self._field_now(eid)
+            before = self._read_field(field)
+            ok, _, detail = self._run("set_value", text=new, element=eid, snapshot=self._snapshot)
             self._snapshot = None
-            self.observe()
-            if not self._window_id:
-                return self._settle(False, "lost the window mid-typing")
-            ok, _, detail = self._run("press", chord="return", app=self.app,
-                                      window=self._window_id)
+            after = (axfield.settled_value(field, before, wait=self.AX_INSERT_WAIT_S)
+                     if before is not None else None)
+            if after is not None and axfield.typed_in(before, after, new, True):
+                return ExecResult(True, f"set {len(new)} chars (with their newlines) into {label!r}, verified by "
+                                        f"read-back")
+            shown = "it cannot be read back" if after is None else f"it reads {after[-120:]!r}"
             if not ok:
-                return self._settle(False, f"return between lines failed: {detail}")
-            if seg:
-                self._snapshot = None
-                self.observe()
-                ok, _, detail = self._run("type", text=seg, snapshot=self._snapshot)
-
-        self._snapshot = None
-        obs = self.observe()
-        got = next((e.value for e in obs.elements if e.settable and e.value is not None), None)
-        if got is None:
-            return self._settle(False, "cannot read the field back to verify the write")
-        if got.rstrip("\n") != text.rstrip("\n"):
-            return self._settle(False,
-                                f"readback mismatch: field holds {got[:60]!r}, wrote {text[:60]!r}")
-        return self._settle(True, f"typed {len(segments)} lines, verified by readback")
+                shown += f" (the write answered: {detail[:160]})"
+            return ExecResult(True, indeterminate=True,
+                              detail=f"set {len(new)} chars (with their newlines) into {label!r}, unverified: {shown} "
+                                     f"-- observe before typing again")
+        if action.foreground and self.allow_foreground:
+            return None
+        return ExecResult(False, NothingSent(f"text with a newline goes in only as text -- a value written ({label!r} "
+                                             f"takes none) or a paste (the foreground, which this step may not use): "
+                                             f"nothing was typed. Type it without the newline, and press Return as "
+                                             f"its own step if you mean to submit"))
 
     def _geometry(self) -> ScreenGeometry:
         """The frame the last observation reported, for converting a model point."""

@@ -85,6 +85,8 @@ class FocusGuard(unittest.TestCase):
         d._execute_inner = lambda action: time.sleep(0.3) or ExecResult(True, "clicked 'Submit'")   # a step takes a while
         d.activated = []
         d._osa = lambda script: d.activated.append(script) or (True, "")
+        # the give-back of the front: by bundle id, else by name (_restore_front, never AppleScript activate)
+        d._restore_front = lambda b, name="": d.activated.append(("front back", b or name)) or True
         d._q = lambda s: s
         from deskmind_hands.actions import Binding
         return d, Action(kind=ActionKind.CLICK, binding=Binding(element_id="elem_1"))
@@ -94,7 +96,7 @@ class FocusGuard(unittest.TestCase):
         d, act = self._driver(["iTerm2", "Some Updater"], idle=60)
         with mock.patch.dict("os.environ", {"HANDS_EFFECT_NOTES": "1"}):
             res = d._execute_outer(act)
-        self.assertEqual(d.activated, ['tell application "iTerm2" to activate'])
+        self.assertEqual(d.activated, [("front back", "iTerm2")])
         self.assertIn("given back to iTerm2", res.detail)
 
     def test_the_guard_acts_but_says_nothing_by_default(self):
@@ -102,7 +104,7 @@ class FocusGuard(unittest.TestCase):
         d, act = self._driver(["iTerm2", "Some Updater"], idle=60)
         with mock.patch.dict("os.environ", {"HANDS_EFFECT_NOTES": "0"}):
             res = d._execute_outer(act)
-        self.assertEqual(d.activated, ['tell application "iTerm2" to activate'])   # the front is still given back
+        self.assertEqual(d.activated, [("front back", "iTerm2")])   # the front is still given back
         self.assertNotIn("given back", res.detail)                                 # but the planner's text is as before
 
     def test_the_user_switching_apps_is_left_alone(self):
@@ -117,7 +119,7 @@ class FocusGuard(unittest.TestCase):
         click, type and key. This table passes on origin/main's driver and on this branch's."""
         from deskmind_hands.actions import Action, ActionKind, Binding
         ne = "com.netease.163music"
-        given = ['tell application "iTerm2" to activate']
+        given = [("front back", "com.googlecode.iterm2")]
         # (driver app, front before, front after, HID idle, foreground) -> (activated, counted as a front take)
         table = [
             ("com.apple.Safari", ("iTerm2", "com.googlecode.iterm2"), ("Finder", "com.apple.finder"), 60, False, given, 1),

@@ -437,7 +437,10 @@ class NoSendBypassesTheCount(unittest.TestCase):
         ("deskmind_hands.drivers.skylight", "_post_record", 'fns["post_rec"]'): "focus records: a key-window change",
         ("deskmind_hands.drivers.skylight", "_set_focused_window", "AXUIElementSetAttributeValue"): "AXFocusedWindow: a key-window change",
         ("deskmind_hands.drivers.peekaboo", "PeekabooDriver._make_frontmost", "AXUIElementSetAttributeValue"): "AXFrontmost: a front, no reopen",
-        ("deskmind_hands.executor", "HandsExecutor._make_frontmost", "AXUIElementSetAttributeValue"): "AXFrontmost: a front, no reopen",
+        ("deskmind_hands.drivers.front", "restore_front", "AXUIElementSetAttributeValue"):
+            "AXFrontmost: a give-back of the front, no reopen",
+        ("deskmind_hands.drivers.front", "restore_front", "activateWithOptions_"):
+            "a give-back of the front: activation without a reopen",
         ("deskmind_hands.drivers.peekaboo", "PeekabooDriver._activate_without_reopen", "activateWithOptions_"): "activation without a reopen: a front, for an app with a window on screen",
         ("deskmind_hands.drivers.peekaboo", "_sh", "subprocess.run"): "the counted wrapper of commands",
         ("deskmind_hands.drivers.peekaboo", "PeekabooDriver._run", "subprocess.run"): "the counted wrapper of peekaboo commands",

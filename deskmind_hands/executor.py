@@ -57,6 +57,7 @@ from pathlib import Path
 
 from .actions import Action, ActionKind, Binding
 from .axdocument import _q, document_text, window_document
+from .drivers.front import restore_front
 from .grounding import STOP
 from .drivers.base import (ExecResult, Observation, StepExpired, act_by, input_scope, release_all, set_wait_sink,
                            step_expired_result)
@@ -335,26 +336,26 @@ class HandsExecutor:
             pre.discard(wid)
 
     @staticmethod
-    def _make_frontmost(bundle: str) -> bool:
-        """Make the app frontmost through accessibility (AXFrontmost), without a reopen."""
-        try:
-            import ApplicationServices as AS
-            from AppKit import NSRunningApplication
-            apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle)
-            if not apps:
-                return False
-            return AS.AXUIElementSetAttributeValue(AS.AXUIElementCreateApplication(apps[0].processIdentifier()), "AXFrontmost", True) == 0
-        except Exception:  # noqa: BLE001
-            return False
+    def _restore_front(bundle: str) -> str:
+        """A give-back of the front: the running process activated without a reopen, else AXFrontmost (front.py)."""
+        return restore_front(bundle)
 
     @staticmethod
-    def _front_bundle_id() -> str:
+    def _front_running_app():
+        """The front app (NSRunningApplication), read fresh (drivers/front.fresh_front_pid -- never NSWorkspace's
+        frontmostApplication, stale in this process with no run loop); None when unknown."""
         try:
-            from AppKit import NSWorkspace
-            app = NSWorkspace.sharedWorkspace().frontmostApplication()
-            return str(app.bundleIdentifier() or "") if app else ""
+            from AppKit import NSRunningApplication
+            from .drivers.front import fresh_front_pid
+            pid = fresh_front_pid()
+            return NSRunningApplication.runningApplicationWithProcessIdentifier_(pid) if pid else None
         except Exception:  # noqa: BLE001
-            return ""
+            return None
+
+    @classmethod
+    def _front_bundle_id(cls) -> str:
+        app = cls._front_running_app()
+        return str(app.bundleIdentifier() or "") if app else ""
 
     def _known_windows(self) -> set[str]:
         """Every window that exists now, on screen or not: a window not among these afterwards was made meanwhile."""
@@ -373,7 +374,7 @@ class HandsExecutor:
     def _front(self) -> str:
         if AppKit is None:
             return ""
-        app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        app = self._front_running_app()
         return (app.localizedName() if app else None) or ""
 
     #: The user is "active" when the keyboard or mouse moved within this many seconds (hands' driver uses the same
@@ -1241,7 +1242,7 @@ class HandsExecutor:
                 launched = self._launch_windows(bundle, before_launch, self.LAUNCH_WAIT_S)
                 if front_before and front_before != bundle and self._front_bundle_id() == bundle:
                     # some apps take the front on their first launch whatever -g says: given back at once
-                    self._make_frontmost(front_before)
+                    self._restore_front(front_before)        # a give-back: never a reopen (drivers/front.py)
             finally:
                 front_given_back(taken)
                 self._step_ended(step)

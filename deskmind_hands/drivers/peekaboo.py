@@ -737,19 +737,11 @@ def _pid_by_bundle(bundle: str) -> int | None:
 
 
 def _front_app_pid() -> int | None:
-    """The front app's pid without an accessibility wait: the window server (skylight.front_pid), else -- its symbols
-    missing on some macOS -- NSWorkspace's frontmost application (review of #66 @24fbf21: with the window server's
-    answer alone, every foreground paste refused there). None only when neither tells."""
-    from deskmind_hands.drivers import skylight
-    front = skylight.front_pid()
-    if front is not None:
-        return front
-    try:
-        from AppKit import NSWorkspace
-        app = NSWorkspace.sharedWorkspace().frontmostApplication()
-        return int(app.processIdentifier()) if app is not None else None
-    except Exception:  # noqa: BLE001 -- not known
-        return None
+    """The front app's pid for the gates' instant check: drivers/front.fresh_front_pid -- the window server's front
+    process only, never inferred (window order, NSWorkspace's stale frontmostApplication). None when unknown: the gate
+    refuses."""
+    from deskmind_hands.drivers.front import fresh_front_pid
+    return fresh_front_pid()
 
 
 class Gate:
@@ -1309,7 +1301,7 @@ class PeekabooDriver:
         try:
             if taken and front_before and self._mcp is not None:
                 self._foreground_actions += 1
-                self._osa_forward(f'tell application "{self._q(front_before)}" to activate')
+                self._restore_front(before_bundle, front_before)
         finally:
             for token in tokens:
                 self._front_given_back(token)
@@ -4185,8 +4177,26 @@ class PeekabooDriver:
         except Exception:  # noqa: BLE001
             pass
 
+    @staticmethod
+    def _restore_front(bundle: str, name: str = "") -> str:
+        """Every give-back of the front (drivers/front.py): the running process -- by bundle id, else (no bundle id)
+        by its one ordinary app of that name -- activated without a reopen, then AXFrontmost when it is not in front;
+        never `open -b`, never AppleScript `activate`, never a launch. What happened (front.GIVEN, QUIT, ...)."""
+        from deskmind_hands.drivers.front import restore_front
+        return restore_front(bundle, name)
+
+    @staticmethod
+    def _given_back(status, app: str) -> str:
+        """What a give-back did, for the step's result: given back, or not and why (the app quit, refused, ...)."""
+        from deskmind_hands.drivers.front import GIVEN, UNCONFIRMED
+        if status is True or status == GIVEN:
+            return f"given back to {app}"
+        if status == UNCONFIRMED:
+            return f"given back to {app} (not confirmed: the front app cannot be read)"
+        return f"{status} ({app})"
+
     def _give_front_back(self, prev: str, ours: str | None = None, late_s: float = 0.0) -> None:
-        """Give `prev` the front again, through accessibility (AXFrontmost) for every app: `open -b` is a reopen,
+        """Give `prev` the front again (_restore_front: activated without a reopen, else AXFrontmost): `open -b` is a reopen,
         which un-minimises a browser's windows (deskmind#73) and opens a new Finder window on a bare desktop (hands
         #55 review). With `ours`, the app the driver brought forward: given back only while that one is in front,
         and the tries stop once the user has gone to a third app. A front that cannot be read is not taken for the
@@ -4207,7 +4217,7 @@ class PeekabooDriver:
                 continue
             if ours is not None and front.lower() != ours.lower():
                 return              # the user went elsewhere: theirs to keep
-            self._make_frontmost(prev)
+            self._restore_front(prev)
             tries += 1
             time.sleep(0.1)
 
@@ -4762,16 +4772,18 @@ class PeekabooDriver:
         try:
             if before and after and after != before and self._ours(after) and not self._ours(before):
                 self._foreground_actions += 1
-                self._osa_forward(f'tell application "{self._q(before)}" to activate')
-                res = replace(res, detail=f"{res.detail} [took the foreground ({after}); given back to {before}]")
+                back = self._restore_front(before_bundle, before)
+                res = replace(res, detail=f"{res.detail} [took the foreground ({after}); "
+                                          f"{self._given_back(back, before)}]")
             elif (before and after and after != before and not self._ours(before) and not action.foreground
                   and self._hid_idle() >= time.time() - t0):
                 # Something else took the front while the step ran -- a helper app, a notification, an app the click
                 # launched -- and the user did not do it (untouched since the step began): the user's app gets it
                 # back (cua's focus guard). An intended foreground step, or the user switching apps, is left alone.
-                self._osa_forward(f'tell application "{self._q(before)}" to activate')
+                back = self._restore_front(before_bundle, before)
                 if effect_notes():
-                    res = replace(res, detail=f"{res.detail} [{after} took the front during the step; given back to {before}]")
+                    res = replace(res, detail=f"{res.detail} [{after} took the front during the step; "
+                                              f"{self._given_back(back, before)}]")
         finally:
             for token in tokens:
                 self._front_given_back(token)

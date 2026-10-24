@@ -47,8 +47,9 @@ from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, vision_elements
 from . import keys
 from .session import MESSAGES as SESSION_BLOCKED, gui_session, require_usable
 from .base import (USER_BUSY, Driver, DriverUnavailable, Element, ExecResult, Observation, effect_notes,
-                   MaybeSent, NothingSent, StepExpired, act_by, counted, input_scope, sends_so_far, step_expired_result,
-                   tell_wait, time_left, uncounted, WindowRef)
+                   MaybeSent, NothingSent, StepExpired, act_by, counted, input_scope, note_pressed, note_released,
+                   release_all, releasing, sends_so_far, step_expired_result, tell_wait, time_left, uncounted,
+                   WindowRef)
 
 #: Verified against `peekaboo help <cmd>` for 4.3.1. Collected here so a CLI
 #: change is one edit rather than an archaeology exercise.
@@ -720,7 +721,21 @@ def _transient_read(detail: str) -> bool:
 
 
 
-def _post(Q, tap, event) -> None:
+def _post(Q, tap, event, press=None, release=None) -> None:
+    """Every event this driver posts (see the rest below). `press`: (key, let_go) -- a down whose up must follow,
+    remembered until it does (base.release_all lets it go whatever ends the step). `release`: the key of an up -- the
+    completion of input already started, never refused by the deadline (base.releasing)."""
+    if release is not None:
+        with releasing():
+            _post_one(Q, tap, event)
+        note_released(release)
+        return
+    _post_one(Q, tap, event)
+    if press is not None:
+        note_pressed(*press)
+
+
+def _post_one(Q, tap, event) -> None:
     """Every event this driver posts: counted as sent before it goes (base.counted) -- a BackgroundQuartz counts its
     own, after its key check, so a key it refuses before posting is not counted."""
     if getattr(Q, "counts_own_posts", False):
@@ -2810,9 +2825,18 @@ class PeekabooDriver:
                 return ExecResult(False, "the chat app did not come to the front; nothing was clicked")
             arrived = True
             time.sleep(0.15)
+            button = ("mouse", "left")
+
+            def mouse(kind):
+                return Quartz.CGEventCreateMouseEvent(None, kind, (x, y), Quartz.kCGMouseButtonLeft)
             for kind in (Quartz.kCGEventMouseMoved, Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
-                _post(Quartz, Quartz.kCGHIDEventTap,
-                      Quartz.CGEventCreateMouseEvent(None, kind, (x, y), Quartz.kCGMouseButtonLeft))
+                if kind == Quartz.kCGEventLeftMouseDown:
+                    _post(Quartz, Quartz.kCGHIDEventTap, mouse(kind), press=(button, lambda: _post(
+                        Quartz, Quartz.kCGHIDEventTap, mouse(Quartz.kCGEventLeftMouseUp), release=button)))
+                elif kind == Quartz.kCGEventLeftMouseUp:
+                    _post(Quartz, Quartz.kCGHIDEventTap, mouse(kind), release=button)
+                else:
+                    _post(Quartz, Quartz.kCGHIDEventTap, mouse(kind))
                 time.sleep(0.05)
             time.sleep(0.2)
         finally:
@@ -3673,11 +3697,20 @@ class PeekabooDriver:
         song row never played, a gym card never started."""
         kinds = (Q.kCGEventLeftMouseDown, Q.kCGEventLeftMouseUp) if count > 1 else \
             (Q.kCGEventMouseMoved, Q.kCGEventLeftMouseDown, Q.kCGEventLeftMouseUp)
-        for kind in kinds:
+        def event(kind):
             ev = Q.CGEventCreateMouseEvent(None, kind, (x, y), Q.kCGMouseButtonLeft)
             if kind != Q.kCGEventMouseMoved:
                 Q.CGEventSetIntegerValueField(ev, Q.kCGMouseEventClickState, count)
-            _post(Q, Q.kCGHIDEventTap, ev)
+            return ev
+        button = ("mouse", "left")
+        for kind in kinds:
+            if kind == Q.kCGEventLeftMouseDown:
+                _post(Q, Q.kCGHIDEventTap, event(kind),
+                      press=(button, lambda: _post(Q, Q.kCGHIDEventTap, event(Q.kCGEventLeftMouseUp), release=button)))
+            elif kind == Q.kCGEventLeftMouseUp:
+                _post(Q, Q.kCGHIDEventTap, event(kind), release=button)
+            else:
+                _post(Q, Q.kCGHIDEventTap, event(kind))
             time.sleep(0.05 if count == 1 else 0.02)
 
     #: The key events, serialized: "<key code>:<1 down | 0 up>" -> bytes, and the key code that types each letter
@@ -3745,12 +3778,20 @@ class PeekabooDriver:
 
     @classmethod
     def _post_key(cls, Q, keycode: int, flags: int = 0) -> None:
+        def up_event():
+            ev = cls._key_event(Q, keycode, False)
+            Q.CGEventSetFlags(ev, flags)
+            return ev
         for down in (True, False):
-            ev = cls._key_event(Q, keycode, down)
+            ev = cls._key_event(Q, keycode, down) if down else up_event()
             # Always, the empty flags too: an event can carry modifiers held when it was made, and a stray shift or
             # cmd turns a key into another shortcut (cua's keyboard.rs does the same).
             Q.CGEventSetFlags(ev, flags)
-            _post(Q, Q.kCGHIDEventTap, ev)
+            key = ("key", keycode)
+            if down:
+                _post(Q, Q.kCGHIDEventTap, ev, press=(key, lambda: _post(Q, Q.kCGHIDEventTap, up_event(), release=key)))
+            else:
+                _post(Q, Q.kCGHIDEventTap, ev, release=key)
             time.sleep(0.03)
 
     def _post_unicode(self, Q, text: str, stop=None) -> tuple[int, str | None]:
@@ -3776,12 +3817,17 @@ class PeekabooDriver:
             self._post_key(Q, keys.TAB if chunk == "\t" else keys.RETURN)
             return
         units = len(chunk.encode("utf-16-le")) // 2
-        for down in (True, False):
+
+        def event(down: bool):
             ev = self._key_event(Q, 0, down)
             Q.CGEventKeyboardSetUnicodeString(ev, units, chunk)
             Q.CGEventSetFlags(ev, 0)
-            _post(Q, Q.kCGHIDEventTap, ev)
-            time.sleep(0.01)
+            return ev
+        key = ("key", 0)
+        _post(Q, Q.kCGHIDEventTap, event(True), press=(key, lambda: _post(Q, Q.kCGHIDEventTap, event(False), release=key)))
+        time.sleep(0.01)
+        _post(Q, Q.kCGHIDEventTap, event(False), release=key)
+        time.sleep(0.01)
         time.sleep(0.02)
 
     #: Apps found at run time to show no accessibility structure: observed and acted on through the screenshot
@@ -4161,8 +4207,10 @@ class PeekabooDriver:
             return self._execute_outer(action)
         except StepExpired:
             # a send asked for past the caller's deadline was not made (base.counted): the step ends here
+            release_all()
             return step_expired_result()
         finally:
+            release_all()                     # nothing the step pressed is left held, however it ended
             scope.__exit__(None, None, None)
             # A browser-field allowance is for this one step: an early return or an error must not leave it for the
             # next one.

@@ -265,10 +265,12 @@ AX_NOT_DELIVERED = frozenset({
 class _Step:
     """One step's count of sends (and how deep it is inside uncounted()), and `by`: the last moment it may send for its
     caller (base.act_by of the caller's deadline; None: no caller deadline, `hands do`)."""
-    __slots__ = ("n", "quiet", "by")
+    __slots__ = ("n", "quiet", "by", "releasing", "pressed")
 
     def __init__(self, by: float | None = None):
-        self.n, self.quiet, self.by = 0, 0, by
+        self.n, self.quiet, self.by, self.releasing = 0, 0, by, 0
+        #: what is held down now (a key, a mouse button), with how to let it go: never left held, whatever ends the step
+        self.pressed: dict = {}
 
 
 class StepExpired(BaseException):
@@ -290,8 +292,11 @@ def counted(call, refused=None):
     st = _STEP.get()
     if st is None or st.quiet:
         return call()
-    if st.by is not None and time.time() > st.by:
-        raise StepExpired()           # checked right before the OS call: nothing late reaches an app
+    if st.by is not None and not st.releasing and time.time() > st.by:
+        # checked right before the OS call: no NEW input reaches an app late. The completion of input already started
+        # (an up for a down sent, a release) is never held back: it goes inside releasing() (review of hands#64,
+        # Codex: a key-up blocked by the deadline left the key held)
+        raise StepExpired()
     st.n += 1
     result = call()
     if refused is not None and refused(result):
@@ -302,6 +307,50 @@ def counted(call, refused=None):
 def ax_counted(call):
     """An accessibility write or action (returns an AXError code): counted unless the code is in AX_NOT_DELIVERED."""
     return counted(call, refused=lambda err: err in AX_NOT_DELIVERED)
+
+
+class releasing:
+    """What runs inside completes input already started (a key-up, a mouse-up) or cleans up after it: counted, never
+    refused by the deadline."""
+
+    def __enter__(self):
+        self._st = _STEP.get()
+        if self._st is not None:
+            self._st.releasing += 1
+        return self
+
+    def __exit__(self, *exc):
+        if self._st is not None:
+            self._st.releasing -= 1
+        return False
+
+
+def note_pressed(key, let_go) -> None:
+    """`key` (a key code, a mouse button) went down in the step in progress; `let_go()` sends its up."""
+    st = _STEP.get()
+    if st is not None:
+        st.pressed[key] = let_go
+
+
+def note_released(key) -> None:
+    st = _STEP.get()
+    if st is not None:
+        st.pressed.pop(key, None)
+
+
+def release_all() -> None:
+    """Let go of everything the step in progress still holds down (its downs whose ups did not go: an exception, a
+    stop, the deadline between them). Called as the step ends, whatever ended it."""
+    st = _STEP.get()
+    if st is None:
+        return
+    for key, let_go in list(st.pressed.items()):
+        try:
+            with releasing():
+                let_go()
+        except Exception:  # noqa: BLE001 -- one that cannot be let go must not keep the others held
+            pass
+        st.pressed.pop(key, None)
 
 
 class uncounted:

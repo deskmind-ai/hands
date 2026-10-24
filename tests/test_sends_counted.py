@@ -423,7 +423,7 @@ class NoSendBypassesTheCount(unittest.TestCase):
     EXEMPT = {
         ("deskmind_hands.drivers.axfield", "_set", "AXUIElementSetAttributeValue"): "the counted wrapper (ax_counted)",
         ("deskmind_hands.drivers.axpopup", "_act", "AXUIElementPerformAction"): "the counted wrapper (ax_counted)",
-        ("deskmind_hands.drivers.peekaboo", "_post", "CGEventPost"): "the counted wrapper of every event post",
+        ("deskmind_hands.drivers.peekaboo", "_post_one", "CGEventPost"): "the counted wrapper of every event post (_post marks presses and releases around it)",
         ("deskmind_hands.drivers.skylight", "post_key_event", "CGEventPostToPid"): "counted around the post",
         ("deskmind_hands.drivers.skylight", "post_key_event", 'fns["post"]'): "counted around the post",
         ("deskmind_hands.drivers.skylight", "BackgroundQuartz.CGEventPost", "CGEventPostToPid"): "counted around the post",
@@ -651,3 +651,94 @@ class DeadlineAtTheSend(unittest.TestCase):
                 res = base.step_expired_result()
         self.assertEqual(posted, [])
         self.assertIs(res.performed, False, res.detail)
+
+
+class ReleasesSurviveTheDeadline(unittest.TestCase):
+    """Codex P1 on hands#64 @3678581: the deadline blocked every event, so a key-up or mouse-up falling past it was
+    never sent -- a key left held, a button left down. It blocks only NEW input; the completion of input already
+    started goes. Codex's three probes (a key, a click, Unicode), then a deadline at each point of a chord and of a
+    two-key sequence. Fail on 3678581."""
+
+    class Clock:
+        def __init__(self):
+            self.t = 1000.0
+
+        def time(self):
+            return self.t
+
+        def sleep(self, s):
+            self.t += s
+
+    def run_step(self, allowance, action):
+        from deskmind_hands.actions import Action, ActionKind
+        from deskmind_hands.drivers import peekaboo as P
+        clock, events = self.Clock(), []
+        q = types.SimpleNamespace(
+            kCGHIDEventTap=0, kCGMouseButtonLeft=0, kCGMouseEventClickState=1,
+            kCGEventMouseMoved="move", kCGEventLeftMouseDown="mouse-down", kCGEventLeftMouseUp="mouse-up",
+            CGEventCreateMouseEvent=lambda _, kind, *args: kind,
+            CGEventSetIntegerValueField=lambda *args: None,
+            CGEventSetFlags=lambda ev, flags: None,
+            CGEventKeyboardSetUnicodeString=lambda *args: None,
+            CGEventPost=lambda tap, event: events.append(event),
+        )
+        d = P.PeekabooDriver.__new__(P.PeekabooDriver)
+        d.caller_deadline = clock.t + base.DEADLINE_MARGIN_S + allowance
+        d._require_session = lambda: None
+        d.CONFIRM_BY_DIFF = False
+        d._execute_outer = lambda a: action(d, q) or ExecResult(True, "done")
+        with mock.patch.object(base, "time", clock), mock.patch.object(P, "time", clock), \
+                mock.patch.object(P.PeekabooDriver, "_key_event",
+                                  classmethod(lambda cls, Q, keycode, down: f"{keycode}-{'down' if down else 'up'}")):
+            result = d.execute(Action(kind=ActionKind.KEY, keys=("a",)))
+        return events, result
+
+    def test_codex_a_key_released_after_the_deadline(self):
+        events, _ = self.run_step(0.02, lambda d, q: d._post_key(q, 0))
+        self.assertEqual(events, ["0-down", "0-up"])
+
+    def test_codex_a_mouse_button_released_after_the_deadline(self):
+        events, _ = self.run_step(0.075, lambda d, q: d._post_click(q, 10, 10))
+        self.assertEqual(events, ["move", "mouse-down", "mouse-up"])
+
+    def test_codex_unicode_released_after_the_deadline(self):
+        events, _ = self.run_step(0.005, lambda d, q: d._post_chunk(q, "x"))
+        self.assertEqual(events, ["0-down", "0-up"])
+
+    def test_a_deadline_at_each_point_of_a_chord_and_a_sequence(self):
+        """cmd+shift+d (the modifiers ride on the key's events), then cmd+A, cmd+V: whatever the deadline, every down
+        sent has its up, and no down is sent after it."""
+        CMD_SHIFT = (1 << 20) | (1 << 17)
+
+        def chord_then_sequence(d, q):
+            d._post_key(q, 2, CMD_SHIFT)                      # cmd+shift+d
+            d._post_key(q, 0, 1 << 20)                        # cmd+A
+            d._post_key(q, 9, 1 << 20)                        # cmd+V
+        for allowance in (-1.0, 0.0, 0.01, 0.03, 0.05, 0.07, 0.1, 0.2, 10.0):
+            with self.subTest(allowance=allowance):
+                events, result = self.run_step(allowance, chord_then_sequence)
+                downs = [e for e in events if e.endswith("down")]
+                ups = [e for e in events if e.endswith("up")]
+                self.assertEqual([d.replace("down", "up") for d in downs], ups)   # each down has its up, in order
+                self.assertEqual(events, [x for k in ("2", "0", "9")[:len(downs)] for x in (f"{k}-down", f"{k}-up")])
+                if len(downs) < 3:                            # stopped by the deadline
+                    self.assertIs(result.performed, False if not downs else None)
+
+    def test_an_exception_between_a_down_and_its_up_still_lets_go(self):
+        from deskmind_hands.actions import Action, ActionKind
+        from deskmind_hands.drivers import peekaboo as P
+        seen = []
+        q = types.SimpleNamespace(CGEventPost=lambda tap, ev: seen.append(ev))
+
+        def broken(a):
+            key = ("key", 7)
+            P._post(q, 0, "7-down", press=(key, lambda: P._post(q, 0, "7-up", release=key)))
+            raise RuntimeError("the route failed half way")
+        d = P.PeekabooDriver.__new__(P.PeekabooDriver)
+        d.caller_deadline = None
+        d._require_session = lambda: None
+        d.CONFIRM_BY_DIFF = False
+        d._execute_outer = broken
+        with self.assertRaises(RuntimeError):
+            d.execute(Action(kind=ActionKind.KEY, keys=("a",)))
+        self.assertEqual(seen, ["7-down", "7-up"])

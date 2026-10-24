@@ -47,7 +47,7 @@ from ..vision import GENERIC_CONTROLS, VISION_APPS, ground_one, vision_elements
 from . import keys
 from .session import MESSAGES as SESSION_BLOCKED, gui_session, require_usable
 from .base import (USER_BUSY, Driver, DriverUnavailable, Element, ExecResult, Observation, effect_notes,
-                   NothingSent, act_by, tell_wait, WindowRef)
+                   MaybeSent, NothingSent, act_by, tell_wait, WindowRef)
 
 #: Verified against `peekaboo help <cmd>` for 4.3.1. Collected here so a CLI
 #: change is one edit rather than an archaeology exercise.
@@ -2865,14 +2865,21 @@ class PeekabooDriver:
                 try:
                     detail = perform(q)
                 except skylight.WindowKeyRefused as exc:
-                    refused = exc       # a key while the user is on the app (or the window lost key): none was sent
+                    refused = exc       # a key while the user is on the app (or the window lost key): that one not sent
                 finally:
                     skylight.give_focus_back(token)
                 note = token.note() if hasattr(token, "note") else ""
                 if refused is None:
                     return True, (f"{detail} (in the background, {bundle} not brought forward, "
                                   f"{time.time() - t0:.1f}s)" + (f"; {note}" if note else ""))
-                # Falls through to the path below, as with no background route: its own waits and flash rules.
+                if getattr(q, "sent", 1):
+                    # Some of the step went before the refused key (a click, a paste): no other route now -- the
+                    # front route would do it again, and its refusal would say nothing was done (review of hands#64
+                    # round 5). A stand-in that does not count is taken to have sent.
+                    return False, MaybeSent(f"part of the step went to {bundle} in the background before a key was "
+                                            f"refused ({refused}) -- it may have taken effect; observe before doing "
+                                            f"it again")
+                # Nothing went: falls through to the path below, as with no background route (its own waits and rules).
         allowed = {b.strip().lower() for b in os.environ.get("HANDS_FLASH_APPS", "").split(",") if b.strip()}
         browser = bundle.lower() in self.BROWSERS
         if browser and not (bundle.lower() in allowed and self._in_own_browser_window(bundle)):
@@ -3365,6 +3372,14 @@ class PeekabooDriver:
         if late != before:
             # Read once more right before the keys: an insertion that landed after the wait is not typed again.
             return result(late, "accessibility insertion, shown late")
+        def gone(q) -> None:
+            # None hands the step to another route; if a key of this one went (a cmd+A), that is said: a later
+            # refusal of the step is then no "nothing was done" (execute: _went). A stand-in that does not count
+            # is taken to have sent.
+            if q is not None and getattr(q, "sent", 1):
+                self._input_went = True
+            return None
+
         try:
             with skylight.enter_window_key(pid, wid) as key:
                 if not axfield.focus(field):
@@ -3387,14 +3402,14 @@ class PeekabooDriver:
                     try:
                         self._post_key(q, self._keycode(q, "a"), q.kCGEventFlagMaskCommand)
                     except skylight.WindowKeyRefused:
-                        return None         # refused before it was sent: nothing typed
+                        return gone(q)      # refused before it was sent: nothing typed
                     if not axfield.all_selected(field):
-                        return None
+                        return gone(q)
                 sent, why = self._post_unicode(q, text, stop=lost)
         except skylight.WindowKeyRefused as exc:
             if exc.kind == "stopped":
                 return ExecResult(False, "stopped by the app; nothing was done")
-            return None
+            return gone(locals().get("q"))
         after = axfield.settled_value(field, before)
         if sent < len(text):
             self._snapshot = None
@@ -4063,16 +4078,26 @@ class PeekabooDriver:
 
     def execute(self, action: Action) -> ExecResult:
         self._require_session()      # nothing is done on a locked screen, however the action was chosen
+        self._input_went = False     # set by a route that sent something and then handed the step on (_type_in_background)
         try:
             if self.CONFIRM_BY_DIFF and action.kind in (ActionKind.CLICK, ActionKind.DOUBLE_CLICK,
                                                         ActionKind.RIGHT_CLICK):
                 res = self._execute_outer(action)
-                return self._confirm_by_diff(res) if res.indeterminate else res
-            return self._execute_outer(action)
+                return self._went(self._confirm_by_diff(res) if res.indeterminate else res)
+            return self._went(self._execute_outer(action))
         finally:
             # A browser-field allowance is for this one step: an early return or an error must not leave it for the
             # next one.
             self._browser_field_allowed = None
+
+    def _went(self, res: ExecResult) -> ExecResult:
+        """A refusal that says nothing was sent, after an earlier route of this step did send something (a cmd+A
+        before it handed the step on): not "nothing done" -- unverified (review of hands#64 round 5)."""
+        if getattr(self, "_input_went", False) and not res.ok and res.performed is False:
+            return replace(res, ok=False, indeterminate=True, performed=None, stale=False, deferred=False,
+                           detail=MaybeSent(f"{res.detail}; but input already went to the app earlier in this step -- "
+                                            f"observe before doing it again"))
+        return res
 
     def _execute_outer(self, action: Action) -> ExecResult:
         if self._mcp is None:

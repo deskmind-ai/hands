@@ -858,9 +858,10 @@ class NoKeysToTheUsersApp(unittest.TestCase):
         self.assertIsNot(res.performed, False)
         self.assertEqual(self.keys_posted, [])
 
-    def test_a_flash_paste_sends_no_key_and_takes_the_original_path(self):
-        """_vision_act's paste (click, cmd+A, cmd+V) through _flash: refused before the first key, then the path
-        that waits for the user and keeps the flash rules -- here, a browser not allowed forward."""
+    def test_a_flash_paste_sends_no_key_and_takes_no_other_path(self):
+        """_vision_act's paste (click, cmd+A, cmd+V) through _flash: refused at the first key, after the click went.
+        No key reaches the user's app, and the step does not fall through to the front route: the click may have
+        done something, so it is unverified, never that route's "not done" (review of hands#64 round 5)."""
         d = driver()
         d.app = "com.apple.Safari"
         d._background_input = lambda bundle: True
@@ -877,7 +878,10 @@ class NoKeysToTheUsersApp(unittest.TestCase):
         with mock.patch.object(skylight, "_load", lambda: None):
             ok, detail = d._flash("com.apple.Safari", perform, what="type")
         self.assertFalse(ok)
-        self.assertIn("not done", detail)
+        self.assertIn("may have taken effect", detail)
+        from deskmind_hands.drivers.base import ExecResult
+        self.assertTrue(ExecResult(ok, detail).indeterminate)
+        self.assertGreater(q.sent, 0)                                   # the click (its mouse events)
         self.assertEqual(self.keys_posted, [])
 
     def test_flash_reports_a_key_window_not_given_back(self):

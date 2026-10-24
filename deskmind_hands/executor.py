@@ -1000,7 +1000,9 @@ class HandsExecutor:
                 # the next step stale, eleven times in one search (rc.10, 10-21)
                 self._settle_title(window)
             status = "ok" if res.ok else "unsupported" if res.unsupported else "user_busy" if res.deferred else "error"
-            if res.ok and res.indeterminate:
+            if res.indeterminate:
+                # dispatched, outcome unknown -- whether the driver said ok or not (typing stopped part way, a step
+                # stopped after part of its input went): never "error", which reads as nothing done
                 status = "unverified"
             out = {"status": status, "why": res.detail, "window": window}
             if res.performed is False:
@@ -1131,7 +1133,9 @@ class HandsExecutor:
         fresh = [w for w in wins if w["id"] not in before and (w.get("bundle") or "") == bundle]
         if not fresh:
             return [], None, [], wins
-        if self._last_input_at() > since:
+        # input at the very instant the list was taken cannot be proved to come before it: counted (>=), so the
+        # window is not claimed -- the safe side (and with a microsecond clock the two reads can be equal)
+        if self._last_input_at() >= since:
             why = "the user's input reached an app the task operates while the action ran"
             return [], None, [{"id": w["id"], "why": why} for w in fresh], wins
         listed = self.__dict__.setdefault("_listed", set())

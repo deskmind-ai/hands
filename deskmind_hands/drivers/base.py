@@ -208,8 +208,10 @@ class ExecResult:
     def __post_init__(self):
         if not self.ok and (self.detail or "").lower().startswith(USER_BUSY):
             self.deferred = True
-        if not self.ok and self.performed is None and (self.stale or self.unsupported or self.deferred
-                                                       or isinstance(self.detail, NothingSent)):
+        if isinstance(self.detail, MaybeSent):
+            self.indeterminate = True
+        if not self.ok and self.performed is None and not self.indeterminate and (
+                self.stale or self.unsupported or self.deferred or isinstance(self.detail, NothingSent)):
             self.performed = False
 
 
@@ -220,6 +222,11 @@ USER_BUSY = "the user is active"
 class NothingSent(str):
     """A driver's words for a refusal made before any input was sent (ExecResult.performed becomes False). Words built
     from them by formatting are plain strings again: unknown, the safe side."""
+
+
+class MaybeSent(str):
+    """A driver's words for a step stopped after some of its input went (a click and a paste, then a refused key):
+    neither done nor not done -- ExecResult.indeterminate, so the reply is unverified."""
 
 #: Seconds kept before a caller's deadline for the action itself and what is read after it (the executor's window and
 #: document reads, the reply): a step that has not started acting by then does nothing. HANDS_DEADLINE_MARGIN_S

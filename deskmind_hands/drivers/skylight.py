@@ -565,6 +565,9 @@ class BackgroundQuartz:
         self.key_auth = True
         #: What holds the window key (WindowKey), or NoWindowKey (the app is the user's front app: no key at all).
         self.key = key
+        #: How many events went to the app through this stand-in: a refusal after the first one is no "nothing
+        #: was done" (review of hands#64 round 5: a click and a paste went, then Return was refused).
+        self.sent = 0
 
     def _key_allowed(self) -> None:
         """Raise WindowKeyRefused unless a key-down may go now: never without a WindowKey (to the user's front app
@@ -592,8 +595,10 @@ class BackgroundQuartz:
         if kind in (q.kCGEventKeyDown, q.kCGEventKeyUp, q.kCGEventFlagsChanged):
             if kind != q.kCGEventKeyUp:
                 self._key_allowed()     # a key-up always goes: a key-down already sent is never left held
+            self.sent += 1              # counted before the post: one that throws half way may have gone
             post_key_event(self.pid, event, auth=self.key_auth)
             return
+        self.sent += 1
         if not fns:
             q.CGEventPostToPid(self.pid, event)
             return

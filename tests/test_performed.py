@@ -152,6 +152,91 @@ class AfterTheAction(unittest.TestCase):
         self.assertNotIn("performed", r)
 
 
+class AfterPartOfTheStepWent(unittest.TestCase):
+    """Round 5: once a route has sent any event, a later refusal is never "nothing was done"."""
+
+    def flash(self, sent_before_refusal: int):
+        from test_caller_deadline import APP, Clock, FlashDriver
+        d = FlashDriver(Clock(), busy_s=0.0)
+        d._background_input = lambda b: True
+        d._wait_until_still = lambda b, w="": None
+        d._too_late = lambda waited: None
+
+        class Q:
+            sent = 0
+
+        q = Q()
+        d._background_quartz = lambda b, observed_only=False: (q, object())
+        went = []
+
+        def perform(Q_):
+            for e in ["click", "cmd+A", "cmd+V"][:sent_before_refusal]:
+                went.append(e)
+                q.sent += 1
+            raise skylight.WindowKeyRefused("the user came to the app; Return not sent")
+        with mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": ""}), \
+                mock.patch.object(skylight, "give_focus_back", lambda t: True):
+            ok, detail = d._flash(APP, perform, what="type")
+        return ExecResult(ok, detail), went
+
+    def test_the_background_route_refused_after_a_click_and_paste_is_unverified(self):
+        """The reviewer's probe (rv64_probe_flash): click, cmd+A, cmd+V went, Return refused; it fell through to the
+        front route, whose refusal said performed: false."""
+        res, went = self.flash(3)
+        self.assertEqual(went, ["click", "cmd+A", "cmd+V"])
+        self.assertIsNot(res.performed, False, res.detail)
+        self.assertTrue(res.indeterminate, res.detail)          # the executor says unverified
+
+    def test_refused_before_anything_went_it_falls_through_as_before(self):
+        res, went = self.flash(0)
+        self.assertEqual(went, [])
+        self.assertIs(res.performed, False, res.detail)         # the front route's own refusal: nothing went
+
+    def test_a_typing_route_that_sent_a_key_then_handed_on_makes_a_later_refusal_unverified(self):
+        import test_background_keys as BK
+        t = BK.TypeText()
+        t._cleanups = []
+        d, typed = t.run_type(BK.Field("old", takes_insertion=False), clear=True, selects=False, all_selected=False)
+        self.assertIsNone(typed)                                # handed on to the next route, as before
+        self.assertTrue(d._input_went)                          # but the cmd+A it sent is known
+        res = d._went(ExecResult(False, "moved; observe again", stale=True))
+        self.assertIsNone(res.performed)
+        self.assertTrue(res.indeterminate)
+
+    def test_ok_false_but_indeterminate_is_unverified_not_error(self):
+        ex, stub = TE._executor()
+        ex.observe(TE.W12)
+        stub.execute = lambda action: ExecResult(False, "typing stopped after 3 of 9 chars", indeterminate=True)
+        r = ex.perform({"kind": "type", "window": TE.W12, "target": "T1", "text": "123456789"})
+        self.assertEqual(r["status"], "unverified", r)
+        self.assertNotIn("performed", r)
+
+
+class InputAtTheInstantTheListWasTaken(unittest.TestCase):
+    def test_counts_and_the_window_is_not_claimed(self):
+        """test_executor.CreatedWindows' flake: the user's input read at the same microsecond as the list before.
+        It cannot be proved to come before the list: counted (>=), so the window that appeared is not claimed."""
+        import deskmind_hands.executor as exe
+        ex, stub = TE._executor()
+        state = {"on": [TE._win("12")]}
+        ex._windows = lambda every=False: list(state["on"])     # noqa: SLF001
+        ex.observe(TE.W12)
+
+        def execute(action):
+            state["on"].append(TE._win("14", title="未命名-9"))
+            return ExecResult(True, "done")
+        stub.execute = execute
+        ex._text = lambda w: ""                                 # noqa: SLF001
+        ex._document = lambda window, wins: (None, False) if window.endswith("#14") else None   # noqa: SLF001
+        clock = mock.Mock()
+        clock.time = lambda: 1000.0
+        clock.sleep = lambda s: None
+        ex._last_input_at = lambda: 1000.0                      # noqa: SLF001 -- the same instant as `since`
+        with mock.patch.object(exe, "time", clock):
+            r = ex.perform({"kind": "click", "window": TE.W12, "target": "B2"})
+        self.assertNotIn("new_window", r)
+
+
 class Helpers(unittest.TestCase):
     def test_the_executor_helper_reads_no_real_windows(self):
         """test_executor._executor(): no window server and no `peekaboo app list` (it could hang the suite)."""

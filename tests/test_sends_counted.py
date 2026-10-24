@@ -425,7 +425,7 @@ class NoSendBypassesTheCount(unittest.TestCase):
     SUBPROCESS = {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
     #: (module, qualified function, what): why it may be made there
     EXEMPT = {
-        ("deskmind_hands.drivers.axfield", "_set", "AXUIElementSetAttributeValue"): "the counted wrapper (ax_counted)",
+        ("deskmind_hands.drivers.axfield", "_set_answer", "AXUIElementSetAttributeValue"): "the counted wrapper (ax_counted)",
         ("deskmind_hands.drivers.axpopup", "_act", "AXUIElementPerformAction"): "the counted wrapper (ax_counted)",
         ("deskmind_hands.drivers.skylight", "BackgroundQuartz.post_checked", "CGEventPost"):
             "any event other than a key: BackgroundQuartz's own CGEventPost, which counts its posts (counts_own_posts)",

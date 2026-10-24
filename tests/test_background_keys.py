@@ -1191,9 +1191,18 @@ class TheInsertionBehindItsGate(_TypeHarness):
     target app not in front), asked right before each of its two writes. Driven through _type_in_background and the
     real axfield.insert."""
 
-    def run_t1(self, d, field, **kw):
+    def run_t1(self, d, field, text_answer=0, applies=False, **kw):
         texts = []
-        extra = [mock.patch.object(axfield, "_set", lambda el, attr, v: texts.append((attr, v)) or True)]
+
+        def answer(el, attr, v):                                  # the text write, as the OS answers it
+            texts.append((attr, v))
+            if text_answer == 0 or text_answer not in base.AX_NOT_DELIVERED:
+                base.counted(lambda: None)
+            if applies:
+                field.value += v
+            return text_answer
+        extra = [mock.patch.object(axfield, "_set", lambda el, attr, v: answer(el, attr, v) == 0),
+                 mock.patch.object(axfield, "_set_answer", answer, create=True)]
         d, res = self.run_type(field, d=d, insert=REAL_INSERT, count_sends=True, extra=extra,
                                enter=lambda pid, wid: Key(d.log, lost=lambda: None), **kw)
         return d, res, texts
@@ -1250,6 +1259,29 @@ class TheInsertionBehindItsGate(_TypeHarness):
                         self.assertIn("select", d.log)
                         self.assertTrue(res.indeterminate, res.detail)
                         self.assertIn("no text was written", res.detail)
+
+    def test_a_text_write_that_times_out_after_applying_is_read_back_and_verified(self):
+        """Codex on #67 @9310989: the OS applied the text, then answered kAXErrorCannotComplete (-25204) -- which
+        may have been delivered (base.ax_not_delivered) -- and the result said no text was written."""
+        d = driver()
+        d, res, texts = self.run_t1(d, Field("start", takes_insertion=True), text_answer=-25204, applies=True)
+        self.assertEqual(texts, [("AXSelectedText", "hello 你好")])
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)    # read back: there
+        self.assertEqual(self.keys_sent(d), [])
+
+    def test_a_text_write_that_times_out_and_shows_nothing_may_have_been_written(self):
+        d = driver()
+        d, res, texts = self.run_t1(d, Field("start", takes_insertion=True), text_answer=-25204)
+        self.assertTrue(res.indeterminate, res.detail)
+        self.assertIn("may have been written", res.detail)
+        self.assertEqual(self.keys_sent(d), [])
+
+    def test_a_text_write_refused_for_certain_is_the_selection_only(self):
+        d = driver()
+        d, res, texts = self.run_t1(d, Field("start", takes_insertion=True), text_answer=-25205)
+        self.assertTrue(res.indeterminate, res.detail)                  # the selection went
+        self.assertIn("no text was written", res.detail)
+        self.assertEqual(self.keys_sent(d), [])
 
     def test_a_field_whose_selection_cannot_be_read_is_handed_back_before_any_send(self):
         """Review of #67 @8e08b5e (A1): the keys' caret and select-all are read back by the same selection, so the

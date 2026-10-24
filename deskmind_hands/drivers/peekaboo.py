@@ -3907,10 +3907,12 @@ class PeekabooDriver:
                                                        f"again"))
                 return None             # nothing went: the caller's route
             reached = sends_so_far() > sent_before
-            if went == axfield.TEXT:
-                # Long enough for a slow app to show it.
+            if went in (axfield.TEXT, axfield.TEXT_MAYBE):
+                # Long enough for a slow app to show it. A write answered with an error that may still have arrived:
+                # read back like any other -- verified if the text is there, else unverified, "may have been written"
                 after = axfield.settled_value(field, before, wait=self.AX_INSERT_WAIT_S)
-                return result(after, "accessibility insertion")
+                return result(after, "accessibility insertion" if went == axfield.TEXT
+                              else f"accessibility insertion; {why}")
             if reached:
                 # the selection went and no text was written: said so, unverified -- no keys after a send
                 self._snapshot = None

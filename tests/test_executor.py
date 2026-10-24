@@ -6,8 +6,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1591,3 +1593,85 @@ class ShotRequest(unittest.TestCase):
         with mock.patch.object(_sys, "stdin", lines), mock.patch.object(_sys, "stdout", out), mock.patch.object(exe, "HandsExecutor", Fake):
             exe.main()
         self.assertEqual(seen, [("/tmp/x/st_1.png", True), (None, False), (None, True)])
+
+
+class ClicksOnDeskMindThatMove(unittest.TestCase):
+    """rc.15 (run_7a6176f9, 10-24): 8 of 9 approvals on DeskMind's card staled the action they approved -- "to:
+    unknown", the input 8-30 ms before the answer. A trackpad click that moves a point or two posts drag events
+    between its press and release, and every drag (with its release) was input to an unknown target. A drag's events
+    go to the process that got the press: on DeskMind, near where it was pressed, it is DeskMind's. Fails on
+    76e3bfd."""
+
+    DESKMIND, TERMINAL = 76611, 4242
+
+    def setUp(self):
+        from deskmind_hands.inputwatch import InputWatch
+        self.ex, _ = _executor()
+        del self.ex._last_input_at
+        w = self.w = InputWatch()
+        w.active, w.keys = True, True
+        _stable_pids(self)
+        w._pid_bundle = {self.DESKMIND: "ai.deskmind.app", self.TERMINAL: "com.apple.TextEdit"}
+        w._pid_regular = {self.DESKMIND: True, self.TERMINAL: True}
+        self.ex._watch, self.ex._watch_tried = w, True
+        self.ex._windows = lambda every=False: [_win("12")]   # noqa: SLF001
+        self.ex._front = lambda: "DeskMind"                   # noqa: SLF001
+        q = self.q = types.ModuleType("Quartz")
+        for k, v in {"kCGEventTapDisabledByTimeout": -2, "kCGEventTapDisabledByUserInput": -1,
+                     "kCGEventLeftMouseDown": 1, "kCGEventRightMouseDown": 3, "kCGEventOtherMouseDown": 25,
+                     "kCGEventLeftMouseDragged": 6, "kCGEventRightMouseDragged": 7, "kCGEventOtherMouseDragged": 27,
+                     "kCGEventLeftMouseUp": 2, "kCGEventRightMouseUp": 4, "kCGEventOtherMouseUp": 26,
+                     "kCGEventKeyDown": 10, "kCGEventFlagsChanged": 12,
+                     "kCGEventTargetUnixProcessID": 40, "kCGEventSourceUnixProcessID": 41}.items():
+            setattr(q, k, v)
+        self.ev = {"pid": 0, "at": (0.0, 0.0)}
+        q.CGEventGetIntegerValueField = lambda e, f: self.ev["pid"] if f == 40 else 0
+        q.CGEventGetLocation = lambda e: types.SimpleNamespace(x=self.ev["at"][0], y=self.ev["at"][1])
+        patch = mock.patch.dict(sys.modules, {"Quartz": q})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.ex.observe(W12)
+        self.e0 = self.ex.snapshot()["epoch"]
+
+    def event(self, kind, pid, at):
+        time.sleep(0.002)
+        self.ev.update(pid=pid, at=at)
+        self.w._callback(None, kind, object(), None)
+
+    def click(self, path, pid=None, pids=None):
+        pids = pids or [pid] * len(path)
+        self.event(1, pids[0], path[0])
+        for p, at in zip(pids[1:-1], path[1:-1]):
+            self.event(6, p, at)
+        self.event(2, pids[-1], path[-1])
+
+    def test_a_click_on_deskmind_that_moves_a_little_leaves_the_epoch(self):
+        self.click([(800, 500), (801, 500), (802, 501), (802, 501)], pid=self.DESKMIND)
+        s = self.ex.snapshot()
+        self.assertEqual(s["epoch"], self.e0)
+        self.assertEqual(self.w.last_unknown_at, 0.0)
+        self.assertGreater(self.w.last_own_at, 0.0)
+
+    def test_a_drag_from_deskmind_that_goes_further_is_still_an_unknown_target(self):
+        """It may be a drop into another window: unknown, as before."""
+        self.click([(800, 500), (801, 500), (900, 520), (1200, 600)], pid=self.DESKMIND)
+        s = self.ex.snapshot()
+        self.assertEqual(s["epoch"], self.e0 + 1)
+        self.assertEqual((s["epoch_reason"]["by"], s["epoch_reason"]["to"]), ("input", "unknown"))
+
+    def test_a_small_drag_pressed_elsewhere_or_routed_elsewhere_is_unknown(self):
+        self.click([(800, 500), (801, 500), (801, 500)], pid=0)                 # no target known
+        self.assertEqual(self.ex.snapshot()["epoch"], self.e0 + 1)
+        e1 = self.ex.snapshot()["epoch"]
+        self.click([(800, 500), (801, 500), (801, 500)],                        # pressed on DeskMind, then not its
+                   pids=[self.DESKMIND, 0, self.DESKMIND])
+        self.assertEqual(self.ex.snapshot()["epoch"], e1 + 1)
+
+    def test_a_plain_click_or_key_to_deskmind_leaves_the_epoch_and_an_unknown_one_moves_it(self):
+        self.click([(800, 500), (800, 500)], pid=self.DESKMIND)
+        self.event(10, self.DESKMIND, (0, 0))                                   # a key to DeskMind
+        self.assertEqual(self.ex.snapshot()["epoch"], self.e0)
+        self.event(1, 0, (10, 10))                                              # a press with no target
+        s = self.ex.snapshot()
+        self.assertEqual(s["epoch"], self.e0 + 1)
+        self.assertEqual(s["epoch_reason"]["to"], "unknown")

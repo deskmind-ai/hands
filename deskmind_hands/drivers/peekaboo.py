@@ -3863,9 +3863,15 @@ class PeekabooDriver:
         # (review of #67 @7926924)
         try:
             insert_at = None if web else axfield.wanted(field, clear_first)
-            insertable = not web and axfield.selection_readable(field)
-        except Exception:   # noqa: BLE001 -- unread: not by the insertion
-            insert_at, insertable = None, False
+            readable = axfield.selection_readable(field)
+        except Exception:   # noqa: BLE001 -- unread: not this route
+            insert_at, readable = None, False
+        if not readable:
+            # Both ways in here are confirmed by the field's selection -- the insertion's selection, the keys' caret
+            # or select-all read back -- so a field whose selection cannot be read is not typed into here at all:
+            # the caller's route, before anything is sent (review of #67 @8e08b5e)
+            return None
+        insertable = not web
         t1 = Gate.untouched(pid, field)
         if STOP.is_set():
             return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
@@ -3893,8 +3899,13 @@ class PeekabooDriver:
             # the selection, then, once it reads back as written, the text
             try:
                 went, why = axfield.insert(field, text, clear_first, check=t1.before_focus_write, want=insert_at)
-            except Exception as exc:   # noqa: BLE001 -- failed part way: it may have reached the app
-                went, why = axfield.TEXT, str(exc)
+            except Exception as exc:   # noqa: BLE001 -- failed part way: what went is told by the count
+                if sends_so_far() > sent_before:
+                    self._snapshot = None
+                    return ExecResult(False, MaybeSent(f"the insertion into {label!r} failed part way ({exc}): the "
+                                                       f"selection or the text may have gone -- observe before typing "
+                                                       f"again"))
+                return None             # nothing went: the caller's route
             reached = sends_so_far() > sent_before
             if went == axfield.TEXT:
                 # Long enough for a slow app to show it.

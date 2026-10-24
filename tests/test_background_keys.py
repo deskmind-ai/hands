@@ -451,12 +451,14 @@ class _TypeHarness(unittest.TestCase):
                    # the selection's range read (it can wait), apart from its write: a test may act there
                    mock.patch.object(axfield, "wanted", lambda el, all_: getattr(d, "on_length_read", lambda: None)()
                                      or (0, 0), create=True),
+                   # a selection that cannot be read cannot be read back as set either (consistent with it)
                    mock.patch.object(axfield, "select_range", lambda el, want, wait=0.3: d.log.append("select")
-                                     or sends() or getattr(d, "on_select", lambda: None)() or selects,
-                                     create=True),
+                                     or sends() or getattr(d, "on_select", lambda: None)()
+                                     or (selects and getattr(d, "selection_readable", True)), create=True),
                    mock.patch.object(axfield, "selection_readable", lambda el: getattr(d, "selection_readable", True),
                                      create=True),
-                   mock.patch.object(axfield, "all_selected", lambda el, wait=0.5: all_selected),
+                   mock.patch.object(axfield, "all_selected",
+                                     lambda el, wait=0.5: all_selected and getattr(d, "selection_readable", True)),
                    mock.patch.object(skylight, "user_on", lambda pid: user_on),
                    mock.patch.object(skylight, "BackgroundQuartz",
                                      type("HeldWindow", (FakeQ,), {"__init__": lambda self_, pid, wid, origin, key=None:
@@ -1249,13 +1251,37 @@ class TheInsertionBehindItsGate(_TypeHarness):
                         self.assertTrue(res.indeterminate, res.detail)
                         self.assertIn("no text was written", res.detail)
 
-    def test_a_field_whose_selection_cannot_be_read_goes_to_keys_before_any_send(self):
-        d = driver()
-        d.selection_readable = False
-        d, res, texts = self.run_t1(d, Field("start", takes_insertion=True))
-        self.assertEqual(texts, [])
-        self.assertNotIn(("ax insert", "hello 你好"), d.log)
-        self.assertTrue(self.keys_sent(d))
+    def test_a_field_whose_selection_cannot_be_read_is_handed_back_before_any_send(self):
+        """Review of #67 @8e08b5e (A1): the keys' caret and select-all are read back by the same selection, so the
+        key route failed after its sends too. Unreadable: neither way here, the caller's route, nothing sent."""
+        for clear in (False, True):
+            with self.subTest(replace=clear):
+                d = driver()
+                d.selection_readable = False
+                d, res, texts = self.run_t1(d, Field("start", takes_insertion=True), clear=clear)
+                self.assertIsNone(res)
+                self.assertEqual(texts, [])
+                self.assertEqual([e for e in d.log if e in ("focus", "select") or isinstance(e, tuple)
+                                  and e[0] in ("keys", "key", "ax insert")], [])
+
+    def test_an_insertion_that_raises_says_what_went(self):
+        """Review of #67 @8e08b5e (A2): an exception was taken for a text write. Told by the count now."""
+        for counted in (True, False):
+            with self.subTest(counted=counted):
+                def boom(el, t, r, check=None, want=None, counted=counted):
+                    if counted:
+                        base.counted(lambda: None)                   # the selection went
+                    raise RuntimeError("the accessibility call failed")
+                d = driver()
+                d, res = self.run_type(Field("start", takes_insertion=True), d=d, insert=boom, count_sends=True,
+                                       enter=lambda pid, wid: Key(d.log, lost=lambda: None))
+                if counted:
+                    self.assertIsNot(res.performed, False)
+                    self.assertTrue(res.indeterminate, res.detail)
+                    self.assertIn("failed part way", res.detail)
+                else:
+                    self.assertIsNone(res)
+                self.assertEqual(self.keys_sent(d), [])
 
 
 REAL_INSERT = axfield.insert

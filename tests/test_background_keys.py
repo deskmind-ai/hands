@@ -416,16 +416,20 @@ class _TypeHarness(unittest.TestCase):
                 field.value = ""
         d._post_key = post_key
 
-        def ax_insert(el, t, replace_all, go=None, want=None):
+        def ax_insert(el, t, replace_all, check=None, want=None):
             # takes_insertion: True, it shows; "ignored", it reaches the app and nothing shows (accepted, a no-op);
-            # False, refused before it reached the app (nothing counted as sent)
+            # False, refused before it reached the app (nothing counted as sent). The gate (`check`) as the real one
+            # asks it, before the first write.
+            why = check() if check is not None else None
+            if why:
+                return axfield.NOTHING, why
             d.log.append(("ax insert", t))
             if not field.takes:
-                return False
+                return axfield.SELECTION, "the selection was refused"
             base.counted(lambda: None)
             if field.takes is True:
                 field.value = t if replace_all else field.value + t
-            return True
+            return axfield.TEXT, None
         d.settle_waits = []
 
         def default_settle(el, before, wait=0.6):
@@ -448,7 +452,10 @@ class _TypeHarness(unittest.TestCase):
                    mock.patch.object(axfield, "wanted", lambda el, all_: getattr(d, "on_length_read", lambda: None)()
                                      or (0, 0), create=True),
                    mock.patch.object(axfield, "select_range", lambda el, want, wait=0.3: d.log.append("select")
-                                     or sends() or selects, create=True),
+                                     or sends() or getattr(d, "on_select", lambda: None)() or selects,
+                                     create=True),
+                   mock.patch.object(axfield, "selection_readable", lambda el: getattr(d, "selection_readable", True),
+                                     create=True),
                    mock.patch.object(axfield, "all_selected", lambda el, wait=0.5: all_selected),
                    mock.patch.object(skylight, "user_on", lambda pid: user_on),
                    mock.patch.object(skylight, "BackgroundQuartz",
@@ -489,8 +496,9 @@ class TypeText(_TypeHarness):
                                  ("keys", "hello 你好"), "exit"])
 
     def test_nothing_written_no_wait(self):
-        d, res = self.run_type(Field("start", takes_insertion=False), insert=lambda el, t, r, go=None, want=None: False)
-        self.assertEqual(d.settle_waits[0], 0)
+        d, res = self.run_type(Field("start", takes_insertion=False),
+                               insert=lambda el, t, r, check=None, want=None: (axfield.SELECTION, "refused"))
+        self.assertNotIn(PeekabooDriver.AX_INSERT_WAIT_S, d.settle_waits)   # nothing went: no wait for it to show
 
     def test_an_insertion_shown_late_is_not_typed_again(self):
         """The value shows the insertion only after ~1 s: the wait (1.5 s) sees it, and no key is sent."""
@@ -502,9 +510,10 @@ class TypeText(_TypeHarness):
                 field.value += pending.pop()
             return field.value
 
-        def insert(el, t, replace_all, go=None, want=None):
+        def insert(el, t, replace_all, check=None, want=None):
             pending.append(t)
-            return True
+            base.counted(lambda: None)
+            return axfield.TEXT, None
         fake_time = types.SimpleNamespace(monotonic=lambda: clock[0],
                                           sleep=lambda dt: clock.__setitem__(0, clock[0] + dt))
         d, res = self.run_type(field, settle=real_settle, value=value, insert=insert,
@@ -1153,7 +1162,8 @@ class GateAtEverySendSiteInTheBackground(_TypeHarness):
         d = driver()
         d.on_length_read = STOP.set
         writes = []
-        d, res = self.run_type(field, d=d, insert=lambda el, t, r, go=None, want=None: writes.append(t) or True)
+        d, res = self.run_type(field, d=d, insert=lambda el, t, r, check=None, want=None: (check and check()) and (axfield.NOTHING, check())
+                               or (writes.append(t), (axfield.TEXT, None))[1])
         self.assertEqual(writes, [])
         self.assertIs(res.performed, False)
 
@@ -1165,9 +1175,89 @@ class GateAtEverySendSiteInTheBackground(_TypeHarness):
                                STOP.set() or True), \
                 mock.patch.object(axfield, "_length", lambda el: 4), \
                 mock.patch.object(axfield, "_set", lambda el, attr, v: writes.append(attr) or True):
-            self.assertFalse(axfield.insert("FIELD", "text", False, go=lambda: not STOP.is_set()))
+            went, why = axfield.insert("FIELD", "text", False,
+                                       check=lambda: "stopped by the app" if STOP.is_set() else None)
+        self.assertEqual((went, why), (axfield.SELECTION, "stopped by the app"))
         self.assertEqual(writes, ["selection"])                 # no AXSelectedText after the stop
 
 
+class TheInsertionBehindItsGate(_TypeHarness):
+    """Review of #67 @7926924, T1 (the accessibility insertion): (1) a send of the selection alone was reported as
+    "typed N chars"; the text is now written only after the selection reads back as written, and a selection that
+    went with no text after it says so (unverified, no keys after a send); (2) T1 asked STOP only, after reads that
+    can wait -- the user came to the app during the range read and the insertion went. T1 has a gate now (STOP, the
+    target app not in front), asked right before each of its two writes. Driven through _type_in_background and the
+    real axfield.insert."""
+
+    def run_t1(self, d, field, **kw):
+        texts = []
+        extra = [mock.patch.object(axfield, "_set", lambda el, attr, v: texts.append((attr, v)) or True)]
+        d, res = self.run_type(field, d=d, insert=REAL_INSERT, count_sends=True, extra=extra,
+                               enter=lambda pid, wid: Key(d.log, lost=lambda: None), **kw)
+        return d, res, texts
+
+    def test_a_selection_that_went_and_did_not_read_back_writes_no_text_and_says_so(self):
+        d = driver()
+        d, res, texts = self.run_t1(d, Field("start", takes_insertion=True), selects=False)
+        self.assertEqual(texts, [])                                  # no AXSelectedText
+        self.assertEqual(self.keys_sent(d), [])                      # no keys after a send
+        self.assertIsNot(res.performed, False)
+        self.assertTrue(res.indeterminate, res.detail)
+        self.assertIn("no text was written", res.detail)
+        self.assertNotIn("typed", res.detail)
+
+    def test_a_stop_after_the_selection_writes_no_text_and_says_so(self):
+        from deskmind_hands.grounding import STOP
+        self.addCleanup(STOP.clear)
+        d = driver()
+        d.on_select = STOP.set
+        d, res, texts = self.run_t1(d, Field("start", takes_insertion=True))
+        self.assertEqual(texts, [])
+        self.assertTrue(res.indeterminate, res.detail)
+        self.assertIn("no text was written", res.detail)
+
+    def test_the_gate_before_each_write(self):
+        """A front-app row and a STOP row for each of T1's two writes: arising during the read before it (the range
+        read before the selection; the selection's read-back before the text) -- that write is not made."""
+        from deskmind_hands.grounding import STOP
+        for write in ("selection", "text"):
+            for what in ("front", "stop"):
+                with self.subTest(write=write, condition=what):
+                    STOP.clear()
+                    self.addCleanup(STOP.clear)
+                    d = driver()
+
+                    def arise(d=d, what=what):
+                        if what == "stop":
+                            STOP.set()
+                        else:
+                            d.front_app = PID                         # the user brought the target app forward
+                    if write == "selection":
+                        d.on_length_read = arise
+                    else:
+                        d.on_select = arise
+                    d, res, texts = self.run_t1(d, Field("start", takes_insertion=True))
+                    self.assertEqual(texts, [])
+                    if write == "selection":
+                        self.assertNotIn("select", d.log)
+                        if what == "stop":
+                            self.assertIs(res.performed, False)
+                        else:
+                            self.assertIsNone(res)                   # nothing went: the caller's route
+                    else:
+                        self.assertIn("select", d.log)
+                        self.assertTrue(res.indeterminate, res.detail)
+                        self.assertIn("no text was written", res.detail)
+
+    def test_a_field_whose_selection_cannot_be_read_goes_to_keys_before_any_send(self):
+        d = driver()
+        d.selection_readable = False
+        d, res, texts = self.run_t1(d, Field("start", takes_insertion=True))
+        self.assertEqual(texts, [])
+        self.assertNotIn(("ax insert", "hello 你好"), d.log)
+        self.assertTrue(self.keys_sent(d))
+
+
+REAL_INSERT = axfield.insert
 _chunks = skylight.text_chunks
 

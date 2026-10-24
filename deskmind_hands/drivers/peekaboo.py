@@ -765,12 +765,14 @@ class Gate:
     its two constructors; a background gate is bound to its BackgroundQuartz's WindowKey, and only such a gate lets
     a key go without the window being asked again in the post (BackgroundQuartz.post_checked)."""
 
-    __slots__ = ("field", "window_key", "front_pid")
+    __slots__ = ("field", "window_key", "front_pid", "away")
 
-    def __init__(self, field, window_key, front_pid, _token):
+    def __init__(self, field, window_key, front_pid, _token, away=None):
         if _token is not Gate._MADE:
             raise TypeError("a Gate is made by Gate.background or Gate.foreground")
         self.field, self.window_key, self.front_pid = field, window_key, front_pid
+        #: the target app must stay out of the front (background), or be it (foreground)
+        self.away = (window_key is not None) if away is None else away
 
     _MADE = object()
 
@@ -784,6 +786,12 @@ class Gate:
     @classmethod
     def foreground(cls, pid: int, field) -> "Gate":
         return cls(field, None, int(pid), cls._MADE)
+
+    @classmethod
+    def untouched(cls, pid: int, field) -> "Gate":
+        """An app left in the background with no window held (the accessibility insertion, T1): the target app must
+        stay out of the front; no window to read, and the element's focus is not needed (the write names it)."""
+        return cls(field, None, int(pid), cls._MADE, away=True)
 
     # The order is the gate's, once, here: the checks that can wait first, the instant ones last, so nothing that
     # can wait sits between the last check and the send (Codex on #66 @79cd02d: STOP was asked, then the focus read
@@ -820,9 +828,9 @@ class Gate:
         front = _front_app_pid()
         if front is None:
             return "the front app could not be read"
-        if self.window_key is None and front != self.front_pid:
+        if not self.away and front != self.front_pid:
             return "the app is no longer the front app (the user went elsewhere)"
-        if self.window_key is not None and front == self.front_pid:
+        if self.away and front == self.front_pid:
             return "the user brought the app forward"
         return None
 
@@ -3849,12 +3857,16 @@ class PeekabooDriver:
             return None
         if web and clear_first and self._background_input(self.app):
             return None             # a web field's replace: the click and paste route, ahead of this one as before
-        # T1's selection range read now (the text's length: an accessibility read that can wait), so the STOP check
-        # right below is right before the insertion's first write (review of #66 @24fbf21)
+        # T1, read before its gate (accessibility reads that can wait): the selection range to write, and whether the
+        # field's selection can be read back at all -- the insertion writes its text only after the selection reads
+        # back as written, so a field whose selection cannot be read goes to keys, decided here, before a send
+        # (review of #67 @7926924)
         try:
             insert_at = None if web else axfield.wanted(field, clear_first)
-        except Exception:   # noqa: BLE001 -- unread: the insertion reads it itself
-            insert_at = None
+            insertable = not web and axfield.selection_readable(field)
+        except Exception:   # noqa: BLE001 -- unread: not by the insertion
+            insert_at, insertable = None, False
+        t1 = Gate.untouched(pid, field)
         if STOP.is_set():
             return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
 
@@ -3875,19 +3887,29 @@ class PeekabooDriver:
         # write that lands after the wait plus keys typed the text twice ("ls -lals -la", hands#66 review). Keys only
         # when the insertion was refused before anything reached the app (nothing counted as sent: base.ax_counted).
         # No window is remembered as "the insertion does nothing here" either -- that was decided from a failed write.
-        if not web:
+        if insertable:
             sent_before = sends_so_far()
+            # T1: the gate (STOP, the target app not in front) right before each of the insertion's two writes --
+            # the selection, then, once it reads back as written, the text
             try:
-                # T1: STOP right before, nothing that can wait between; and between the insertion's own two writes
-                # (the selection, a read-back of up to 0.3 s, the text) once more
-                written = axfield.insert(field, text, clear_first, go=lambda: not STOP.is_set(), want=insert_at)
-            except Exception:   # noqa: BLE001 -- refused or failed: it may have reached the app
-                written = True
-            reached = written or sends_so_far() > sent_before
-            # Long enough for a slow app to show it. Nothing reached the app, nothing to wait for.
-            after = axfield.settled_value(field, before, wait=self.AX_INSERT_WAIT_S if reached else 0)
-            if reached or after != before:
+                went, why = axfield.insert(field, text, clear_first, check=t1.before_focus_write, want=insert_at)
+            except Exception as exc:   # noqa: BLE001 -- failed part way: it may have reached the app
+                went, why = axfield.TEXT, str(exc)
+            reached = sends_so_far() > sent_before
+            if went == axfield.TEXT:
+                # Long enough for a slow app to show it.
+                after = axfield.settled_value(field, before, wait=self.AX_INSERT_WAIT_S)
                 return result(after, "accessibility insertion")
+            if reached:
+                # the selection went and no text was written: said so, unverified -- no keys after a send
+                self._snapshot = None
+                return ExecResult(False, MaybeSent(f"the selection in {label!r} was set but no text was written "
+                                                   f"({why}) -- observe before typing again"))
+            if went == axfield.NOTHING:                 # the gate refused before the first write
+                if STOP.is_set():
+                    return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
+                return None         # the user came to the app: nothing went, the caller's route (its own gates)
+            # the selection refused before it reached the app (nothing counted): the keys below, chosen before a send
         multiline = axfield.role(field) == "AXTextArea"
         if "\n" in text or (not multiline and "\t" in text):
             # A newline is never a bare Return key (hands#66: in a chat box Return sends, "one\ntwo" sent "one"): text

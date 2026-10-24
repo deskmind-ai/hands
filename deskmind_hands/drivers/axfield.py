@@ -123,13 +123,31 @@ def _selection(el) -> tuple[int, int] | None:
     return (int(r[0]), int(r[1])) if isinstance(r, tuple) else (int(r.location), int(r.length))
 
 
-def insert(el, text: str, replace_all: bool, go=None, want=None) -> bool:
-    """`text` in place of the whole text (replace_all) or at the end, by the accessibility insertion
-    (AXSelectedText); True when the write was sent and accepted -- which is not proof it changed anything. False:
-    nothing was written (the selection was refused, or the write, or `go()` said no after the selection's wait).
-    `want`: the selection range read beforehand (wanted), so nothing is read before the first write."""
+NOTHING, SELECTION, TEXT = "nothing", "selection", "text"
+
+
+def insert(el, text: str, replace_all: bool, check=None, want=None) -> tuple[str, str | None]:
+    """`text` in place of the whole text (replace_all) or at the end, by the accessibility insertion: the selection
+    written (`want`, read beforehand: wanted), then -- only once it reads back as written -- the text (AXSelectedText).
+    `check()` right before each write: a reason to stop, or None. (how far it went: NOTHING, SELECTION or TEXT -- the
+    text write sent and accepted, which is not proof it changed anything -- and why it stopped there, or None)."""
     at = want if want is not None else wanted(el, replace_all)
-    return select_range(el, at) and (go is None or bool(go())) and _set(el, "AXSelectedText", text)
+    why = check() if check is not None else None
+    if why:
+        return NOTHING, why
+    if not select_range(el, at):
+        return SELECTION, "the selection did not read back as written"
+    why = check() if check is not None else None
+    if why:
+        return SELECTION, why
+    if not _set(el, "AXSelectedText", text):
+        return SELECTION, "the text write was refused"
+    return TEXT, None
+
+
+def selection_readable(el) -> bool:
+    """Whether the field's selection can be read (AXSelectedTextRange): the insertion is confirmed by it."""
+    return _selection(el) is not None
 
 
 def focus(el, wait: float = 0.5) -> bool:

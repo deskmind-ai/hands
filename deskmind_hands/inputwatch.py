@@ -53,6 +53,7 @@ every input counts. Listen-only: nothing is changed or delayed.
 from __future__ import annotations
 
 import collections
+import math
 import queue
 import threading
 import time
@@ -154,6 +155,11 @@ def track_children() -> None:
 
 #: DeskMind's own processes: input to them is the user answering DeskMind, not changing their Mac.
 OWN_BUNDLES = {"ai.deskmind.app", "ai.deskmind.hands"}
+
+#: How far (points) the pointer may move between a press on DeskMind and its release for the drag events between to
+#: be DeskMind's input (_own_click_moved): a click on a trackpad moves a point or two; AppKit starts a drag-and-drop
+#: only past a few points.
+OWN_CLICK_SLOP_PT = 4.0
 
 #: How old a key event may be when its callback runs for the app with the keyboard to be read for it then.
 KEY_FRESH_S = 0.05
@@ -327,6 +333,8 @@ class InputWatch:
         #: a Command-Tab (or Command-`) app switcher open: from its first Tab until Command is let go (_switcher)
         self._switching = False
         self._dragging = False
+        #: the mouse press in progress, when the window server sent it to DeskMind: (pid, x, y) (_own_press)
+        self._press = None
         #: this process and its children (Peekaboo, the key-event child): events they post are the driver's own
         #: input, not the user's -- a driver click that reached the tap after the action had ended was taken for the
         #: user's input to the task's app and staled the next step (rc.9, 10-20). Refreshed every few seconds.
@@ -792,25 +800,36 @@ class InputWatch:
                 # watch says of keys is not trusted from here on -- the executor counts key presses by the HID idle
                 # time, as main did -- and the next begin makes a new watch (healthy); turned back on meanwhile
                 self.keys_lost = True
+                # events were missed: a press seen before is not the start of whatever comes next (a down unseen, a
+                # drag from there into a task window) -- the DeskMind exemption is for one press, drag and release
+                # seen whole (_own_click_moved)
+                self._press = None
                 if self._tap is not None:
                     Quartz.CGEventTapEnable(self._tap, True)
                 return event
             # a drag goes to whatever is under the pointer when it is let go (a file dragged from Finder into the
-            # task's window), and the press is the source's: the whole drag, and its release, is input to an
-            # unknown target (PR #49 review)
+            # task's window), and the press is the source's: a drag, and its release, is input to an unknown target
+            # (PR #49 review) -- unless it is a click on DeskMind that moved a little (_own_click_moved)
             if self.posted_by_us(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUnixProcessID) or 0)):
+                if type_ not in (getattr(Quartz, "kCGEventKeyDown", None), getattr(Quartz, "kCGEventFlagsChanged", None)):
+                    self._press = None                    # a mouse event of the driver's breaks the user's sequence
                 return event                              # the driver's own click or key, not the user's
             drags = (Quartz.kCGEventLeftMouseDragged, Quartz.kCGEventRightMouseDragged, Quartz.kCGEventOtherMouseDragged)
             ups = (Quartz.kCGEventLeftMouseUp, Quartz.kCGEventRightMouseUp, Quartz.kCGEventOtherMouseUp)
-            if type_ in drags:
-                self._dragging = True
-                self.note(None)
+            downs = tuple(getattr(Quartz, n, None) for n in
+                          ("kCGEventLeftMouseDown", "kCGEventRightMouseDown", "kCGEventOtherMouseDown"))
+            if type_ in drags or (type_ in ups and self._dragging):
+                self._dragging = type_ in drags
+                own = self._own_click_moved(Quartz, event)
+                if not self._dragging:
+                    self._press = None
+                self.note(own)                            # DeskMind's (its pid), else None: an unknown target
                 return event
             if type_ in ups:
-                if self._dragging:
-                    self._dragging = False
-                    self.note(None)
+                self._press = None                        # the press is over: a drag after it has a down of its own
                 return event
+            if type_ in downs:
+                self._press = self._own_press(Quartz, event)
             key = type_ in (Quartz.kCGEventKeyDown, Quartz.kCGEventFlagsChanged)
             t0 = time.monotonic()                          # sampled once: the key's age is as of t0
             age = self._event_age(Quartz, event) if key else None
@@ -818,8 +837,49 @@ class InputWatch:
             self.note(int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0),
                       key=key, age=age, t0=t0, switcher=switcher)
         except Exception:  # noqa: BLE001 -- unknown where it went: it counts, the safe side (an unknown target)
+            self._press = None
             self.note(None)
         return event
+
+    def _own_press(self, Quartz, event):
+        """(pid, x, y) of a mouse press the window server sent to DeskMind; None for any other, or unreadable."""
+        try:
+            pid = int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0)
+            if not self.is_own(pid):
+                return None
+            at = Quartz.CGEventGetLocation(event)
+            return pid, float(at.x), float(at.y)
+        except Exception:  # noqa: BLE001 -- not known: the drag stays an unknown target
+            return None
+
+    def _own_click_moved(self, Quartz, event) -> int | None:
+        """A drag event (or its release) that is DeskMind's: DeskMind's pid, else None (an unknown target).
+
+        rc.15 (run_7a6176f9, 10-24): 8 of 9 approvals on DeskMind's card staled the action they approved, "to:
+        unknown" each time, the input stamped 8-30 ms before the answer -- the release of the click. A trackpad
+        click that moves a point or two between press and release posts drag events, and a drag (and its release)
+        was counted as input to an unknown target, wherever it was. A drag's events are routed to the process that
+        got the press; what is not known is only where a drop lands -- under the pointer when it is let go. So a drag
+        is DeskMind's while the press went to DeskMind, each of its events too, and the pointer has stayed within
+        OWN_CLICK_SLOP_PT of the press (a drag-and-drop does not start inside that, and nothing else is under the
+        pointer there); once any of that fails, the rest of the drag is an unknown target, as before. Only for one
+        press, drag and release seen whole: the press is forgotten at every release, whenever the tap was turned off
+        (events missed), at a mouse event of the driver's and at an event that could not be read -- a drag with no
+        press seen since is an unknown target (Codex on hands#65 @b9eb9dc: a press kept across a missed down made a
+        later drag near it DeskMind's, into a task window)."""
+        press = self._press
+        if press is None:
+            return None
+        try:
+            pid = int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventTargetUnixProcessID) or 0)
+            at = Quartz.CGEventGetLocation(event)
+            near = math.hypot(float(at.x) - press[1], float(at.y) - press[2]) <= OWN_CLICK_SLOP_PT
+        except Exception:  # noqa: BLE001 -- not known
+            pid, near = 0, False
+        if near and pid and self.is_own(pid):
+            return pid
+        self._press = None                                # left DeskMind or the click's place: unknown from here
+        return None
 
     #: Tab and ` (the key above Tab on a US keyboard): with Command held they open the app switcher
     SWITCHER_KEYCODES = (48, 50)

@@ -1047,15 +1047,16 @@ class GateAtEverySendSiteInTheBackground(_TypeHarness):
                 field.focused = False
 
         def lost():
-            # the gate asks STOP, then this, then the focus: a STOP flips at the ask before the previous site, the
-            # window answers at the site's own ask, the focus flips there (it is read after this)
+            # the gate reads this (it can wait), then the focus, then asks STOP: whatever arises during the site's
+            # own read -- the window gone, a STOP (Codex on #66 @79cd02d: one during this read went unseen), the
+            # focus moved -- is seen by that same gate
             calls[0] += 1
             if calls[0] == at and what == "window":
                 return "window 200 is no longer the app's key window (now 100)"
-            if (what == "stop" and calls[0] == at - 1) or (what == "focus" and calls[0] == at):
+            if calls[0] == at:
                 flip()
             return None
-        prepare_flip = site == "focus write" and what == "stop"  # while preparing (Codex's repro: a STOP then)
+        prepare_flip = False
         text = "x" * 40
         clear = site in ("select", "cmd+A")
 

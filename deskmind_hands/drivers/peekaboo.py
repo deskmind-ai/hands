@@ -2755,7 +2755,7 @@ class PeekabooDriver:
                 self._labels_by_id = {e.id: e.label or "" for e in docs}
                 self._element_role = {e.id: e.role or "" for e in docs}
                 self._rects, self._element_value = {}, {e.id: "" for e in docs}
-                self._element_settable = {}
+                self._element_settable, self._element_ax_role = {}, {}
                 miss = self._miss_note()
                 return Observation(
                     id=obs_id,
@@ -2845,7 +2845,7 @@ class PeekabooDriver:
             self._rects = {e.id: e.rect for e in els if e.rect}
             self._element_window = {e.id: e.window_id for e in els}
             self._element_value = {e.id: e.value or "" for e in els}
-            self._element_settable = {}                  # read from pixels: not known
+            self._element_settable, self._element_ax_role = {}, {}    # read from pixels: not known
             self._labels_by_id = {e.id: e.label or "" for e in els}
             self._element_role = {e.id: e.role or "" for e in els}
             # What the pixels gave, counted by vision_elements before any of it became an element.
@@ -2910,6 +2910,8 @@ class PeekabooDriver:
         # whether each element's value can be set through accessibility (AXValue settable), as read: a terminal's
         # text view reads its text and takes no value written (rc.15) -- typed with keys instead (_type_by_keys)
         self._element_settable = {e.id: bool(e.settable) for e in els}
+        # the raw accessibility role (Peekaboo's `role` says textField for a text area too: review of #68 @98654dd)
+        self._element_ax_role = {e.id: e.ax_role or "" for e in els}
         self._keep_baseline(els)
         self._labels_by_id = {e.id: e.label or "" for e in els}
         self._element_role = {e.id: e.role or "" for e in els}
@@ -5375,21 +5377,34 @@ class PeekabooDriver:
                     "consequence of committing it. Note that a rename field usually "
                     "pre-selects the base name only, so an extension typed in is kept twice."))
 
+    #: Accessibility roles that hold one line: a newline there would submit part way
+    ONE_LINE_AX_ROLES = {"AXTextField", "AXSecureTextField", "AXSearchField", "AXComboBox"}
+
     def _text_with_newlines(self, action: Action, text: str) -> ExecResult | None:
         """Text with a newline, on the command-line channel: in as text, never with a Return key -- the way chosen
-        before the first send. A one-line field: refused (a newline would submit it part way). The element's value
-        settable: written whole (set-value), then read back from the element -- verified or unverified, never a paste
-        after it. Else, where this step may use the foreground: None, the paste below (_type_foreground: paste_fg,
-        never type_fg for text with a newline). Else: refused, nothing sent."""
+        before the first send.
+        - A field known one-line by its accessibility role (ONE_LINE_AX_ROLES; Peekaboo's own role cannot tell a text
+          area from a field): refused. An unknown role is not refused on.
+        - Replacing: the element's value settable -> written whole (set-value), read back; else, where the step may
+          use the foreground, pasted over its whole text selected (_paste_into); else refused.
+        - Appending: never a rewrite of what is there (review of #68 @98654dd: cached + text, set as the value,
+          deleted what loaded after the observation). Inserted at the end through accessibility (_insert_at_end);
+          that not possible with nothing sent -> pasted at the end in the foreground; else refused. Verified by the
+          field holding exactly what it held just before, then the text.
+        - No element (the focused field): the foreground paste below, never submitted after.
+        Each result read back from the element: verified or unverified, never another way after a send."""
         from deskmind_hands.drivers import axfield
         eid = action.binding.element_id or ""
         label = self._labels_by_id.get(eid) or eid or "the focused field"
-        if eid and self._element_role.get(eid, "").lower() == "textfield":
+        if eid and getattr(self, "_element_ax_role", {}).get(eid, "") in self.ONE_LINE_AX_ROLES:
             return ExecResult(False, NothingSent(f"{label!r} is a one-line field and the text has a newline, which "
                                                  f"would submit it part way: nothing was typed. Type the text without "
                                                  f"it, then press Return as its own step if you mean to submit"))
-        if eid and getattr(self, "_element_settable", {}).get(eid):
-            new = text if action.clear_first else self._element_value.get(eid, "") + text
+        foreground = bool(action.foreground and self.allow_foreground)
+        if not eid:
+            return None if foreground else self._no_way_for_newlines(label)
+        if action.clear_first and getattr(self, "_element_settable", {}).get(eid):
+            new = text
             field = self._field_now(eid)
             before = self._read_field(field)
             ok, _, detail = self._run("set_value", text=new, element=eid, snapshot=self._snapshot)
@@ -5408,19 +5423,76 @@ class PeekabooDriver:
             return ExecResult(True, indeterminate=True,
                               detail=f"set {len(new)} chars (with their newlines) into {label!r}, unverified: {shown} "
                                      f"-- observe before typing again")
-        if action.foreground and self.allow_foreground:
-            if action.clear_first:
-                return self._replace_by_paste(eid, label, text)
-            return None
-        return ExecResult(False, NothingSent(f"text with a newline goes in only as text -- a value written ({label!r} "
-                                             f"takes none) or a paste (the foreground, which this step may not use): "
+        if not action.clear_first:
+            inserted = self._insert_at_end(eid, label, text)
+            if inserted is not None:
+                return inserted
+        if foreground:
+            return self._paste_into(eid, label, text, replace=action.clear_first)
+        return self._no_way_for_newlines(label)
+
+    @staticmethod
+    def _no_way_for_newlines(label: str) -> ExecResult:
+        return ExecResult(False, NothingSent(f"text with a newline goes in only as text -- a value written, an "
+                                             f"insertion or a paste, none of which can be done for {label!r} here: "
                                              f"nothing was typed. Type it without the newline, and press Return as "
                                              f"its own step if you mean to submit"))
+
+    @staticmethod
+    def _read_back(label: str, field, before: str, after, expected: str, how: str) -> ExecResult:
+        """The field itself, read back: verified when it holds exactly `expected`, else unverified."""
+        if after is not None and after == expected:
+            return ExecResult(True, f"{how} into {label!r}, verified by read-back")
+        shown = "it cannot be read back" if after is None else f"it reads {after[-120:]!r}"
+        return ExecResult(True, indeterminate=True, detail=f"{how} into {label!r}, unverified: {shown} -- observe "
+                                                           f"before typing again")
+
+    def _insert_at_end(self, eid: str, label: str, text: str) -> ExecResult | None:
+        """Append `text` by the accessibility insertion at the end of the field (axfield.insert: the caret put at the
+        end, then the text at the selection), behind a Gate.untouched (STOP, the target app not in front) right
+        before each write; the field's value read fresh just before. None when this way cannot be taken with nothing
+        sent (no field, its selection or value unreadable, no process, the app in front): the caller's next way."""
+        from deskmind_hands.drivers import axfield
+        field = self._field_now(eid)
+        if field is None:
+            return None
+        try:
+            if not axfield.selection_readable(field):
+                return None
+            want = axfield.wanted(field, False)
+            before = axfield.value(field)
+        except Exception:   # noqa: BLE001
+            return None
+        pid = self._pid_of(self.app) or _pid_by_bundle(self.app)
+        if before is None or not pid:
+            return None
+        gate = Gate.untouched(pid, field)
+        sent_before = sends_so_far()
+        if STOP.is_set():
+            return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
+        try:
+            went, why = axfield.insert(field, text, False, check=gate.before_focus_write, want=want)
+        except Exception as exc:   # noqa: BLE001
+            if sends_so_far() > sent_before:
+                return ExecResult(False, MaybeSent(f"appending to {label!r} failed part way ({exc}) -- observe "
+                                                   f"before typing again"))
+            return None
+        self._snapshot = None
+        if went in (axfield.TEXT, axfield.TEXT_MAYBE):
+            after = axfield.settled_value(field, before, wait=self.AX_INSERT_WAIT_S)
+            return self._read_back(label, field, before, after, before + text,
+                                   f"appended {len(text)} chars (with their newlines)")
+        if sends_so_far() > sent_before:
+            return ExecResult(False, MaybeSent(f"the caret in {label!r} was put at the end but no text was written "
+                                               f"({why}) -- observe before typing again"))
+        if STOP.is_set():
+            return ExecResult(False, NothingSent("stopped by the app; nothing was done"))
+        return None
 
     def _wait_front(self, bundle: str) -> str | None:
         """Wait for `bundle`, asked forward, to be the front app (bringing an app forward is asynchronous): None once
         it is, else why not -- the caller's deadline came (the wait ends in time; nothing is sent late), or it did
-        not come within the wait (30 reads, 50 ms apart). The one wait, for _flash and _replace_by_paste."""
+        not come within the wait (30 reads, 50 ms apart). The one wait, for _flash and _paste_into."""
         for _ in range(30):
             if self._front_bundle().lower() == bundle.lower():
                 return None
@@ -5430,10 +5502,12 @@ class PeekabooDriver:
             time.sleep(0.05)
         return f"{bundle} did not come to the front"
 
-    def _replace_by_paste(self, eid: str, label: str, text: str) -> ExecResult:
-        """Replace the field's text with `text` (it has a newline) by a paste: a paste inserts at the caret, so the
-        field's text is selected first (review of #68 @1194dde: without the selection "old" became "olda\nb" and
-        read as done), and verified by the field holding exactly the text.
+    def _paste_into(self, eid: str, label: str, text: str, replace: bool) -> ExecResult:
+        """Replace the field's text with `text` (it has a newline), or append it, by a paste: a paste inserts at the
+        caret, so the field's whole text is selected first (replace; review of #68 @1194dde: without the selection
+        "old" became "olda\nb" and read as done) or the caret put at its end (append). Verified by that same field --
+        never a scan of the window's fields (@98654dd) -- holding exactly the text (replace) or what it held just
+        before, then the text (append).
         Prepared first: the field, its range, whether its selection can be read, the app's process; the app brought
         forward (activated without a reopen where it has a window on screen: _raise_app); then a foreground Gate
         (hands#66: the reads that can wait first -- the field's focus -- then STOP and the app still in front),
@@ -5447,16 +5521,18 @@ class PeekabooDriver:
             # focused or selected (review of #68 @1fb0766)
             return ExecResult(False, NothingSent(browser_window))
         field = self._field_now(eid) if eid else None
-        refused = (f"replacing {label!r} with text that has a newline needs its text selected first, and "
-                   f"{{why}}: nothing was typed")
+        doing = "replacing" if replace else "appending to"
+        refused = (f"{doing} {label!r} with text that has a newline needs its "
+                   f"{'text selected' if replace else 'caret at the end'} first, and {{why}}: nothing was typed")
         if field is None:
             return ExecResult(False, NothingSent(refused.format(why="the field was not found to select it")))
         try:
-            want = axfield.wanted(field, True)                  # the reads before the writes
+            want = axfield.wanted(field, replace)               # the reads before the writes
             readable = axfield._selection(field) is not None
+            before = axfield.value(field)
         except Exception:   # noqa: BLE001 -- unread
             readable = False
-        if not readable:
+        if not readable or before is None:
             return ExecResult(False, NothingSent(refused.format(why="its selection cannot be read")))
         pid = self._pid_of(self.app) or _pid_by_bundle(self.app)
         if not pid:
@@ -5465,7 +5541,7 @@ class PeekabooDriver:
 
         def stop(why: str) -> ExecResult:
             if sends_so_far() > sent_before:
-                return ExecResult(False, MaybeSent(f"replacing {label!r} stopped part way: {why} -- the front, the "
+                return ExecResult(False, MaybeSent(f"{doing} {label!r} stopped part way: {why} -- the front, the "
                                                    f"focus or the selection may have changed; observe before typing "
                                                    f"again"))
             return ExecResult(False, NothingSent(refused.format(why=why)))
@@ -5487,11 +5563,19 @@ class PeekabooDriver:
         if why:
             return stop(why)
         if not axfield.select_range(field, want):
-            return stop("its text could not be selected")
+            return stop("its text could not be selected" if replace else "its caret could not be put at the end")
         why = gate.before_send()
         if why:
             return stop(why)
-        return self._type_foreground(text, clear_first=True, element_bound=True)
+        self._foreground_actions += 1
+        ok, _, detail = self._run("paste_fg", text=text)
+        self._snapshot = None
+        after = axfield.settled_value(field, before, wait=self.AX_INSERT_WAIT_S)
+        res = self._read_back(label, field, before, after, text if replace else before + text,
+                              f"pasted {len(text)} chars (with their newlines)")
+        if not ok and res.indeterminate:
+            return ExecResult(True, indeterminate=True, detail=f"{res.detail} (the paste answered: {detail[:160]})")
+        return res
 
     def _geometry(self) -> ScreenGeometry:
         """The frame the last observation reported, for converting a model point."""

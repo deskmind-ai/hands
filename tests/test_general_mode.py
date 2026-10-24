@@ -2012,9 +2012,11 @@ class NewlinesGoInAsText(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def driver(self, role="textArea", settable=True, foreground=False, takes=True, paste="ok"):
+    def driver(self, role="textArea", settable=True, foreground=False, takes=True, paste="ok", ax_role="AXTextArea"):
         self.selected_all = False
         d = PeekabooDriver.__new__(PeekabooDriver)
+        d._element_ax_role = {"e1": ax_role}
+        d._pid_of = lambda bundle, all_wins=None: 4242
         d.app, d._mcp, d._snapshot = "com.example.notes", None, "s1"
         d._pinned_window, d._element_window, d._window_id = None, {"e1": ""}, "200"
         d._element_role, d._element_settable = {"e1": role}, {"e1": settable}
@@ -2057,11 +2059,40 @@ class NewlinesGoInAsText(unittest.TestCase):
         self.assertFalse([s for s in self.sent if s[0] in ("type", "type_clear", "type_fg") and "\n" in (s[1] or "")],
                          self.sent)
 
-    def test_appended_text_with_a_newline_is_written_as_the_value(self):
+    def test_appended_text_with_a_newline_is_inserted_at_the_end(self):
+        self.replace_fakes()
+        self.insert_fakes()
         res = self.type_(self.driver(), "a\nb")
-        self.assertEqual(self.sent, [("set_value", "olda\nb", None)])
-        self.no_return()
+        self.assertEqual((self.sent, self.inserted), ([], ["a\nb"]))      # no value written over it
+        self.assertEqual(self.shown["value"], "olda\nb")
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_codex_an_append_keeps_what_loaded_after_the_observation(self):
+        """Review of #68 @98654dd: cached + text was written as the value, deleting what loaded after the
+        observation, and read as verified."""
+        self.replace_fakes()
+        self.insert_fakes()
+        d = self.driver()
+        self.shown["value"] = "old + loaded since"                       # the cache still says "old"
+        res = self.type_(d, "a\nb")
+        self.assertEqual(self.shown["value"], "old + loaded sincea\nb")
+        self.assertFalse([x for x in self.sent if x[0] == "set_value"], self.sent)
+        self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_codex_a_text_area_peekaboo_calls_textfield_is_typed(self):
+        """Review of #68 @98654dd: Peekaboo's role is textField for AXTextArea too; TextEdit's body was refused."""
+        self.replace_fakes()
+        self.insert_fakes()
+        res = self.type_(self.driver(role="textField", ax_role="AXTextArea"), "a\nb")
+        self.assertEqual(self.inserted, ["a\nb"])
+        self.assertTrue(res.ok, res.detail)
+        for ax_role, refused in (("AXTextField", True), ("", False)):
+            with self.subTest(ax_role=ax_role):
+                self.setUp()
+                self.replace_fakes()
+                self.insert_fakes()
+                res = self.type_(self.driver(role="textField", ax_role=ax_role), "a\nb")
+                self.assertEqual(res.performed is False and "one-line" in res.detail, refused, res.detail)
 
     def test_replacing_with_lines_is_written_whole_and_not_shown_is_unverified_with_no_paste_after(self):
         res = self.type_(self.driver(takes=False, foreground=True), "a\nb", clear=True, foreground=True)
@@ -2076,7 +2107,12 @@ class NewlinesGoInAsText(unittest.TestCase):
         self.assertIn("press Return as its own step", res.detail)
 
     def test_no_value_to_write_pastes_in_the_foreground_and_never_types_it(self):
-        res = self.type_(self.driver(settable=False, foreground=True, paste="unknown"), "a\nb", foreground=True)
+        self.replace_fakes()
+        self.insert_fakes(front=4242)                             # the app in front: no insertion in the background
+        d = self.driver(settable=False, foreground=True, paste="unknown")
+        d._raise_app = lambda bundle: True
+        d._front_bundle = lambda: d.app
+        res = self.type_(d, "a\nb", foreground=True)
         self.assertEqual([s[0] for s in self.sent], ["paste_fg"])               # no type_fg after it
         self.no_return()
         self.assertIsNotNone(res)
@@ -2093,12 +2129,15 @@ class NewlinesGoInAsText(unittest.TestCase):
     # -- review of #68 @1194dde
     def test_a_lone_carriage_return_is_a_newline_before_any_route(self):
         """B1: a lone "\r" reached Peekaboo's `type`."""
-        self.type_(self.driver(), "a\rb")
-        self.assertEqual(self.sent, [("set_value", "olda\nb", None)])
-        self.sent.clear()
-        self.type_(self.driver(settable=False, foreground=True), "a\rb", foreground=True)
+        self.type_(self.driver(), "a\rb", clear=True)
+        self.assertEqual(self.sent, [("set_value", "a\nb", None)])
+        self.replace_fakes()
+        self.insert_fakes(front=4242)                             # the app in front: the paste route
+        d = self.driver(settable=False, foreground=True)
+        d._raise_app, d._front_bundle = (lambda bundle: True), (lambda: d.app)
+        self.type_(d, "a\rb", foreground=True)
         self.assertFalse([x for x in self.sent if "\r" in (x[1] or "")], self.sent)
-        self.assertEqual([x[0] for x in self.sent], ["paste_fg"])
+        self.assertEqual(self.sent, [("paste_fg", "a\nb", None)])
 
     def test_text_with_a_newline_into_the_focused_field_is_never_submitted(self):
         """B2: TYPE_FOCUSED (no element) pasted, then pressed Return as the rename's commit -- a chat message sent."""
@@ -2143,6 +2182,25 @@ class NewlinesGoInAsText(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
+    def insert_fakes(self, front=1111):
+        """The accessibility insertion at the end (axfield.insert), its gate asked first as the real one does."""
+        from deskmind_hands.drivers import axfield, base
+        self.inserted = []
+        self.front = front                                        # the user's app in front: the target is not
+
+        def insert(el, text, replace_all, check=None, want=None):
+            why = check() if check is not None else None
+            if why:
+                return axfield.NOTHING, why
+            base.ax_counted(lambda: 0)
+            self.inserted.append(text)
+            self.shown["value"] += text                           # at the end: what is there stays
+            return axfield.TEXT, None
+        for name, fn in (("insert", insert), ("selection_readable", lambda el: True)):
+            p = mock.patch.object(axfield, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+
     def replace_driver(self, arrives_after=0):
         """The app's process is 4242; `arrives_after` reads of the front after the raise, it is in front."""
         d = self.driver(settable=False, foreground=True)
@@ -2171,6 +2229,23 @@ class NewlinesGoInAsText(unittest.TestCase):
         self.assertEqual([x[0] for x in self.sent], ["paste_fg"])
         self.assertEqual(self.shown["value"], "a\nb")
         self.assertTrue(res.ok and not res.indeterminate, res.detail)
+
+    def test_codex_the_replace_reads_back_its_own_field_not_any_field(self):
+        """Review of #68 @98654dd: the replace's read-back scanned every settable field -- another holding the text
+        made a failed paste "verified"."""
+        self.replace_fakes()
+        d = self.replace_driver()
+        real_run = d._run
+
+        def run(key, _extra=None, **fmt):
+            if key == "paste_fg":
+                return False, {}, "the paste did not go"                 # the target unchanged
+            return real_run(key, _extra, **fmt)
+        d._run = run
+        d.observe = lambda: SimpleNamespace(elements=[SimpleNamespace(settable=True, value="a\nb")])  # another field
+        res = self.type_(d, "a\nb", clear=True, foreground=True)
+        self.assertTrue(res.indeterminate, res.detail)
+        self.assertNotIn("verified by read", res.detail)
 
     def test_a_replace_that_only_contains_the_text_is_not_verified(self):
         self.replace_fakes(selects=True)
@@ -2253,7 +2328,7 @@ class NewlinesGoInAsText(unittest.TestCase):
         self.assertIs(res.performed, False, res.detail)
 
     def test_a_failed_value_write_says_so(self):
-        res = self.type_(self.driver(takes="fails"), "a\nb")
+        res = self.type_(self.driver(takes="fails"), "a\nb", clear=True)
         self.assertFalse(res.ok)
         self.assertTrue(res.indeterminate, res.detail)
         self.assertIn("failed", res.detail)

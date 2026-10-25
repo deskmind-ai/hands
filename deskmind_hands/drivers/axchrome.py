@@ -103,15 +103,41 @@ def subrole_at(rect: tuple[float, float, float, float], buttons: list[tuple[str,
     return ""
 
 
+#: A save sheet's fields, the same set whatever was read (unknown: None).
+SAVE_SHEET_KEYS = ("read", "name", "stem", "name_focused", "folder", "path", "nested_sheet")
+#: The save panel's own controls, by AXIdentifier (never by their words): the name field, the "hide extension" box.
+SAVE_NAME_ID = "saveAsNameTextField"
+HIDE_EXTENSION_IDS = ("hideExtensionButton", "NSSavePanelHideExtensionCheckbox")
+#: How many elements of a sheet are read, breadth first (the name field and the location pop-up are near the top).
+SAVE_SHEET_MAX = 3000
+
+
+def _unknown_sheet() -> dict:
+    """A save sheet that is there (or may be) but could not be read: every field unknown -- a floor treats it as a
+    sheet, never as none."""
+    return {"read": False, "name": None, "stem": None, "name_focused": None, "folder": None, "path": None,
+            "nested_sheet": None}
+
+
 def read_save_sheet(win, get=None, resolve=None) -> dict | None:
-    """The save sheet open on `win`, from its accessibility values alone (K1) -- never from the words on it:
-    {name: the name field's value, name_focused, folder: the folder it saves in -- only from a file AXURL on the location
-    pop-up or the sheet itself that resolves to a directory on disk, and only when exactly one such folder is read (the
-    sidebar's places carry URLs too: never taken), else None --, path: folder/name only when both were read, nested_sheet: a sheet open inside it
-    (an alert -- an overwrite, an invalid name, no permission: told apart by nothing here)}. None: no sheet with a name
-    field. The name field: the save panel's (AXIdentifier saveAsNameTextField), else the sheet's one settable text field.
+    """The save sheet open on `win`, from its accessibility values alone (K1) -- never from the words on it. None only
+    when the window has no sheet; a sheet always gives every key of SAVE_SHEET_KEYS, unknown ones None (hands#70
+    review: a sheet that could not be read is not "no sheet"):
+      read: the whole sheet was read (within SAVE_SHEET_MAX elements, breadth first) and its name field found;
+      name: the name field's value as shown (the save panel's, AXIdentifier saveAsNameTextField, else the sheet's one
+        settable text field -- only on a sheet read whole); a name with "/" is no name (None);
+      stem: the name without its extension (the whole name when it has none): what a file it would replace is
+        named, whatever extension the panel adds or hides;
+      name_focused;
+      folder: only from a file AXURL on the location pop-up or the sheet itself that resolves to a directory, exactly
+        one such read, on a sheet read whole (the sidebar's places carry URLs too: never taken);
+      path: folder/name only when the name shows an extension and the panel's "hide extension" box was read
+        unchecked -- else None (报告 shown may save as 报告.docx: the stem says it);
+      nested_sheet: a sheet open inside it (an alert -- an overwrite, an invalid name, no permission: told apart by
+        nothing here); None when not read whole.
     `get(el, attr)` and `resolve(url) -> str | None` are injectable (tests)."""
     import os
+    from collections import deque
     get = get or _get
     def default_resolve(u):
         try:
@@ -127,42 +153,66 @@ def read_save_sheet(win, get=None, resolve=None) -> dict | None:
     sheet = next((c for c in (get(win, "AXChildren") or []) if str(get(c, "AXRole") or "") == "AXSheet"), None)
     if sheet is None:
         return None
-    named, fields, folders, nested = None, [], set(), False
-    stack, seen = [sheet], 0
-    while stack and seen < 400:          # (bounded: a sheet's tree is small)
-        el = stack.pop(); seen += 1
+    out = _unknown_sheet()
+    named, fields, folders, nested, hide = None, [], set(), False, None
+    queue, seen = deque([sheet]), 0
+    while queue and seen < SAVE_SHEET_MAX:
+        el = queue.popleft(); seen += 1
         role = str(get(el, "AXRole") or "")
         if el is not sheet and role == "AXSheet":
             nested = True
             continue
+        ident = str(get(el, "AXIdentifier") or "")
         if role == "AXTextField":
-            if str(get(el, "AXIdentifier") or "") == "saveAsNameTextField":
+            if ident == SAVE_NAME_ID:
                 named = el
             elif get(el, "AXValueSettable") or get(el, "AXEnabled"):
                 fields.append(el)
+        if role == "AXCheckBox" and ident in HIDE_EXTENSION_IDS:
+            try:
+                v = get(el, "AXValue")
+                hide = None if v is None else bool(int(v))
+            except (TypeError, ValueError):
+                hide = None
         if el is sheet or role == "AXPopUpButton":
             url = get(el, "AXURL")
             r = resolve(url) if url is not None else None
             if r:
                 folders.add(r)
-        stack.extend(get(el, "AXChildren") or [])
-    folder = next(iter(folders)) if len(folders) == 1 else None
-    field = named if named is not None else (fields[0] if len(fields) == 1 else None)
-    if field is None:
-        return None
-    name = get(field, "AXValue")
-    name = str(name) if name is not None else None
-    return {"name": name, "name_focused": bool(get(field, "AXFocused")), "folder": folder,
-            "path": os.path.join(folder, name) if folder and name else None, "nested_sheet": nested}
+        queue.extend(get(el, "AXChildren") or [])
+    whole = not queue
+    field = named if named is not None else (fields[0] if whole and len(fields) == 1 else None)
+    if field is not None:
+        name = get(field, "AXValue")
+        name = str(name) if name is not None else None
+        if name is not None and ("/" in name or not name.strip()):
+            name = None
+        out["name"] = name
+        out["name_focused"] = bool(get(field, "AXFocused"))
+        if name is not None:
+            root, ext = os.path.splitext(name)
+            out["stem"] = root if ext and root else name
+    if whole:
+        out["nested_sheet"] = nested
+        out["folder"] = next(iter(folders)) if len(folders) == 1 else None
+    out["read"] = whole and field is not None
+    name, folder = out["name"], out["folder"]
+    if out["read"] and name and folder and out["stem"] != name and hide is False:
+        out["path"] = os.path.join(folder, name)
+    return out
 
 
 def save_sheet(pid: int, frame: tuple | None, wid=None) -> dict | None:
-    """The save sheet open on the window, if any (read_save_sheet); None when there is none or it cannot be read."""
+    """The save sheet open on the window (read_save_sheet): None when the window was read and has none; when the
+    window or its sheet could not be read, a sheet with every field unknown (fail closed: a floor never takes "could
+    not read" for "no sheet")."""
     try:
         win = _the_window(pid, frame, wid)
-        return read_save_sheet(win) if win is not None else None
+        if win is None:
+            return _unknown_sheet()
+        return read_save_sheet(win)
     except Exception:  # noqa: BLE001
-        return None
+        return _unknown_sheet()
 
 
 def _window_at(win, frame) -> bool:

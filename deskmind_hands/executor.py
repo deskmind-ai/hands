@@ -157,6 +157,18 @@ def running_apps(strict: bool = False) -> list[tuple[str, str]] | None:
         return None if strict else []
 
 
+def app_running(bundle: str) -> bool | None:
+    """Whether an app with `bundle` runs now, read fresh for that one bundle (NSRunningApplication asks LaunchServices
+    each time; NSWorkspace's runningApplications list is not updated in this process, which has no run loop -- an app
+    the user started after its first read was missing from it seconds later: hands#70 review). Hidden and windowless
+    apps run like any. None: not known (the read failed) -- never "not running"."""
+    try:
+        from AppKit import NSRunningApplication
+        return len(NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle) or []) > 0
+    except Exception:  # noqa: BLE001
+        return None
+
+
 _INSTALLED: list[tuple[str, str]] | None = None
 
 
@@ -1255,14 +1267,16 @@ class HandsExecutor:
             self._step_ended(step)
 
     def _open_window_now(self, app: str, url: str | None) -> dict:
-        # one read of the running apps, for both which app this is and whether it was running (K1): hidden and
-        # windowless ones included; a read that failed counts as running -- nothing is launched, and no window this
-        # action brings up is called the task's (fail closed: an app the user had running stays the user's)
+        # which app this is: from the running apps' names and the installed ones. Whether it runs: read fresh for that
+        # bundle (app_running; the list is stale in this process -- hands#70 review), hidden and windowless ones
+        # included; any read saying it runs, or one that failed, counts as running -- nothing is launched, and no
+        # window this action brings up is called the task's (fail closed: an app the user had running stays theirs)
         apps = running_apps(strict=True)
         bundle = resolve_app(app, apps or [], installed_apps())
         if not bundle:
             return {"status": "unsupported", "why": f"no application called {app!r} is running or installed"}
-        was_running = apps is None or bundle in {b for _, b in apps}
+        fresh = app_running(bundle)
+        was_running = fresh is None or fresh or apps is None or bundle in {b for _, b in apps}
         launched: list[dict] = []
         if not was_running:
             # Not running: launched first, on its own. What it brings back then -- the last session's windows, as

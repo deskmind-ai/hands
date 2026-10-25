@@ -60,6 +60,100 @@ class Waits(unittest.TestCase):
             self.assertEqual(r["why"], why, name)
             self.assertIn("waited_s", r, name)
 
+    # -- the loops themselves, with mocks, on every way out (hands#70 review: counted, not grepped)
+
+    class Clock:
+        def __init__(self):
+            self.now = 1000.0
+        def time(self):
+            return self.now
+        def sleep(self, d):
+            self.now += d
+        def __getattr__(self, k):       # (anything else the module takes from time)
+            import time as _t
+            return getattr(_t, k)
+
+    def _driver(self, clock, idle, **over):
+        """A driver whose flash goes the foreground way: `idle` the HID idle seconds, one per read (the last repeats)."""
+        d = PeekabooDriver.__new__(PeekabooDriver)
+        seq = list(idle)
+        def hid():
+            v = seq.pop(0) if len(seq) > 1 else seq[0]
+            if isinstance(v, Exception):
+                raise v
+            return v
+        d.__dict__.update(dict(
+            _background_input=lambda b: False, _wait_until=lambda s: clock.now + self.give_up_in,
+            _too_late=lambda waited: None, _front_bundle=lambda: "com.example.other", _takeover=lambda: False, _hid_idle=hid,
+            _front_taken=lambda b, t: object(), _bring_forward=lambda b, browser: True, _wait_front=lambda b: None,
+            _give_front_back=lambda *a, **k: None, _front_given_back=lambda t: None, _foreground_actions=0))
+        d.__dict__.update(over)
+        return d
+
+    def _run(self, fn, clock):
+        quartz = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"Quartz": quartz}), \
+             mock.patch("deskmind_hands.drivers.peekaboo.time", clock), \
+             mock.patch("deskmind_hands.drivers.peekaboo.release_all", lambda: None), \
+             mock.patch("deskmind_hands.drivers.peekaboo._ascii_input_source", lambda: None), \
+             mock.patch.dict("os.environ", {"HANDS_FLASH_APPS": "com.example.app", "HANDS_FLASH_WAIT_S": "60", "HANDS_BG_STILL_S": "5"}):
+            try:
+                return fn(), None
+            except Exception as exc:  # noqa: BLE001
+                return None, exc
+
+    def test_the_flash_loop_closes_every_wait(self):
+        from deskmind_hands.grounding import STOP
+        busy, still = 0.0, 100.0
+        def boom(*a, **k):
+            raise RuntimeError("boom")
+        # (name, HID idle reads, overrides, give up in, stop after the first wait) -> resumed whys (none: no wait), raised
+        rows = [
+            ("still at once: no wait", [still], {}, 60, False, [], False),
+            ("busy, then still: the step goes on", [busy, still], {}, 60, False, [""], False),
+            ("busy, the app's stop", [busy], {}, 60, True, ["stopped"], False),
+            ("busy, too late for the caller", [busy, busy], {"_too_late": lambda waited: "late" if waited else None}, 60, False, ["timed_out"], False),
+            ("busy past the wait's own end", [busy], {}, 3, False, ["timed_out"], False),
+            ("busy, then the window not raised", [busy, still], {"_bring_forward": lambda b, br: False}, 60, False, ["failed"], False),
+            ("busy, then the front not arrived", [busy, still], {"_wait_front": lambda b: "the app did not come forward"}, 60, False, ["failed"], False),
+            ("busy, then bringing it forward raised", [busy, still], {"_bring_forward": boom}, 60, False, ["failed"], True),
+            ("busy, touched while it came forward, then still", [busy, still, busy, still, still], {}, 60, False, [""], False),
+        ]
+        for name, idle, over, give_up, stop, want, raises in rows:
+            self.told.clear()
+            clock, self.give_up_in = self.Clock(), give_up
+            d = self._driver(clock, idle, **over)
+            if stop:
+                d._announce_wait = (lambda orig: (lambda *a, **k: (STOP.set(), orig(*a, **k))[1]))(d._announce_wait)
+            try:
+                _, exc = self._run(lambda: d._flash("com.example.app", lambda q: "done", "click 保存"), clock)
+            finally:
+                STOP.clear()
+            kinds = [k for k, _ in self.told]
+            self.assertEqual(kinds, (["user_wait"] if want else []) + ["user_resumed"] * len(want), name)
+            self.assertEqual([b["why"] for k, b in self.told if k == "user_resumed"], want, name)
+            self.assertEqual(exc is not None, raises, f"{name}: {exc}")
+            self.assertNotIn("_wait_t0", d.__dict__, name)
+
+    def test_the_still_wait_closes_every_wait(self):
+        from deskmind_hands.grounding import STOP
+        rows = [("still at once", [100.0], 60, False, []), ("busy, then still", [0.0, 100.0], 60, False, [""]),
+                ("busy, the app's stop", [0.0], 60, True, ["stopped"]), ("busy past its end", [0.0], 3, False, ["timed_out"]),
+                ("busy, then reading the idle time raised", [0.0, RuntimeError("io")], 60, False, ["failed"])]
+        for name, idle, give_up, stop, want in rows:
+            self.told.clear()
+            clock, self.give_up_in = self.Clock(), give_up
+            d = self._driver(clock, idle)
+            if stop:
+                d._announce_wait = (lambda orig: (lambda *a, **k: (STOP.set(), orig(*a, **k))[1]))(d._announce_wait)
+            try:
+                self._run(lambda: d._wait_until_still("com.example.app", "type"), clock)
+            finally:
+                STOP.clear()
+            self.assertEqual([b["why"] for k, b in self.told if k == "user_resumed"], want, name)
+            self.assertEqual([k for k, _ in self.told].count("user_wait"), 1 if want else 0, name)
+            self.assertNotIn("_wait_t0", d.__dict__, name)
+
     def test_every_wait_in_the_driver_says_its_numbers_and_every_stop_says_stopped(self):
         src = (REPO / "deskmind_hands/drivers/peekaboo.py").read_text()
         calls = re.findall(r"self\._announce_wait\(waited, bundle, what(.*?)\)\n", src)
@@ -102,16 +196,36 @@ class OpenedWindow(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"AppKit": ok}):
             self.assertEqual(exe.running_apps(strict=True), [("Player", "com.example.player")])
 
+    def test_the_fresh_read(self):
+        # NSWorkspace's list stale (empty), NSRunningApplication's read for the bundle fresh: running
+        app = mock.MagicMock()
+        fake = mock.MagicMock()
+        fake.NSWorkspace.sharedWorkspace.return_value.runningApplications.return_value = []
+        fake.NSRunningApplication.runningApplicationsWithBundleIdentifier_.side_effect = lambda b: [app] if b == "com.example.player" else []
+        with mock.patch.dict(sys.modules, {"AppKit": fake}):
+            self.assertEqual(exe.running_apps(strict=True), [])
+            self.assertIs(exe.app_running("com.example.player"), True)
+            self.assertIs(exe.app_running("com.example.other"), False)
+        broken = mock.MagicMock()
+        broken.NSRunningApplication.runningApplicationsWithBundleIdentifier_.side_effect = RuntimeError("no")
+        with mock.patch.dict(sys.modules, {"AppKit": broken}):
+            self.assertIsNone(exe.app_running("com.example.player"))
+
     def test_was_running_from_the_one_read(self):
-        # (the app's state at the read) -> launched?  -- read failed: as running, nothing launched, no opened_window
-        rows = [("running, a window", [("Player", "com.example.player")], False),
-                ("running hidden / windowless (listed all the same)", [("Player", "com.example.player")], False),
-                ("not running", [], True),
-                ("the read failed", None, False)]
-        for name, apps, launches in rows:
+        # (the list, the fresh read for the bundle) -> launched?  -- any read saying it runs, or one that failed: as
+        # running, nothing launched, no opened_window
+        listed = [("Player", "com.example.player")]
+        rows = [("running, listed and read", listed, True, False),
+                ("running hidden / windowless (read all the same)", listed, True, False),
+                ("started after the list was read (a stale list)", [], True, False),
+                ("not running", [], False, True),
+                ("the list failed", None, False, False),
+                ("the fresh read failed", [], None, False)]
+        for name, apps, fresh, launches in rows:
             e = exe.HandsExecutor.__new__(exe.HandsExecutor)
             # the launch branch reads the windows before it launches; the other goes straight to the app's driver
             with mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda strict=False, apps=apps: apps), \
+                 mock.patch("deskmind_hands.executor.app_running", return_value=fresh), \
                  mock.patch("deskmind_hands.executor.resolve_app", return_value="com.example.player"), \
                  mock.patch("deskmind_hands.executor.installed_apps", return_value=[]), \
                  mock.patch.object(exe.HandsExecutor, "_known_windows", create=True, side_effect=RuntimeError("launch")), \
@@ -150,7 +264,7 @@ class Subroles(unittest.TestCase):
 
 
 class SaveSheets(unittest.TestCase):
-    """(4) where a save sheet would save, from its AX values only."""
+    """(4) where a save sheet would save, from its AX values only; a sheet is always reported, unknown as None."""
 
     @staticmethod
     def node(role, **attrs):
@@ -163,29 +277,53 @@ class SaveSheets(unittest.TestCase):
     def sheet(self, *children):
         return self.node("AXWindow", AXChildren=[self.node("AXSheet", AXChildren=list(children))])
 
+    def want(self, **k):
+        w = {"read": True, "name": None, "stem": None, "name_focused": False, "folder": None, "path": None, "nested_sheet": False}
+        w.update(k)
+        self.assertEqual(set(w), set(axchrome.SAVE_SHEET_KEYS))
+        return w
+
     def test_the_table(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = str(Path(tmp).resolve())
             resolve = lambda u: folder if u == "file://docs" else None   # noqa: E731
-            name = self.node("AXTextField", AXIdentifier="saveAsNameTextField", AXValue="报告.txt", AXFocused=True)
+            def name(v, focused=True):
+                return self.node("AXTextField", AXIdentifier="saveAsNameTextField", AXValue=v, AXFocused=focused)
             where = self.node("AXPopUpButton", AXURL="file://docs")
             sidebar = self.node("AXRow", AXURL="file://elsewhere")
             alert = self.node("AXSheet", AXChildren=[self.node("AXButton")])
+            shown = self.node("AXCheckBox", AXIdentifier=axchrome.HIDE_EXTENSION_IDS[0], AXValue=0)
+            hidden = self.node("AXCheckBox", AXIdentifier=axchrome.HIDE_EXTENSION_IDS[0], AXValue=1)
+            full = str(Path(folder) / "报告.docx")
             rows = [
                 ("no sheet", self.node("AXWindow", AXChildren=[]), None),
-                ("name only", self.sheet(name), {"name": "报告.txt", "name_focused": True, "folder": None, "path": None, "nested_sheet": False}),
-                ("name and folder", self.sheet(name, where, sidebar),
-                 {"name": "报告.txt", "name_focused": True, "folder": folder, "path": str(Path(folder) / "报告.txt"), "nested_sheet": False}),
-                ("a nested sheet", self.sheet(name, where, alert),
-                 {"name": "报告.txt", "name_focused": True, "folder": folder, "path": str(Path(folder) / "报告.txt"), "nested_sheet": True}),
-                ("the name field not focused", self.sheet(dict(name, AXFocused=False), where),
-                 {"name": "报告.txt", "name_focused": False, "folder": folder, "path": str(Path(folder) / "报告.txt"), "nested_sheet": False}),
-                ("no name field", self.sheet(where), None),
-                ("a sidebar's place only: no folder", self.sheet(name, sidebar),
-                 {"name": "报告.txt", "name_focused": True, "folder": None, "path": None, "nested_sheet": False}),
+                ("name only", self.sheet(name("报告.docx")), self.want(name="报告.docx", stem="报告", name_focused=True)),
+                ("name, folder, extension shown", self.sheet(name("报告.docx"), where, shown, sidebar),
+                 self.want(name="报告.docx", stem="报告", name_focused=True, folder=folder, path=full)),
+                ("the extension hidden: no path, the stem", self.sheet(name("报告"), where, hidden),
+                 self.want(name="报告", stem="报告", name_focused=True, folder=folder)),
+                ("the box not read: no path", self.sheet(name("报告.docx"), where),
+                 self.want(name="报告.docx", stem="报告", name_focused=True, folder=folder)),
+                ("no extension, the box unchecked: no path", self.sheet(name("报告"), where, shown),
+                 self.want(name="报告", stem="报告", name_focused=True, folder=folder)),
+                ("a name with /: no name", self.sheet(name("a/b.txt"), where, shown), self.want(name_focused=True, folder=folder)),
+                ("a nested sheet", self.sheet(name("报告.docx"), where, shown, alert),
+                 self.want(name="报告.docx", stem="报告", name_focused=True, folder=folder, path=full, nested_sheet=True)),
+                ("not focused", self.sheet(name("报告.docx", False), where, shown),
+                 self.want(name="报告.docx", stem="报告", folder=folder, path=full)),
+                ("a sheet with no name field: reported, unknown", self.sheet(where), self.want(read=False, name_focused=None, folder=folder)),
+                ("a sidebar's place only: no folder", self.sheet(name("报告.docx"), sidebar, shown),
+                 self.want(name="报告.docx", stem="报告", name_focused=True)),
             ]
             for label, win, want in rows:
                 self.assertEqual(axchrome.read_save_sheet(win, get=self.get, resolve=resolve), want, label)
+
+    def test_a_sheet_too_big_to_read_whole(self):
+        # the name field near the top is still read (breadth first); folder, nested and path unknown
+        filler = [self.node("AXGroup", AXChildren=[self.node("AXStaticText") for _ in range(50)]) for _ in range(100)]
+        name = self.node("AXTextField", AXIdentifier="saveAsNameTextField", AXValue="a.txt")
+        got = axchrome.read_save_sheet(self.sheet(name, self.node("AXPopUpButton", AXURL="u"), *filler), get=self.get, resolve=lambda u: "/tmp")
+        self.assertEqual((got["read"], got["name"], got["folder"], got["path"], got["nested_sheet"]), (False, "a.txt", None, None, None))
 
     def test_two_folders_read_is_no_folder(self):
         name = self.node("AXTextField", AXIdentifier="saveAsNameTextField", AXValue="a.txt")
@@ -199,7 +337,15 @@ class SaveSheets(unittest.TestCase):
         got = axchrome.read_save_sheet(self.sheet(f), get=self.get, resolve=lambda u: None)
         self.assertEqual(got["name"], "x.txt")
         two = self.sheet(f, self.node("AXTextField", AXValueSettable=True, AXValue="y"))
-        self.assertIsNone(axchrome.read_save_sheet(two, get=self.get, resolve=lambda u: None), "two fields, no identifier: no guess")
+        got = axchrome.read_save_sheet(two, get=self.get, resolve=lambda u: None)
+        self.assertEqual((got["read"], got["name"]), (False, None), "two fields, no identifier: no guess, still a sheet")
+
+    def test_could_not_read_is_not_no_sheet(self):
+        with mock.patch.object(axchrome, "_the_window", side_effect=RuntimeError("AX")):
+            self.assertEqual(axchrome.save_sheet(1, (0, 0, 1, 1)), axchrome._unknown_sheet())
+        with mock.patch.object(axchrome, "_the_window", return_value=None):
+            self.assertEqual(axchrome.save_sheet(1, (0, 0, 1, 1))["read"], False)
+        self.assertEqual(set(axchrome._unknown_sheet()), set(axchrome.SAVE_SHEET_KEYS))
 
 
 if __name__ == "__main__":

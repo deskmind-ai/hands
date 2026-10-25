@@ -13,6 +13,11 @@ from unittest import mock
 from deskmind_hands.inputwatch import InputWatch
 
 
+
+def _listed(bundle):
+    """The fresh per-bundle read (executor.app_running), as the test's running_apps stub lists it (K1)."""
+    return bundle in {b for _, b in (sys.modules["deskmind_hands.executor"].running_apps(strict=True) or [])}
+
 def stable_pids(case: unittest.TestCase, *pids: int) -> None:
     """The made-up `pids` a test injects into a watch's caches: processes whose start time does not change
     (InputWatch._check_pid forgets a pid whose start time is unreadable or changed); every other pid as the system
@@ -965,6 +970,7 @@ class FlashesTold(_EpochCase):
         ex._settled = mock.Mock(side_effect=RuntimeError("stop here"))   # noqa: SLF001
         with mock.patch.object(exe, "resolve_app", return_value=NE), \
              mock.patch.object(exe, "running_apps", return_value=[]), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch.object(exe, "installed_apps", return_value=[]), \
              mock.patch.object(exe.subprocess, "run"):
             with self.assertRaises(RuntimeError):
@@ -1172,6 +1178,7 @@ class FlashesToldBeforeTheFront(_EpochCase):
         ex._settled = mock.Mock(side_effect=RuntimeError("stop here"))   # noqa: SLF001
         with mock.patch.object(exe, "resolve_app", return_value=NE), \
              mock.patch.object(exe, "running_apps", return_value=[]), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch.object(exe, "installed_apps", return_value=[]), \
              mock.patch.object(exe.subprocess, "run"):
             with self.assertRaises(RuntimeError):
@@ -1194,6 +1201,7 @@ class StepsClose(_KeysCase):
         ex._front_bundle_id = lambda: "com.googlecode.iterm2"   # noqa: SLF001
         with mock.patch.object(exe, "resolve_app", return_value=NE), \
              mock.patch.object(exe, "running_apps", return_value=[]), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch.object(exe, "installed_apps", return_value=[]), \
              mock.patch.object(exe.subprocess, "run", side_effect=subprocess.TimeoutExpired("open", 20)):
             with self.assertRaises(subprocess.TimeoutExpired):
@@ -1522,6 +1530,7 @@ class MainIsTheFloor(_EpochCase):
         ex._settled = mock.Mock(side_effect=RuntimeError("stop here"))   # noqa: SLF001
         with mock.patch.object(exe, "resolve_app", return_value=NE), \
              mock.patch.object(exe, "running_apps", return_value=[]), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch.object(exe, "installed_apps", return_value=[]), \
              mock.patch.object(exe.subprocess, "run"):
             try:
@@ -2160,6 +2169,7 @@ class InFlightAndTheMark(_EpochCase):
         ex._fresh_windows = lambda before, wait, bundle: []                     # noqa: SLF001
         with mock.patch.object(exe, "resolve_app", return_value=TE), \
              mock.patch.object(exe, "running_apps", return_value=[("TextEdit", TE)]), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch.object(exe, "installed_apps", return_value=[]), \
              mock.patch.object(exe, "is_browser", return_value=False), \
              mock.patch.object(exe.subprocess, "run", side_effect=run):

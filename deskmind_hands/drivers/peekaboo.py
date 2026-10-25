@@ -27,6 +27,7 @@ binding, so actions pin to it rather than to coordinates wherever possible.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -3060,6 +3061,11 @@ class PeekabooDriver:
         return NothingSent("the caller's deadline came before the step could act; nothing was done")
 
     def _flash(self, bundle: str, perform, what: str = "") -> tuple[bool, str]:
+        """_flash_now, its wait closed on every way out (_closing_wait)."""
+        with self._closing_wait():
+            return self._flash_now(bundle, perform, what)
+
+    def _flash_now(self, bundle: str, perform, what: str = "") -> tuple[bool, str]:
         """Bring `bundle` forward for as long as `perform()` takes, then give the user's app the front back.
 
         For apps that ignore every background input (the chat app, the music app: AX, PostToPid and SkyLight
@@ -3390,6 +3396,11 @@ class PeekabooDriver:
         return self._settle(ok, f"{detail} in {self._labels_by_id.get(eid, eid)!r} (in the background)")
 
     def _wait_until_still(self, bundle: str, what: str = "") -> str | None:
+        """_still_now, its wait closed on every way out (_closing_wait)."""
+        with self._closing_wait():
+            return self._still_now(bundle, what)
+
+    def _still_now(self, bundle: str, what: str = "") -> str | None:
         """Wait (up to HANDS_FLASH_WAIT_S, and never past the caller's _act_by) until the user has not touched the
         keyboard or mouse for a moment, saying so as the flash does; None when it is fine to go on, else why not. No
         wait while the user has handed the screen over (_takeover)."""
@@ -4082,6 +4093,18 @@ class PeekabooDriver:
             tell_wait("user_wait", body)
         return True
 
+    @contextlib.contextmanager
+    def _closing_wait(self):
+        """Every user_wait said inside has its user_resumed by the end, whatever way the waiter left (hands#70 review:
+        a return after the wait -- the window not raised, the front not arrived, the run's window not in front -- or
+        an exception left the wait open): one still open then ends with why "failed" (the wait is over, the step did
+        not go on), said once. Owned by the open wait itself (_wait_t0, set by _announce_wait, taken by _resumed)."""
+        try:
+            yield
+        finally:
+            if "_wait_t0" in self.__dict__:
+                self._resumed("failed")
+
     def _add_wait(self, seconds: float) -> None:
         global WAITED_S
         self.user_wait_s = getattr(self, "user_wait_s", 0.0) + seconds
@@ -4091,7 +4114,8 @@ class PeekabooDriver:
         """The wait is over: said on stdout, and its length added to user_wait_s -- time the run spent on the user, not
         on the task, which the run's wall clock does not count. Counted, it ran gym tasks out of time while the user
         worked at the Mac: 3 of 9 expense runs ended "wall clock 385 s > 360 s" after a few steps (10-01).
-        `why`: how it ended -- "" the step goes on, "stopped" the app's stop, "timed_out" it gave up (K1, for H4). Every
+        `why`: how it ended -- "" the step goes on, "stopped" the app's stop, "timed_out" it gave up, "failed" the waiter
+        left another way, the step not going on (_closing_wait) (K1, for H4). Every
         user_wait has exactly one of these after it."""
         t0 = self.__dict__.pop("_wait_t0", None)
         if t0 is not None:

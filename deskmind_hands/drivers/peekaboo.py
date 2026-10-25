@@ -3232,11 +3232,14 @@ class PeekabooDriver:
                         # the run's own window is not the one in front (the user's came up): nothing is sent into it
                         return False, NothingSent(f"the run's own {bundle} window could not be put in front; "
                                                   f"nothing was done")
-                    if waited:
-                        self._resumed()
+                    # how the wait ends, decided first and then said with it (hands#70 Codex review at b7ec190)
                     if STOP.is_set():
+                        if waited:
+                            self._resumed("stopped")
                         return False, NothingSent("stopped by the app; nothing was done")
                     late = self._too_late(waited)     # bringing it forward took the last of the caller's time
+                    if waited:
+                        self._resumed("timed_out" if late else "")
                     if late:
                         return False, NothingSent(late)
                     self._foreground_actions += 1
@@ -3421,13 +3424,17 @@ class PeekabooDriver:
             # (a background step: the Mac must be still, the app is not brought forward)
             waited = self._announce_wait(waited, bundle, what, quiet_s=still, needs_front=False, gives_up_at=deadline)
             time.sleep(0.5)
-        if waited:
-            self._resumed()
+        # how the wait ends is decided first, then said with it (hands#70 Codex review at b7ec190: the event agrees
+        # with what is returned): the app's stop, too late for the caller (still now, but after its deadline less the
+        # margin -- the idle check comes first in the loop), else the step goes on
         if STOP.is_set():
+            if waited:
+                self._resumed("stopped")
             return NothingSent("stopped by the app; nothing was done")
-        # still now, but after the caller's deadline less the margin (the idle check comes first in the loop): too
-        # late to act for it
-        return self._too_late(waited)
+        late = self._too_late(waited)
+        if waited:
+            self._resumed("timed_out" if late else "")
+        return late
 
     def _background_quartz(self, bundle: str, observed_only: bool = False):
         """A Quartz stand-in that delivers to `bundle`'s window (the pinned one, else its largest -- with

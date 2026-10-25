@@ -169,6 +169,17 @@ def app_running(bundle: str) -> bool | None:
         return None
 
 
+def app_liveness(fresh: bool | None, apps: list[tuple[str, str]] | None, bundle: str) -> str:
+    """"running", "not_running" or "unknown", from the fresh read for the bundle and the (stale) list: running when
+    either says it runs; not running only when the fresh read says no and the list was read and does not name it."""
+    listed = apps is not None and bundle in {b for _, b in apps}
+    if fresh is True or listed:
+        return "running"
+    if fresh is False and apps is not None:
+        return "not_running"
+    return "unknown"
+
+
 _INSTALLED: list[tuple[str, str]] | None = None
 
 
@@ -1267,18 +1278,19 @@ class HandsExecutor:
             self._step_ended(step)
 
     def _open_window_now(self, app: str, url: str | None) -> dict:
-        # which app this is: from the running apps' names and the installed ones. Whether it runs: read fresh for that
-        # bundle (app_running; the list is stale in this process -- hands#70 review), hidden and windowless ones
-        # included; any read saying it runs, or one that failed, counts as running -- nothing is launched, and no
-        # window this action brings up is called the task's (fail closed: an app the user had running stays theirs)
+        # which app this is: from the running apps' names and the installed ones. Whether it runs, in three states
+        # (hands#70 Codex review at b7ec190: unknown is never the permissive value): running -- the fresh read for the
+        # bundle (app_running; the list is stale in this process) or the list says so, hidden and windowless ones
+        # included; not running -- the fresh read says no and the list was read and does not name it; else unknown.
+        # Only "not running" launches it (and may report opened_window); only "running" lets a window that appeared
+        # be the task's (new_window). Unknown does neither: nothing launched, nothing claimed.
         apps = running_apps(strict=True)
         bundle = resolve_app(app, apps or [], installed_apps())
         if not bundle:
             return {"status": "unsupported", "why": f"no application called {app!r} is running or installed"}
-        fresh = app_running(bundle)
-        was_running = fresh is None or fresh or apps is None or bundle in {b for _, b in apps}
+        liveness = app_liveness(app_running(bundle), apps, bundle)
         launched: list[dict] = []
-        if not was_running:
+        if liveness == "not_running":
             # Not running: launched first, on its own. What it brings back then -- the last session's windows, as
             # Safari and TextEdit do -- is the user's, not a window this action made (PR #48 review, third round).
             # An app slow to start (a music player took longer than the 8 s this waited, 10-20) is waited for up to
@@ -1369,7 +1381,7 @@ class HandsExecutor:
         if not fresh:
             return {"status": "unverified", "why": f"{app} ({bundle}) was asked to open a window; none appeared"}
         w = fresh[-1]
-        owned = bool(proof) or (was_running and self._split(w["id"])[1] not in {self._split(b)[1] for b in before})
+        owned = bool(proof) or (liveness == "running" and self._split(w["id"])[1] not in {self._split(b)[1] for b in before})
         if not owned:
             return {"status": "ok", "window": w["id"],
                     "why": f"a window of {app} is there, but it may be one the app brought back when it launched, not one this action made"}

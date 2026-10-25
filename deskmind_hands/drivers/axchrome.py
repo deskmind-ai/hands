@@ -24,6 +24,25 @@ def _get(el, attr):
     return v if err == 0 else None
 
 
+class AXReadError(Exception):
+    """An accessibility read that failed -- not one that found no value (hands#70 Codex review at b7ec190)."""
+
+
+#: AX errors that mean the element has no such value: the attribute is unsupported, or it is empty.
+_NO_VALUE = (-25205, -25212)   # kAXErrorAttributeUnsupported, kAXErrorNoValue
+
+
+def _get_strict(el, attr):
+    """An attribute's value; None when the element has none; AXReadError when the read itself failed."""
+    from ApplicationServices import AXUIElementCopyAttributeValue
+    err, v = AXUIElementCopyAttributeValue(el, attr, None)
+    if err == 0:
+        return v
+    if err in _NO_VALUE:
+        return None
+    raise AXReadError(f"{attr}: AX error {err}")
+
+
 def _frame(el) -> tuple[float, float, float, float] | None:
     from ApplicationServices import AXValueGetValue, kAXValueCGPointType, kAXValueCGSizeType
     pos, size = _get(el, "AXPosition"), _get(el, "AXSize")
@@ -135,10 +154,18 @@ def read_save_sheet(win, get=None, resolve=None) -> dict | None:
         unchecked -- else None (报告 shown may save as 报告.docx: the stem says it);
       nested_sheet: a sheet open inside it (an alert -- an overwrite, an invalid name, no permission: told apart by
         nothing here); None when not read whole.
-    `get(el, attr)` and `resolve(url) -> str | None` are injectable (tests)."""
+    Every read is checked: one that failed (AXReadError from `get`), however deep, makes the sheet unknown (read
+    false, every fact None) -- never "no sheet", never a fact read past a gap. None needs the window's children read.
+    `get(el, attr)` (None: no value; raises: the read failed) and `resolve(url) -> str | None` are injectable (tests)."""
+    try:
+        return _read_save_sheet(win, get or _get_strict, resolve)
+    except AXReadError:
+        return _unknown_sheet()
+
+
+def _read_save_sheet(win, get, resolve) -> dict | None:
     import os
     from collections import deque
-    get = get or _get
     def default_resolve(u):
         try:
             p = u.path() if hasattr(u, "path") else str(u)
@@ -150,9 +177,10 @@ def read_save_sheet(win, get=None, resolve=None) -> dict | None:
         except Exception:  # noqa: BLE001
             return None
     resolve = resolve or default_resolve
-    sheet = next((c for c in (get(win, "AXChildren") or []) if str(get(c, "AXRole") or "") == "AXSheet"), None)
+    kids = get(win, "AXChildren")
+    sheet = next((c for c in (kids or []) if str(get(c, "AXRole") or "") == "AXSheet"), None)
     if sheet is None:
-        return None
+        return None          # (the window's children read, none a sheet: the one way to "no sheet")
     out = _unknown_sheet()
     named, fields, folders, nested, hide = None, [], set(), False, None
     queue, seen = deque([sheet]), 0

@@ -72,6 +72,99 @@ def focused_identifier(pid: int, frame: tuple | None = None, wid=None) -> str | 
     return _get(el, "AXIdentifier")
 
 
+#: The buttons a window's frame carries, as accessibility names them on the window itself (AXWindow's attributes).
+WINDOW_BUTTONS = ("AXCloseButton", "AXMinimizeButton", "AXZoomButton", "AXFullScreenButton")
+
+
+def window_buttons(pid: int, frame: tuple | None, wid=None) -> list[tuple[str, tuple[float, float, float, float]]]:
+    """[(AX subrole, frame on screen)] of the window's own buttons (close, minimise, zoom, full screen), read from the
+    window's attributes and each button's AXSubrole -- [] when the window or a button cannot be read (K1)."""
+    try:
+        win = _the_window(pid, frame, wid)
+        if win is None:
+            return []
+        out = []
+        for attr in WINDOW_BUTTONS:
+            b = _get(win, attr)
+            f = _frame(b) if b is not None else None
+            sub = str(_get(b, "AXSubrole") or "") if b is not None else ""
+            if f and sub:
+                out.append((sub, f))
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def subrole_at(rect: tuple[float, float, float, float], buttons: list[tuple[str, tuple]], tol: float = 1.5) -> str:
+    """The subrole of the window button whose frame is `rect` (on screen, within `tol` points each side), else ""."""
+    for sub, (x, y, w, h) in buttons:
+        if abs(rect[0] - x) <= tol and abs(rect[1] - y) <= tol and abs(rect[2] - w) <= tol and abs(rect[3] - h) <= tol:
+            return sub
+    return ""
+
+
+def read_save_sheet(win, get=None, resolve=None) -> dict | None:
+    """The save sheet open on `win`, from its accessibility values alone (K1) -- never from the words on it:
+    {name: the name field's value, name_focused, folder: the folder it saves in -- only from a file AXURL on the location
+    pop-up or the sheet itself that resolves to a directory on disk, and only when exactly one such folder is read (the
+    sidebar's places carry URLs too: never taken), else None --, path: folder/name only when both were read, nested_sheet: a sheet open inside it
+    (an alert -- an overwrite, an invalid name, no permission: told apart by nothing here)}. None: no sheet with a name
+    field. The name field: the save panel's (AXIdentifier saveAsNameTextField), else the sheet's one settable text field.
+    `get(el, attr)` and `resolve(url) -> str | None` are injectable (tests)."""
+    import os
+    get = get or _get
+    def default_resolve(u):
+        try:
+            p = u.path() if hasattr(u, "path") else str(u)
+            if str(u).startswith("file://") and not hasattr(u, "path"):
+                from urllib.parse import unquote, urlparse
+                p = unquote(urlparse(str(u)).path)
+            r = os.path.realpath(p)
+            return r if os.path.isdir(r) else None
+        except Exception:  # noqa: BLE001
+            return None
+    resolve = resolve or default_resolve
+    sheet = next((c for c in (get(win, "AXChildren") or []) if str(get(c, "AXRole") or "") == "AXSheet"), None)
+    if sheet is None:
+        return None
+    named, fields, folders, nested = None, [], set(), False
+    stack, seen = [sheet], 0
+    while stack and seen < 400:          # (bounded: a sheet's tree is small)
+        el = stack.pop(); seen += 1
+        role = str(get(el, "AXRole") or "")
+        if el is not sheet and role == "AXSheet":
+            nested = True
+            continue
+        if role == "AXTextField":
+            if str(get(el, "AXIdentifier") or "") == "saveAsNameTextField":
+                named = el
+            elif get(el, "AXValueSettable") or get(el, "AXEnabled"):
+                fields.append(el)
+        if el is sheet or role == "AXPopUpButton":
+            url = get(el, "AXURL")
+            r = resolve(url) if url is not None else None
+            if r:
+                folders.add(r)
+        stack.extend(get(el, "AXChildren") or [])
+    folder = next(iter(folders)) if len(folders) == 1 else None
+    field = named if named is not None else (fields[0] if len(fields) == 1 else None)
+    if field is None:
+        return None
+    name = get(field, "AXValue")
+    name = str(name) if name is not None else None
+    return {"name": name, "name_focused": bool(get(field, "AXFocused")), "folder": folder,
+            "path": os.path.join(folder, name) if folder and name else None, "nested_sheet": nested}
+
+
+def save_sheet(pid: int, frame: tuple | None, wid=None) -> dict | None:
+    """The save sheet open on the window, if any (read_save_sheet); None when there is none or it cannot be read."""
+    try:
+        win = _the_window(pid, frame, wid)
+        return read_save_sheet(win) if win is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _window_at(win, frame) -> bool:
     f = _frame(win)
     return bool(f) and all(abs(a - b) <= 2 for a, b in zip(f, frame))

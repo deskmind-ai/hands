@@ -1217,7 +1217,7 @@ class OpenWindow(unittest.TestCase):
                     return SimpleNamespace(returncode=0, stdout=f"{state['n']}\n")
                 return SimpleNamespace(returncode=1, stdout="")
             return SimpleNamespace(returncode=0, stdout="")
-        running_apps = lambda: [("文本编辑", TE)] if state["running"] else []   # noqa: E731
+        running_apps = lambda strict=False: [("文本编辑", TE)] if state["running"] else []   # noqa: E731
         return state, run, running_apps
 
     def _open(self, ex, run, running):
@@ -1278,7 +1278,7 @@ class OpenWindow(unittest.TestCase):
         state, run, running = self._mac(ex, running=False, restored=[_win("700", bundle=player, title="Player", app="Player")],
                                          answers=False, documents={})
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
-             mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda: [("Player", player)] if state["running"] else []), \
+             mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda strict=False: [("Player", player)] if state["running"] else []), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=player), \
              mock.patch("deskmind_hands.executor.is_browser", return_value=False), \
              mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": ""}), \
@@ -1297,7 +1297,7 @@ class OpenWindow(unittest.TestCase):
         state, run, running = self._mac(ex, running=False, restored=[_win("701", bundle="com.example.web", title="Tabs", app="Web")],
                                          answers=False, documents={})
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
-             mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda: [("Web", "com.example.web")] if state["running"] else []), \
+             mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda strict=False: [("Web", "com.example.web")] if state["running"] else []), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value="com.example.web"), \
              mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
              mock.patch("deskmind_hands.executor.time.sleep"):

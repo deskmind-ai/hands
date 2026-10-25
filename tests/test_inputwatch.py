@@ -1076,7 +1076,7 @@ class FlashesToldBeforeTheFront(_EpochCase):
         d._takeover = lambda: False
         idle = iter([100.0, -1.0, 100.0, 100.0])           # still; touched since the check; still again
         d._hid_idle = lambda: next(idle, 100.0)
-        d._announce_wait = lambda waited, bundle, what: True
+        d._announce_wait = lambda waited, bundle, what, **kw: True
         ok, why = self._run_flash(d, NE, lambda Q: "typed")
         self.assertTrue(ok, why)
         turns = [f for f in self.iw.FLASHES if f[0] == NE.lower()]
@@ -1393,7 +1393,7 @@ class MainIsTheFloor(_EpochCase):
         d._hid_idle = lambda: 100.0
         d._osa = lambda script: (True, "")
         d._takeover = lambda: True
-        d._resumed = lambda: None
+        d._resumed = lambda *a, **k: None
         d._background_input = lambda bundle: False
         d.BROWSERS = set()
         d._browser_front_sid = lambda bundle: None

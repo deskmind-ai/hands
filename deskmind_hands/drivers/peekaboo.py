@@ -3143,14 +3143,14 @@ class PeekabooDriver:
             # the flash went ahead a second later (hands #54 review).
             if STOP.is_set():
                 if waited:
-                    self._resumed()
+                    self._resumed("stopped")
                 return False, NothingSent("stopped by the app; nothing was done")
             # Past the caller's deadline nothing is brought forward or sent, still Mac or not: the caller has given up
             # on this step (or is about to), and an effect it never hears of is one it may do again.
             late = self._too_late(waited)
             if late:
                 if waited:
-                    self._resumed()
+                    self._resumed("timed_out")
                 return False, NothingSent(late)
             prev = self._front_bundle()
             if browser and prev.lower() == bundle.lower() and not self._takeover():
@@ -3159,10 +3159,11 @@ class PeekabooDriver:
                 # place in the stack is put back after, as for any browser flash)
                 if time.time() > deadline:
                     if waited:
-                        self._resumed()
+                        self._resumed("timed_out")
                     return False, NothingSent((self._too_late(True)
                                    or f"{USER_BUSY} (in {bundle}); the step was not carried out -- wait"))
-                waited = self._announce_wait(waited, bundle, what)
+                # (the user is in this browser: the wait is for them to leave it, not for a still Mac)
+                waited = self._announce_wait(waited, bundle, what, quiet_s=None, needs_front=True, gives_up_at=deadline)
                 time.sleep(1)
                 continue
             watching = prev.lower() in spectator or prev.lower() == bundle.lower()
@@ -3251,14 +3252,14 @@ class PeekabooDriver:
                     finally:
                         self._front_given_back(token)   # ended even if the pointer could not be put back
                     if retry:
-                        waited = self._announce_wait(waited, bundle, what)
                         still = min(still * 2, 30.0)
+                        waited = self._announce_wait(waited, bundle, what, quiet_s=still, needs_front=True, gives_up_at=deadline)
                 return True, f"{detail} ({bundle} in front {time.time() - t0:.1f}s, then {prev} again)"
             if time.time() > deadline:
                 if waited:
-                    self._resumed()
+                    self._resumed("timed_out")
                 return False, NothingSent(self._too_late(True) or f"{USER_BUSY}; the step was not carried out -- wait")
-            waited = self._announce_wait(waited, bundle, what)
+            waited = self._announce_wait(waited, bundle, what, quiet_s=(1.0 if watching else still), needs_front=True, gives_up_at=deadline)
             time.sleep(1)
 
     #: Apps whose screenshot-placed clicks and pastes (_flash, _vision_act) go in the background rather than in the
@@ -3400,13 +3401,14 @@ class PeekabooDriver:
         while self._hid_idle() < still:
             if STOP.is_set():
                 if waited:
-                    self._resumed()
+                    self._resumed("stopped")
                 return NothingSent("stopped by the app; nothing was done")
             if time.time() > deadline:
                 if waited:
-                    self._resumed()
+                    self._resumed("timed_out")
                 return self._too_late(True) or NothingSent(f"{USER_BUSY}; the step was not carried out -- wait")
-            waited = self._announce_wait(waited, bundle, what)
+            # (a background step: the Mac must be still, the app is not brought forward)
+            waited = self._announce_wait(waited, bundle, what, quiet_s=still, needs_front=False, gives_up_at=deadline)
             time.sleep(0.5)
         if waited:
             self._resumed()
@@ -4061,12 +4063,23 @@ class PeekabooDriver:
         return ExecResult(True, indeterminate=True,
                           detail=f"{done}; nothing read back shows its effect -- observe before pressing it again{note}")
 
-    def _announce_wait(self, already: bool, bundle: str = "", what: str = "") -> bool:
+    def _announce_wait(self, already: bool, bundle: str = "", what: str = "", *, quiet_s: float | None = None,
+                       needs_front: bool = True, gives_up_at: float | None = None) -> bool:
         """Say once that the step is waiting for the user, and what it will do: a paused run that did not say what
-        it was about to do read as frozen. The wait is timed from here (see _resumed)."""
+        it was about to do read as frozen. The wait is timed from here (see _resumed). With it, the wait's own facts --
+        the waiter's, from the numbers its loop tests (K1, for harness H4): `quiet_s` how long the Mac must be still
+        (None: the wait is for the user to leave the app, not for stillness), `needs_front` whether the step comes to
+        the front, `gives_up_at` when it gives up (epoch seconds), `started_at` when it began. Said once per wait, with
+        the numbers it began with: every user_wait has exactly one user_resumed after it."""
         if not already:
             self._wait_t0 = time.time()
-            tell_wait("user_wait", {"reason": "user_active", "app": bundle, "what": what})
+            body = {"reason": "user_active", "app": bundle, "what": what, "needs_front": needs_front,
+                    "started_at": round(float(self._wait_t0), 3)}
+            if quiet_s is not None:
+                body["quiet_s"] = round(float(quiet_s), 3)
+            if gives_up_at is not None:
+                body["gives_up_at"] = round(float(gives_up_at), 3)
+            tell_wait("user_wait", body)
         return True
 
     def _add_wait(self, seconds: float) -> None:
@@ -4074,14 +4087,18 @@ class PeekabooDriver:
         self.user_wait_s = getattr(self, "user_wait_s", 0.0) + seconds
         WAITED_S = self.user_wait_s
 
-    def _resumed(self) -> None:
+    def _resumed(self, why: str = "") -> None:
         """The wait is over: said on stdout, and its length added to user_wait_s -- time the run spent on the user, not
         on the task, which the run's wall clock does not count. Counted, it ran gym tasks out of time while the user
-        worked at the Mac: 3 of 9 expense runs ended "wall clock 385 s > 360 s" after a few steps (10-01)."""
+        worked at the Mac: 3 of 9 expense runs ended "wall clock 385 s > 360 s" after a few steps (10-01).
+        `why`: how it ended -- "" the step goes on, "stopped" the app's stop, "timed_out" it gave up (K1, for H4). Every
+        user_wait has exactly one of these after it."""
         t0 = self.__dict__.pop("_wait_t0", None)
         if t0 is not None:
             self._add_wait(time.time() - t0)
-        tell_wait("user_resumed", {"waited_s": round(time.time() - t0, 1)} if t0 is not None else {})
+        body = {"waited_s": round(time.time() - t0, 1)} if t0 is not None else {}
+        body["why"] = why
+        tell_wait("user_resumed", body)
 
     def _in_own_browser_window(self, bundle: str) -> bool:
         """Whether the window this step acts in is the run's own browser window (opened by the run, _run_windows)."""

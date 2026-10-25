@@ -35,8 +35,11 @@ at most until the margin. An observe's pop-ups share the one deadline and the ch
 a look read within OBSERVE_MARGIN_S of its deadline is not started. Without `deadline_ms`, HANDS_FLASH_WAIT_S alone bounds the waits, as before.
 
 While a request waits for the user, event lines go out beside the replies (they have no `id`):
-`{"event": "user_wait", "req": <request id>, "reason": "user_active", "app", "what"}`, then
-`{"event": "user_resumed", "req": <request id>, "waited_s"}` -- the CLI prints `HANDS_WAIT` / `HANDS_RESUME` instead.
+`{"event": "user_wait", "req": <request id>, "reason": "user_active", "app", "what", "needs_front", "started_at", "quiet_s"?, "gives_up_at"?}`
+(the waiter's own numbers: the stillness it needs -- absent when it waits for the user to leave the app --, whether the
+step comes to the front, when it began and when it gives up; once per wait), then
+`{"event": "user_resumed", "req": <request id>, "waited_s", "why"}` (why: "" goes on, "stopped", "timed_out"; exactly one
+after each wait) -- the CLI prints `HANDS_WAIT` / `HANDS_RESUME` instead.
 
 Ownership, consequence classes, consent and the guard live in harness (`src/executor/`); nothing here judges. The
 window inventory comes from Quartz (fast, every app at once); seeing and acting inside a window go through the
@@ -117,8 +120,31 @@ def resolve_app(name: str, running: list[tuple[str, str]], installed: list[tuple
     return ""
 
 
-def running_apps() -> list[tuple[str, str]]:
-    """(localized name, bundle id) of every running app, as the snapshot names them."""
+def element_subrole(e, frame, buttons) -> str:
+    """An element's AX subrole: its own when the driver read one, else the window button's whose frame it is on (its
+    rect is local to the window, `frame` the window's on screen); "" otherwise -- never a guess (K1)."""
+    if getattr(e, "ax_subrole", ""):
+        return e.ax_subrole
+    if not buttons or not frame or e.rect is None or getattr(e, "source", "ax") == "pixels":
+        return ""
+    from .drivers.axchrome import subrole_at
+    return subrole_at((frame[0] + e.rect.x, frame[1] + e.rect.y, e.rect.w, e.rect.h), buttons)
+
+
+#: The fields of an `opened_window`, exactly (fixtures/contracts/opened_window.json: harness tests against the same set).
+OPENED_WINDOW_KEYS = ("id", "app", "app_name", "bundle", "title", "was_running")
+
+
+def opened_window(w: dict, bundle: str) -> dict:
+    """The window a launch of `bundle` (not running before it, by this launch's own read) brought up."""
+    return {"id": w["id"], "app": w["app"], "app_name": w["app"] or app_display_name(w.get("bundle") or bundle),
+            "bundle": w.get("bundle") or bundle, "title": w["title"], "was_running": False}
+
+
+def running_apps(strict: bool = False) -> list[tuple[str, str]] | None:
+    """(localized name, bundle id) of every running app, as the snapshot names them -- hidden and windowless ones
+    included (NSWorkspace lists every application process). A failed read is [], or with `strict` None: a caller that
+    decides from it whether an app was running must not take a failed read for "not running" (K1)."""
     try:
         from AppKit import NSWorkspace
         out = []
@@ -128,7 +154,30 @@ def running_apps() -> list[tuple[str, str]]:
                 out.append((str(a.localizedName() or ""), str(b)))
         return out
     except Exception:  # noqa: BLE001
-        return []
+        return None if strict else []
+
+
+def app_running(bundle: str) -> bool | None:
+    """Whether an app with `bundle` runs now, read fresh for that one bundle (NSRunningApplication asks LaunchServices
+    each time; NSWorkspace's runningApplications list is not updated in this process, which has no run loop -- an app
+    the user started after its first read was missing from it seconds later: hands#70 review). Hidden and windowless
+    apps run like any. None: not known (the read failed) -- never "not running"."""
+    try:
+        from AppKit import NSRunningApplication
+        return len(NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle) or []) > 0
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def app_liveness(fresh: bool | None, apps: list[tuple[str, str]] | None, bundle: str) -> str:
+    """"running", "not_running" or "unknown", from the fresh read for the bundle and the (stale) list: running when
+    either says it runs; not running only when the fresh read says no and the list was read and does not name it."""
+    listed = apps is not None and bundle in {b for _, b in apps}
+    if fresh is True or listed:
+        return "running"
+    if fresh is False and apps is not None:
+        return "not_running"
+    return "unknown"
 
 
 _INSTALLED: list[tuple[str, str]] | None = None
@@ -622,6 +671,9 @@ class HandsExecutor:
         # every window this task has been shown: one of them coming back later is not a window an action made
         self.__dict__.setdefault("_listed", set()).update(w["id"] for w in wins)
         return {"epoch": self.epoch, "locked": self.locked(), "front_app": front, "user_active": self.user_active(),
+                # how long the Mac must have been still for user_active to read false (K1: the executor's own number;
+                # a step's wait says its own, with the event that announces it)
+                "user_quiet_s": self.USER_ACTIVE_S,
                 "input_watch": ("keys" if self._watch.keys_trusted else "mouse") if self._watch is not None and self._watch.active else "",
                 **({"epoch_reason": self._epoch_reason} if getattr(self, "_epoch_reason", None) else {}),
                 # the apps whose steps must bring them to the front (read from their pixels, or a step that could not
@@ -706,6 +758,13 @@ class HandsExecutor:
                 self._inventory[key] = tuple(sorted(self._inventory[key] + ((window, title),)))
         els = []
         texts = []
+        # the window's own buttons as accessibility names them (K1): an element on one's frame carries its subrole
+        info = next((w for w in pre if w["id"] == window), None)
+        frame0 = self._frame(window, pre)
+        buttons: list = []
+        if info and info.get("pid") and frame0:
+            from .drivers.axchrome import window_buttons
+            buttons = window_buttons(int(info["pid"]), tuple(frame0), wid)
         for e in obs.elements:
             actions = ["click"]
             if e.settable:
@@ -717,7 +776,9 @@ class HandsExecutor:
                 texts.append(e.value or e.label)
             # where it was read from: the accessibility tree, or the screenshot (an app read from its pixels)
             el = {"id": e.id, "role": role, "label": e.label, "actions": actions,
-                  "source": "pixels" if e.source == "pixels" else "ax"}
+                  "source": "pixels" if e.source == "pixels" else "ax",
+                  # read from accessibility, "" when not: never guessed from the label (K1)
+                  "ax_subrole": element_subrole(e, frame0, buttons)}
             # the localized role name, and whether the label is only that (no name of its own): an empty container
             if getattr(e, "role_description", ""):
                 el["role_description"] = e.role_description
@@ -742,6 +803,13 @@ class HandsExecutor:
                                                # rect is local to it, so the app can place a mark on a picture of it
                                                **({"frame": frame} if frame else {})},
                "modal": {"title": "dialog"} if obs.dialog else None, "elements": els, "text": "\n".join(texts)[:4000]}
+        # a save sheet open on the window: where it would save, from its accessibility values (K1) -- harness floors a
+        # Save As over a file of the user's by this path (whose the window is, is its ledger's: the window's id)
+        if info and info.get("pid") and frame0:
+            from .drivers.axchrome import save_sheet
+            sheet = save_sheet(int(info["pid"]), tuple(frame0), wid)
+            if sheet is not None:
+                out["save_sheet"] = sheet
         notes = list(getattr(d, "wait_notes", None) or [])
         if notes:
             out["notes"] = notes
@@ -1210,12 +1278,19 @@ class HandsExecutor:
             self._step_ended(step)
 
     def _open_window_now(self, app: str, url: str | None) -> dict:
-        bundle = resolve_app(app, running_apps(), installed_apps())
+        # which app this is: from the running apps' names and the installed ones. Whether it runs, in three states
+        # (hands#70 Codex review at b7ec190: unknown is never the permissive value): running -- the fresh read for the
+        # bundle (app_running; the list is stale in this process) or the list says so, hidden and windowless ones
+        # included; not running -- the fresh read says no and the list was read and does not name it; else unknown.
+        # Only "not running" launches it (and may report opened_window); only "running" lets a window that appeared
+        # be the task's (new_window). Unknown does neither: nothing launched, nothing claimed.
+        apps = running_apps(strict=True)
+        bundle = resolve_app(app, apps or [], installed_apps())
         if not bundle:
             return {"status": "unsupported", "why": f"no application called {app!r} is running or installed"}
-        was_running = bundle in {b for _, b in running_apps()}
+        liveness = app_liveness(app_running(bundle), apps, bundle)
         launched: list[dict] = []
-        if not was_running:
+        if liveness == "not_running":
             # Not running: launched first, on its own. What it brings back then -- the last session's windows, as
             # Safari and TextEdit do -- is the user's, not a window this action made (PR #48 review, third round).
             # An app slow to start (a music player took longer than the 8 s this waited, 10-20) is waited for up to
@@ -1265,7 +1340,10 @@ class HandsExecutor:
                 w = shown[-1]
                 allow_flash(bundle)              # the task opened the app: it may bring it forward for its steps
                 return {"status": "ok", "window": w["id"],
-                        "opened_window": {"id": w["id"], "app": w["app"], "app_name": w["app"] or app_display_name(w.get("bundle") or ""), "title": w["title"]},
+                        # (the newest window the launch brought up, when it brought several: one, never a guess between
+                        # them; was_running: this launch's own read said the app was not running -- the only way a
+                        # window is ever reported here. Its key set is a contract: fixtures/contracts/opened_window.json)
+                        "opened_window": opened_window(w, bundle),
                         "why": "the window the app showed when this opened it; what is in it is the user's"}
         # Whose the window is: the task's on proof that this action made it -- the window id the app's scripting
         # returned for the document it made, or a browser window the driver opened and told apart by its marker.
@@ -1303,7 +1381,7 @@ class HandsExecutor:
         if not fresh:
             return {"status": "unverified", "why": f"{app} ({bundle}) was asked to open a window; none appeared"}
         w = fresh[-1]
-        owned = bool(proof) or (was_running and self._split(w["id"])[1] not in {self._split(b)[1] for b in before})
+        owned = bool(proof) or (liveness == "running" and self._split(w["id"])[1] not in {self._split(b)[1] for b in before})
         if not owned:
             return {"status": "ok", "window": w["id"],
                     "why": f"a window of {app} is there, but it may be one the app brought back when it launched, not one this action made"}

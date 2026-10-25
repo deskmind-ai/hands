@@ -297,8 +297,8 @@ class Round9(unittest.TestCase):
         d._front_bundle = lambda: next(fronts)
         idle = iter([10.0, 0.0])
         d._hid_idle = lambda: next(idle, 0.0)
-        d._announce_wait = lambda w, b="", what="": True
-        d._resumed = lambda: None
+        d._announce_wait = lambda w, b="", what="", **kw: True
+        d._resumed = lambda *a, **k: None
         d._front_taken = lambda b, t: None
         d._front_given_back = lambda tok: None
         d._give_front_back = lambda prev, ours=None, late_s=0.0: None

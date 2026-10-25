@@ -82,8 +82,8 @@ class StopInTheDriver(unittest.TestCase):
         d = PeekabooDriver.__new__(PeekabooDriver)
         d.app = "com.example.player"
         d._takeover = lambda: False
-        d._resumed = lambda: None
-        d._announce_wait = lambda waited, bundle, what: True
+        d._resumed = lambda *a, **k: None
+        d._announce_wait = lambda waited, bundle, what, **kw: True
         d._front_bundle = lambda: "com.apple.Terminal"
         d._background_input = lambda bundle: False
         d.BROWSERS = set()
@@ -121,7 +121,7 @@ class BrowserForeground(unittest.TestCase):
         d._window_id = "61"
         d._run_windows = {"61"} if own else set()
         d._takeover = lambda: True                 # the user handed the screen over: no wait
-        d._resumed = lambda: None
+        d._resumed = lambda *a, **k: None
         d._background_input = lambda bundle: False
         d.BROWSERS = {"com.google.chrome"}
         d.front = ["com.googlecode.iterm2"]        # the user's terminal is in front
@@ -187,7 +187,7 @@ class BrowserForeground(unittest.TestCase):
         d = self._driver(True)
         d._takeover = lambda: False
         d.front[0] = "com.google.Chrome"
-        d._announce_wait = lambda waited, bundle, what: True
+        d._announce_wait = lambda waited, bundle, what, **kw: True
         with mock.patch.dict(_os.environ, {"HANDS_FLASH_APPS": "com.google.Chrome", "HANDS_FLASH_WAIT_S": "0"}), \
              mock.patch.dict(_sys.modules, {"Quartz": types.ModuleType("Quartz")}), \
              mock.patch("deskmind_hands.drivers.peekaboo.time.sleep"):
@@ -241,7 +241,7 @@ class BrowserForeground(unittest.TestCase):
         d = self._driver(True)
         d._takeover = lambda: False
         d._own_window_in_front = lambda bundle: True
-        d._announce_wait = lambda waited, bundle, what: True
+        d._announce_wait = lambda waited, bundle, what, **kw: True
         clock = [100.0]
         idle = iter([10.0, 0.5])                       # still at the check; touched 0.5 s ago, 1 s after it
         d._hid_idle = lambda: next(idle, 0.0)

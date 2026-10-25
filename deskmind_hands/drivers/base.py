@@ -32,6 +32,9 @@ class Element:
     #: while AX calls it an "AXTextArea" -- and collapsing them makes element
     #: selection silently miss its target.
     ax_role: str = ""
+    #: The AX subrole when accessibility names it ("AXCloseButton", "AXMinimizeButton"), else "" -- read, never
+    #: guessed from a label (K1: harness floors a window's close button by this, exactly).
+    ax_subrole: str = ""
     label: str = ""
     rect: Rect | None = None
     value: str | None = None

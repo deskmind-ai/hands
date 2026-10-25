@@ -24,6 +24,11 @@ W12 = f"{TE}#12"
 W13 = f"{TE}#13"
 
 
+
+def _listed(bundle):
+    """The fresh per-bundle read (executor.app_running), as the test's running_apps stub lists it (K1)."""
+    return bundle in {b for _, b in (sys.modules["deskmind_hands.executor"].running_apps(strict=True) or [])}
+
 def _win(wid: str, bundle: str = TE, title: str = "未命名", app: str = "文本编辑") -> dict:
     return {"id": f"{bundle}#{wid}", "app": app, "bundle": bundle, "title": title, "pid": 1, "bounds": None}
 
@@ -379,6 +384,7 @@ class Windows(unittest.TestCase):
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=opens), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=TE), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[("文本编辑", TE)]), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch("deskmind_hands.executor.time.sleep"):
             r = ex.perform({"kind": "open_window", "app": "TextEdit"})
         self.assertEqual(r["status"], "unverified")      # nothing the action made appeared
@@ -835,6 +841,7 @@ class Background(unittest.TestCase):
         ex._front_bundle_id = lambda: "com.googlecode.iterm2"   # noqa: SLF001 -- the user's terminal is in front
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[]), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=TE), \
              mock.patch("deskmind_hands.executor.time.sleep"):
             ex.perform({"kind": "open_window", "app": "TextEdit"})
@@ -862,6 +869,7 @@ class Background(unittest.TestCase):
         ex._restore_front = lambda b: given.append(b) or True   # noqa: SLF001
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[]), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=TE), \
              mock.patch("deskmind_hands.executor.time.sleep"):
             ex.perform({"kind": "open_window", "app": "TextEdit"})
@@ -1217,12 +1225,13 @@ class OpenWindow(unittest.TestCase):
                     return SimpleNamespace(returncode=0, stdout=f"{state['n']}\n")
                 return SimpleNamespace(returncode=1, stdout="")
             return SimpleNamespace(returncode=0, stdout="")
-        running_apps = lambda: [("文本编辑", TE)] if state["running"] else []   # noqa: E731
+        running_apps = lambda strict=False: [("文本编辑", TE)] if state["running"] else []   # noqa: E731
         return state, run, running_apps
 
     def _open(self, ex, run, running):
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", side_effect=running), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=TE), \
              mock.patch("deskmind_hands.executor.time.sleep"):
             return ex.perform({"kind": "open_window", "app": "文本编辑"})
@@ -1278,7 +1287,8 @@ class OpenWindow(unittest.TestCase):
         state, run, running = self._mac(ex, running=False, restored=[_win("700", bundle=player, title="Player", app="Player")],
                                          answers=False, documents={})
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
-             mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda: [("Player", player)] if state["running"] else []), \
+             mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda strict=False: [("Player", player)] if state["running"] else []), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=player), \
              mock.patch("deskmind_hands.executor.is_browser", return_value=False), \
              mock.patch.dict(os.environ, {"HANDS_FLASH_APPS": ""}), \
@@ -1297,7 +1307,8 @@ class OpenWindow(unittest.TestCase):
         state, run, running = self._mac(ex, running=False, restored=[_win("701", bundle="com.example.web", title="Tabs", app="Web")],
                                          answers=False, documents={})
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
-             mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda: [("Web", "com.example.web")] if state["running"] else []), \
+             mock.patch("deskmind_hands.executor.running_apps", side_effect=lambda strict=False: [("Web", "com.example.web")] if state["running"] else []), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value="com.example.web"), \
              mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
              mock.patch("deskmind_hands.executor.time.sleep"):
@@ -1336,6 +1347,7 @@ class OpenWindow(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout="")
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[("Safari", safari)]), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=safari), \
              mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
              mock.patch("deskmind_hands.executor.time.sleep"):
@@ -1390,6 +1402,7 @@ class OpenWindow(unittest.TestCase):
         sent = []
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=lambda argv, **k: sent.append(argv)), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[("Google Chrome", chrome)]), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=chrome), \
              mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
              mock.patch("deskmind_hands.executor.time.sleep"):
@@ -1436,6 +1449,7 @@ class OpenWindow(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout="")
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[("Google Chrome", chrome)]), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=chrome), \
              mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
              mock.patch("deskmind_hands.executor.time.sleep"):
@@ -1450,6 +1464,7 @@ class OpenWindow(unittest.TestCase):
         stub._own_browser_script = {}
         with mock.patch("deskmind_hands.executor.subprocess.run", side_effect=run), \
              mock.patch("deskmind_hands.executor.running_apps", return_value=[("Google Chrome", chrome)]), \
+             mock.patch("deskmind_hands.executor.app_running", side_effect=_listed), \
              mock.patch("deskmind_hands.executor.resolve_app", return_value=chrome), \
              mock.patch("deskmind_hands.executor.is_browser", return_value=True), \
              mock.patch("deskmind_hands.executor.time.sleep"):

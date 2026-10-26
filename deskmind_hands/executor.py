@@ -1083,6 +1083,10 @@ class HandsExecutor:
                 # stopped after part of its input went): never "error", which reads as nothing done
                 status = "unverified"
             out = {"status": status, "why": res.detail, "window": window}
+            # what a save came to, where the driver can tell: "saved", or "sheet_opened" (the app showed its save sheet;
+            # nothing saved yet -- an ok step, the sheet is in the next observe's save_sheet)
+            if getattr(res, "outcome", ""):
+                out["outcome"] = res.outcome
             if res.performed is False:
                 # the driver knows nothing was sent: a refusal before acting (stale, unsupported, waited out for the
                 # user, the deadline). A harness that does not know user_busy takes it as an error, as before

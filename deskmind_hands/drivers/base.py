@@ -211,6 +211,10 @@ class ExecResult:
     #: (stale, unsupported, waited out for the user, or words marked NothingSent). None: not known, which the layer
     #: above takes as "may have happened". Never False on a guess: an action that may have gone out stays unknown.
     performed: bool | None = None
+    #: What a save came to, where the driver can tell (scripted saves): "saved" -- the document is clean afterwards;
+    #: "sheet_opened" -- the app showed its save sheet instead (a document never saved has nowhere to go) and nothing
+    #: is saved yet. Empty elsewhere. Sent to the layer above as `outcome`.
+    outcome: str = ""
 
     def __post_init__(self):
         if not self.ok and (self.detail or "").lower().startswith(USER_BUSY):

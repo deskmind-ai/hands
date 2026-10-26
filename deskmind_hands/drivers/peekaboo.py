@@ -5859,11 +5859,14 @@ class PeekabooDriver:
         ]
 
     def _textedit_save(self, name: str) -> ExecResult:
-        """Save a TextEdit document without waiting for TextEdit's reply, then check that it took.
+        """Save a TextEdit document without waiting for TextEdit's reply, then check what came of it.
 
         From 09-24 on, TextEdit in the background completes a scripted save (the file is written, `modified`
         turns false) and never answers the Apple Event: every save timed out, and was reported as a failure the
-        planner retried. The save is sent ignoring the reply; success is the document no longer being modified."""
+        planner retried. The save is sent ignoring the reply. What happened is told by structure, never by the title:
+        saved -- the document is no longer modified; sheet_opened -- a document never saved has nowhere to go, so the
+        app shows its save sheet on the window and nothing is saved yet (ok: the next step fills it in; it was
+        reported as "could not confirm ... saved", an error); failed -- neither, or the sheet could not be read."""
         doc = self._q(name)
         # The receipt needs a save to have happened: unsaved changes before, none after. A save of a document with
         # nothing to save writes nothing the task can be credited with (PR #16 review, eighth round).
@@ -5875,6 +5878,9 @@ class PeekabooDriver:
         for _ in range(25):
             time.sleep(0.2)
             ok, out = self._osa_read(f'tell application "TextEdit" to get modified of (first document whose name is "{doc}")')
+            if not (ok and out.strip() == "false") and self._save_sheet_open() is True:
+                return ExecResult(True, f"the save sheet opened for {name!r}; nothing is saved yet: fill in its name "
+                                        f"and place, then save", outcome="sheet_opened")
             if ok and out.strip() == "false":
                 self._scripted_actions += 1
                 # The receipt: where the document was written, asked of TextEdit by the same query
@@ -5889,8 +5895,18 @@ class PeekabooDriver:
                     content = text.encode("utf-8") if text is not None else None
                     written = self._receipt(where.strip(), content) if ok else ()
                 return ExecResult(True, f"saved {name!r} (scripted, in the background)" if was_modified
-                                  else f"{name!r} had no unsaved changes; nothing to save", files=written)
+                                  else f"{name!r} had no unsaved changes; nothing to save", files=written, outcome="saved")
         return ExecResult(False, f"could not confirm that {name!r} was saved")
+
+    def _save_sheet_open(self) -> bool | None:
+        """Whether the observed window has a sheet open now (axchrome.sheet_present): True, False, or None (not
+        known)."""
+        try:
+            from deskmind_hands.drivers import axchrome
+            pid = self._pid_of(self.app)
+            return axchrome.sheet_present(pid, self._window_frame(), wid=self._observed_id()) if pid else None
+        except Exception:  # noqa: BLE001 -- not known
+            return None
 
     def _receipt(self, path: str, data: bytes | None) -> tuple[tuple[str, str | None], ...]:
         """`path` as a files receipt, (absolute path, SHA-256 of `data`): the content written -- the bytes this driver

@@ -230,6 +230,21 @@ def _read_save_sheet(win, get, resolve) -> dict | None:
     return out
 
 
+def sheet_present(pid: int, frame: tuple | None, wid=None, get=None) -> bool | None:
+    """Whether the window at `frame` has a sheet open (an AXSheet among its children): True, False, or None when that
+    cannot be read (no such window, two at the frame, a failed read) -- never False on a guess. Structure only: no
+    title, no words. `get` is injectable (tests)."""
+    try:
+        win = _the_window(pid, frame, wid)
+        if win is None:
+            return None
+        get = get or _get_strict
+        kids = get(win, "AXChildren") or []
+        return any(str(get(c, "AXRole") or "") == "AXSheet" for c in kids)
+    except Exception:  # noqa: BLE001 -- AXReadError and the rest: not known
+        return None
+
+
 def save_sheet(pid: int, frame: tuple | None, wid=None) -> dict | None:
     """The save sheet open on the window (read_save_sheet): None when the window was read and has none; when the
     window or its sheet could not be read, a sheet with every field unknown (fail closed: a floor never takes "could
